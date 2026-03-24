@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pandas as pd
+
+from pm15min.research.labels.alignment import merge_feature_and_label_frames
+
+
+REPLAY_KEY_COLUMNS = ["decision_ts", "cycle_start_ts", "cycle_end_ts", "offset"]
+REPLAY_SCORE_COLUMNS = [
+    *REPLAY_KEY_COLUMNS,
+    "p_lgb",
+    "p_lr",
+    "p_signal",
+    "p_up",
+    "p_down",
+    "score_valid",
+    "score_reason",
+]
+
+
+@dataclass(frozen=True)
+class ReplayLoadSummary:
+    feature_rows: int
+    label_rows: int
+    merged_rows: int
+    score_rows: int
+    score_covered_rows: int
+    score_missing_rows: int
+    score_valid_rows: int
+    score_invalid_rows: int
+    unresolved_label_rows: int
+    bundle_offset_missing_rows: int
+    ready_rows: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "feature_rows": self.feature_rows,
+            "label_rows": self.label_rows,
+            "merged_rows": self.merged_rows,
+            "score_rows": self.score_rows,
+            "score_covered_rows": self.score_covered_rows,
+            "score_missing_rows": self.score_missing_rows,
+            "score_valid_rows": self.score_valid_rows,
+            "score_invalid_rows": self.score_invalid_rows,
+            "unresolved_label_rows": self.unresolved_label_rows,
+            "bundle_offset_missing_rows": self.bundle_offset_missing_rows,
+            "ready_rows": self.ready_rows,
+        }
+
+
+def build_score_frame(score_frames: list[pd.DataFrame]) -> pd.DataFrame:
+    if not score_frames:
+        return pd.DataFrame(columns=REPLAY_SCORE_COLUMNS)
+    frame = pd.concat(score_frames, ignore_index=True, sort=False)
+    for column in ("decision_ts", "cycle_start_ts", "cycle_end_ts"):
+        frame[column] = pd.to_datetime(frame[column], utc=True, errors="coerce")
+    frame["offset"] = pd.to_numeric(frame["offset"], errors="coerce").astype("Int64")
+    frame["score_valid"] = _bool_series(frame, "score_valid")
+    frame["score_reason"] = _string_series(frame, "score_reason")
+    return (
+        frame.reindex(columns=REPLAY_SCORE_COLUMNS)
+        .drop_duplicates(subset=REPLAY_KEY_COLUMNS, keep="last")
+        .sort_values(REPLAY_KEY_COLUMNS)
+        .reset_index(drop=True)
+    )
+
+
+def build_replay_frame(
+    *,
+    features: pd.DataFrame,
+    labels: pd.DataFrame,
+    score_frames: list[pd.DataFrame],
+    available_offsets: list[int],
+) -> tuple[pd.DataFrame, ReplayLoadSummary]:
+    merged, alignment_metadata = merge_feature_and_label_frames(features, labels)
+    score_frame = build_score_frame(score_frames)
+    replay = merged.merge(score_frame, on=REPLAY_KEY_COLUMNS, how="left")
+    replay["bundle_offset_available"] = pd.to_numeric(replay["offset"], errors="coerce").isin(
+        [int(offset) for offset in available_offsets]
+    )
+    replay["score_present"] = replay["p_up"].notna() & replay["p_down"].notna()
+    replay["score_valid"] = _bool_series(replay, "score_valid")
+    replay["score_reason"] = _string_series(replay, "score_reason")
+    replay["winner_side"] = _string_series(replay, "winner_side").str.upper()
+    replay["resolved"] = _bool_series(replay, "resolved")
+
+    ready_mask = (
+        replay["bundle_offset_available"]
+        & replay["score_present"]
+        & replay["score_valid"]
+        & replay["resolved"]
+        & replay["winner_side"].isin(["UP", "DOWN"])
+    )
+    summary = ReplayLoadSummary(
+        feature_rows=int(alignment_metadata.get("feature_rows", len(features))),
+        label_rows=int(alignment_metadata.get("label_rows", len(labels))),
+        merged_rows=int(len(replay)),
+        score_rows=int(len(score_frame)),
+        score_covered_rows=int(replay["score_present"].sum()),
+        score_missing_rows=int((~replay["score_present"]).sum()),
+        score_valid_rows=int(replay["score_valid"].sum()),
+        score_invalid_rows=int((~replay["score_valid"]).sum()),
+        unresolved_label_rows=int((~replay["resolved"]).sum()),
+        bundle_offset_missing_rows=int((~replay["bundle_offset_available"]).sum()),
+        ready_rows=int(ready_mask.sum()),
+    )
+    return replay.sort_values(REPLAY_KEY_COLUMNS).reset_index(drop=True), summary
+
+
+def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
+    values = frame[column] if column in frame.columns else pd.Series(False, index=frame.index, dtype="boolean")
+    return values.astype("boolean").fillna(False).astype(bool)
+
+
+def _string_series(frame: pd.DataFrame, column: str) -> pd.Series:
+    values = frame[column] if column in frame.columns else pd.Series("", index=frame.index, dtype="string")
+    return values.astype("string").fillna("").astype(str)

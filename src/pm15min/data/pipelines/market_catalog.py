@@ -1,0 +1,113 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pandas as pd
+
+from ..config import DataConfig
+from ..io.parquet import upsert_parquet, write_parquet_atomic
+from ..sources.polymarket_gamma import (
+    GammaEventsClient,
+    build_market_catalog_records,
+    build_market_catalog_records_from_markets,
+)
+from ..layout import utc_snapshot_label
+
+
+MARKET_CATALOG_COLUMNS = [
+    "market_id",
+    "condition_id",
+    "asset",
+    "cycle",
+    "cycle_start_ts",
+    "cycle_end_ts",
+    "token_up",
+    "token_down",
+    "slug",
+    "question",
+    "resolution_source",
+    "event_id",
+    "event_slug",
+    "event_title",
+    "series_slug",
+    "closed_ts",
+    "source_snapshot_ts",
+]
+
+
+def _frame_from_records(records) -> pd.DataFrame:
+    if not records:
+        return pd.DataFrame(columns=MARKET_CATALOG_COLUMNS)
+    df = pd.DataFrame([record.to_row() for record in records], columns=MARKET_CATALOG_COLUMNS)
+    return df.sort_values(["cycle_start_ts", "market_id"]).reset_index(drop=True)
+
+
+def sync_market_catalog(
+    cfg: DataConfig,
+    *,
+    start_ts: int,
+    end_ts: int,
+    client: GammaEventsClient | None = None,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    snapshot_ts = utc_snapshot_label(now)
+    client = client or GammaEventsClient()
+    source_mode = "gamma_closed_events"
+    fetched_rows = 0
+    if cfg.surface == "live":
+        markets = client.fetch_active_markets(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            limit=cfg.gamma_limit,
+            max_pages=cfg.max_pages,
+            sleep_sec=cfg.sleep_sec,
+        )
+        records = build_market_catalog_records_from_markets(
+            markets=markets,
+            asset=cfg.asset.slug,
+            cycle=cfg.cycle,
+            snapshot_ts=snapshot_ts,
+        )
+        source_mode = "gamma_active_markets"
+        fetched_rows = len(markets)
+    else:
+        events = client.fetch_closed_events(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            limit=cfg.gamma_limit,
+            max_pages=cfg.max_pages,
+            sleep_sec=cfg.sleep_sec,
+        )
+        records = build_market_catalog_records(
+            events=events,
+            asset=cfg.asset.slug,
+            cycle=cfg.cycle,
+            snapshot_ts=snapshot_ts,
+        )
+        fetched_rows = len(events)
+    snapshot_df = _frame_from_records(records)
+
+    snapshot_path = cfg.layout.market_catalog_snapshot_path(snapshot_ts)
+    write_parquet_atomic(snapshot_df, snapshot_path)
+
+    canonical_df = upsert_parquet(
+        path=cfg.layout.market_catalog_table_path,
+        incoming=snapshot_df,
+        key_columns=["market_id"],
+        sort_columns=["cycle_start_ts", "source_snapshot_ts", "market_id"],
+    )
+
+    return {
+        "dataset": "market_catalog",
+        "market": cfg.asset.slug,
+        "cycle": cfg.cycle,
+        "surface": cfg.surface,
+        "source_mode": source_mode,
+        "start_ts": int(start_ts),
+        "end_ts": int(end_ts),
+        "rows_fetched": int(fetched_rows),
+        "snapshot_rows": int(len(snapshot_df)),
+        "canonical_rows": int(len(canonical_df)),
+        "snapshot_path": str(snapshot_path),
+        "canonical_path": str(cfg.layout.market_catalog_table_path),
+    }

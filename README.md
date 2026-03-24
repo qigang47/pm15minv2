@@ -7,18 +7,18 @@
 这份 README 的目标不是“简短介绍一下项目”，而是做一份能直接代替口头讲解的代码地图：你只看这一个文件，就应该知道：
 
 - 这套系统整体在做什么
-- `data / research / live` 三条线怎么衔接
-- 每个目录为什么存在
-- 主要文件各自负责哪一段链路
-- 如果你要改某个行为，应该先去看哪里
+- `core / data / research / live / console` 五块边界怎么串起来
+- 运行产物到底落在哪些目录
+- 主要文件各自负责哪一段链路、上游读什么、下游喂给谁
+- 如果你要改某个行为，应该先去看哪里，以及改完要回头验证哪一层
 
 默认不展开 `__pycache__`。但这份 README 不再默认忽略 `__init__.py`，因为在 v2 里很多 `__init__.py` 其实就是稳定门面，不只是包标记。
 
 ## 一句话总览
 
-这套代码把 Polymarket 相关的多源数据整理成 canonical 数据面，在研究域里把它们变成 feature、label、training run、bundle、backtest、evaluation，然后在 live 域里消费 active bundle、最新市场状态和账户状态，产出 signal、quote、decision、execution，再根据交易网关执行下单、撤单、赎回和状态落盘；现在还额外提供了一个只读 `console` 层，用来把 canonical data/research 产物组织成更适合 UI/API 消费的 read-model。
+这套代码把 Polymarket 相关的多源数据整理成 canonical 数据面，在研究域里把它们变成 feature、label、training run、bundle、backtest、evaluation，然后在 live 域里消费 active bundle、最新市场状态和账户状态，产出 signal、quote、decision、execution，再根据交易网关执行下单、撤单、赎回和状态落盘；此外还有一个 `console` 层，负责把 canonical 产物重组为 read-model，并把标准化 action 请求转成既有 CLI 调用、后台任务和本地 HTTP 控制台入口。
 
-## 四条主线怎么连起来
+## 五块核心边界怎么连起来
 
 按运行时真实依赖看，主链路是：
 
@@ -31,14 +31,14 @@
 4. `live/`
    读取 active bundle、live data foundation、账户状态、风险状态，组装 signal、quote、decision、execution，并把副作用交给 trading adapter。
 5. `console/`
-   只读消费 `data` 和 `research` 的 canonical outputs，提供稳定的 read-model、CLI 和轻量 JSON HTTP 入口，给后续可视化控制台使用。
+   不重新实现业务逻辑，而是消费 `data / research / live` 已经落好的 canonical 产物，提供 read-model、动作目录、任务管理、CLI 和轻量 HTTP UI。
 
 把它压成一句更实用的话就是：
 
 - `data` 负责“把世界变成稳定数据”
 - `research` 负责“把稳定数据变成可用模型和离线结论”
 - `live` 负责“把模型和最新状态变成实时动作”
-- `console` 负责“把现有 canonical 产物变成可展示、可查询的只读视图”
+- `console` 负责“把现有 canonical 产物变成可查询视图、标准化动作和控制台入口”
 
 ## 推荐阅读顺序
 
@@ -54,8 +54,9 @@
 6. `src/pm15min/live/runtime.py`
 7. `src/pm15min/live/service/__init__.py`
 8. `src/pm15min/live/runner/__init__.py`
+9. `src/pm15min/console/service.py`
 
-读完这 8 个入口，你会知道：
+读完这 9 个入口，你会知道：
 
 - 仓库怎么分域
 - 路径怎么统一
@@ -67,6 +68,48 @@
 - 想看数据底座：`data/layout/__init__.py -> data/config.py -> data/cli/__init__.py -> data/pipelines/* -> data/service/__init__.py`
 - 想看研究产物：`research/layout.py -> research/config.py -> research/service.py -> research/datasets/* -> research/training/* -> research/bundles/* -> research/backtests/*`
 - 想看实盘主线：`live/runtime.py -> live/cli/__init__.py -> live/service/__init__.py -> live/signal/* -> live/quotes/* -> live/execution/* -> live/actions/* -> live/runner/* -> live/trading/*`
+- 想看控制台层：`console/service.py -> console/read_models/* -> console/actions.py -> console/tasks.py -> console/http/*`
+
+## 看文件名就知道职责
+
+如果你还没点开文件，先记住这组命名约定。v2 里很多文件名本身就是架构语言：
+
+- `layout.py` / `layout/*`
+  定义目录结构、文件命名约定和路径推导；改路径、改产物位置、改 latest/snapshot 规则，先看这里。
+- `config.py`
+  把 CLI 参数或运行参数收口成结构化配置；跨层调用一般都先 build config。
+- `contracts.py` / `_contracts_*.py`
+  定义跨文件共享的数据契约、spec 和 manifest 语义；一旦这里改了，下游 loader、service、tests 往往都要跟着动。
+- `cli.py` / `cli/parser.py` / `cli/handlers.py`
+  `parser` 只管命令树，`handlers` 只管参数转调用，`cli.py` 或 `__init__.py` 负责稳定门面。
+- `service.py`
+  该子域对外的正式 API 边界。外部优先调它，不直接跳进更底层实现。
+- `runtime.py`
+  把一次动作变成持续运行的循环、节奏控制或边界解释；尤其常见于 `data` foundation、`live` runner、`redeem` loop。
+- `state.py`
+  负责构造某个运行态快照；通常是把多个来源拼成统一状态对象。
+- `persistence.py`
+  负责状态或结果的落盘、读取和 latest 约定，不承担业务判断。
+- `builder.py` / `builders.py`
+  把多个输入装配成更高层对象，例如 feature frame、bundle、quote row、action payload。
+- `loader.py` / `loaders.py`
+  从 canonical 目录里按统一规则把对象读回来；读失败时，先看这里怎么解析目录和 manifest。
+- `policy.py` / `policy_*`
+  具体的阈值、筛选、重试或执行规则；改行为时通常是最接近“业务判断”的地方。
+- `parity.py`
+  离线/在线一致性校验。只要你改了 live 逻辑、feature、guard、execution，相关 parity 文件和测试都应该回看。
+
+## 关键对象怎么流
+
+如果你要掌控全局，不要只记目录名，要记“对象在仓库里的生命周期”：
+
+- `data/sources/*` 拉原始世界，`data/pipelines/*` 把它们落成 canonical source/table/export。
+- `research/datasets/*` 把 canonical 数据拼成 feature frame / label frame / training set。
+- `research/training/*` 产出 training run，随后 `research/bundles/*` 把它封装成可部署 model bundle。
+- `research/active_bundles/*` 只保留每个 `market/profile/target` 当前激活的 bundle 指针，`live` 读取的不是“随便哪个 bundle 目录”，而是这个单一 selection。
+- `live/signal -> quotes -> decision -> execution -> actions -> trading` 是实盘主链路；每一步都会往 `var/live/` 写快照，便于 operator 回看。
+- `console/read_models/*` 主要读 `data/`、`research/`、`var/` 里已经存在的产物；`console/actions.py` 和 `console/tasks.py` 则把“用户动作”重新映射回标准 `pm15min` CLI，而不是旁路执行私有逻辑。
+- 调 bug 最有效的顺序通常不是“从报错文件往下猜”，而是沿对象链路前后各追一层：上游是谁产出的、下游谁消费了、manifest 或 state 是不是已经开始漂移。
 
 ## 根目录地图
 
@@ -77,15 +120,15 @@
 - `tests/`
   行为测试、架构护栏、CLI 接线检查、跨域 parity 检查。
 - `docs/`
-  设计文档、重构审查、operator runbook、路线图。
+  设计文档、重构审查、operator runbook、路线图和近期审计记录。
 - `scripts/`
-  少量迁移或导入脚本。
+  canonical shell 入口和少量迁移/导入脚本。
 - `data/`
-  v2 的 canonical 数据产物目录。
+  v2 的 canonical 数据产物目录，按 `sources / tables / live / backtest / exports` 分层。
 - `research/`
-  v2 的研究产物目录，包括 feature/label/training/bundle/backtest/evaluation。
+  v2 的研究产物目录，包括 feature frame、label frame、training set、training run、bundle、backtest、evaluation、experiment。
 - `var/`
-  运行态日志、状态、缓存、临时产物。
+  运行态日志、状态、缓存、控制台任务和临时产物。
 
 ### 运行态重要目录
 
@@ -93,6 +136,8 @@
   live surface 的 canonical 数据。
 - `data/backtest/`
   backtest surface 的 canonical 数据。
+- `data/exports/`
+  面向人工检查或外部消费的导出文件。
 - `research/model_bundles/`
   可部署 bundle 的正式落盘目录。
 - `research/active_bundles/`
@@ -103,8 +148,12 @@
   评估结果目录。
 - `var/live/`
   live runner、quotes、decision、execution、account、regime、readiness 等状态快照。
+- `var/console/`
+  console 的任务记录、运行态摘要和 history window。
 - `var/research/`
   research 的缓存、锁、日志、临时结果。
+- `var/state/`
+  更通用的最新状态或兼容性状态落盘区域。
 
 ## `src/pm15min/` 顶层文件
 
@@ -113,7 +162,7 @@
 - `src/pm15min/__main__.py`
   让 `python -m pm15min` 直接走到顶层 CLI。
 - `src/pm15min/cli.py`
-  全局 CLI 总入口。它不直接做业务，只负责把命令分发给 `data`、`research`、`live` 三个域，并提供一个最顶层的 `layout` 检查命令。
+  全局 CLI 总入口。它不直接做业务，只负责把命令分发给 `data`、`research`、`live`、`console` 四个域，并提供一个最顶层的 `layout` 检查命令。
 
 ## `core/`
 
@@ -401,6 +450,8 @@
   包标记。
 - `research/training/calibration.py`
   训练后校准逻辑，例如概率校准和相关报告。
+- `research/training/explainability.py`
+  训练后解释性产物构建器。负责把 logreg 系数、LightGBM feature importance、因子相关性和方向摘要整理成可直接落盘的诊断对象。
 - `research/training/metrics.py`
   训练指标汇总与标准输出。
 - `research/training/probes.py`
@@ -875,18 +926,315 @@
 - `live/runner/utils.py`
   runner 共用工具和错误 payload 构造。
 
+## `console/`
+
+`console/` 不是第四套业务逻辑，而是站在 `data / research / live` 产物之上的“控制台边界”。它主要做四件事：
+
+1. 用 `read_models/` 把 canonical 目录重组成人更好读的对象。
+2. 用 `actions.py` 把界面/HTTP/CLI 请求变成标准 `pm15min` 命令计划。
+3. 用 `tasks.py` 把长任务变成可跟踪、可轮询的后台任务记录。
+4. 用 `http/` 和 `web/` 提供一个本地可访问的 JSON API + 简易控制台壳层。
+
+### 推荐阅读顺序
+
+1. `console/service.py`
+2. `console/read_models/common.py`
+3. `console/actions.py`
+4. `console/action_runner.py`
+5. `console/tasks.py`
+6. `console/http/routes.py`
+7. `console/http/app.py`
+
+### 顶层文件
+
+- `console/__init__.py`
+  控制台域的稳定导出面。
+- `console/action_runner.py`
+  同步执行 action plan 的最薄包装层。它会调用顶层 `pm15min` CLI、捕获 stdout/stderr、尝试解析 JSON 并生成结构化执行结果。
+- `console/actions.py`
+  action 目录和参数归一化中心。这里定义有哪些动作、每个动作需要哪些字段、如何拼出标准命令参数，以及哪些动作支持异步任务化。
+- `console/service.py`
+  console 域正式门面。外部无论走 CLI、HTTP 还是页面，都应优先经由这里读取首页、section、action catalog、task state 和各类 read-model。
+- `console/tasks.py`
+  后台任务管理器。负责 task id、持久化记录、进度心跳、运行态摘要、历史窗口和任务扫描容错。
+
+### `console/cli/`
+
+- `console/cli/__init__.py`
+  console CLI 门面，负责注册顶层 `console` 子命令。
+- `console/cli/parser.py`
+  console 命令树定义，包括 read-model 查询、action 构建/执行、task 查询和 HTTP server 启动。
+- `console/cli/handlers.py`
+  CLI 参数到 console service 的分发层，统一 JSON 输出格式。
+
+### `console/read_models/`
+
+- `console/read_models/__init__.py`
+  read-model 子包出口。
+- `console/read_models/common.py`
+  read-model 共用工具，主要处理 `Path`/`Timestamp` 的 JSON 化和安全读取 JSON 对象。
+- `console/read_models/data_overview.py`
+  数据总览 read-model。优先读取已持久化 summary，不存在时回退到实时计算，并补齐 dataset rows、audit、manifest 和 runtime 说明。
+- `console/read_models/training_runs.py`
+  训练运行 read-model。把 training run 目录、manifest、offset 诊断、explainability 产物和 bundle readiness 组装成控制台可直接消费的对象。
+- `console/read_models/bundles.py`
+  模型包 read-model。负责 bundle 列表、bundle 详情、来源训练链路和 active selection 视图。
+- `console/read_models/backtests.py`
+  回测 read-model。负责标准回测摘要、artifact inventory、stake sweep 等控制台对象。
+- `console/read_models/experiments.py`
+  实验 read-model。负责 suite、run、leaderboard、matrix 和对比结果的控制台摘要。
+
+### `console/http/`
+
+- `console/http/__init__.py`
+  HTTP 子包稳定出口。
+- `console/http/action_routes.py`
+  action 相关 HTTP payload 组装与校验。把 `/api/console/actions`、`/api/console/actions/execute` 这类请求映射到 action catalog、plan 或执行器。
+- `console/http/app.py`
+  HTTP 路由总入口。负责解析目标路径、分发 JSON API、返回 HTML/CSS/JS 壳层，并统一错误响应格式。
+- `console/http/routes.py`
+  section 路由注册表。把 `home / runtime / data_overview / training_runs / bundles / backtests / experiments / actions / tasks` 这些查询映射到具体 handler。
+- `console/http/server.py`
+  基于 `ThreadingHTTPServer` 的最薄 server 封装，用来把 `app.py` 暴露成真正监听的本地服务。
+- `console/http/task_routes.py`
+  task 查询相关 HTTP payload 组装，负责 list/detail 两种任务视图。
+
+### `console/web/`
+
+- `console/web/__init__.py`
+  Web 壳层导出面。
+- `console/web/assets.py`
+  内嵌控制台 CSS/JS 和静态资源路径清单。这里定义页面视觉样式、交互脚本和 asset manifest。
+- `console/web/page.py`
+  HTML 页面壳层生成器。负责 section 导航、全局默认值、bootstrap payload 和控制台页面结构。
+
+## `scripts/`
+
+`scripts/` 不是业务真相，但它们决定了你平时怎么启动系统、怎么导入历史 bundle。改 shell 入口、环境变量加载顺序或迁移脚本时，需要看这里。
+
+### 顶层文件
+
+- `scripts/import_direction_model_bundles.py`
+  一次性 bundle 导入/整理脚本，用来把既有 direction 模型包按 v2 目录约定导入到 canonical `research/model_bundles/` 体系。
+
+### `scripts/entrypoints/`
+
+- `scripts/entrypoints/README.md`
+  说明这些 shell 脚本才是 `v2/` standalone 运行面的 canonical 入口，以及 `.env` 的加载顺序。
+- `scripts/entrypoints/_python_env.sh`
+  共享环境初始化脚本，负责定位 `v2/` 根目录、设置 Python 相关环境并被其他 entrypoint 复用。
+- `scripts/entrypoints/start_v2_auto_redeem.sh`
+  启动自动赎回 loop 的标准 shell 入口。
+- `scripts/entrypoints/start_v2_live_foundation.sh`
+  启动 live data foundation 刷新流程的标准 shell 入口。
+- `scripts/entrypoints/start_v2_live_trading.sh`
+  启动 live runner / live trading 主流程的标准 shell 入口。
+- `scripts/entrypoints/start_v2_orderbook_fleet.sh`
+  启动多市场 orderbook recorder fleet 的标准 shell 入口。
+
+## `var/`
+
+`var/` 是运行态区，不是正式研究产物区。这里的东西通常有 4 类：
+
+- 最新快照，例如 `latest.json`、`state.json`、`run.json`
+- 追加式运行日志，例如 `*.jsonl`
+- 缓存、锁和临时文件
+- 隔离区数据，也就是“先留着排查/迁移，但先不要当 canonical 上游”
+
+判断原则很简单：
+
+- 想找正式数据、训练结果、bundle、backtest，请优先去 `data/` 和 `research/`
+- 想看“刚刚跑了什么、最近状态是什么、哪里失败了”，才来看 `var/`
+
+### `var/` 顶层目录
+
+- `var/backtest/`
+  `data` 域在 `backtest` surface 上的运行态目录。它主要回答“回测要吃的数据面现在健康不健康”，不是回测结果本体。
+- `var/cache/`
+  通用缓存根目录。目前更多是预留位，方便未来把跨域缓存收口。
+- `var/console/`
+  console 域的后台任务和运行态目录。这里能看到 action 是否在跑、进度到哪一步、最近任务历史是什么。
+- `var/live/`
+  live 运行面的核心运行态目录。里面既有 `data` 域为 live surface 写的状态，也有 `live` 域自己写的 signal/quote/decision/execution/account 等快照和日志。
+- `var/logs/`
+  通用日志根目录。目前更多是预留位，跨域日志大多已经落到更具体的 `var/live/logs/` 或 `var/research/logs/`。
+- `var/quarantine/`
+  隔离区。存放迁移、重导入、历史压缩包解包后的中间结果，保留审计价值，但默认不当作 canonical 正式输入。
+- `var/research/`
+  research 域的缓存、锁、迁移日志和临时目录。
+- `var/state/`
+  通用状态根目录。目前更多是预留位；具体域的状态大多已经下沉到 `var/live/state/` 或 `var/backtest/state/`。
+
+### `var/live/`
+
+- `var/live/`
+  live 运行面的总根目录。最重要的两块是 `state/` 和 `logs/`。
+- `var/live/state/`
+  结构化最新状态区。这里的文件更适合程序和 operator 做“读当前状态”。
+- `var/live/logs/`
+  追加式运行日志区。这里更适合回放“这一轮一轮到底发生了什么”。
+
+#### `var/live/state/` 的命名规律
+
+- 资产级目录
+  例如 `open_orders/`、`positions/`，通常按 `asset=<market>/latest.json` 落。
+- profile 级目录
+  例如 `liquidity/`、`regime/`、`cancel/`、`redeem/`、`redeem_runner/`，通常按 `cycle=<cycle>/asset=<market>/profile=<profile>/...` 落。
+- target 级目录
+  例如 `signals/`、`quotes/`、`decisions/`、`orders/`、`execution/`、`runner/`，通常按 `cycle=<cycle>/asset=<market>/profile=<profile>/target=<target>/...` 落。
+
+#### `var/live/state/` 逐目录小结
+
+- `var/live/state/cancel/`
+  cancel policy / cancel action 的结果快照。它记录这轮撤单候选、真正提交了哪些撤单、哪些是 dry-run、哪些失败。
+- `var/live/state/decisions/`
+  decision 快照。这里是 signal、quote、guard、account、liquidity、regime 汇总后的“最终要不要做事”的结构化结果。
+- `var/live/state/execution/`
+  execution plan 快照。这里关注的是价格、数量、重试、下单策略，不等于最终已经下单成功。
+- `var/live/state/foundation/`
+  live data foundation 刷新状态。它会写市场目录、binance、oracle、orderbook 这轮刷新是成功、降级还是失败，以及 fallback 到了哪个数据路径。
+- `var/live/state/liquidity/`
+  流动性状态快照。它是 live guard 和 regime 的一个上游输入，关注 spot/perp 侧流动性、阈值命中、temporal filter 等结果。
+- `var/live/state/open_orders/`
+  当前挂单快照。它是“账户现在还挂着什么单”的事实状态，不是某次下单动作的回执。
+- `var/live/state/orderbooks/`
+  orderbook recorder / hot cache 状态。
+  `state.json` 记录这轮 recorder 的摘要。
+  `recent.parquet` 是最近窗口的轻量盘口缓存，给 quote/readiness/operator 走热路径读取。
+- `var/live/state/orders/`
+  order submit action 的结果快照。它和 `open_orders/` 不同：`orders/` 是“我刚刚尝试提交了什么”，`open_orders/` 是“账户里现在实际挂着什么”。
+- `var/live/state/positions/`
+  当前持仓快照。它是账户侧事实状态，上游来自 gateway / adapter 的 positions 读取。
+- `var/live/state/quotes/`
+  quote 快照。它把 market、orderbook、signal 上下文压成可执行前的一组 entry/roi/spread/depth 视图。
+- `var/live/state/redeem/`
+  redeem action 的结果快照。它记录这轮赎回候选、提交、dry-run 和失败情况。
+- `var/live/state/redeem_runner/`
+  auto-redeem loop 的运行状态。重点是这轮 loop 是否跑过、跑到哪一步、有没有错误。
+- `var/live/state/regime/`
+  regime 状态快照。它是对市场环境的分类/阻断结论，会被 guard 和 operator 摘要消费。
+- `var/live/state/runner/`
+  live runner 单轮主流程快照。它是最接近“这一轮完整实盘 pipeline 总结”的状态对象。
+- `var/live/state/signals/`
+  signal / scoring 快照。这里还没有叠加 quote 和 decision，是“模型怎么看当前市场”的输出。
+- `var/live/state/summary/`
+  `data` 域针对 `live surface` 生成的数据健康摘要。
+  这不是 live runner summary。
+  它回答的是“live 依赖的数据齐不齐、有没有 stale/missing、各 dataset 覆盖如何”。
+  常见文件是 `latest.json` 和 `latest.manifest.json`。
+
+#### `var/live/logs/` 逐目录小结
+
+- `var/live/logs/data/`
+  live surface 上由 `data` 域写出的顺序日志根目录。
+- `var/live/logs/data/foundation/`
+  live foundation 追加日志，通常是 `refresh.jsonl`。每行代表一个刷新事件或一轮完成状态。
+- `var/live/logs/data/recorders/`
+  orderbook recorder 追加日志，通常是 `recorder.jsonl`。每行会记录一次 `iteration_ok`、`iteration_error` 或 `run_finished`。
+- `var/live/logs/redeem_runner/`
+  redeem loop 的追加日志，适合看长期运行过程中每轮发生了什么。
+- `var/live/logs/runner/`
+  live runner 的追加日志，适合回放每轮 pipeline、risk、operator summary 和 side effect 过程。
+
+### `var/backtest/`
+
+- `var/backtest/`
+  `backtest surface` 的运行态目录。这里主要是 `data` 域为了离线研究/回测准备的数据摘要，不是某次 backtest 的 pnl 结果。
+- `var/backtest/state/`
+  `backtest surface` 的结构化状态区。
+- `var/backtest/state/summary/`
+  `backtest surface` 的数据健康摘要目录。
+  典型文件是 `latest.json` 和 `latest.manifest.json`。
+  它回答的是：binance/oracle/truth/orderbook 这些离线数据面现在完整不完整、哪些 dataset 缺失、哪些 freshness/alignment 检查失败。
+
+### `var/console/`
+
+- `var/console/`
+  console 域的运行态根目录。
+- `var/console/state/`
+  console 自己的摘要状态。
+  `runtime_summary.json` 聚合最近任务计数、分组、最新 marker。
+  `runtime_history.json` 保存历史窗口和保留策略信息。
+- `var/console/tasks/`
+  每个后台任务一个 `task_*.json` 文件。
+  里面通常有 `action_id`、请求参数、进度、command preview、stdout/stderr 摘要、关联对象路径和最终状态。
+
+### `var/research/`
+
+- `var/research/`
+  research 域运行态根目录。这里放的是“跑研究流程时需要的辅助文件”，不是正式训练运行结果。
+- `var/research/cache/`
+  research 中间缓存目录。用来避免重复构建相同中间结果。
+- `var/research/locks/`
+  运行锁目录。用来限制重复执行或并发冲突。
+- `var/research/logs/`
+  research 运行日志目录。当前仓库里主要能看到迁移、bundle 导入之类的一次性流程记录。
+- `var/research/tmp/`
+  research 临时目录。运行中间文件应该优先落这里，而不是污染正式产物目录。
+
+### `var/quarantine/`
+
+- `var/quarantine/`
+  隔离区总根目录。这里的共同语义是“保留，方便审计和迁移，但先不要默认信任为 canonical 数据”。
+- `var/quarantine/bundle_reimports/`
+  model bundle 重导入隔离区。通常按 `cycle=.../asset=...` 再往下分层，方便核对重导入前后的结构差异。
+- `var/quarantine/model_bundles_reversal_legacy/`
+  legacy reversal bundle 的隔离区。用途是保留旧结构、做迁移比对，而不是给 live/research 直接消费。
+- `var/quarantine/orderbooks_from_gz/`
+  从旧 gzip/压缩资料解出的 orderbook 隔离区。当前按 `btc/eth/sol/xrp` 这种资产目录再往下放，不直接视为 canonical orderbook source。
+
+### `var/cache/`、`var/logs/`、`var/state/`
+
+- `var/cache/`
+  通用缓存预留目录。当前项目里更常用的是 `var/research/cache/` 和各域自己更细分的状态目录。
+- `var/logs/`
+  通用日志预留目录。当前实际高频写入更多发生在 `var/live/logs/` 和 `var/research/logs/`。
+- `var/state/`
+  通用状态预留目录。当前高频状态更多已经按域下沉到了 `var/live/state/` 和 `var/backtest/state/`。
+
 ## `tests/`
 
-测试文件的命名基本就是代码地图。想知道某块有没有稳定下来，先看对应测试。
+测试文件的命名基本就是代码地图。想知道某块有没有稳定下来，先看对应测试；想评估一次改动会不会破坏边界，就去找同名域下的 parity、service、layout、cli 测试。
 
-### 顶层与架构护栏
+### 顶层、架构与 `core`
 
 - `tests/conftest.py`
   测试公共夹具、临时目录和通用环境约定。
 - `tests/test_architecture_guards.py`
-  架构边界护栏：deprecated shim 是否正确指向 v2、`MarketLayout` 是否正确切分 rewrite/legacy 路径，以及 v2 是否违规导入 `live_trading`、旧 `src`、旧脚本或 `poly_eval` 等历史边界外代码。
+  架构边界护栏：deprecated shim 是否正确指向 v2、`MarketLayout` 是否正确切分 rewrite/legacy 路径，以及 v2 是否违规导入历史边界外代码。
 - `tests/test_cli.py`
   顶层 CLI、domain CLI、命令接线和参数入口。
+- `tests/test_core_layout.py`
+  `core/layout.py` 的路径发现、rewrite/legacy 区分和 market layout 结构。
+
+### `console` 相关测试
+
+- `tests/test_console_action_runner.py`
+  action runner 对 CLI 调用、stdout/stderr 捕获和结果解析的行为。
+- `tests/test_console_actions.py`
+  action catalog、request normalization 和命令计划构造。
+- `tests/test_console_analysis_runs.py`
+  analysis 类 read-model 汇总与控制台摘要对象。
+- `tests/test_console_backtests_extra.py`
+  backtest read-model 的附加场景、额外产物和边角 case。
+- `tests/test_console_cli.py`
+  console CLI 命令接线。
+- `tests/test_console_data_overview.py`
+  数据总览 read-model，包括 persisted/computed summary 回退逻辑。
+- `tests/test_console_http.py`
+  console HTTP app 总路由、健康检查和响应格式。
+- `tests/test_console_http_action_routes.py`
+  action HTTP payload、执行模式和请求校验。
+- `tests/test_console_http_routes.py`
+  section 查询路由映射和参数分发。
+- `tests/test_console_research_assets.py`
+  研究资产类 read-model，例如 training runs、bundles、backtests、experiments 的读取和摘要。
+- `tests/test_console_service.py`
+  console service 门面的稳定契约。
+- `tests/test_console_tasks.py`
+  后台任务记录、进度更新、runtime summary 和 history 行为。
+- `tests/test_console_web.py`
+  HTML/CSS/JS 壳层和页面 bootstrap 内容。
 
 ### `data` 相关测试
 
@@ -977,6 +1325,8 @@
   实验缓存。
 - `tests/test_research_experiment_compare_policy.py`
   实验比较策略。
+- `tests/test_research_experiment_feature_set_variants.py`
+  experiment suite 中 feature_set variant 的展开和一致性。
 - `tests/test_research_experiment_matrix_parity.py`
   实验矩阵/parity。
 - `tests/test_research_experiment_parity_specs.py`
@@ -1043,6 +1393,10 @@
 - 想改 live 副作用：`live/actions/*`
 - 想改交易接入：`live/trading/*`
 - 想改 operator/readiness：`live/readiness/*`、`live/operator/*`
+- 想改 console read-model：`console/read_models/*`
+- 想改 console 动作目录或任务编排：`console/actions.py`、`console/action_runner.py`、`console/tasks.py`
+- 想改 console HTTP/UI：`console/http/*`、`console/web/*`
+- 想改 shell 启动入口：`scripts/entrypoints/*`
 
 ## 常用命令
 
@@ -1053,10 +1407,12 @@ PYTHONPATH=v2/src python -m pm15min --help
 PYTHONPATH=v2/src python -m pm15min layout --market sol --json
 PYTHONPATH=v2/src python -m pm15min data show-layout --market sol --cycle 15m --surface live
 PYTHONPATH=v2/src python -m pm15min data run live-foundation --market sol --surface live
-PYTHONPATH=v2/src python -m pm15min research list-runs --market sol --profile deep_otm --target direction
+PYTHONPATH=v2/src python -m pm15min research list-runs --market sol --target direction
 PYTHONPATH=v2/src python -m pm15min console show-home
+PYTHONPATH=v2/src python -m pm15min console show-runtime-state
 PYTHONPATH=v2/src python -m pm15min console show-actions
 PYTHONPATH=v2/src python -m pm15min console build-action --action-id data_refresh_summary --request-json '{"market":"sol"}'
+PYTHONPATH=v2/src python -m pm15min console list-tasks --status-group active
 PYTHONPATH=v2/src python -m pm15min console show-data-overview --market sol --cycle 15m --surface backtest
 PYTHONPATH=v2/src python -m pm15min console serve --host 127.0.0.1 --port 8765
 PYTHONPATH=v2/src python -m pm15min live show-config --market sol --profile deep_otm
@@ -1064,28 +1420,40 @@ PYTHONPATH=v2/src python -m pm15min live runner-once --market sol --profile deep
 PYTHONPATH=v2/src pytest -q v2/tests
 ```
 
-## 相关文档
+## `docs/`
 
+`docs/` 不是“读不读都行”的补充材料；它记录了这套 rewrite 为什么长成现在这样、还有哪些风险没有收口、operator 实际怎么跑。很多设计取舍在代码里只剩结果，在这里才有上下文。
+
+- `docs/CURRENT_REMAINING_CHECKLIST.md`
+  当前剩余待办和收尾清单。
 - `docs/DATA_TECHNICAL_PLAN.md`
-  Data 域正式方案。
-- `docs/RESEARCH_TECHNICAL_PLAN.md`
-  Research 域正式方案。
-- `docs/LIVE_TECHNICAL_PLAN.md`
-  Live 域正式方案。
+  Data 域正式技术方案。
+- `docs/EXECUTION_BOARD.md`
+  并行开发/执行看板，记录谁在做什么。
 - `docs/LIVE_OPERATOR_RUNBOOK.md`
   实盘 operator 视角运行手册。
+- `docs/LIVE_OPERATOR_VALIDATION_20260322.md`
+  2026-03-22 的 live operator 验证记录。
+- `docs/LIVE_TECHNICAL_PLAN.md`
+  Live 域正式技术方案。
 - `docs/MODEL_BUNDLE_IMPORT_STATE.md`
-  bundle 导入状态。
-- `docs/EXECUTION_BOARD.md`
-  多 agent 并行开发执行板。
+  model bundle 导入状态和遗留问题。
+- `docs/PHASE_A_TRADING_INFRA_TECHNICAL_PLAN.md`
+  trading infra phase A 设计方案。
+- `docs/POLY_EVAL_AND_SCRIPTS_MIGRATION_TECHNICAL_PLAN.md`
+  poly eval 与历史脚本迁移方案。
+- `docs/RESEARCH_TECHNICAL_PLAN.md`
+  Research 域正式技术方案。
+- `docs/REWRITE_STATUS_AND_ROADMAP.md`
+  rewrite 当前完成度与路线图。
+- `docs/V2_FULL_CODE_PARITY_AUDIT_20260323.md`
+  2026-03-23 的全代码 parity 审计记录。
+- `docs/V2_REFACTOR_REVIEW_20260320.md`
+  2026-03-20 的重构审查与风险记录。
+- `docs/V2_SHOULD_DO_EXECUTION_20260322.md`
+  2026-03-22 关于执行链路“should do”语义的专项记录。
 - `docs/V2_TRAINING_BACKTEST_VISUALIZATION_PLAN.md`
   训练 / bundle / backtest 可视化规划。
-- `docs/REWRITE_STATUS_AND_ROADMAP.md`
-  当前完成度与路线图。
-- `docs/V2_REFACTOR_REVIEW_20260320.md`
-  当前重构审查与风险记录。
-- `docs/CURRENT_REMAINING_CHECKLIST.md`
-  剩余待办。
 
 ## 最后一句
 
@@ -1094,7 +1462,6 @@ PYTHONPATH=v2/src pytest -q v2/tests
 - 边界已经大体稳定
 - 真正应该继续投入的是让每个边界里的业务逻辑更可靠
 - 如果你一时不知道从哪里开始，就回到：
-  `cli.py -> core/layout.py -> data/layout -> research/layout -> live/runtime -> live/service -> live/runner`
+  `cli.py -> core/layout.py -> data/layout -> research/layout -> live/runtime -> live/service -> live/runner -> console/service`
 
 这是整套 v2 的最短主干。
-# pm15minv2

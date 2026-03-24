@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+
+ORDERBOOK_RETRYABLE_REASONS = {
+    "depth_snapshot_missing",
+    "depth_fill_unavailable",
+    "depth_fill_ratio_below_threshold",
+}
+NON_RESTING_ORDER_TYPES = {"FAK", "FOK"}
+FAK_IMMEDIATE_RETRY_ERROR_HINTS = (
+    "no orders found to match",
+)
+FAST_RETRY_ERROR_HINTS = (
+    "no orders found to match",
+    "fill and kill",
+    "fok orders are fully filled or killed",
+    "couldn't be fully filled",
+)
+
+
+def build_retry_policy(
+    *,
+    spec,
+    execution_status: str,
+    execution_reasons: list[str],
+    order_type: str,
+) -> dict[str, object]:
+    order_type_norm = str(order_type or spec.default_order_type).upper()
+    pre_submit_depth_retry_enabled = bool(
+        execution_status == "blocked" and any(reason in ORDERBOOK_RETRYABLE_REASONS for reason in execution_reasons)
+    )
+    post_submit_retry_enabled = bool(execution_status == "plan")
+    same_decision_enabled = bool(post_submit_retry_enabled and spec.repeat_same_decision_enabled)
+    orderbook_retry_interval = float(spec.orderbook_fast_retry_interval_seconds)
+    orderbook_retry_max = int(spec.orderbook_fast_retry_max)
+    order_retry_interval = float(spec.order_retry_interval_seconds)
+    fast_retry_interval = float(spec.fast_retry_interval_seconds)
+    order_retry_max = int(spec.max_order_retries)
+    fak_retry_max = int(spec.fak_immediate_retry_max)
+    if post_submit_retry_enabled:
+        status = "armed"
+        reason = "post_submit_retry_ready"
+    elif pre_submit_depth_retry_enabled:
+        status = "armed"
+        reason = "pre_submit_orderbook_recheck"
+    else:
+        status = "inactive"
+        reason = execution_reasons[0] if execution_reasons else execution_status
+
+    return {
+        "status": status,
+        "reason": reason,
+        "pre_submit_depth_retry": {
+            "enabled": pre_submit_depth_retry_enabled,
+            "retry_interval_sec": orderbook_retry_interval,
+            "max_retries": orderbook_retry_max,
+            "retry_state_key": "orderbook_retry_count",
+            "trigger_statuses": ["blocked"],
+            "retryable_reasons": sorted(ORDERBOOK_RETRYABLE_REASONS),
+        },
+        "post_submit_order_retry": {
+            "enabled": post_submit_retry_enabled,
+            "retry_interval_sec": order_retry_interval,
+            "fast_retry_interval_sec": fast_retry_interval,
+            "max_retries": order_retry_max,
+            "retry_state_keys": [
+                "attempts",
+                "last_attempt",
+                "last_error",
+                "fast_retry",
+                "retry_interval_seconds",
+            ],
+            "retryable_on_non_success_response": True,
+            "fast_retry_error_hints": list(FAST_RETRY_ERROR_HINTS),
+        },
+        "post_submit_fak_retry": {
+            "enabled": bool(post_submit_retry_enabled and order_type_norm == "FAK"),
+            "order_type": order_type_norm,
+            "immediate_retry_max": fak_retry_max,
+            "requires_orderbook_reprice": True,
+            "response_driven": True,
+            "retryable_message_hints": list(FAK_IMMEDIATE_RETRY_ERROR_HINTS),
+        },
+        "same_decision_repeat": {
+            "enabled": same_decision_enabled,
+            "lock_side": bool(spec.repeat_same_decision_lock_side),
+            "max_trades": int(spec.repeat_same_decision_max_trades),
+            "max_stake_usd": spec.repeat_same_decision_max_stake_usd,
+            "max_total_stake_usd": spec.repeat_same_decision_max_total_stake_usd,
+            "stake_multiple": float(spec.repeat_same_decision_stake_multiple),
+            "success_state_last_error": "matched_repeat_window",
+        },
+    }

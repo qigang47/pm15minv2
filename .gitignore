@@ -1,0 +1,34 @@
+# macOS / editor noise
+.DS_Store
+
+# Python / test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local env files inside v2/
+.env
+.env.*
+
+# Canonical runtime data and state at repo root
+/data/
+/var/
+
+# Generated research artifacts
+research/feature_frames/
+research/label_frames/
+research/training_sets/
+research/training_runs/
+research/model_bundles/
+research/backtests/
+research/evaluations/
+research/experiments/runs/
+research/active_bundles/
+
+# Research/runtime scratch
+research/**/*.tmp
+research/**/*.bak

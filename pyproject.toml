@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pm15min-v2"
+version = "0.1.0"
+description = "Clean-room rewrite for the pm15min repository"
+requires-python = ">=3.11"
+dependencies = [
+  "eth-abi>=5.0",
+  "eth-utils>=5.0",
+  "joblib>=1.5",
+  "lightgbm>=4.0",
+  "numpy>=2.0",
+  "pandas>=2.0",
+  "requests>=2.31",
+  "scikit-learn>=1.5",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

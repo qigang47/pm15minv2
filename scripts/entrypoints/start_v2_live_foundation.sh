@@ -1,0 +1,176 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: start_v2_live_foundation.sh
+
+Env overrides:
+  CONDA_ENV                               default: pm15min
+  V2_LIVE_FOUNDATION_MARKETS              default: sol,xrp
+  V2_LIVE_FOUNDATION_CYCLE                default: 15m
+  V2_LIVE_FOUNDATION_SURFACE              default: live
+  V2_LIVE_FOUNDATION_ITERATIONS           default: 0
+  V2_LIVE_FOUNDATION_SLEEP_SEC            default: 1
+  V2_LIVE_FOUNDATION_MARKET_DEPTH         default: 1
+  V2_LIVE_FOUNDATION_TIMEOUT_SEC          default: 1.2
+  V2_LIVE_FOUNDATION_RECENT_WINDOW_MINUTES default: 15
+  V2_LIVE_FOUNDATION_MARKET_CATALOG_REFRESH_SEC default: 300
+  V2_LIVE_FOUNDATION_BINANCE_REFRESH_SEC  default: 5
+  V2_LIVE_FOUNDATION_ORACLE_REFRESH_SEC   default: 60
+  V2_LIVE_FOUNDATION_ORDERBOOK_REFRESH_SEC default: 0.35
+  V2_LIVE_FOUNDATION_MARKET_CATALOG_LOOKBACK_HOURS default: 24
+  V2_LIVE_FOUNDATION_MARKET_CATALOG_LOOKAHEAD_HOURS default: 24
+  V2_LIVE_FOUNDATION_BINANCE_LOOKBACK_MINUTES default: 2880
+  V2_LIVE_FOUNDATION_BINANCE_BATCH_LIMIT  default: 1000
+  V2_LIVE_FOUNDATION_ORACLE_LOOKBACK_DAYS default: 2
+  V2_LIVE_FOUNDATION_ORACLE_LOOKAHEAD_HOURS default: 24
+  V2_LIVE_FOUNDATION_NO_DIRECT_ORACLE     default: 0
+  V2_LIVE_FOUNDATION_NO_ORDERBOOKS        default: 1
+  V2_LIVE_FOUNDATION_LOG_DIR              default: var/live/logs/entrypoints
+EOF
+}
+
+is_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON|y|Y)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+while getopts "h" opt; do
+  case "$opt" in
+    h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "$PROJECT_DIR"
+export PM15MIN_PROJECT_DIR="$PROJECT_DIR"
+export PYTHONPATH="$PROJECT_DIR/src:$PROJECT_DIR:${PYTHONPATH:-}"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_python_env.sh"
+
+pm15min_load_project_env
+pm15min_activate_python
+
+MARKETS_RAW="${V2_LIVE_FOUNDATION_MARKETS:-sol,xrp}"
+MARKETS_CSV="$(echo "$MARKETS_RAW" | tr '[:space:]' ',' | tr -s ',')"
+IFS=',' read -r -a RAW_MARKETS <<< "$MARKETS_CSV"
+MARKETS_LIST=()
+for market in "${RAW_MARKETS[@]}"; do
+  market="$(echo "$market" | tr '[:upper:]' '[:lower:]' | xargs)"
+  case "$market" in
+    sol|xrp)
+      if [[ ! " ${MARKETS_LIST[*]} " =~ [[:space:]]${market}[[:space:]] ]]; then
+        MARKETS_LIST+=("$market")
+      fi
+      ;;
+    "")
+      ;;
+    *)
+      echo "WARN: unsupported v2 live foundation market ignored: $market"
+      ;;
+  esac
+done
+if [[ ${#MARKETS_LIST[@]} -eq 0 ]]; then
+  MARKETS_LIST=("sol" "xrp")
+fi
+
+CYCLE="${V2_LIVE_FOUNDATION_CYCLE:-15m}"
+SURFACE="${V2_LIVE_FOUNDATION_SURFACE:-live}"
+ITERATIONS="${V2_LIVE_FOUNDATION_ITERATIONS:-0}"
+SLEEP_SEC="${V2_LIVE_FOUNDATION_SLEEP_SEC:-1}"
+MARKET_DEPTH="${V2_LIVE_FOUNDATION_MARKET_DEPTH:-1}"
+TIMEOUT_SEC="${V2_LIVE_FOUNDATION_TIMEOUT_SEC:-1.2}"
+RECENT_WINDOW_MINUTES="${V2_LIVE_FOUNDATION_RECENT_WINDOW_MINUTES:-15}"
+MARKET_CATALOG_REFRESH_SEC="${V2_LIVE_FOUNDATION_MARKET_CATALOG_REFRESH_SEC:-300}"
+BINANCE_REFRESH_SEC="${V2_LIVE_FOUNDATION_BINANCE_REFRESH_SEC:-5}"
+ORACLE_REFRESH_SEC="${V2_LIVE_FOUNDATION_ORACLE_REFRESH_SEC:-60}"
+ORDERBOOK_REFRESH_SEC="${V2_LIVE_FOUNDATION_ORDERBOOK_REFRESH_SEC:-0.35}"
+MARKET_CATALOG_LOOKBACK_HOURS="${V2_LIVE_FOUNDATION_MARKET_CATALOG_LOOKBACK_HOURS:-24}"
+MARKET_CATALOG_LOOKAHEAD_HOURS="${V2_LIVE_FOUNDATION_MARKET_CATALOG_LOOKAHEAD_HOURS:-24}"
+BINANCE_LOOKBACK_MINUTES="${V2_LIVE_FOUNDATION_BINANCE_LOOKBACK_MINUTES:-2880}"
+BINANCE_BATCH_LIMIT="${V2_LIVE_FOUNDATION_BINANCE_BATCH_LIMIT:-1000}"
+ORACLE_LOOKBACK_DAYS="${V2_LIVE_FOUNDATION_ORACLE_LOOKBACK_DAYS:-2}"
+ORACLE_LOOKAHEAD_HOURS="${V2_LIVE_FOUNDATION_ORACLE_LOOKAHEAD_HOURS:-24}"
+NO_DIRECT_ORACLE="${V2_LIVE_FOUNDATION_NO_DIRECT_ORACLE:-0}"
+NO_ORDERBOOKS="${V2_LIVE_FOUNDATION_NO_ORDERBOOKS:-1}"
+LOG_DIR="${V2_LIVE_FOUNDATION_LOG_DIR:-$PROJECT_DIR/var/live/logs/entrypoints}"
+
+mkdir -p "$LOG_DIR"
+
+echo "============================================="
+echo "Starting v2 live foundation loops"
+echo "Project: $PROJECT_DIR"
+echo "Markets: ${MARKETS_LIST[*]}"
+echo "Cycle: $CYCLE"
+echo "Surface: $SURFACE"
+echo "Iterations: $ITERATIONS"
+echo "Sleep Sec: $SLEEP_SEC"
+echo "Binance Refresh Sec: $BINANCE_REFRESH_SEC"
+echo "Oracle Refresh Sec: $ORACLE_REFRESH_SEC"
+echo "No Direct Oracle: $NO_DIRECT_ORACLE"
+echo "No Orderbooks: $NO_ORDERBOOKS"
+echo "============================================="
+
+for market in "${MARKETS_LIST[@]}"; do
+  echo "Stopping previous v2 live foundation for ${market}/${CYCLE}/${SURFACE} ..."
+  pkill -f "pm15min data run live-foundation --market ${market} --cycle ${CYCLE} --surface ${SURFACE}" || true
+done
+sleep 1
+
+for market in "${MARKETS_LIST[@]}"; do
+  log_path="$LOG_DIR/live_foundation_${market}_${CYCLE}_${SURFACE}.out"
+  touch "$log_path"
+  cmd=(
+    "$PYTHON_BIN" -m pm15min data run live-foundation
+    --market "$market"
+    --cycle "$CYCLE"
+    --surface "$SURFACE"
+    --market-depth "$MARKET_DEPTH"
+    --timeout-sec "$TIMEOUT_SEC"
+    --recent-window-minutes "$RECENT_WINDOW_MINUTES"
+    --loop
+    --iterations "$ITERATIONS"
+    --sleep-sec "$SLEEP_SEC"
+    --market-catalog-refresh-sec "$MARKET_CATALOG_REFRESH_SEC"
+    --binance-refresh-sec "$BINANCE_REFRESH_SEC"
+    --oracle-refresh-sec "$ORACLE_REFRESH_SEC"
+    --orderbook-refresh-sec "$ORDERBOOK_REFRESH_SEC"
+    --market-catalog-lookback-hours "$MARKET_CATALOG_LOOKBACK_HOURS"
+    --market-catalog-lookahead-hours "$MARKET_CATALOG_LOOKAHEAD_HOURS"
+    --binance-lookback-minutes "$BINANCE_LOOKBACK_MINUTES"
+    --binance-batch-limit "$BINANCE_BATCH_LIMIT"
+    --oracle-lookback-days "$ORACLE_LOOKBACK_DAYS"
+    --oracle-lookahead-hours "$ORACLE_LOOKAHEAD_HOURS"
+  )
+  if is_truthy "$NO_DIRECT_ORACLE"; then
+    cmd+=(--no-direct-oracle)
+  fi
+  if is_truthy "$NO_ORDERBOOKS"; then
+    cmd+=(--no-orderbooks)
+  fi
+
+  nohup "${cmd[@]}" >> "$log_path" 2>&1 &
+  echo "started v2 live foundation: market=${market} pid=$!"
+  echo "  wrapper log: $log_path"
+done
+
+echo ""
+echo "Canonical operator checks:"
+echo "  PYTHONPATH=src python -m pm15min data run live-foundation --market sol --cycle 15m --surface live --iterations 1 --no-orderbooks"
