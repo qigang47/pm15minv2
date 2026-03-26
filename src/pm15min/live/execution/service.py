@@ -164,27 +164,44 @@ def build_execution_snapshot(
         denom = max((1.0 + float(roi_threshold) + float(fee_rate)) * (1.0 + slip), 1e-9)
         p_cap = max(1e-6, min(float(p_side) / denom, 1.0))
 
-    data_cfg = DataConfig.build(
-        market=market,
-        cycle=cycle,
-        surface="live",
-        root=cfg.layout.rewrite.root,
-    )
-    depth_plan, depth_reason = build_depth_execution_plan_fn(
-        data_cfg=data_cfg,
-        quote_row=quote_row,
+    reused_depth_plan = False
+    depth_plan = None
+    depth_reason = None
+    repriced_metrics = None
+    if _can_reuse_precomputed_depth_plan(
+        quote_metrics=quote_metrics,
         side=side,
         requested_notional=requested_notional,
         price_cap=p_cap,
-        max_slippage_bps=float(spec.orderbook_max_slippage_bps),
-        min_fill_ratio=float(spec.orderbook_min_fill_ratio),
-        orderbook_provider=orderbook_provider,
-        prefer_live_provider=prefer_live_depth,
-    )
+        prefer_live_depth=prefer_live_depth,
+        float_or_none_fn=float_or_none_fn,
+    ):
+        depth_plan = dict(quote_metrics.get("depth_plan") or {})
+        depth_reason = str(quote_metrics.get("depth_reason") or "") or None
+        reused_depth_plan = True
+    else:
+        data_cfg = DataConfig.build(
+            market=market,
+            cycle=cycle,
+            surface="live",
+            root=cfg.layout.rewrite.root,
+        )
+        depth_plan, depth_reason = build_depth_execution_plan_fn(
+            data_cfg=data_cfg,
+            quote_row=quote_row,
+            side=side,
+            requested_notional=requested_notional,
+            price_cap=p_cap,
+            max_slippage_bps=float(spec.orderbook_max_slippage_bps),
+            min_fill_ratio=float(spec.orderbook_min_fill_ratio),
+            orderbook_provider=orderbook_provider,
+            prefer_live_provider=prefer_live_depth,
+        )
+
     if depth_reason:
         execution_reasons.append(depth_reason)
-    repriced_metrics = None
     if depth_plan is not None and str(depth_plan.get("status") or "") == "ok":
+        # Cached repriced metrics carry numbers but not the current rejection reasons.
         repriced_metrics, repriced_reasons = repriced_order_guard_fn(
             spec=spec,
             selected_row=selected_row,
@@ -242,7 +259,46 @@ def build_execution_snapshot(
             "market_cycle_end_ts": policy_context.get("cycle_end_ts"),
             "minutes_left_to_market_end": policy_context.get("minutes_left_to_market_end"),
             "depth_plan": depth_plan,
+            "depth_plan_reused": reused_depth_plan,
             "repriced_metrics": repriced_metrics,
         },
     )
     return payload
+
+
+def _can_reuse_precomputed_depth_plan(
+    *,
+    quote_metrics: dict[str, Any],
+    side: str,
+    requested_notional: float,
+    price_cap: float | None,
+    prefer_live_depth: bool,
+    float_or_none_fn,
+) -> bool:
+    if prefer_live_depth:
+        return False
+    if not isinstance(quote_metrics, dict):
+        return False
+    if not bool(quote_metrics.get("depth_enforced")):
+        return False
+    depth_plan = quote_metrics.get("depth_plan")
+    if not isinstance(depth_plan, dict):
+        return False
+    if str(depth_plan.get("status") or "").strip().lower() != "ok":
+        return False
+    entry_side = str(quote_metrics.get("entry_side") or "").upper()
+    if entry_side and entry_side != str(side or "").upper():
+        return False
+    precomputed_notional = float_or_none_fn(quote_metrics.get("requested_notional_usd"))
+    if precomputed_notional is None or abs(float(precomputed_notional) - float(requested_notional)) > 1e-9:
+        return False
+    precomputed_price_cap = float_or_none_fn(quote_metrics.get("price_cap"))
+    if not _same_optional_float(precomputed_price_cap, price_cap):
+        return False
+    return True
+
+
+def _same_optional_float(left: float | None, right: float | None, *, tol: float = 1e-9) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    return abs(float(left) - float(right)) <= float(tol)

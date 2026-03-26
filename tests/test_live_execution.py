@@ -110,6 +110,373 @@ def test_execution_snapshot_prefers_local_latest_full_depth_snapshot(tmp_path: P
     assert out["execution"]["depth_plan"]["depth_source_kind"] == "local_latest"
 
 
+def test_execution_snapshot_reuses_precomputed_depth_plan(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    price_cap = 0.8 / 1.01
+    calls = {"repriced": 0}
+
+    def _should_not_run(*args, **kwargs):
+        raise AssertionError("depth plan should be reused from decision payload")
+
+    def _recomputed_repriced(*, spec, selected_row, repriced_entry_price):
+        calls["repriced"] += 1
+        return (
+            {
+                "repriced_entry_price": float(repriced_entry_price),
+                "repriced_effective_price": float(repriced_entry_price),
+                "repriced_fee_rate": 0.02,
+                "repriced_raw_edge": 0.55,
+                "repriced_min_net_edge_required": 0.01,
+                "repriced_roi_net": 2.75,
+                "repriced_roi_threshold_required": 0.0,
+            },
+            [],
+        )
+
+    monkeypatch.setattr("pm15min.live.execution.build_depth_execution_plan", _should_not_run)
+    monkeypatch.setattr("pm15min.live.execution.repriced_order_guard", _recomputed_repriced)
+
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "snapshot_ts": "2026-03-20T00-00-00Z",
+        "decision": {"status": "accept", "selected_offset": 7, "selected_side": "UP"},
+        "accepted_offsets": [
+            {
+                "offset": 7,
+                "recommended_side": "UP",
+                "decision_ts": "2026-03-20T00:08:00+00:00",
+                "p_up": 0.80,
+                "confidence": 0.80,
+                "quote_metrics": {
+                    "entry_side": "UP",
+                    "entry_price": 0.2005,
+                    "fee_rate": 0.01,
+                    "slippage_bps": 0.0,
+                    "roi_net_vs_quote": 0.20,
+                    "depth_enforced": True,
+                    "requested_notional_usd": 1.0,
+                    "price_cap": price_cap,
+                    "depth_reason": None,
+                    "depth_plan": {
+                        "status": "ok",
+                        "max_price": 0.2005,
+                        "fill_ratio": 1.0,
+                        "filled_shares": 4.987531172069826,
+                    },
+                    "repriced_metrics": {
+                        "repriced_entry_price": 0.2005,
+                        "repriced_effective_price": 0.2005,
+                        "repriced_fee_rate": 0.01,
+                        "repriced_raw_edge": 0.5995,
+                        "repriced_min_net_edge_required": 0.01,
+                        "repriced_roi_net": 2.99002493765586,
+                        "repriced_roi_threshold_required": 0.0,
+                    },
+                },
+                "quote_row": {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "cycle_end_ts": "2026-03-20T00:15:00+00:00",
+                    "question": "test",
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "decision_ts": "2026-03-20T00:08:00+00:00",
+                    "quote_up_ask": 0.20,
+                    "quote_up_bid": 0.19,
+                    "quote_up_ask_size_1": 10.0,
+                },
+            }
+        ],
+    }
+
+    out = build_execution_snapshot(cfg, payload)
+
+    assert out["execution"]["status"] == "plan"
+    assert out["execution"]["depth_plan"]["status"] == "ok"
+    assert out["execution"]["depth_plan_reused"] is True
+    assert out["execution"]["repriced_metrics"]["repriced_entry_price"] == 0.2005
+    assert out["execution"]["repriced_metrics"]["repriced_fee_rate"] == 0.02
+    assert calls == {"repriced": 1}
+
+
+def test_execution_snapshot_blocks_when_reused_depth_plan_fails_repriced_guard(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    price_cap = 0.8 / 1.01
+
+    def _should_not_run(*args, **kwargs):
+        raise AssertionError("depth plan should be reused from decision payload")
+
+    def _blocked_repriced(*, spec, selected_row, repriced_entry_price):
+        return (
+            {
+                "repriced_entry_price": float(repriced_entry_price),
+                "repriced_effective_price": float(repriced_entry_price),
+                "repriced_fee_rate": 0.01,
+                "repriced_raw_edge": 0.05,
+                "repriced_min_net_edge_required": 0.10,
+                "repriced_roi_net": -0.02,
+                "repriced_roi_threshold_required": 0.0,
+            },
+            ["repriced_net_edge_below_threshold", "repriced_roi_below_threshold"],
+        )
+
+    monkeypatch.setattr("pm15min.live.execution.build_depth_execution_plan", _should_not_run)
+    monkeypatch.setattr("pm15min.live.execution.repriced_order_guard", _blocked_repriced)
+
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "snapshot_ts": "2026-03-20T00-00-00Z",
+        "decision": {"status": "accept", "selected_offset": 7, "selected_side": "UP"},
+        "accepted_offsets": [
+            {
+                "offset": 7,
+                "recommended_side": "UP",
+                "decision_ts": "2026-03-20T00:08:00+00:00",
+                "p_up": 0.80,
+                "confidence": 0.80,
+                "quote_metrics": {
+                    "entry_side": "UP",
+                    "entry_price": 0.2005,
+                    "fee_rate": 0.01,
+                    "slippage_bps": 0.0,
+                    "roi_net_vs_quote": 0.20,
+                    "depth_enforced": True,
+                    "requested_notional_usd": 1.0,
+                    "price_cap": price_cap,
+                    "depth_reason": None,
+                    "depth_plan": {
+                        "status": "ok",
+                        "max_price": 0.2005,
+                        "fill_ratio": 1.0,
+                        "filled_shares": 4.987531172069826,
+                    },
+                    "repriced_metrics": {
+                        "repriced_entry_price": 0.2005,
+                        "repriced_effective_price": 0.2005,
+                        "repriced_fee_rate": 0.01,
+                        "repriced_raw_edge": 0.5995,
+                        "repriced_min_net_edge_required": 0.01,
+                        "repriced_roi_net": 2.99002493765586,
+                        "repriced_roi_threshold_required": 0.0,
+                    },
+                },
+                "quote_row": {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "cycle_end_ts": "2026-03-20T00:15:00+00:00",
+                    "question": "test",
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "decision_ts": "2026-03-20T00:08:00+00:00",
+                    "quote_up_ask": 0.20,
+                    "quote_up_bid": 0.19,
+                    "quote_up_ask_size_1": 10.0,
+                },
+            }
+        ],
+    }
+
+    out = build_execution_snapshot(cfg, payload)
+
+    assert out["execution"]["status"] == "blocked"
+    assert out["execution"]["depth_plan_reused"] is True
+    assert "repriced_net_edge_below_threshold" in out["execution"]["execution_reasons"]
+    assert "repriced_roi_below_threshold" in out["execution"]["execution_reasons"]
+
+
+def test_execution_snapshot_recomputes_when_cached_depth_plan_is_blocked(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    calls = {"depth": 0, "repriced": 0}
+
+    def _recomputed_depth_plan(**kwargs):
+        calls["depth"] += 1
+        return (
+            {
+                "status": "ok",
+                "max_price": 0.2005,
+                "fill_ratio": 1.0,
+                "filled_shares": 4.987531172069826,
+            },
+            None,
+        )
+
+    def _recomputed_repriced(*, spec, selected_row, repriced_entry_price):
+        calls["repriced"] += 1
+        return (
+            {
+                "repriced_entry_price": float(repriced_entry_price),
+                "repriced_effective_price": float(repriced_entry_price),
+                "repriced_fee_rate": 0.01,
+                "repriced_raw_edge": 0.5995,
+                "repriced_min_net_edge_required": 0.01,
+                "repriced_roi_net": 2.99002493765586,
+                "repriced_roi_threshold_required": 0.0,
+            },
+            [],
+        )
+
+    monkeypatch.setattr("pm15min.live.execution.build_depth_execution_plan", _recomputed_depth_plan)
+    monkeypatch.setattr("pm15min.live.execution.repriced_order_guard", _recomputed_repriced)
+
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "snapshot_ts": "2026-03-20T00-00-00Z",
+        "decision": {"status": "accept", "selected_offset": 7, "selected_side": "UP"},
+        "accepted_offsets": [
+            {
+                "offset": 7,
+                "recommended_side": "UP",
+                "decision_ts": "2026-03-20T00:08:00+00:00",
+                "p_up": 0.80,
+                "confidence": 0.80,
+                "quote_metrics": {
+                    "entry_side": "UP",
+                    "entry_price": 0.20,
+                    "fee_rate": 0.01,
+                    "slippage_bps": 0.0,
+                    "roi_net_vs_quote": 0.20,
+                    "depth_enforced": True,
+                    "requested_notional_usd": 1.0,
+                    "price_cap": 0.8 / 1.01,
+                    "depth_reason": "depth_fill_unavailable",
+                    "depth_plan": {
+                        "status": "blocked",
+                        "max_price": None,
+                        "fill_ratio": 0.0,
+                    },
+                },
+                "quote_row": {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "cycle_end_ts": "2026-03-20T00:15:00+00:00",
+                    "question": "test",
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "decision_ts": "2026-03-20T00:08:00+00:00",
+                    "quote_up_ask": 0.20,
+                    "quote_up_bid": 0.19,
+                    "quote_up_ask_size_1": 10.0,
+                },
+            }
+        ],
+    }
+
+    out = build_execution_snapshot(cfg, payload)
+
+    assert out["execution"]["status"] == "plan"
+    assert out["execution"]["depth_plan_reused"] is False
+    assert calls == {"depth": 1, "repriced": 1}
+
+
+def test_execution_snapshot_does_not_reuse_cached_depth_plan_when_live_depth_is_preferred(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    calls = {"depth": 0, "repriced": 0}
+
+    def _fresh_depth_plan(**kwargs):
+        calls["depth"] += 1
+        return (
+            {
+                "status": "ok",
+                "max_price": 0.201,
+                "fill_ratio": 1.0,
+                "filled_shares": 4.975124378109452,
+            },
+            None,
+        )
+
+    def _recomputed_repriced(*, spec, selected_row, repriced_entry_price):
+        calls["repriced"] += 1
+        return (
+            {
+                "repriced_entry_price": float(repriced_entry_price),
+                "repriced_effective_price": float(repriced_entry_price),
+                "repriced_fee_rate": 0.01,
+                "repriced_raw_edge": 0.599,
+                "repriced_min_net_edge_required": 0.01,
+                "repriced_roi_net": 2.97,
+                "repriced_roi_threshold_required": 0.0,
+            },
+            [],
+        )
+
+    monkeypatch.setattr("pm15min.live.execution.build_depth_execution_plan", _fresh_depth_plan)
+    monkeypatch.setattr("pm15min.live.execution.repriced_order_guard", _recomputed_repriced)
+
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "snapshot_ts": "2026-03-20T00-00-00Z",
+        "decision": {"status": "accept", "selected_offset": 7, "selected_side": "UP"},
+        "accepted_offsets": [
+            {
+                "offset": 7,
+                "recommended_side": "UP",
+                "decision_ts": "2026-03-20T00:08:00+00:00",
+                "p_up": 0.80,
+                "confidence": 0.80,
+                "quote_metrics": {
+                    "entry_side": "UP",
+                    "entry_price": 0.2005,
+                    "fee_rate": 0.01,
+                    "slippage_bps": 0.0,
+                    "roi_net_vs_quote": 0.20,
+                    "depth_enforced": True,
+                    "requested_notional_usd": 1.0,
+                    "price_cap": 0.8 / 1.01,
+                    "depth_reason": None,
+                    "depth_plan": {
+                        "status": "ok",
+                        "max_price": 0.2005,
+                        "fill_ratio": 1.0,
+                        "filled_shares": 4.987531172069826,
+                    },
+                },
+                "quote_row": {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "cycle_end_ts": "2026-03-20T00:15:00+00:00",
+                    "question": "test",
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "decision_ts": "2026-03-20T00:08:00+00:00",
+                    "quote_up_ask": 0.20,
+                    "quote_up_bid": 0.19,
+                    "quote_up_ask_size_1": 10.0,
+                },
+            }
+        ],
+    }
+
+    out = build_execution_snapshot(cfg, payload, prefer_live_depth=True)
+
+    assert out["execution"]["status"] == "plan"
+    assert out["execution"]["depth_plan_reused"] is False
+    assert out["execution"]["depth_plan"]["max_price"] == 0.201
+    assert calls == {"depth": 1, "repriced": 1}
+
+
 def test_execution_snapshot_blocks_when_depth_fill_ratio_is_too_small(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
