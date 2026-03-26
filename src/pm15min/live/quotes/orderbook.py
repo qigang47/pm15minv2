@@ -55,6 +55,39 @@ def resolve_orderbook_row(
     return None
 
 
+def resolve_orderbook_row_within_window(
+    index_df: pd.DataFrame,
+    *,
+    market_id: str,
+    token_id: str,
+    side: str,
+    reference_ts_ms: int | None,
+    window_start_ts_ms: int | None,
+    window_end_ts_ms: int | None,
+):
+    df = index_df.copy()
+    df = df[
+        (df["market_id"].astype(str) == str(market_id))
+        & (df["token_id"].astype(str) == str(token_id))
+        & (df["side"].astype(str).str.lower() == str(side).lower())
+    ]
+    df["captured_ts_ms"] = pd.to_numeric(df["captured_ts_ms"], errors="coerce")
+    df = df.dropna(subset=["captured_ts_ms"])
+    if df.empty:
+        return None
+    if window_start_ts_ms is not None:
+        df = df[df["captured_ts_ms"] >= int(window_start_ts_ms)]
+    if window_end_ts_ms is not None:
+        df = df[df["captured_ts_ms"] < int(window_end_ts_ms)]
+    if df.empty:
+        return None
+    if reference_ts_ms is not None:
+        df = df[df["captured_ts_ms"] <= int(reference_ts_ms)]
+        if df.empty:
+            return None
+    return df.sort_values("captured_ts_ms").iloc[-1].to_dict()
+
+
 def load_orderbook_index_frame(
     *,
     index_path: Path,

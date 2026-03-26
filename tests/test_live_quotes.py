@@ -16,7 +16,7 @@ def _patch_v2_roots(monkeypatch, root: Path) -> None:
     monkeypatch.setattr("pm15min.research.layout.rewrite_root", lambda: root)
 
 
-def test_quote_snapshot_accepts_small_post_decision_orderbook_delay(tmp_path: Path, monkeypatch) -> None:
+def test_quote_snapshot_uses_latest_in_window_orderbook_row(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
@@ -93,7 +93,7 @@ def test_quote_snapshot_accepts_small_post_decision_orderbook_delay(tmp_path: Pa
             ],
         },
         persist=False,
-        now=pd.Timestamp("2026-03-12T15:07:00Z"),
+        now=pd.Timestamp("2026-03-12T15:07:45Z"),
     )
     row = quote["quote_rows"][0]
     assert row["status"] == "ok"
@@ -101,7 +101,7 @@ def test_quote_snapshot_accepts_small_post_decision_orderbook_delay(tmp_path: Pa
     assert row["cycle_end_ts"] == cycle_end.isoformat()
     assert row["quote_up_ask"] == 0.51
     assert row["quote_down_bid"] == 0.39
-    assert row["quote_age_ms_up"] == -30000
+    assert row["quote_age_ms_up"] == 15000
 
 
 def test_quote_snapshot_rejects_expired_signal_window(tmp_path: Path, monkeypatch) -> None:

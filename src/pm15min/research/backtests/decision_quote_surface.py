@@ -126,19 +126,18 @@ def attach_initial_snapshot_decision_surface(
             surface_values["decision_quote_orderbook_missing"][row_idx] = False
             continue
         surface_values["decision_quote_has_raw_depth"][row_idx] = True
-        initial_snapshot = candidates[0]
-        up_payload = _resolve_initial_side_depth_quote(
+        up_payload = _resolve_window_side_depth_quote(
             probability=_float_or_none(probability_up[row_idx]),
             offset=_int_or_none(offsets[row_idx]) or 0,
-            raw_depth_candidate=initial_snapshot,
+            raw_depth_candidates=candidates,
             side="UP",
             profile_spec=profile_spec,
             fill_config=fill_config,
         )
-        down_payload = _resolve_initial_side_depth_quote(
+        down_payload = _resolve_window_side_depth_quote(
             probability=_float_or_none(probability_down[row_idx]),
             offset=_int_or_none(offsets[row_idx]) or 0,
-            raw_depth_candidate=initial_snapshot,
+            raw_depth_candidates=candidates,
             side="DOWN",
             profile_spec=profile_spec,
             fill_config=fill_config,
@@ -168,11 +167,11 @@ def attach_initial_snapshot_decision_surface(
     return frame
 
 
-def _resolve_initial_side_depth_quote(
+def _resolve_window_side_depth_quote(
     *,
     probability: float | None,
     offset: int,
-    raw_depth_candidate: dict[str, object],
+    raw_depth_candidates: list[dict[str, object]],
     side: str,
     profile_spec: LiveProfileSpec,
     fill_config: BacktestFillConfig,
@@ -180,11 +179,7 @@ def _resolve_initial_side_depth_quote(
     side_key = "depth_up_record" if side == "UP" else "depth_down_record"
     if probability is None:
         return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "prob_missing"}
-    record = raw_depth_candidate.get(side_key)
-    if not isinstance(record, dict):
-        return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "orderbook_missing"}
-    asks = normalize_levels(record.get("asks"))
-    if not asks:
+    if not raw_depth_candidates:
         return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "orderbook_missing"}
     requested_notional = _resolve_side_target_notional(
         probability=probability,
@@ -193,33 +188,49 @@ def _resolve_initial_side_depth_quote(
     if requested_notional <= 0.0:
         return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "target_notional_nonpositive"}
     roi_threshold = profile_spec.roi_threshold_for(offset=offset)
-    best_price = float(asks[0][0])
-    slip = max(0.0, float(profile_spec.slippage_bps)) / 10_000.0
-    fee_rate = float(profile_spec.fee_rate(price=best_price * (1.0 + slip)))
-    price_cap = _resolve_probability_price_cap(
-        probability=probability,
-        roi_threshold=roi_threshold,
-        fee_rate=fee_rate,
-        slippage_bps=float(profile_spec.slippage_bps),
+    max_slippage_bps = (
+        float(fill_config.depth_max_slippage_bps)
+        if fill_config.depth_max_slippage_bps is not None
+        else float(profile_spec.orderbook_max_slippage_bps)
     )
-    max_slippage_bps = float(fill_config.depth_max_slippage_bps) if fill_config.depth_max_slippage_bps is not None else float(profile_spec.orderbook_max_slippage_bps)
-    fill = compute_fill_from_depth_record(
-        record=record,
-        target_notional=requested_notional,
-        max_slippage_bps=max_slippage_bps,
-        price_cap=price_cap,
-    )
-    if fill is None:
+    saw_book = False
+    for raw_depth_candidate in raw_depth_candidates:
+        record = raw_depth_candidate.get(side_key)
+        if not isinstance(record, dict):
+            continue
+        asks = normalize_levels(record.get("asks"))
+        if not asks:
+            continue
+        saw_book = True
+        best_price = float(asks[0][0])
+        slip = max(0.0, float(profile_spec.slippage_bps)) / 10_000.0
+        fee_rate = float(profile_spec.fee_rate(price=best_price * (1.0 + slip)))
+        price_cap = _resolve_probability_price_cap(
+            probability=probability,
+            roi_threshold=roi_threshold,
+            fee_rate=fee_rate,
+            slippage_bps=float(profile_spec.slippage_bps),
+        )
+        fill = compute_fill_from_depth_record(
+            record=record,
+            target_notional=requested_notional,
+            max_slippage_bps=max_slippage_bps,
+            price_cap=price_cap,
+        )
+        if fill is None:
+            continue
+        max_price = _float_or_none(fill.get("max_price"))
+        total_cost = _float_or_none(fill.get("total_cost")) or 0.0
+        liquidity = 0.0 if not max_price or max_price <= 0 else float(total_cost / max_price)
+        return {
+            "price": float(max_price or 1.0),
+            "liquidity": float(liquidity),
+            "repriced": True,
+            "status": str(fill.get("stop_reason") or "ok"),
+        }
+    if saw_book:
         return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "orderbook_limit_reject"}
-    max_price = _float_or_none(fill.get("max_price"))
-    total_cost = _float_or_none(fill.get("total_cost")) or 0.0
-    liquidity = 0.0 if not max_price or max_price <= 0 else float(total_cost / max_price)
-    return {
-        "price": float(max_price or 1.0),
-        "liquidity": float(liquidity),
-        "repriced": True,
-        "status": str(fill.get("stop_reason") or "ok"),
-    }
+    return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "orderbook_missing"}
 
 
 def build_empty_initial_snapshot_decision_summary() -> InitialSnapshotDecisionSummary:

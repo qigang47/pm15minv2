@@ -252,13 +252,24 @@ def _build_date_lookups(
         decision_ts = getattr(row, "decision_ts", None)
         if decision_ts is None or pd.isna(decision_ts):
             continue
+        window_start_ts = _coalesce_window_start_ts(
+            getattr(row, "window_start_ts", None),
+            decision_ts,
+        )
+        window_end_ts = _coalesce_window_end_ts(
+            getattr(row, "window_end_ts", None),
+            window_start_ts,
+            decision_ts,
+            cycle_end_ts=getattr(row, "cycle_end_ts", None),
+            snapshot_tolerance_ms=snapshot_tolerance_ms,
+        )
         market_id = str(getattr(row, "market_id", "") or "").strip()
         if not market_id:
             continue
         decision_ts_ms = int(pd.Timestamp(decision_ts).timestamp() * 1000)
         scan_dates = _scan_dates_for_decision_ts(
-            pd.Timestamp(decision_ts),
-            snapshot_tolerance_ms=snapshot_tolerance_ms,
+            pd.Timestamp(window_start_ts),
+            window_end_ts=pd.Timestamp(window_end_ts),
         )
         offset = _int_or_none(getattr(row, "offset", None))
         token_pairs = [
@@ -284,24 +295,27 @@ def _build_date_lookups(
                 if not token_id:
                     continue
                 token_key = (market_id, token_id, side)
-                entry["token_lookup"].setdefault(token_key, []).append((int(row.Index), decision_ts_ms))
+                entry["token_lookup"].setdefault(token_key, []).append(
+                    (
+                        int(row.Index),
+                        int(pd.Timestamp(window_start_ts).timestamp() * 1000),
+                        int(pd.Timestamp(window_end_ts).timestamp() * 1000),
+                    )
+                )
     return by_date
 
 
 def _scan_dates_for_decision_ts(
     decision_ts: pd.Timestamp,
     *,
-    snapshot_tolerance_ms: int,
+    window_end_ts: pd.Timestamp,
 ) -> set[str]:
     dates = {decision_ts.strftime("%Y-%m-%d")}
-    start_ts = decision_ts - pd.Timedelta(milliseconds=LEGACY_RAW_DECISION_TS_BACKSHIFT_MS)
-    if start_ts.strftime("%Y-%m-%d") != decision_ts.strftime("%Y-%m-%d"):
-        dates.add(start_ts.strftime("%Y-%m-%d"))
-    if snapshot_tolerance_ms <= 0:
-        return dates
-    end_ts = decision_ts + pd.Timedelta(milliseconds=int(snapshot_tolerance_ms))
-    if end_ts.strftime("%Y-%m-%d") != decision_ts.strftime("%Y-%m-%d"):
-        dates.add(end_ts.strftime("%Y-%m-%d"))
+    backshift_start_ts = decision_ts - pd.Timedelta(milliseconds=LEGACY_RAW_DECISION_TS_BACKSHIFT_MS)
+    if backshift_start_ts.strftime("%Y-%m-%d") != decision_ts.strftime("%Y-%m-%d"):
+        dates.add(backshift_start_ts.strftime("%Y-%m-%d"))
+    if window_end_ts.strftime("%Y-%m-%d") != decision_ts.strftime("%Y-%m-%d"):
+        dates.add(window_end_ts.strftime("%Y-%m-%d"))
     return dates
 
 
@@ -317,7 +331,7 @@ def _match_replay_rows(
     raw: dict[str, Any],
     *,
     decision_lookup: dict[tuple[str, int, int], list[int]],
-    token_lookup: dict[tuple[str, str, str], list[tuple[int, int]]],
+    token_lookup: dict[tuple[str, str, str], list[tuple[int, int, int]]],
     snapshot_tolerance_ms: int,
     allow_token_window_fallback: bool,
 ) -> tuple[list[int], str | None]:
@@ -343,12 +357,46 @@ def _match_replay_rows(
         return [], None
     matches = [
         row_idx
-        for row_idx, row_decision_ts_ms in token_lookup.get((market_id, token_id, side), [])
-        if int(row_decision_ts_ms) <= int(snapshot_ts_ms) <= int(row_decision_ts_ms) + int(snapshot_tolerance_ms)
+        for row_idx, row_window_start_ts_ms, row_window_end_ts_ms in token_lookup.get((market_id, token_id, side), [])
+        if int(row_window_start_ts_ms) <= int(snapshot_ts_ms) < int(row_window_end_ts_ms)
     ]
     if matches:
         return matches, "token_window"
     return [], None
+
+
+def _coalesce_window_start_ts(value: object, decision_ts: object) -> pd.Timestamp:
+    window_start_ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if window_start_ts is None or pd.isna(window_start_ts):
+        window_start_ts = pd.to_datetime(decision_ts, utc=True, errors="coerce")
+    if window_start_ts is None or pd.isna(window_start_ts):
+        raise ValueError("window_start_ts/decision_ts missing for depth replay row")
+    return pd.Timestamp(window_start_ts)
+
+
+def _coalesce_window_end_ts(
+    value: object,
+    window_start_ts: pd.Timestamp,
+    decision_ts: object,
+    *,
+    cycle_end_ts: object,
+    snapshot_tolerance_ms: int,
+) -> pd.Timestamp:
+    window_end_ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if window_end_ts is None or pd.isna(window_end_ts):
+        duration_seconds = 60.0
+        decision_dt = pd.to_datetime(decision_ts, utc=True, errors="coerce")
+        if decision_dt is not None and not pd.isna(decision_dt):
+            window_end_ts = pd.Timestamp(decision_dt) + pd.to_timedelta(duration_seconds, unit="s")
+        else:
+            window_end_ts = window_start_ts + pd.to_timedelta(duration_seconds, unit="s")
+    cycle_end_dt = pd.to_datetime(cycle_end_ts, utc=True, errors="coerce")
+    if cycle_end_dt is not None and not pd.isna(cycle_end_dt):
+        window_end_ts = min(pd.Timestamp(window_end_ts), pd.Timestamp(cycle_end_dt))
+    if window_end_ts <= window_start_ts:
+        fallback_end = window_start_ts + pd.to_timedelta(max(1, int(snapshot_tolerance_ms)), unit="ms")
+        window_end_ts = max(pd.Timestamp(window_end_ts), fallback_end)
+    return pd.Timestamp(window_end_ts)
 
 
 def _build_depth_replay_output(

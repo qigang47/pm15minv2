@@ -13,6 +13,7 @@ from .orderbook import (
     float_or_none,
     load_orderbook_index_frame,
     resolve_orderbook_row,
+    resolve_orderbook_row_within_window,
 )
 
 
@@ -112,8 +113,11 @@ def build_offset_quote_row_impl(
         out["reasons"].append("decision_ts_missing")
         return out
     decision_ts_ms = int(decision_ts.timestamp() * 1000) if not pd.isna(decision_ts) else None
-    if decision_ts_ms is not None and not pd.isna(trade_cycle_start_ts) and trade_cycle_start_ts > decision_ts:
-        decision_ts_ms = None
+    reference_ts_ms = int(now.timestamp() * 1000)
+    window_start_ts_ms = int(window_start_ts.timestamp() * 1000) if not pd.isna(window_start_ts) else decision_ts_ms
+    window_end_ts_ms = int(window_end_ts.timestamp() * 1000) if not pd.isna(window_end_ts) else None
+    if not pd.isna(trade_cycle_start_ts) and trade_cycle_start_ts > now:
+        reference_ts_ms = None
     index_path = data_cfg.layout.orderbook_index_path(date_str)
     recent_path = data_cfg.layout.orderbook_recent_path
     out["quote_source_path"] = str(index_path)
@@ -136,19 +140,23 @@ def build_offset_quote_row_impl(
         if missing_cols:
             out["reasons"].append(f"orderbook_index_missing_columns:{','.join(missing_cols)}")
             return out
-        up_row = resolve_orderbook_row(
+        up_row = resolve_orderbook_row_within_window(
             index_df,
             market_id=out["market_id"],
             token_id=out["token_up"],
             side="up",
-            decision_ts_ms=decision_ts_ms,
+            reference_ts_ms=reference_ts_ms,
+            window_start_ts_ms=window_start_ts_ms,
+            window_end_ts_ms=window_end_ts_ms,
         )
-        down_row = resolve_orderbook_row(
+        down_row = resolve_orderbook_row_within_window(
             index_df,
             market_id=out["market_id"],
             token_id=out["token_down"],
             side="down",
-            decision_ts_ms=decision_ts_ms,
+            reference_ts_ms=reference_ts_ms,
+            window_start_ts_ms=window_start_ts_ms,
+            window_end_ts_ms=window_end_ts_ms,
         )
     if (up_row is None or down_row is None) and orderbook_provider is not None:
         if provider_frame_cache is not None and provider_key in provider_frame_cache:
@@ -165,19 +173,26 @@ def build_offset_quote_row_impl(
                 provider_frame_cache[provider_key] = provider_df
             index_df = provider_df
         if not index_df.empty:
-            up_row = resolve_orderbook_row(
+            provider_reference_ts_ms = reference_ts_ms
+            if provider_reference_ts_ms is None and "captured_ts_ms" in index_df.columns:
+                provider_reference_ts_ms = int(pd.to_numeric(index_df["captured_ts_ms"], errors="coerce").max())
+            up_row = resolve_orderbook_row_within_window(
                 index_df,
                 market_id=out["market_id"],
                 token_id=out["token_up"],
                 side="up",
-                decision_ts_ms=decision_ts_ms,
+                reference_ts_ms=provider_reference_ts_ms,
+                window_start_ts_ms=window_start_ts_ms,
+                window_end_ts_ms=window_end_ts_ms,
             )
-            down_row = resolve_orderbook_row(
+            down_row = resolve_orderbook_row_within_window(
                 index_df,
                 market_id=out["market_id"],
                 token_id=out["token_down"],
                 side="down",
-                decision_ts_ms=decision_ts_ms,
+                reference_ts_ms=provider_reference_ts_ms,
+                window_start_ts_ms=window_start_ts_ms,
+                window_end_ts_ms=window_end_ts_ms,
             )
     if up_row is None:
         out["reasons"].append("up_quote_missing")
@@ -187,7 +202,7 @@ def build_offset_quote_row_impl(
         out["quote_up_ask_size_1"] = float_or_none(up_row.get("ask_size_1"))
         out["quote_up_bid_size_1"] = float_or_none(up_row.get("bid_size_1"))
         out["quote_captured_ts_ms_up"] = int(up_row["captured_ts_ms"])
-        out["quote_age_ms_up"] = decision_ts_ms - int(up_row["captured_ts_ms"]) if decision_ts_ms is not None else None
+        out["quote_age_ms_up"] = reference_ts_ms - int(up_row["captured_ts_ms"]) if reference_ts_ms is not None else None
     if down_row is None:
         out["reasons"].append("down_quote_missing")
     else:
@@ -196,7 +211,7 @@ def build_offset_quote_row_impl(
         out["quote_down_ask_size_1"] = float_or_none(down_row.get("ask_size_1"))
         out["quote_down_bid_size_1"] = float_or_none(down_row.get("bid_size_1"))
         out["quote_captured_ts_ms_down"] = int(down_row["captured_ts_ms"])
-        out["quote_age_ms_down"] = decision_ts_ms - int(down_row["captured_ts_ms"]) if decision_ts_ms is not None else None
+        out["quote_age_ms_down"] = reference_ts_ms - int(down_row["captured_ts_ms"]) if reference_ts_ms is not None else None
 
     if not out["reasons"]:
         out["status"] = "ok"
