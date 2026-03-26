@@ -9,6 +9,7 @@ from pm15min.research.bundles.loader import (
     resolve_model_bundle_dir,
 )
 from pm15min.research.config import ResearchConfig
+from pm15min.research.labels.sources import normalize_label_set
 from pm15min.research.manifests import read_manifest
 from pm15min.research.service import (
     get_active_bundle_selection as _get_active_bundle_selection,
@@ -171,7 +172,7 @@ def _build_bundle_row(bundle_dir: Path) -> dict[str, object]:
     target = _string_value(summary, "target") or _string_value(spec, "target") or _part_value(bundle_dir, "target")
     bundle_label = _string_value(summary, "bundle_label") or _string_value(spec, "bundle_label") or _part_value(bundle_dir, "bundle")
     feature_set = _string_value(summary, "feature_set") or _string_value(spec, "feature_set")
-    label_set = _string_value(summary, "label_set") or _string_value(spec, "label_set")
+    label_set = normalize_label_set(_string_value(summary, "label_set") or _string_value(spec, "label_set") or "truth")
     model_family = _string_value(summary, "model_family") or _string_value(spec, "model_family")
     source_training_run_dir = _string_value(summary, "source_training_run_dir") or _string_value(spec, "source_training_run")
     allowed_blacklist_columns = _string_list(summary, "allowed_blacklist_columns")

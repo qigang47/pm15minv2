@@ -22,4 +22,9 @@ def persist_quote_snapshot_impl(*, rewrite_root: Path, payload: dict[str, Any]) 
         target=str(payload["target"]),
         snapshot_ts=str(payload["snapshot_ts"]),
     )
-    return write_live_payload_pair(payload=payload, latest_path=latest_path, snapshot_path=snapshot_path)
+    return write_live_payload_pair(
+        payload=payload,
+        latest_path=latest_path,
+        snapshot_path=snapshot_path,
+        write_snapshot_history=False,
+    )

@@ -31,6 +31,10 @@ DEFAULT_CHAINLINK_SYMBOL: dict[str, str] = {
 _EXACT_CACHE_SOURCES = {"polymarket_open_price_api", "streams_parquet"}
 _STREAMS_REFRESH_SECONDS = 60.0
 _OPEN_PRICE_MIN_REFRESH_SECONDS = 30.0
+_OPEN_PRICE_EMPTY_RETRY_MAX_ATTEMPTS = 5
+_OPEN_PRICE_EMPTY_RETRY_BASE_SECONDS = 0.15
+_OPEN_PRICE_EMPTY_RETRY_MAX_SECONDS = 1.2
+_OPEN_PRICE_EMPTY_RETRY_MULTIPLIER = 2.0
 _DEFAULT_RTDS_MAX_SKEW_MS = 1000
 _OPEN_PRICE_CACHE: dict[tuple[str, int, int], "StrikeQuote"] = {}
 _OPEN_PRICE_LAST_ATTEMPT: dict[tuple[str, int, int], float] = {}
@@ -280,21 +284,30 @@ def _resolve_open_price_quote(
     if now - last_attempt < max(1.0, float(min_refresh_seconds)):
         return None
     _OPEN_PRICE_LAST_ATTEMPT[cache_key] = now
-    payload = oracle_client.fetch_crypto_price(
-        symbol=DEFAULT_POLYMARKET_SYMBOL.get(str(market_slug), str(market_slug).upper()),
-        cycle_start_ts=cycle_start_sec,
-        cycle_seconds=int(cycle_seconds),
+    symbol = DEFAULT_POLYMARKET_SYMBOL.get(str(market_slug), str(market_slug).upper())
+    max_attempts = _env_int(
+        "PM15MIN_OPEN_PRICE_EMPTY_RETRY_MAX_ATTEMPTS",
+        default=_OPEN_PRICE_EMPTY_RETRY_MAX_ATTEMPTS,
     )
-    open_price = pd.to_numeric(payload.get("openPrice"), errors="coerce")
-    if pd.isna(open_price) or float(open_price) <= 0.0:
-        return None
-    quote = StrikeQuote(
-        price=float(open_price),
-        ts_ms=int(cycle_start_sec * 1000),
-        source="polymarket_open_price_api",
-    )
-    _OPEN_PRICE_CACHE[cache_key] = quote
-    return quote
+    for attempt in range(max(1, int(max_attempts))):
+        payload = oracle_client.fetch_crypto_price(
+            symbol=symbol,
+            cycle_start_ts=cycle_start_sec,
+            cycle_seconds=int(cycle_seconds),
+        )
+        open_price = pd.to_numeric(payload.get("openPrice"), errors="coerce")
+        if not pd.isna(open_price) and float(open_price) > 0.0:
+            quote = StrikeQuote(
+                price=float(open_price),
+                ts_ms=int(cycle_start_sec * 1000),
+                source="polymarket_open_price_api",
+            )
+            _OPEN_PRICE_CACHE[cache_key] = quote
+            return quote
+        if attempt + 1 >= max_attempts:
+            break
+        time.sleep(_open_price_retry_sleep_seconds(attempt))
+    return None
 
 
 def _resolve_streams_boundary_quote(
@@ -521,6 +534,46 @@ def _default_rtds_provider(*, market_slug: str) -> RTDSBoundaryStrikeProvider | 
             )
             _RTDS_PROVIDER_CACHE[key] = provider
         return provider
+
+
+def _open_price_retry_sleep_seconds(attempt: int) -> float:
+    base_seconds = _env_float(
+        "PM15MIN_OPEN_PRICE_EMPTY_RETRY_BASE_SECONDS",
+        default=_OPEN_PRICE_EMPTY_RETRY_BASE_SECONDS,
+    )
+    max_seconds = _env_float(
+        "PM15MIN_OPEN_PRICE_EMPTY_RETRY_MAX_SECONDS",
+        default=_OPEN_PRICE_EMPTY_RETRY_MAX_SECONDS,
+    )
+    multiplier = _env_float(
+        "PM15MIN_OPEN_PRICE_EMPTY_RETRY_MULTIPLIER",
+        default=_OPEN_PRICE_EMPTY_RETRY_MULTIPLIER,
+    )
+    base_seconds = max(0.0, float(base_seconds))
+    max_seconds = max(base_seconds, float(max_seconds))
+    multiplier = max(1.0, float(multiplier))
+    sleep_seconds = base_seconds * (multiplier ** max(0, int(attempt)))
+    return min(max_seconds, sleep_seconds)
+
+
+def _env_float(name: str, *, default: float) -> float:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, *, default: int) -> int:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return int(default)
+    try:
+        return int(float(raw))
+    except Exception:
+        return int(default)
 
 
 @lru_cache(maxsize=1)

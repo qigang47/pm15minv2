@@ -16,6 +16,7 @@ from pm15min.live.service import (
     show_live_latest_runner,
     show_live_ready,
 )
+from pm15min.live.signal.utils import build_live_feature_frame
 
 
 class FakeGateway:
@@ -38,6 +39,9 @@ def _prepare_nan_feature_score_case(tmp_path: Path, monkeypatch) -> LiveConfig:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    decision_ts = pd.Timestamp.now(tz="UTC").floor("min")
+    cycle_start_ts = decision_ts.floor("15min")
+    cycle_end_ts = cycle_start_ts + pd.Timedelta(minutes=15)
     bundle_dir = root / "bundles" / "bundle=nan_guard"
     (bundle_dir / "offsets" / "offset=7").mkdir(parents=True, exist_ok=True)
 
@@ -66,9 +70,9 @@ def _prepare_nan_feature_score_case(tmp_path: Path, monkeypatch) -> LiveConfig:
         lambda *args, **kwargs: pd.DataFrame(
             [
                 {
-                    "decision_ts": "2026-03-20T00:08:00+00:00",
-                    "cycle_start_ts": "2026-03-20T00:00:00+00:00",
-                    "cycle_end_ts": "2026-03-20T00:15:00+00:00",
+                    "decision_ts": decision_ts.isoformat(),
+                    "cycle_start_ts": cycle_start_ts.isoformat(),
+                    "cycle_end_ts": cycle_end_ts.isoformat(),
                     "offset": 7,
                     "ret_30m": 0.01,
                     "delta_rsi_5": float("nan"),
@@ -81,13 +85,18 @@ def _prepare_nan_feature_score_case(tmp_path: Path, monkeypatch) -> LiveConfig:
         lambda *args, **kwargs: pd.DataFrame(
             [
                 {
-                    "decision_ts": pd.Timestamp("2026-03-20T00:08:00+00:00"),
-                    "cycle_start_ts": pd.Timestamp("2026-03-20T00:00:00+00:00"),
-                    "cycle_end_ts": pd.Timestamp("2026-03-20T00:15:00+00:00"),
+                    "decision_ts": decision_ts,
+                    "cycle_start_ts": cycle_start_ts,
+                    "cycle_end_ts": cycle_end_ts,
                     "offset": 7,
+                    "p_lgb": 0.83,
+                    "p_lr": 0.77,
                     "p_signal": 0.80,
+                    "w_lgb": 0.6,
+                    "w_lr": 0.4,
                     "p_up": 0.80,
                     "p_down": 0.20,
+                    "probability_mode": "raw_blend",
                     "score_valid": True,
                     "score_reason": "",
                 }
@@ -107,6 +116,13 @@ def test_score_live_latest_marks_nan_features_invalid(tmp_path: Path, monkeypatc
     row = payload["offset_signals"][0]
     assert row["score_valid"] is False
     assert row["score_reason"] == "nan_features"
+    assert row["p_lgb"] == 0.83
+    assert row["p_lr"] == 0.77
+    assert row["w_lgb"] == 0.6
+    assert row["w_lr"] == 0.4
+    assert row["probability_mode"] == "raw_blend"
+    assert row["feature_snapshot"]["ret_30m"] == 0.01
+    assert row["feature_snapshot"]["delta_rsi_5"] is None
     assert row["coverage"]["nan_feature_count"] == 1
     assert row["coverage"]["nan_feature_columns"] == ["delta_rsi_5"]
 
@@ -120,6 +136,201 @@ def test_check_live_latest_fails_when_nan_features_present(tmp_path: Path, monke
     offset_check = next(item for item in payload["checks"] if item["name"] == "offset_signals_valid")
     assert offset_check["ok"] is False
     assert offset_check["detail"][0]["nan_feature_count"] == 1
+
+
+def test_score_live_latest_ignores_expired_offset_rows(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    current_decision_ts = pd.Timestamp.now(tz="UTC").floor("min")
+    expired_decision_ts = current_decision_ts - pd.Timedelta(minutes=20)
+    current_cycle_start_ts = current_decision_ts.floor("15min")
+    expired_cycle_start_ts = expired_decision_ts.floor("15min")
+    bundle_dir = root / "bundles" / "bundle=fresh_guard"
+    (bundle_dir / "offsets" / "offset=7").mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        "pm15min.live.service.get_active_bundle_selection",
+        lambda *args, **kwargs: {
+            "selection": {"bundle_label": "fresh_guard"},
+            "selection_path": str(root / "selection.json"),
+        },
+    )
+    monkeypatch.setattr("pm15min.live.service.resolve_model_bundle_dir", lambda *args, **kwargs: bundle_dir)
+    monkeypatch.setattr(
+        "pm15min.live.service.read_model_bundle_manifest",
+        lambda *args, **kwargs: SimpleNamespace(spec={"feature_set": "v6_user_core", "bundle_label": "fresh_guard"}),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.service.read_bundle_config",
+        lambda *args, **kwargs: {
+            "feature_columns": ["ret_30m"],
+            "signal_target": "direction",
+            "allowed_blacklist_columns": [],
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.service._build_live_feature_frame",
+        lambda *args, **kwargs: pd.DataFrame(
+            [
+                {
+                    "decision_ts": expired_decision_ts.isoformat(),
+                    "cycle_start_ts": expired_cycle_start_ts.isoformat(),
+                    "cycle_end_ts": (expired_cycle_start_ts + pd.Timedelta(minutes=15)).isoformat(),
+                    "offset": 7,
+                    "ret_30m": 0.01,
+                },
+                {
+                    "decision_ts": current_decision_ts.isoformat(),
+                    "cycle_start_ts": current_cycle_start_ts.isoformat(),
+                    "cycle_end_ts": (current_cycle_start_ts + pd.Timedelta(minutes=15)).isoformat(),
+                    "offset": 7,
+                    "ret_30m": 0.02,
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.service.score_bundle_offset",
+        lambda *args, **kwargs: pd.DataFrame(
+            [
+                {
+                    "decision_ts": expired_decision_ts,
+                    "cycle_start_ts": expired_cycle_start_ts,
+                    "cycle_end_ts": expired_cycle_start_ts + pd.Timedelta(minutes=15),
+                    "offset": 7,
+                    "p_lgb": 0.70,
+                    "p_lr": 0.65,
+                    "p_signal": 0.68,
+                    "w_lgb": 0.5,
+                    "w_lr": 0.5,
+                    "p_up": 0.68,
+                    "p_down": 0.32,
+                    "probability_mode": "raw_blend",
+                    "score_valid": True,
+                    "score_reason": "",
+                },
+                {
+                    "decision_ts": current_decision_ts,
+                    "cycle_start_ts": current_cycle_start_ts,
+                    "cycle_end_ts": current_cycle_start_ts + pd.Timedelta(minutes=15),
+                    "offset": 7,
+                    "p_lgb": 0.83,
+                    "p_lr": 0.77,
+                    "p_signal": 0.80,
+                    "w_lgb": 0.6,
+                    "w_lr": 0.4,
+                    "p_up": 0.80,
+                    "p_down": 0.20,
+                    "probability_mode": "raw_blend",
+                    "score_valid": True,
+                    "score_reason": "",
+                },
+            ]
+        ),
+    )
+
+    payload = score_live_latest(cfg, persist=False)
+
+    assert len(payload["offset_signals"]) == 1
+    row = payload["offset_signals"][0]
+    assert row.get("status") in (None, "")
+    assert row["decision_ts"] == current_decision_ts.isoformat()
+    assert row["window_start_ts"] == current_decision_ts.isoformat()
+    assert row["offset"] == 7
+    assert row["feature_snapshot"]["ret_30m"] == 0.02
+
+
+def test_build_live_feature_frame_refreshes_trade_inputs_when_missing(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    calls: list[tuple[str, str]] = []
+
+    def _touch(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ok", encoding="utf-8")
+
+    def _sync_market_catalog(data_cfg, **kwargs):
+        calls.append(("market_catalog", data_cfg.asset.slug))
+        _touch(data_cfg.layout.market_catalog_table_path)
+        return {"status": "ok"}
+
+    def _sync_binance(data_cfg, *, symbol=None, **kwargs):
+        calls.append(("binance", str(symbol or data_cfg.asset.binance_symbol)))
+        _touch(data_cfg.layout.binance_klines_path(symbol=symbol))
+        return {"status": "ok"}
+
+    monkeypatch.setattr("pm15min.live.signal.utils.sync_market_catalog", _sync_market_catalog)
+    monkeypatch.setattr("pm15min.live.signal.utils.sync_binance_klines_1m", _sync_binance)
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_binance_klines_1m",
+        lambda *args, **kwargs: pd.DataFrame([{"open_time": pd.Timestamp("2026-03-20T00:00:00Z"), "close_time": pd.Timestamp("2026-03-20T00:00:59Z"), "close": 100.0}]),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_oracle_prices_table",
+        lambda *args, **kwargs: pd.DataFrame([{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_live_runtime_oracle_prices",
+        lambda **kwargs: pd.DataFrame([{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_feature_frame_df",
+        lambda *args, **kwargs: pd.DataFrame([{"decision_ts": pd.Timestamp("2026-03-20T00:01:00Z"), "cycle_start_ts": pd.Timestamp("2026-03-20T00:00:00Z"), "cycle_end_ts": pd.Timestamp("2026-03-20T00:15:00Z"), "offset": 1, "ret_30m": 0.0}]),
+    )
+
+    out = build_live_feature_frame(cfg, feature_set="v6_user_core")
+
+    assert not out.empty
+    assert ("market_catalog", "sol") in calls
+    assert ("binance", "SOLUSDT") in calls
+    assert ("binance", "BTCUSDT") in calls
+
+
+def test_build_live_feature_frame_skips_trade_input_refresh_when_files_are_fresh(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    btc_cfg = DataConfig.build(market="btc", cycle="15m", surface="live", root=root)
+    for path in (
+        data_cfg.layout.market_catalog_table_path,
+        data_cfg.layout.binance_klines_path(),
+        btc_cfg.layout.binance_klines_path(),
+        data_cfg.layout.oracle_prices_table_path,
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ok", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.sync_market_catalog",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("market catalog should not refresh")),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.sync_binance_klines_1m",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("binance should not refresh")),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_binance_klines_1m",
+        lambda *args, **kwargs: pd.DataFrame([{"open_time": pd.Timestamp("2026-03-20T00:00:00Z"), "close_time": pd.Timestamp("2026-03-20T00:00:59Z"), "close": 100.0}]),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_oracle_prices_table",
+        lambda *args, **kwargs: pd.DataFrame([{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_live_runtime_oracle_prices",
+        lambda **kwargs: pd.DataFrame([{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_feature_frame_df",
+        lambda *args, **kwargs: pd.DataFrame([{"decision_ts": pd.Timestamp("2026-03-20T00:01:00Z"), "cycle_start_ts": pd.Timestamp("2026-03-20T00:00:00Z"), "cycle_end_ts": pd.Timestamp("2026-03-20T00:15:00Z"), "offset": 1, "ret_30m": 0.0}]),
+    )
+
+    out = build_live_feature_frame(cfg, feature_set="v6_user_core")
+
+    assert not out.empty
 
 
 def test_check_live_trading_gateway_reports_injected_gateway(tmp_path: Path, monkeypatch) -> None:

@@ -195,6 +195,8 @@ def attach_research_subcommands(
     add_target_arg(backtest_run)
     backtest_run.add_argument("--spec", default="baseline_truth")
     backtest_run.add_argument("--run-label", default="planned")
+    backtest_run.add_argument("--decision-start", default=None, help="Inclusive decision_ts lower bound.")
+    backtest_run.add_argument("--decision-end", default=None, help="Inclusive decision_ts upper bound or date.")
     backtest_run.add_argument("--bundle-label", default=None)
     backtest_run.add_argument("--stake-usd", type=float, default=None)
     backtest_run.add_argument("--max-notional-usd", type=float, default=None)

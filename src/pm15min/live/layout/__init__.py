@@ -448,6 +448,9 @@ class LiveStateLayout:
     def runner_log_path(self, *, market: str, cycle: str, profile: str, target: str) -> Path:
         return self.runner_log_dir(market=market, cycle=cycle, profile=profile, target=target) / "runner.jsonl"
 
+    def runner_audit_log_path(self, *, market: str, cycle: str, profile: str, target: str) -> Path:
+        return self.runner_log_dir(market=market, cycle=cycle, profile=profile, target=target) / "audit.jsonl"
+
     execution_state_dir = _make_target_state_dir_method("execution_state_dir", EXECUTION_STATE_GROUP)
     latest_execution_path = _make_latest_target_path_method("latest_execution_path", EXECUTION_STATE_GROUP)
     execution_snapshot_path = _make_target_snapshot_path_method(

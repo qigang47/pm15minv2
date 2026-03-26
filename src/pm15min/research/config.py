@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pm15min.core.assets import AssetSpec, resolve_asset
+from pm15min.research.labels.sources import normalize_label_set
 from pm15min.research.layout import (
     MarketResearchLayout,
     ResearchLayout,
@@ -52,7 +53,7 @@ class ResearchConfig:
             profile=slug_token(profile),
             source_surface=normalize_source_surface(source_surface),
             feature_set=slug_token(feature_set),
-            label_set=slug_token(label_set),
+            label_set=normalize_label_set(label_set),
             target=normalize_target(target),
             model_family=slug_token(model_family),
             run_prefix=slug_token(run_prefix) if run_prefix else None,

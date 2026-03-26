@@ -27,6 +27,17 @@ def build_offset_quote_row_impl(
     provider_frame_cache: dict[tuple[str, str, str], pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
     decision_ts = pd.to_datetime(signal_row.get("decision_ts"), utc=True, errors="coerce")
+    window_start_ts = pd.to_datetime(
+        signal_row.get("window_start_ts") or signal_row.get("decision_ts"),
+        utc=True,
+        errors="coerce",
+    )
+    window_end_ts = pd.to_datetime(signal_row.get("window_end_ts"), utc=True, errors="coerce")
+    if pd.isna(window_end_ts) and not pd.isna(window_start_ts):
+        duration_seconds = pd.to_numeric(signal_row.get("window_duration_seconds"), errors="coerce")
+        if pd.isna(duration_seconds) or float(duration_seconds) <= 0.0:
+            duration_seconds = 60.0
+        window_end_ts = window_start_ts + pd.to_timedelta(float(duration_seconds), unit="s")
     cycle_start_ts = pd.to_datetime(signal_row.get("cycle_start_ts"), utc=True, errors="coerce")
     signal_cycle_end_ts = pd.to_datetime(signal_row.get("cycle_end_ts"), utc=True, errors="coerce")
     date_str = decision_ts.strftime("%Y-%m-%d") if not pd.isna(decision_ts) else None
@@ -59,6 +70,12 @@ def build_offset_quote_row_impl(
         "quote_source_path": None,
         "reasons": [],
     }
+    if not pd.isna(window_start_ts) and now < window_start_ts:
+        out["reasons"].append("signal_window_not_open")
+        return out
+    if not pd.isna(window_end_ts) and now >= window_end_ts:
+        out["reasons"].append("signal_window_expired")
+        return out
     if market_table.empty:
         out["reasons"].append("market_catalog_missing")
         return out
@@ -94,6 +111,9 @@ def build_offset_quote_row_impl(
     if not date_str:
         out["reasons"].append("decision_ts_missing")
         return out
+    decision_ts_ms = int(decision_ts.timestamp() * 1000) if not pd.isna(decision_ts) else None
+    if decision_ts_ms is not None and not pd.isna(trade_cycle_start_ts) and trade_cycle_start_ts > decision_ts:
+        decision_ts_ms = None
     index_path = data_cfg.layout.orderbook_index_path(date_str)
     recent_path = data_cfg.layout.orderbook_recent_path
     out["quote_source_path"] = str(index_path)
@@ -106,8 +126,31 @@ def build_offset_quote_row_impl(
         str(out["token_up"]),
         str(out["token_down"]),
     )
-    index_df = pd.DataFrame()
-    if orderbook_provider is not None:
+    local_index_df = load_orderbook_index_frame(index_path=index_path, recent_path=recent_path)
+    index_df = local_index_df
+    if index_df.empty:
+        up_row = None
+        down_row = None
+    else:
+        missing_cols = sorted(ORDERBOOK_INDEX_COLUMNS - set(index_df.columns))
+        if missing_cols:
+            out["reasons"].append(f"orderbook_index_missing_columns:{','.join(missing_cols)}")
+            return out
+        up_row = resolve_orderbook_row(
+            index_df,
+            market_id=out["market_id"],
+            token_id=out["token_up"],
+            side="up",
+            decision_ts_ms=decision_ts_ms,
+        )
+        down_row = resolve_orderbook_row(
+            index_df,
+            market_id=out["market_id"],
+            token_id=out["token_down"],
+            side="down",
+            decision_ts_ms=decision_ts_ms,
+        )
+    if (up_row is None or down_row is None) and orderbook_provider is not None:
         if provider_frame_cache is not None and provider_key in provider_frame_cache:
             index_df = provider_frame_cache[provider_key]
         else:
@@ -121,33 +164,21 @@ def build_offset_quote_row_impl(
             if provider_frame_cache is not None:
                 provider_frame_cache[provider_key] = provider_df
             index_df = provider_df
-    if index_df.empty:
-        index_df = load_orderbook_index_frame(index_path=index_path, recent_path=recent_path)
-    if index_df.empty:
-        out["reasons"].append("orderbook_index_empty")
-        return out
-    missing_cols = sorted(ORDERBOOK_INDEX_COLUMNS - set(index_df.columns))
-    if missing_cols:
-        out["reasons"].append(f"orderbook_index_missing_columns:{','.join(missing_cols)}")
-        return out
-
-    decision_ts_ms = int(decision_ts.timestamp() * 1000) if not pd.isna(decision_ts) else None
-    if decision_ts_ms is not None and not pd.isna(trade_cycle_start_ts) and trade_cycle_start_ts > decision_ts:
-        decision_ts_ms = None
-    up_row = resolve_orderbook_row(
-        index_df,
-        market_id=out["market_id"],
-        token_id=out["token_up"],
-        side="up",
-        decision_ts_ms=decision_ts_ms,
-    )
-    down_row = resolve_orderbook_row(
-        index_df,
-        market_id=out["market_id"],
-        token_id=out["token_down"],
-        side="down",
-        decision_ts_ms=decision_ts_ms,
-    )
+        if not index_df.empty:
+            up_row = resolve_orderbook_row(
+                index_df,
+                market_id=out["market_id"],
+                token_id=out["token_up"],
+                side="up",
+                decision_ts_ms=decision_ts_ms,
+            )
+            down_row = resolve_orderbook_row(
+                index_df,
+                market_id=out["market_id"],
+                token_id=out["token_down"],
+                side="down",
+                decision_ts_ms=decision_ts_ms,
+            )
     if up_row is None:
         out["reasons"].append("up_quote_missing")
     else:

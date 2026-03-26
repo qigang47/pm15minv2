@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,12 +23,25 @@ class GuardParitySummary:
         }
 
 
+_FEATURE_SNAPSHOT_COLUMNS = (
+    "ret_15m",
+    "ret_30m",
+    "ret_from_strike",
+    "ret_from_cycle_open",
+    "move_z_strike",
+    "move_z",
+)
+
+GUARD_PARITY_HEARTBEAT_INTERVAL_ROWS = 1_000
+
+
 def apply_live_guard_parity(
     *,
     market: str,
     profile: str,
     decisions: pd.DataFrame,
     profile_spec: LiveProfileSpec | None = None,
+    heartbeat: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, GuardParitySummary]:
     if decisions.empty:
         return decisions.copy(), GuardParitySummary(evaluated_rows=0, blocked_rows=0)
@@ -38,9 +52,11 @@ def apply_live_guard_parity(
     quote_metrics_list: list[dict[str, Any]] = []
     account_context_list: list[dict[str, Any]] = []
     blocked_count = 0
+    total_rows = len(out)
+    if heartbeat is not None:
+        heartbeat(f"Applying live guard parity: 0/{total_rows:,} rows")
 
-    for idx in range(len(out)):
-        row = out.iloc[idx]
+    for row_index, row in enumerate(out.itertuples(index=False, name="GuardParityRow"), start=1):
         quote_row = _build_quote_row(row)
         signal_row = _build_signal_row(row)
         if quote_row is None:
@@ -60,8 +76,13 @@ def apply_live_guard_parity(
         guard_reasons_list.append(reasons)
         quote_metrics_list.append(quote_metrics)
         account_context_list.append(account_context)
-        if str(row.get("policy_action") or "reject") == "trade" and reasons:
+        if str(_row_value(row, "policy_action") or "reject") == "trade" and reasons:
             blocked_count += 1
+        if heartbeat is not None and (
+            row_index == total_rows
+            or row_index % GUARD_PARITY_HEARTBEAT_INTERVAL_ROWS == 0
+        ):
+            heartbeat(f"Applying live guard parity: {row_index:,}/{total_rows:,} rows")
 
     out["guard_reasons"] = guard_reasons_list
     out["guard_primary_reason"] = [reasons[0] if reasons else "" for reasons in guard_reasons_list]
@@ -80,40 +101,38 @@ def apply_live_guard_parity(
     )
 
 
-def _build_signal_row(row: pd.Series) -> dict[str, Any]:
-    p_up = _float_or_none(row.get("p_up"))
-    p_down = _float_or_none(row.get("p_down"))
+def _build_signal_row(row: object) -> dict[str, Any]:
+    p_up = _float_or_none(_row_value(row, "p_up"))
+    p_down = _float_or_none(_row_value(row, "p_down"))
     recommended_side = "UP" if (p_up or -1.0) >= (p_down or -1.0) else "DOWN"
     confidence = max(value for value in (p_up, p_down) if value is not None) if (p_up is not None or p_down is not None) else 0.0
-    offset_value = pd.to_numeric(row.get("offset"), errors="coerce")
+    offset_value = pd.to_numeric(_row_value(row, "offset"), errors="coerce")
+    coverage = _row_value(row, "coverage")
     return {
         "offset": int(offset_value) if pd.notna(offset_value) else 0,
         "recommended_side": recommended_side,
         "confidence": float(confidence),
         "p_up": p_up,
         "p_down": p_down,
-        "score_valid": bool(row.get("score_valid", True)),
-        "score_reason": str(row.get("score_reason") or ""),
-        "status": str(row.get("status") or ""),
-        "coverage": row.get("coverage") if isinstance(row.get("coverage"), dict) else {},
-        "feature_snapshot": row.to_dict(),
+        "score_valid": bool(_row_value(row, "score_valid", True)),
+        "score_reason": str(_row_value(row, "score_reason") or ""),
+        "status": str(_row_value(row, "status") or ""),
+        "coverage": coverage if isinstance(coverage, dict) else {},
+        "feature_snapshot": _build_feature_snapshot(row),
     }
 
 
-def _build_quote_row(row: pd.Series) -> dict[str, Any] | None:
-    quote_status = str(row.get("quote_status") or "")
-    has_quote_fields = any(
-        row.get(name) is not None
-        for name in ("quote_up_ask", "quote_down_ask", "quote_prob_up", "quote_prob_down")
-    )
+def _build_quote_row(row: object) -> dict[str, Any] | None:
+    quote_status = str(_row_value(row, "quote_status") or "")
+    has_quote_fields = any(_row_has_value(row, name) for name in ("quote_up_ask", "quote_down_ask", "quote_prob_up", "quote_prob_down"))
     if not quote_status and not has_quote_fields:
         return None
 
     def _fallback(name: str, alt: str) -> float | None:
-        direct = _float_or_none(row.get(name))
-        return direct if direct is not None else _float_or_none(row.get(alt))
+        direct = _float_or_none(_row_value(row, name))
+        return direct if direct is not None else _float_or_none(_row_value(row, alt))
 
-    reasons = [reason for reason in str(row.get("quote_reason") or "").split(",") if reason]
+    reasons = [reason for reason in str(_row_value(row, "quote_reason") or "").split(",") if reason]
     if quote_status == "missing_quote_inputs" and set(reasons).issubset({"market_or_decision_missing", "orderbook_index_missing"}):
         return None
     if not quote_status:
@@ -121,29 +140,29 @@ def _build_quote_row(row: pd.Series) -> dict[str, Any] | None:
     return {
         "status": quote_status,
         "reasons": reasons,
-        "market_id": row.get("market_id"),
+        "market_id": _row_value(row, "market_id"),
         "quote_up_ask": _fallback("quote_up_ask", "quote_prob_up"),
         "quote_down_ask": _fallback("quote_down_ask", "quote_prob_down"),
-        "quote_up_bid": _float_or_none(row.get("quote_up_bid")),
-        "quote_down_bid": _float_or_none(row.get("quote_down_bid")),
-        "quote_up_ask_size_1": _float_or_none(row.get("quote_up_ask_size_1")),
-        "quote_down_ask_size_1": _float_or_none(row.get("quote_down_ask_size_1")),
-        "quote_captured_ts_ms_up": row.get("quote_captured_ts_ms_up"),
-        "quote_captured_ts_ms_down": row.get("quote_captured_ts_ms_down"),
+        "quote_up_bid": _float_or_none(_row_value(row, "quote_up_bid")),
+        "quote_down_bid": _float_or_none(_row_value(row, "quote_down_bid")),
+        "quote_up_ask_size_1": _float_or_none(_row_value(row, "quote_up_ask_size_1")),
+        "quote_down_ask_size_1": _float_or_none(_row_value(row, "quote_down_ask_size_1")),
+        "quote_captured_ts_ms_up": _row_value(row, "quote_captured_ts_ms_up"),
+        "quote_captured_ts_ms_down": _row_value(row, "quote_captured_ts_ms_down"),
     }
 
 
-def _build_liquidity_state(row: pd.Series) -> dict[str, Any]:
-    blocked = bool(row.get("liquidity_blocked", False))
-    degraded = bool(row.get("liquidity_degraded", False))
-    reason_codes = row.get("liquidity_reason_codes")
+def _build_liquidity_state(row: object) -> dict[str, Any]:
+    blocked = bool(_row_value(row, "liquidity_blocked", False))
+    degraded = bool(_row_value(row, "liquidity_degraded", False))
+    reason_codes = _row_value(row, "liquidity_reason_codes")
     if isinstance(reason_codes, str):
         codes = [item for item in reason_codes.split(",") if item]
-    elif isinstance(reason_codes, list):
+    elif isinstance(reason_codes, (list, tuple)):
         codes = [str(item) for item in reason_codes if str(item)]
     else:
         codes = []
-    metrics = row.get("liquidity_metrics")
+    metrics = _row_value(row, "liquidity_metrics")
     return {
         "blocked": blocked,
         "degraded": degraded,
@@ -152,14 +171,14 @@ def _build_liquidity_state(row: pd.Series) -> dict[str, Any]:
     }
 
 
-def _build_regime_state(row: pd.Series) -> dict[str, Any]:
-    status = str(row.get("regime_status") or "ok").lower()
-    state = str(row.get("regime_state") or "NORMAL").upper()
-    pressure = str(row.get("regime_pressure") or "neutral").lower()
-    reason_codes = row.get("regime_reason_codes")
+def _build_regime_state(row: object) -> dict[str, Any]:
+    status = str(_row_value(row, "regime_status") or "ok").lower()
+    state = str(_row_value(row, "regime_state") or "NORMAL").upper()
+    pressure = str(_row_value(row, "regime_pressure") or "neutral").lower()
+    reason_codes = _row_value(row, "regime_reason_codes")
     if isinstance(reason_codes, str):
         codes = [item for item in reason_codes.split(",") if item]
-    elif isinstance(reason_codes, list):
+    elif isinstance(reason_codes, (list, tuple)):
         codes = [str(item) for item in reason_codes if str(item)]
     else:
         codes = []
@@ -171,9 +190,41 @@ def _build_regime_state(row: pd.Series) -> dict[str, Any]:
     }
 
 
-def _build_account_state(row: pd.Series) -> dict[str, Any]:
-    account_state = row.get("account_state")
+def _build_account_state(row: object) -> dict[str, Any]:
+    account_state = _row_value(row, "account_state")
     return account_state if isinstance(account_state, dict) else {}
+
+
+def _build_feature_snapshot(row: object) -> dict[str, Any]:
+    existing = _row_value(row, "feature_snapshot")
+    if isinstance(existing, dict):
+        return existing
+    snapshot: dict[str, Any] = {}
+    for column in _FEATURE_SNAPSHOT_COLUMNS:
+        value = _row_value(row, column)
+        if _is_missing_scalar(value):
+            continue
+        snapshot[column] = value
+    return snapshot
+
+
+def _row_value(row: object, key: str, default: object = None) -> object:
+    if isinstance(row, pd.Series):
+        return row.get(key, default)
+    return getattr(row, key, default)
+
+
+def _row_has_value(row: object, key: str) -> bool:
+    return not _is_missing_scalar(_row_value(row, key))
+
+
+def _is_missing_scalar(value: object) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
 
 
 def _float_or_none(value: object) -> float | None:

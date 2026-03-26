@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from pm15min.research.features.base import normalize_feature_frame, prepare_klines
+from pm15min.research.features.base import decision_reference_ts, normalize_feature_frame, prepare_klines
 from pm15min.research.features.cross_asset import append_cross_asset_features
 from pm15min.research.features.cycle import append_cycle_features
 from pm15min.research.features.price import append_price_features
@@ -30,10 +30,10 @@ def build_feature_frame(
     cycle: str = "15m",
 ) -> pd.DataFrame:
     base = prepare_klines(raw_klines)
+    base["decision_ts"] = decision_reference_ts(base)
     frame = append_price_features(base)
     frame = append_volume_features(frame)
     frame = append_cycle_features(frame, cycle=cycle)
-    frame["decision_ts"] = pd.to_datetime(frame["open_time"], utc=True, errors="coerce") + pd.Timedelta(minutes=1)
     frame = append_strike_features(frame, oracle_prices=oracle_prices, cycle=cycle)
     frame = append_cross_asset_features(frame, btc_klines=btc_klines)
 

@@ -259,6 +259,91 @@ def test_build_truth_preserves_chainlink_source_granularity_from_oracle_prices(t
     assert truth["winner_side"].tolist() == ["UP", "DOWN", "UP"]
 
 
+def test_build_truth_prefers_full_truth_settlement_candidate_for_same_cycle(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=tmp_path / "v2")
+
+    market_table = pd.DataFrame(
+        [
+            {
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "asset": "sol",
+                "cycle": "15m",
+                "cycle_start_ts": 1700000000,
+                "cycle_end_ts": 1700000900,
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "slug": "sol-up-or-down-15m-1700000000",
+                "question": "Sol Up or Down",
+                "resolution_source": "https://data.chain.link/streams/sol-usd",
+                "event_id": "event-1",
+                "event_slug": "slug-1",
+                "event_title": "title-1",
+                "series_slug": "sol-up-or-down-15m",
+                "closed_ts": None,
+                "source_snapshot_ts": "2026-03-19T09-00-00Z",
+            }
+        ]
+    )
+    write_parquet_atomic(market_table, cfg.layout.market_catalog_table_path)
+
+    settlement_source = pd.DataFrame(
+        [
+            {
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "asset": "sol",
+                "cycle": "15m",
+                "cycle_start_ts": 1700000000,
+                "cycle_end_ts": 1700000900,
+                "slug": "sol-up-or-down-15m-1700000000",
+                "question": "Sol Up or Down",
+                "resolution_source": "https://data.chain.link/streams/sol-usd",
+                "winner_side": "",
+                "label_updown": "",
+                "onchain_resolved": False,
+                "stream_match_exact": False,
+                "full_truth": False,
+                "stream_price": pd.NA,
+                "stream_extra_ts": pd.NA,
+                "source_file": "rpc:settlement_truth",
+                "ingested_at": "2026-03-24T17:26:15Z",
+            },
+            {
+                "market_id": "",
+                "condition_id": "",
+                "asset": "sol",
+                "cycle": "15m",
+                "cycle_start_ts": 1700000000,
+                "cycle_end_ts": 1700000900,
+                "slug": "",
+                "question": "",
+                "resolution_source": "",
+                "winner_side": "DOWN",
+                "label_updown": "DOWN",
+                "onchain_resolved": True,
+                "stream_match_exact": False,
+                "full_truth": True,
+                "stream_price": 99.0,
+                "stream_extra_ts": 1700000900,
+                "source_file": "_autofetch/example.csv",
+                "ingested_at": "2026-03-19T14:18:13Z",
+            },
+        ]
+    )
+    write_parquet_atomic(settlement_source, cfg.layout.settlement_truth_source_path)
+
+    truth_summary = build_truth_15m(cfg)
+    truth = pd.read_parquet(cfg.layout.truth_table_path)
+
+    assert truth_summary["rows_written"] == 1
+    assert len(truth) == 1
+    assert truth.iloc[0]["truth_source"] == "settlement_truth"
+    assert truth.iloc[0]["winner_side"] == "DOWN"
+    assert bool(truth.iloc[0]["resolved"]) is True
+    assert bool(truth.iloc[0]["full_truth"]) is True
+
+
 def test_import_legacy_market_catalog_builds_canonical_table(tmp_path: Path) -> None:
     source = tmp_path / "solana_updown_15m_markets_last3y_20260312_150335.csv"
     pd.DataFrame(

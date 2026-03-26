@@ -9,6 +9,7 @@ from ..config import DataConfig
 from ..layout import DataLayout
 from ..service import show_data_summary
 from ..pipelines.binance_klines import sync_binance_klines_1m
+from ..pipelines.backtest_refresh import run_backtest_data_refresh
 from ..pipelines.direct_sync import sync_datafeeds_from_rpc, sync_settlement_truth_from_rpc, sync_streams_from_rpc
 from ..pipelines.export_tables import export_oracle_prices_15m, export_truth_15m
 from ..pipelines.foundation_runtime import run_live_data_foundation
@@ -56,6 +57,7 @@ def _build_cli_deps() -> DataCliDeps:
         run_orderbook_recorder=run_orderbook_recorder,
         run_orderbook_recorder_fleet=run_orderbook_recorder_fleet,
         run_live_data_foundation=run_live_data_foundation,
+        run_backtest_data_refresh=run_backtest_data_refresh,
     )
 
 

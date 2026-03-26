@@ -68,9 +68,19 @@ def persist_order_payload(*, cfg, payload: dict[str, Any], persist: bool) -> dic
     )
     payload["latest_order_action_path"] = str(latest_path)
     payload["order_action_snapshot_path"] = str(snapshot_path)
+    # Keep the latest order-action pointer focused on gate-relevant actions.
+    # Otherwise frequent "execution_not_plan" or dry-run payloads erase the last actionable state
+    # and allow the same order key to be retried later in the same market.
+    if not str(payload.get("action_key") or "").strip() or bool(payload.get("dry_run")):
+        return payload
     write_payload(payload=payload, latest_path=latest_path, snapshot_path=snapshot_path)
     return payload
 
 
 def write_payload(*, payload: dict[str, Any], latest_path: Path, snapshot_path: Path) -> None:
-    write_live_payload_pair(payload=payload, latest_path=latest_path, snapshot_path=snapshot_path)
+    write_live_payload_pair(
+        payload=payload,
+        latest_path=latest_path,
+        snapshot_path=snapshot_path,
+        write_snapshot_history=False,
+    )

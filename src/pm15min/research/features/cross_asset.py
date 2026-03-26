@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from pm15min.research.features.base import decision_reference_ts
+
 
 def append_cross_asset_features(
     frame: pd.DataFrame,
@@ -15,7 +17,8 @@ def append_cross_asset_features(
     btc = btc_klines.copy()
     btc["open_time"] = pd.to_datetime(btc["open_time"], utc=True, errors="coerce")
     btc = btc.dropna(subset=["open_time"]).sort_values("open_time")
-    btc = btc.drop_duplicates(subset=["open_time"], keep="last").set_index("open_time")
+    btc["decision_ts"] = btc["open_time"] + pd.Timedelta(minutes=1)
+    btc = btc.drop_duplicates(subset=["decision_ts"], keep="last").set_index("decision_ts")
     btc_close = pd.to_numeric(btc["close"], errors="coerce")
 
     features = pd.DataFrame(index=btc_close.index)
@@ -23,7 +26,7 @@ def append_cross_asset_features(
     features["btc_vol_30m"] = btc_close.pct_change().rolling(30).std(ddof=0)
 
     target_close = pd.to_numeric(out["close"], errors="coerce")
-    target_ts = pd.DatetimeIndex(out["open_time"])
+    target_ts = pd.DatetimeIndex(decision_reference_ts(out))
     target_returns = pd.Series(target_close.values, index=target_ts).pct_change(15)
     features["rel_strength_15m"] = target_returns.reindex(features.index) - btc_close.pct_change(15)
 

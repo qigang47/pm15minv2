@@ -115,8 +115,9 @@ def limit_legacy_pre_submit_orderbook_retry_candidates(
     raw_depth_candidates: list[dict[str, object]],
     *,
     spec: LiveProfileSpec | None,
+    candidate_total_count: int | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
-    total_count = int(len(raw_depth_candidates))
+    total_count = max(int(len(raw_depth_candidates)), int(candidate_total_count or 0))
     if spec is None:
         return list(raw_depth_candidates), {
             "candidate_total_count": total_count,
@@ -138,8 +139,10 @@ def limit_legacy_fak_refresh_candidates(
     raw_depth_candidates: list[dict[str, object]],
     *,
     spec: LiveProfileSpec | None,
+    candidate_total_count: int | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     return limit_legacy_pre_submit_orderbook_retry_candidates(
         raw_depth_candidates,
         spec=spec,
+        candidate_total_count=candidate_total_count,
     )

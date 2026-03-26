@@ -9,6 +9,7 @@ from ..layout import LiveStateLayout
 
 ACTION_SUCCESS_STATUSES = {"ok"}
 ACTION_RETRYABLE_STATUSES = {"error", "ok_with_errors"}
+SESSION_ACTION_STATE_MAX_KEYS = 256
 
 
 def evaluate_action_gate(
@@ -21,15 +22,25 @@ def evaluate_action_gate(
     action_key: str | None,
     snapshot_ts: str,
     dry_run: bool,
+    session_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     retry_interval_seconds, max_attempts = action_retry_budget(spec=spec, action_type=action_type)
-    previous_payload = load_latest_action_payload(
-        cfg=cfg,
-        action_type=action_type,
-        cycle=cycle,
-        target=target,
+    previous_context = extract_previous_attempt_context(
+        previous_payload=load_session_action_payload(
+            session_state=session_state,
+            action_type=action_type,
+            action_key=action_key,
+        ),
+        action_key=action_key,
     )
-    previous_context = extract_previous_attempt_context(previous_payload=previous_payload, action_key=action_key)
+    if not previous_context["same_key"]:
+        previous_payload = load_latest_action_payload(
+            cfg=cfg,
+            action_type=action_type,
+            cycle=cycle,
+            target=target,
+        )
+        previous_context = extract_previous_attempt_context(previous_payload=previous_payload, action_key=action_key)
     if dry_run:
         return {
             **previous_context,
@@ -188,6 +199,36 @@ def apply_gate_context(*, payload: dict[str, Any], gate: dict[str, Any]) -> None
     }
 
 
+def persist_session_action_payload(
+    *,
+    session_state: dict[str, Any] | None,
+    action_type: str,
+    payload: dict[str, Any],
+) -> None:
+    if not isinstance(session_state, dict):
+        return
+    action_key = str(payload.get("action_key") or "").strip()
+    if not action_key or bool(payload.get("dry_run")):
+        return
+    state = _session_action_state_map(session_state=session_state, action_type=action_type)
+    if action_key in state:
+        state.pop(action_key, None)
+    state[action_key] = {
+        "action_key": action_key,
+        "snapshot_ts": payload.get("snapshot_ts"),
+        "status": payload.get("status"),
+        "reason": payload.get("reason"),
+        "attempt": int_or_none(payload.get("attempt")) or 0,
+        "last_attempt_snapshot_ts": payload.get("last_attempt_snapshot_ts"),
+        "last_attempt_status": payload.get("last_attempt_status"),
+        "last_attempt_reason": payload.get("last_attempt_reason"),
+        "dry_run": bool(payload.get("dry_run")),
+    }
+    while len(state) > SESSION_ACTION_STATE_MAX_KEYS:
+        oldest_key = next(iter(state))
+        state.pop(oldest_key, None)
+
+
 def record_attempt_result(*, payload: dict[str, Any]) -> None:
     payload["attempted"] = True
     payload["last_attempt_snapshot_ts"] = payload.get("snapshot_ts")
@@ -201,3 +242,38 @@ def seconds_since_snapshot(*, current_snapshot_ts: object, previous_snapshot_ts:
     if current_ts is None or previous_ts is None:
         return None
     return max(0.0, float((current_ts - previous_ts).total_seconds()))
+
+
+def load_session_action_payload(
+    *,
+    session_state: dict[str, Any] | None,
+    action_type: str,
+    action_key: str | None,
+) -> dict[str, Any] | None:
+    if not isinstance(session_state, dict):
+        return None
+    key = str(action_key or "").strip()
+    if not key:
+        return None
+    state = _session_action_state_map(session_state=session_state, action_type=action_type)
+    payload = state.get(key)
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def _session_action_state_map(
+    *,
+    session_state: dict[str, Any] | None,
+    action_type: str,
+) -> dict[str, Any]:
+    if not isinstance(session_state, dict):
+        return {}
+    state = session_state.get("action_gate_state")
+    if not isinstance(state, dict):
+        state = {}
+        session_state["action_gate_state"] = state
+    action_map = state.get(action_type)
+    if isinstance(action_map, dict):
+        return action_map
+    action_map = {}
+    state[action_type] = action_map
+    return action_map

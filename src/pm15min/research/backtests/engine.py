@@ -24,7 +24,7 @@ from pm15min.research.backtests.decision_engine_parity import (
     build_profile_decision_engine_parity_config,
 )
 from pm15min.research.backtests.depth_replay import build_raw_depth_replay_frame
-from pm15min.research.backtests.fills import BacktestFillConfig, build_canonical_fills
+from pm15min.research.backtests.fills import BacktestFillConfig, build_canonical_fills, build_depth_candidate_lookup
 from pm15min.research.backtests.guard_parity import apply_live_guard_parity
 from pm15min.research.backtests.hybrid import apply_hybrid_fallback
 from pm15min.research.backtests.live_state_parity import attach_live_state_parity
@@ -35,6 +35,12 @@ from pm15min.research.backtests.replay_loader import build_replay_frame
 from pm15min.research.backtests.retry_contract import (
     attach_pre_submit_orderbook_retry_contract,
     build_backtest_retry_contract,
+)
+from pm15min.research.backtests.runtime_cache import (
+    BacktestPreparedRuntime,
+    BacktestSharedRuntimeKey,
+    process_backtest_runtime_cache,
+    snapshot_source_mtimes,
 )
 from pm15min.research.backtests.reports import (
     build_backtest_summary,
@@ -54,6 +60,7 @@ from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import BacktestRunSpec
 from pm15min.research.datasets.loaders import load_feature_frame, load_label_frame
 from pm15min.research.inference.scorer import score_bundle_offset
+from pm15min.research.labels.sources import normalize_label_set
 from pm15min.research.labels.runtime import build_truth_runtime_summary
 from pm15min.research.manifests import build_manifest, read_manifest, write_manifest
 
@@ -156,50 +163,129 @@ def run_research_backtest(
     )
     bundle_manifest = read_model_bundle_manifest(bundle_dir)
     feature_set = str(bundle_manifest.spec.get("feature_set") or cfg.feature_set)
-    label_set = str(bundle_manifest.spec.get("label_set") or cfg.label_set)
+    label_set = normalize_label_set(str(bundle_manifest.spec.get("label_set") or cfg.label_set))
 
-    features = load_feature_frame(cfg, feature_set=feature_set)
-    labels = load_label_frame(cfg, label_set=label_set)
     data_cfg = DataConfig.build(
         market=cfg.asset.slug,
         cycle=cfg.cycle,
         surface=cfg.source_surface,
         root=cfg.layout.storage.rewrite_root,
     )
-    raw_klines = load_binance_klines_1m(data_cfg)
     profile_spec = resolve_backtest_profile_spec(
         market=cfg.asset.slug,
         profile=spec.profile,
         parity=spec.parity,
     )
     liquidity_proxy_mode = str(spec.parity.liquidity_proxy_mode or "spot_kline_mirror")
-
-    _start_stage("bundle_replay", "Scoring bundle replay")
-    replay, replay_summary, available_offsets = _build_bundle_replay(
+    retry_contract_summary = build_backtest_retry_contract(profile_spec)
+    prepared_runtime = _load_cached_primary_runtime(
+        cfg=cfg,
+        spec=spec,
         bundle_dir=bundle_dir,
-        features=features,
-        labels=labels,
-    )
-    depth_stage_index, depth_stage_name = _start_stage("depth_replay", "Replaying raw depth snapshots")
-    depth_replay, depth_replay_summary = build_raw_depth_replay_frame(
-        replay=replay,
-        data_cfg=data_cfg,
-        heartbeat=progress.heartbeat(stage_index=depth_stage_index, stage_name=depth_stage_name),
-    )
-    _start_stage("runtime_surface", "Attaching runtime surfaces")
-    replay, quote_summary, state_summary = _attach_replay_runtime_surface(
-        replay=replay,
-        data_cfg=data_cfg,
-        market=cfg.asset.slug,
-        raw_klines=raw_klines,
+        feature_set=feature_set,
+        label_set=label_set,
         profile_spec=profile_spec,
         liquidity_proxy_mode=liquidity_proxy_mode,
     )
+    runtime_cache_status = "reused" if prepared_runtime is not None else "built"
+    if prepared_runtime is None:
+        features = load_feature_frame(cfg, feature_set=feature_set)
+        labels = load_label_frame(cfg, label_set=label_set)
+        raw_klines = load_binance_klines_1m(data_cfg)
+        _start_stage("bundle_replay", "Scoring bundle replay")
+        replay, replay_summary, available_offsets = _build_bundle_replay(
+            bundle_dir=bundle_dir,
+            features=features,
+            labels=labels,
+        )
+        replay = _filter_replay_window(
+            replay,
+            decision_start=spec.decision_start,
+            decision_end=spec.decision_end,
+        )
+        depth_stage_index, depth_stage_name = _start_stage("depth_replay", "Replaying raw depth snapshots")
+        depth_replay, depth_replay_summary = build_raw_depth_replay_frame(
+            replay=replay,
+            data_cfg=data_cfg,
+            max_snapshots_per_replay_row=retry_contract_summary.max_pre_submit_orderbook_retry_candidates,
+            heartbeat=progress.heartbeat(stage_index=depth_stage_index, stage_name=depth_stage_name),
+        )
+        depth_candidate_lookup = build_depth_candidate_lookup(depth_replay)
+        quote_stage_index, quote_stage_name = _start_stage("quote_surface", "Attaching quote surface")
+        live_state_stage_index, live_state_stage_name = _start_stage("live_state_surface", "Attaching live state parity")
+        runtime_replay, quote_summary, state_summary = _attach_replay_runtime_surface(
+            replay=replay,
+            data_cfg=data_cfg,
+            market=cfg.asset.slug,
+            raw_klines=raw_klines,
+            profile_spec=profile_spec,
+            liquidity_proxy_mode=liquidity_proxy_mode,
+            quote_heartbeat=progress.heartbeat(stage_index=quote_stage_index, stage_name=quote_stage_name),
+            live_state_heartbeat=progress.heartbeat(stage_index=live_state_stage_index, stage_name=live_state_stage_name),
+        )
+        prepared_runtime = _store_primary_runtime(
+            cfg=cfg,
+            spec=spec,
+            bundle_dir=bundle_dir,
+            feature_set=feature_set,
+            label_set=label_set,
+            profile_spec=profile_spec,
+            liquidity_proxy_mode=liquidity_proxy_mode,
+            prepared=BacktestPreparedRuntime(
+                bundle_dir=str(bundle_dir),
+                feature_set=feature_set,
+                label_set=label_set,
+                features=features,
+                labels=labels,
+                raw_klines=raw_klines,
+                available_offsets=tuple(int(value) for value in available_offsets),
+                replay=replay,
+                replay_summary=replay_summary,
+                depth_replay=depth_replay,
+                depth_replay_summary=depth_replay_summary,
+                depth_candidate_lookup=depth_candidate_lookup,
+                runtime_replay=runtime_replay,
+                quote_summary=quote_summary,
+                state_summary=state_summary,
+                source_mtimes=snapshot_source_mtimes(
+                    _prepared_runtime_source_paths(
+                        cfg=cfg,
+                        data_cfg=data_cfg,
+                        bundle_dir=bundle_dir,
+                        feature_set=feature_set,
+                        label_set=label_set,
+                        depth_replay=depth_replay,
+                        runtime_replay=runtime_replay,
+                    )
+                ),
+            ),
+        )
+    else:
+        _start_stage("bundle_replay", "Reusing cached bundle replay")
+        _start_stage("depth_replay", "Reusing cached depth replay")
+        _start_stage("quote_surface", "Reusing cached quote surface")
+        _start_stage("live_state_surface", "Reusing cached live state parity")
+    features = prepared_runtime.features
+    labels = prepared_runtime.labels
+    raw_klines = prepared_runtime.raw_klines
+    replay = prepared_runtime.runtime_replay
+    replay_summary = prepared_runtime.replay_summary
+    available_offsets = list(prepared_runtime.available_offsets)
+    depth_replay = prepared_runtime.depth_replay
+    depth_replay_summary = prepared_runtime.depth_replay_summary
+    depth_candidate_lookup = prepared_runtime.depth_candidate_lookup
+    quote_summary = prepared_runtime.quote_summary
+    state_summary = prepared_runtime.state_summary
+
+    replay = _filter_replay_window(
+        replay.copy(deep=False),
+        decision_start=spec.decision_start,
+        decision_end=spec.decision_end,
+    )
     fill_config = _build_backtest_fill_config(spec=spec, profile_spec=profile_spec)
-    retry_contract_summary = build_backtest_retry_contract(profile_spec)
     label_runtime_summary = _load_label_runtime_summary(cfg=cfg, label_set=label_set)
     truth_runtime_summary = build_truth_runtime_summary(data_cfg)
-    _start_stage("policy_decisions", "Building policy decisions")
+    policy_stage_index, policy_stage_name = _start_stage("policy_decisions", "Building policy decisions")
     decisions, guard_summary, decision_quote_summary = _build_guarded_policy_decisions(
         replay=replay,
         market=cfg.asset.slug,
@@ -208,6 +294,7 @@ def run_research_backtest(
         model_source="primary",
         depth_replay=depth_replay,
         fill_config=fill_config,
+        heartbeat=progress.heartbeat(stage_index=policy_stage_index, stage_name=policy_stage_name),
     )
     if spec.secondary_bundle_label:
         _start_stage("secondary_decisions", "Building hybrid fallback decisions")
@@ -216,6 +303,11 @@ def run_research_backtest(
             spec=spec,
             features=features,
             labels=labels,
+        )
+        secondary_replay = _filter_replay_window(
+            secondary_replay,
+            decision_start=spec.decision_start,
+            decision_end=spec.decision_end,
         )
         secondary_replay, _secondary_quote_summary, _secondary_state_summary = _attach_replay_runtime_surface(
             replay=secondary_replay,
@@ -239,7 +331,7 @@ def run_research_backtest(
             secondary_decisions,
             fallback_reasons=spec.fallback_reasons or ("direction_prob", "policy_low_confidence"),
         )
-    _start_stage("fills_materialization", "Materializing canonical fills")
+    fills_stage_index, fills_stage_name = _start_stage("fills_materialization", "Materializing canonical fills")
     policy_rejects = build_policy_reject_frame(decisions)
     accepted = decisions.loc[decisions["policy_action"].eq("trade")].copy()
     fills, fill_rejects = build_canonical_fills(
@@ -248,6 +340,8 @@ def run_research_backtest(
         config=fill_config,
         profile_spec=profile_spec,
         depth_replay=depth_replay,
+        depth_candidate_lookup=depth_candidate_lookup,
+        heartbeat=progress.heartbeat(stage_index=fills_stage_index, stage_name=fills_stage_name),
     )
     _start_stage("settlement_summary", "Settling fills and building summaries")
     trades = settle_trade_fills(fills)
@@ -312,6 +406,7 @@ def run_research_backtest(
         parity=spec.parity.to_dict(),
     )
     summary["run_label"] = spec.run_label
+    summary["shared_runtime_cache_status"] = runtime_cache_status
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     stake_sweep = build_stake_sweep_frame(summary=summary)
     offset_summary = build_offset_summary_frame(
@@ -338,6 +433,17 @@ def run_research_backtest(
         encoding="utf-8",
     )
 
+    _append_backtest_log(
+        log_path,
+        {
+            "event": "backtest_runtime_resolved",
+            "shared_runtime_cache_status": runtime_cache_status,
+            "bundle_dir": str(bundle_dir),
+            "available_offsets": available_offsets,
+            "decision_start": spec.decision_start,
+            "decision_end": spec.decision_end,
+        },
+    )
     _append_backtest_log(
         log_path,
         {
@@ -384,6 +490,7 @@ def run_research_backtest(
             "trades": int(len(trades)),
             "rejects": int(len(rejects)),
             "ready_rows": int(summary.get("ready_rows", 0)),
+            "shared_runtime_cache_status": runtime_cache_status,
         },
     )
     write_manifest(run_dir / "manifest.json", manifest)
@@ -406,6 +513,7 @@ def run_research_backtest(
         "feature_set": feature_set,
         "label_set": label_set,
         "run_label": spec.run_label,
+        "shared_runtime_cache_status": runtime_cache_status,
         "trades": int(len(trades)),
         "rejects": int(len(rejects)),
         "run_dir": str(run_dir),
@@ -416,7 +524,49 @@ def run_research_backtest(
 
 
 def _backtest_stage_total(*, spec: BacktestRunSpec) -> int:
-    return 9 if spec.secondary_bundle_label else 8
+    return 10 if spec.secondary_bundle_label else 9
+
+
+def _filter_replay_window(
+    replay: pd.DataFrame,
+    *,
+    decision_start: str | None,
+    decision_end: str | None,
+) -> pd.DataFrame:
+    if replay.empty or (decision_start is None and decision_end is None):
+        return replay
+
+    decision_ts = pd.to_datetime(replay.get("decision_ts"), utc=True, errors="coerce")
+    mask = decision_ts.notna()
+
+    start_bound = _parse_window_bound(decision_start, is_end=False)
+    if start_bound is not None:
+        mask &= decision_ts.ge(start_bound)
+
+    end_bound = _parse_window_bound(decision_end, is_end=True)
+    if end_bound is not None:
+        if _looks_like_date_only(decision_end):
+            mask &= decision_ts.lt(end_bound)
+        else:
+            mask &= decision_ts.le(end_bound)
+
+    return replay.loc[mask].reset_index(drop=True)
+
+
+def _parse_window_bound(value: str | None, *, is_end: bool) -> pd.Timestamp | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = pd.Timestamp(text)
+    parsed = parsed.tz_localize("UTC") if parsed.tzinfo is None else parsed.tz_convert("UTC")
+    if is_end and _looks_like_date_only(text):
+        return parsed + pd.Timedelta(days=1)
+    return parsed
+
+
+def _looks_like_date_only(value: str | None) -> bool:
+    text = str(value or "").strip()
+    return len(text) == 10 and text[4:5] == "-" and text[7:8] == "-"
 
 
 def _stage_progress_pct(*, stage_index: int, total_stages: int) -> int:
@@ -457,6 +607,101 @@ def _bundle_feature_columns(bundle_dir: Path) -> tuple[str, ...]:
     return tuple(columns)
 
 
+def _load_cached_primary_runtime(
+    *,
+    cfg: ResearchConfig,
+    spec: BacktestRunSpec,
+    bundle_dir: Path,
+    feature_set: str,
+    label_set: str,
+    profile_spec,
+    liquidity_proxy_mode: str,
+) -> BacktestPreparedRuntime | None:
+    cache_key = _backtest_runtime_cache_key(
+        cfg=cfg,
+        spec=spec,
+        bundle_dir=bundle_dir,
+        feature_set=feature_set,
+        label_set=label_set,
+        profile_spec=profile_spec,
+        liquidity_proxy_mode=liquidity_proxy_mode,
+    )
+    return process_backtest_runtime_cache().get(cache_key)
+
+
+def _store_primary_runtime(
+    *,
+    cfg: ResearchConfig,
+    spec: BacktestRunSpec,
+    bundle_dir: Path,
+    feature_set: str,
+    label_set: str,
+    profile_spec,
+    liquidity_proxy_mode: str,
+    prepared: BacktestPreparedRuntime,
+) -> BacktestPreparedRuntime:
+    cache_key = _backtest_runtime_cache_key(
+        cfg=cfg,
+        spec=spec,
+        bundle_dir=bundle_dir,
+        feature_set=feature_set,
+        label_set=label_set,
+        profile_spec=profile_spec,
+        liquidity_proxy_mode=liquidity_proxy_mode,
+    )
+    return process_backtest_runtime_cache().put(cache_key, prepared)
+
+
+def _backtest_runtime_cache_key(
+    *,
+    cfg: ResearchConfig,
+    spec: BacktestRunSpec,
+    bundle_dir: Path,
+    feature_set: str,
+    label_set: str,
+    profile_spec,
+    liquidity_proxy_mode: str,
+) -> BacktestSharedRuntimeKey:
+    return BacktestSharedRuntimeKey(
+        rewrite_root=str(cfg.layout.storage.rewrite_root),
+        market=cfg.asset.slug,
+        cycle=cfg.cycle,
+        source_surface=cfg.source_surface,
+        bundle_dir=str(bundle_dir),
+        feature_set=feature_set,
+        label_set=label_set,
+        profile_spec_key=_json_text(profile_spec.to_dict() if hasattr(profile_spec, "to_dict") else profile_spec),
+        liquidity_proxy_mode=str(liquidity_proxy_mode or ""),
+        decision_start=str(spec.decision_start or ""),
+        decision_end=str(spec.decision_end or ""),
+    )
+
+
+def _prepared_runtime_source_paths(
+    *,
+    cfg: ResearchConfig,
+    data_cfg: DataConfig,
+    bundle_dir: Path,
+    feature_set: str,
+    label_set: str,
+    depth_replay: pd.DataFrame,
+    runtime_replay: pd.DataFrame,
+) -> list[Path]:
+    paths = [
+        bundle_dir / "manifest.json",
+        cfg.layout.feature_frame_path(feature_set, source_surface=cfg.source_surface),
+        cfg.layout.label_frame_path(label_set),
+        data_cfg.layout.binance_klines_path(),
+    ]
+    for column in ("depth_source_path", "quote_source_path"):
+        if column not in depth_replay.columns and column not in runtime_replay.columns:
+            continue
+        frame = depth_replay if column in depth_replay.columns else runtime_replay
+        values = frame[column].dropna().astype(str).tolist()
+        paths.extend(Path(value) for value in values if value)
+    return paths
+
+
 def _build_bundle_replay(
     *,
     bundle_dir: Path,
@@ -489,14 +734,21 @@ def _attach_replay_runtime_surface(
     raw_klines: pd.DataFrame,
     profile_spec,
     liquidity_proxy_mode: str,
+    quote_heartbeat: Callable[[str], None] | None = None,
+    live_state_heartbeat: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, object, object]:
-    replay, quote_summary = attach_canonical_quote_surface(replay=replay, data_cfg=data_cfg)
+    replay, quote_summary = attach_canonical_quote_surface(
+        replay=replay,
+        data_cfg=data_cfg,
+        heartbeat=quote_heartbeat,
+    )
     replay, state_summary = attach_live_state_parity(
         market=market,
         profile=profile_spec,
         replay=replay,
         raw_klines=raw_klines,
         liquidity_proxy_mode=liquidity_proxy_mode,
+        heartbeat=live_state_heartbeat,
     )
     return replay, quote_summary, state_summary
 
@@ -510,7 +762,10 @@ def _build_guarded_policy_decisions(
     model_source: str,
     depth_replay: pd.DataFrame | None,
     fill_config: BacktestFillConfig,
+    heartbeat: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, object, InitialSnapshotDecisionSummary]:
+    if heartbeat is not None:
+        heartbeat("Attaching decision engine surface")
     replay, decision_quote_summary = _attach_decision_engine_surface(
         replay,
         market=market,
@@ -518,17 +773,24 @@ def _build_guarded_policy_decisions(
         depth_replay=depth_replay,
         fill_config=fill_config,
     )
+    if heartbeat is not None:
+        heartbeat("Applying policy thresholds")
     decisions = build_policy_decisions(
         replay,
         config=BacktestPolicyConfig(prob_floor=0.55, prob_gap_floor=0.0),
         model_source=model_source,
     )
+    if heartbeat is not None:
+        heartbeat("Applying live guard parity")
     decisions, guard_summary = apply_live_guard_parity(
         market=market,
         profile=profile,
         decisions=decisions,
         profile_spec=profile_spec,
+        heartbeat=heartbeat,
     )
+    if heartbeat is not None:
+        heartbeat(f"Built guarded decisions: {len(decisions):,} rows")
     return decisions, guard_summary, decision_quote_summary
 
 

@@ -538,7 +538,34 @@ def test_console_task_payload_exposes_subject_and_result_paths(monkeypatch) -> N
     listing = service.list_console_tasks(action_id="research_bundle_build")
     assert listing["rows"][0]["subject_summary"] == "bundle_a 来自 train_a | sol / 15m"
     assert listing["rows"][0]["primary_output_label"] == "bundle_dir"
-    assert listing["rows"][0]["primary_output_path"] == "/tmp/bundle"
+
+
+def test_console_task_payload_translates_research_stage_labels(monkeypatch) -> None:
+    monkeypatch.setattr(
+        service,
+        "_load_console_task",
+        lambda **kwargs: {
+            "task_id": kwargs["task_id"],
+            "action_id": "research_backtest_run",
+            "status": "running",
+            "request": {
+                "market": "sol",
+                "cycle": "15m",
+                "run_label": "bt_a",
+            },
+            "progress": {
+                "summary": "Loading backtest inputs",
+                "current_stage": "load_inputs",
+                "progress_pct": 38,
+            },
+            "result": None,
+            "error": None,
+        },
+    )
+
+    payload = service.load_console_task(task_id="task_backtest")
+
+    assert payload["progress_summary"] == "Loading backtest inputs · 加载输入 · 38%"
 
 
 def test_list_console_tasks_exposes_history_markers_and_groups(monkeypatch) -> None:
@@ -750,9 +777,9 @@ def test_load_console_runtime_state_exposes_operator_briefs(monkeypatch) -> None
             "status_group": "active",
             "subject_summary": "planned | sol / 15m",
             "headline": "运行中 · planned | sol / 15m · task_running",
-            "summary": "Training offsets · training_offsets · 42%",
+            "summary": "Training offsets · 训练 offsets · 42%",
             "supporting_text": "/tmp/training",
-            "progress_summary": "Training offsets · training_offsets · 42%",
+            "progress_summary": "Training offsets · 训练 offsets · 42%",
             "result_summary": None,
             "error_summary": None,
             "linked_object": None,

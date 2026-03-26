@@ -212,9 +212,11 @@ def test_run_experiment_suite_reports_progress(monkeypatch, tmp_path: Path) -> N
     assert summary["dataset"] == "experiment_run"
     assert events[0]["current_stage"] == "experiment_suite"
     assert any(event["current_stage"] == "experiment_group" for event in events)
+    assert any(event["current_stage"] == "experiment_group_warmup" for event in events)
     assert any(event["current_stage"] == "experiment_cases" for event in events)
     assert any(event["current_stage"] == "training_offsets" for event in events)
     assert any(event["current_stage"] == "load_inputs" for event in events)
+    assert any("Built prepared datasets for" in str(event["summary"]) for event in events)
     assert all(reporter_trace["train"])
     assert all(reporter_trace["backtest"])
     assert len(reporter_trace["train"]) == 2
@@ -347,6 +349,8 @@ def test_run_experiment_suite_reuses_training_and_bundle_across_stake_matrix_cas
     assert backtest_runs["stake_usd"].tolist() == [1.0, 5.0]
     assert backtest_runs["max_notional_usd"].tolist() == [8.0, 8.0]
     assert '"event": "execution_group_started"' in suite_log
+    assert '"event": "execution_group_warmup_started"' in suite_log
+    assert '"event": "market_cache_resolved"' in suite_log
     assert '"event": "execution_group_completed"' in suite_log
 
 
@@ -657,7 +661,14 @@ def test_run_experiment_suite_parallelizes_remaining_group_cases_when_enabled(mo
     monkeypatch.setattr("pm15min.research.experiments.runner.build_model_bundle", _fake_bundle)
     monkeypatch.setattr("pm15min.research.experiments.runner.run_research_backtest", _fake_backtest)
 
-    summary = run_experiment_suite(cfg=cfg, suite_name="parallel_cases_suite", run_label="parallel-exp")
+    events: list[dict[str, object]] = []
+    summary = run_experiment_suite(
+        cfg=cfg,
+        suite_name="parallel_cases_suite",
+        run_label="parallel-exp",
+        reporter=lambda **payload: events.append(payload),
+    )
+    suite_log = (Path(summary["run_dir"]) / "logs" / "suite.jsonl").read_text(encoding="utf-8")
 
     assert summary["runtime_policy"] == {
         "completed_cases": "resume",
@@ -667,6 +678,14 @@ def test_run_experiment_suite_parallelizes_remaining_group_cases_when_enabled(mo
     assert counters == {"train": 1, "bundle": 1, "backtest": 3}
     assert active["max"] >= 2
     assert sorted(row["stake_usd"] for row in backtest_trace) == [1.0, 5.0, 10.0]
+    assert any(event["current_stage"] == "experiment_group_warmup" for event in events)
+    assert any(event["current_stage"] == "experiment_group_parallel" for event in events)
+    assert any("Queued case" in str(event["summary"]) for event in events)
+    assert any("Launching 2 parallel cases" in str(event["summary"]) for event in events)
+    assert any("Collected parallel case" in str(event["summary"]) for event in events)
+    assert '"event": "execution_group_seed_case_started"' in suite_log
+    assert '"event": "execution_group_parallel_started"' in suite_log
+    assert '"event": "execution_group_parallel_completed"' in suite_log
 
 
 def test_run_experiment_suite_surfaces_pre_training_failures_in_compare_and_report(monkeypatch, tmp_path: Path) -> None:

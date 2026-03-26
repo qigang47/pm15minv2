@@ -5,6 +5,7 @@ from dataclasses import replace
 import pandas as pd
 import pytest
 
+import pm15min.research.backtests.fills as fills_module
 from pm15min.data.config import DataConfig
 from pm15min.data.io.ndjson_zst import append_ndjson_zst
 from pm15min.research._contracts_runs import BacktestParitySpec
@@ -115,6 +116,51 @@ def test_build_fill_plan_frame_applies_regime_stake_scale() -> None:
     assert out["fee_paid"].tolist() == [0.015, 0.0075, 0.03]
 
 
+def test_build_canonical_fills_materializes_mapping_rows(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    accepted = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:08:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "quote_up_ask": 0.20,
+                "quote_up_ask_size_1": 10.0,
+                "p_up": 0.80,
+                "p_down": 0.20,
+            }
+        ]
+    )
+    seen_row_types: list[type[object]] = []
+    original_materialize = fills_module._materialize_fill_row
+
+    def _wrapped_materialize(row, **kwargs):
+        seen_row_types.append(type(row))
+        assert isinstance(row, dict)
+        return original_materialize(row, **kwargs)
+
+    monkeypatch.setattr(fills_module, "_materialize_fill_row", _wrapped_materialize)
+
+    fills, rejects = build_canonical_fills(
+        accepted,
+        data_cfg=data_cfg,
+        config=BacktestFillConfig(
+            base_stake=1.0,
+            max_stake=1.0,
+            fee_bps=50.0,
+            high_conf_threshold=0.99,
+            high_conf_multiplier=1.0,
+            prefer_depth=False,
+        ),
+    )
+
+    assert rejects.empty
+    assert len(fills) == 1
+    assert seen_row_types == [dict]
+
+
 def test_build_canonical_fills_keeps_depth_diagnostics_when_depth_blocks_then_quote_fallbacks(tmp_path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
@@ -180,6 +226,56 @@ def test_build_canonical_fills_keeps_depth_diagnostics_when_depth_blocks_then_qu
     assert fills.loc[0, "depth_source_path"].endswith("depth.ndjson.zst")
     assert float(fills.loc[0, "depth_fill_ratio"]) == 0.2
     assert float(fills.loc[0, "stake"]) == 1.0
+
+
+def test_build_canonical_fills_uses_precomputed_depth_miss_without_rescanning_raw_depth(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    accepted = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:08:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "quote_captured_ts_ms_up": int(pd.Timestamp("2026-03-01T00:08:30Z").timestamp() * 1000),
+                "quote_up_ask": 0.20,
+                "quote_up_bid": 0.19,
+                "quote_up_ask_size_1": 10.0,
+                "p_up": 0.80,
+                "p_down": 0.20,
+            }
+        ]
+    )
+
+    def _raise_on_rescan(**kwargs):
+        raise AssertionError("should not rescan raw depth when precomputed depth lookup is authoritative")
+
+    monkeypatch.setattr(fills_module, "build_depth_execution_plan", _raise_on_rescan)
+
+    fills, rejects = build_canonical_fills(
+        accepted,
+        data_cfg=data_cfg,
+        config=BacktestFillConfig(
+            base_stake=1.0,
+            max_stake=1.0,
+            fee_bps=50.0,
+            high_conf_threshold=0.99,
+            high_conf_multiplier=1.0,
+        ),
+        depth_replay=pd.DataFrame(),
+    )
+
+    assert rejects.empty
+    assert len(fills) == 1
+    assert fills.loc[0, "fill_model"] == "canonical_quote"
+    assert fills.loc[0, "depth_status"] == "missing"
+    assert fills.loc[0, "depth_reason"] == "depth_snapshot_missing"
+    assert fills.loc[0, "depth_chain_mode"] == "precomputed_missing"
 
 
 def test_build_canonical_fills_uses_profile_depth_slippage_for_partial_depth_fill(tmp_path) -> None:

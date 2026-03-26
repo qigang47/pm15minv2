@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections import Counter
 from dataclasses import dataclass
 import math
@@ -39,6 +40,8 @@ LIVE_STATE_PARITY_COLUMNS = [
     "regime_guard_hints",
     "regime_checked_at",
 ]
+
+LIVE_STATE_HEARTBEAT_INTERVAL_ROWS = 1_000
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,7 @@ def attach_live_state_parity(
     replay: pd.DataFrame,
     raw_klines: pd.DataFrame,
     liquidity_proxy_mode: str = "spot_kline_mirror",
+    heartbeat: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, LiveStateParitySummary]:
     spec = _resolve_profile_spec(profile)
     proxy_mode = _normalize_proxy_mode(liquidity_proxy_mode)
@@ -105,6 +109,7 @@ def attach_live_state_parity(
         raw_klines=raw_klines,
         mode=proxy_mode,
     )
+    close_series = _prepare_close_series(raw_klines)
     frame = replay.copy()
     frame["_live_state_order"] = pd.RangeIndex(len(frame))
     frame["_live_state_ts"] = _resolve_row_timestamps(frame)
@@ -113,8 +118,11 @@ def attach_live_state_parity(
     previous_liquidity_state: dict[str, Any] | None = None
     previous_regime_state: dict[str, Any] | None = None
     rows: list[dict[str, object]] = []
+    total_rows = len(ordered)
+    if heartbeat is not None:
+        heartbeat(f"Attaching live state parity: 0/{total_rows:,} rows")
 
-    for _, row in ordered.iterrows():
+    for row_index, row in enumerate(ordered.itertuples(index=False, name="LiveStateParityRow"), start=1):
         checked_at = _checked_at_from_row(row)
         liquidity_state = _build_liquidity_state_payload(
             spec=spec,
@@ -124,7 +132,7 @@ def attach_live_state_parity(
         if liquidity_state is not None:
             previous_liquidity_state = liquidity_state
 
-        features = _single_row_features(row, raw_klines=raw_klines, checked_at=checked_at)
+        features = _single_row_features(row, checked_at=checked_at, close_series=close_series)
         regime_state = build_backtest_regime_state(
             market=market,
             profile=spec,
@@ -136,6 +144,11 @@ def attach_live_state_parity(
         if bool(regime_state.get("enabled", False)):
             previous_regime_state = regime_state
         rows.append(_flatten_state_row(liquidity_state=liquidity_state, regime_state=regime_state))
+        if heartbeat is not None and (
+            row_index == total_rows
+            or row_index % LIVE_STATE_HEARTBEAT_INTERVAL_ROWS == 0
+        ):
+            heartbeat(f"Attaching live state parity: {row_index:,}/{total_rows:,} rows")
 
     attached = pd.DataFrame(rows, index=ordered.index)
     attached = attached.reindex(columns=LIVE_STATE_PARITY_COLUMNS)
@@ -207,9 +220,9 @@ def _resolve_row_timestamps(frame: pd.DataFrame) -> pd.Series:
     return out
 
 
-def _checked_at_from_row(row: pd.Series) -> pd.Timestamp | None:
+def _checked_at_from_row(row: object) -> pd.Timestamp | None:
     for column in ("decision_ts", "open_time", "cycle_start_ts"):
-        value = pd.to_datetime(row.get(column), utc=True, errors="coerce")
+        value = pd.to_datetime(_row_value(row, column), utc=True, errors="coerce")
         if value is not None and not pd.isna(value):
             return pd.Timestamp(value)
     return None
@@ -277,45 +290,53 @@ def _liquidity_status(
 
 
 def _single_row_features(
-    row: pd.Series,
+    row: object,
     *,
-    raw_klines: pd.DataFrame,
     checked_at: pd.Timestamp | None,
+    close_series: pd.Series | None,
 ) -> pd.DataFrame:
-    payload = row.to_dict()
+    payload = {
+        "decision_ts": checked_at,
+        "ret_15m": _float_or_none(_row_value(row, "ret_15m")),
+        "ret_30m": _float_or_none(_row_value(row, "ret_30m")),
+    }
     if checked_at is not None:
         payload["decision_ts"] = checked_at
     if _float_or_none(payload.get("ret_15m")) is None:
-        payload["ret_15m"] = _log_return_over_minutes(raw_klines, checked_at, 15)
+        payload["ret_15m"] = _log_return_over_minutes(close_series, checked_at, 15)
     if _float_or_none(payload.get("ret_30m")) is None:
-        payload["ret_30m"] = _log_return_over_minutes(raw_klines, checked_at, 30)
+        payload["ret_30m"] = _log_return_over_minutes(close_series, checked_at, 30)
     return pd.DataFrame([payload])
 
 
 def _log_return_over_minutes(
-    raw_klines: pd.DataFrame,
+    close_series: pd.Series | None,
     checked_at: pd.Timestamp | None,
     minutes: int,
 ) -> float | None:
-    if checked_at is None or minutes <= 0 or raw_klines is None or raw_klines.empty:
-        return None
-    if "open_time" not in raw_klines.columns or "close" not in raw_klines.columns:
+    if checked_at is None or minutes <= 0 or close_series is None or close_series.empty:
         return None
 
     ts = pd.Timestamp(checked_at).floor("min")
+    price_now = _price_at(close_series, ts)
+    price_prev = _price_at(close_series, ts - pd.Timedelta(minutes=minutes))
+    if price_now is None or price_prev is None or price_now <= 0.0 or price_prev <= 0.0:
+        return None
+    return float(math.log(price_now / price_prev))
+
+
+def _prepare_close_series(raw_klines: pd.DataFrame) -> pd.Series | None:
+    if raw_klines is None or raw_klines.empty:
+        return None
+    if "open_time" not in raw_klines.columns or "close" not in raw_klines.columns:
+        return None
     frame = raw_klines.loc[:, ["open_time", "close"]].copy()
     frame["open_time"] = pd.to_datetime(frame["open_time"], utc=True, errors="coerce")
     frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
     frame = frame.dropna(subset=["open_time", "close"]).drop_duplicates(subset=["open_time"], keep="last")
     if frame.empty:
         return None
-
-    series = frame.set_index("open_time")["close"].sort_index()
-    price_now = _price_at(series, ts)
-    price_prev = _price_at(series, ts - pd.Timedelta(minutes=minutes))
-    if price_now is None or price_prev is None or price_now <= 0.0 or price_prev <= 0.0:
-        return None
-    return float(math.log(price_now / price_prev))
+    return frame.set_index("open_time")["close"].sort_index()
 
 
 def _price_at(series: pd.Series, ts: pd.Timestamp) -> float | None:
@@ -414,3 +435,9 @@ def _normalize_proxy_mode(value: object) -> str:
 
 def _proxy_enabled(mode: str) -> bool:
     return str(mode or "off").strip().lower() not in {"", "off", "none", "false", "0"}
+
+
+def _row_value(row: object, key: str, default: object = None) -> object:
+    if isinstance(row, pd.Series):
+        return row.get(key, default)
+    return getattr(row, key, default)

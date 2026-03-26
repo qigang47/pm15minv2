@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from pm15min.research.config import ResearchConfig
+from pm15min.research.labels.sources import normalize_label_set
 from pm15min.research.manifests import read_manifest
 from pm15min.research.service import list_training_runs as _list_training_runs
 
@@ -140,7 +141,7 @@ def _build_training_run_row(run_dir: Path) -> dict[str, object]:
     target = _string_value(summary, "target") or _string_value(spec, "target") or _part_value(run_dir, "target")
     run_label = _string_value(summary, "run_label") or _part_value(run_dir, "run")
     feature_set = _string_value(summary, "feature_set") or _string_value(spec, "feature_set")
-    label_set = _string_value(summary, "label_set") or _string_value(spec, "label_set")
+    label_set = normalize_label_set(_string_value(summary, "label_set") or _string_value(spec, "label_set") or "truth")
     label_source = _string_value(summary, "label_source") or _string_value(spec, "label_source")
     window = _window_label(summary=summary, spec=spec)
     offset_metric_rows = _offset_metric_rows(run_dir, summary=summary)

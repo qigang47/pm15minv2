@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+from functools import lru_cache
 
 from dotenv import load_dotenv
 
@@ -10,7 +11,7 @@ from .spec import LiveProfileSpec
 
 
 def resolve_live_profile_spec(profile: str) -> LiveProfileSpec:
-    load_dotenv()
+    _ensure_env_loaded()
     token = str(profile or "default").strip().lower()
     spec = LIVE_PROFILE_SPECS.get(token, DEFAULT_LIVE_PROFILE_SPEC)
     stop_trading_override, _ = _resolve_market_env(
@@ -28,7 +29,7 @@ def resolve_max_trades_per_market(
     profile_spec: LiveProfileSpec,
     market: str | None = None,
 ) -> tuple[int, str]:
-    load_dotenv()
+    _ensure_env_loaded()
     override, source = _resolve_market_env(
         market=market,
         base_name="PM15MIN_MAX_TRADES_PER_MARKET",
@@ -37,6 +38,11 @@ def resolve_max_trades_per_market(
     if override is not None:
         return max(0, int(override)), str(source or "env")
     return max(0, int(profile_spec.max_trades_per_market)), "profile_spec"
+
+
+@lru_cache(maxsize=1)
+def _ensure_env_loaded() -> None:
+    load_dotenv()
 
 
 def _float_from_env(name: str) -> float | None:

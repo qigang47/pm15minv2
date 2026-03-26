@@ -11,8 +11,13 @@ def write_live_payload_pair(
     payload: dict[str, Any],
     latest_path: Path,
     snapshot_path: Path,
+    write_snapshot_history: bool = True,
 ) -> dict[str, Path]:
-    # Persist snapshot first so the latest pointer only advances after history exists.
-    write_json_atomic(payload, snapshot_path)
+    if write_snapshot_history:
+        # Persist snapshot first so the latest pointer only advances after history exists.
+        write_json_atomic(payload, snapshot_path)
     write_json_atomic(payload, latest_path)
-    return {"latest": latest_path, "snapshot": snapshot_path}
+    return {
+        "latest": latest_path,
+        "snapshot": snapshot_path if write_snapshot_history else latest_path,
+    }

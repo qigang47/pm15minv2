@@ -5,6 +5,7 @@ import pandas as pd
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import DateWindow, TrainingSetSpec
+from pm15min.research.datasets.loaders import load_label_frame
 from pm15min.research.datasets.training_sets import build_training_set_dataset
 from pm15min.research.labels.alignment import merge_feature_and_label_frames
 from pm15min.research.labels.frames import build_label_frame, label_frame_metadata
@@ -141,6 +142,70 @@ def test_build_label_frame_supports_truth_chainlink_source_filters() -> None:
     assert mixed_frame["label_source"].tolist() == ["chainlink_mixed"]
 
 
+def test_build_label_frame_aliases_settlement_truth_to_truth() -> None:
+    truth = pd.DataFrame(
+        [
+            {
+                "asset": "sol",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+                "winner_side": "UP",
+                "label_updown": "UP",
+                "resolved": True,
+                "truth_source": "settlement_truth",
+                "full_truth": True,
+            }
+        ]
+    )
+
+    frame = build_label_frame(label_set="settlement_truth", truth_table=truth, oracle_prices_table=pd.DataFrame())
+
+    assert frame["label_set"].tolist() == ["truth"]
+    assert frame["label_source"].tolist() == ["settlement_truth"]
+
+
+def test_load_label_frame_uses_truth_for_settlement_truth_alias(tmp_path) -> None:
+    root = tmp_path / "v2"
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        source_surface="backtest",
+        feature_set="deep_otm_v1",
+        label_set="truth",
+        target="direction",
+        root=root,
+    )
+    label_frame = pd.DataFrame(
+        [
+            {
+                "asset": "sol",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+                "label_set": "truth",
+                "settlement_source": "settlement_truth",
+                "label_source": "settlement_truth",
+                "resolved": True,
+                "price_to_beat": 120.0,
+                "final_price": 121.0,
+                "winner_side": "UP",
+                "direction_up": 1.0,
+                "full_truth": True,
+            }
+        ]
+    )
+    write_parquet_atomic(label_frame, cfg.layout.label_frame_path("truth"))
+
+    loaded = load_label_frame(cfg, label_set="settlement_truth")
+
+    assert len(loaded) == 1
+    assert loaded.iloc[0]["label_set"] == "truth"
+
+
 def test_training_set_manifest_captures_label_source_and_alignment(tmp_path) -> None:
     root = tmp_path / "v2"
     cfg = ResearchConfig.build(
@@ -215,3 +280,91 @@ def test_training_set_manifest_captures_label_source_and_alignment(tmp_path) -> 
     assert out.iloc[0]["label_source"] == "streams"
     assert manifest.metadata["label_source_counts"] == {"streams": 1}
     assert manifest.metadata["aligned_rows_in_window"] == 1
+
+
+def test_training_set_window_supports_precise_utc_start(tmp_path) -> None:
+    root = tmp_path / "v2"
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        source_surface="backtest",
+        feature_set="deep_otm_v1",
+        label_set="truth",
+        target="direction",
+        root=root,
+    )
+
+    feature_frame = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "ret_1m": 0.1,
+                "ret_from_strike": 0.05,
+            },
+            {
+                "decision_ts": "2026-03-01T00:16:00Z",
+                "cycle_start_ts": "2026-03-01T00:15:00Z",
+                "cycle_end_ts": "2026-03-01T00:30:00Z",
+                "offset": 7,
+                "ret_1m": -0.1,
+                "ret_from_strike": -0.05,
+            },
+        ]
+    )
+    label_frame = pd.DataFrame(
+        [
+            {
+                "asset": "sol",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+                "label_set": "truth",
+                "settlement_source": "settlement_truth",
+                "label_source": "settlement_truth",
+                "resolved": True,
+                "price_to_beat": 120.0,
+                "final_price": 121.0,
+                "winner_side": "UP",
+                "direction_up": 1.0,
+                "full_truth": True,
+            },
+            {
+                "asset": "sol",
+                "cycle_start_ts": 1_772_324_100,
+                "cycle_end_ts": 1_772_325_000,
+                "market_id": "m-2",
+                "condition_id": "c-2",
+                "label_set": "truth",
+                "settlement_source": "settlement_truth",
+                "label_source": "settlement_truth",
+                "resolved": True,
+                "price_to_beat": 120.0,
+                "final_price": 119.0,
+                "winner_side": "DOWN",
+                "direction_up": 0.0,
+                "full_truth": True,
+            },
+        ]
+    )
+    write_parquet_atomic(feature_frame, cfg.layout.feature_frame_path(cfg.feature_set, source_surface=cfg.source_surface))
+    write_parquet_atomic(label_frame, cfg.layout.label_frame_path(cfg.label_set))
+
+    summary = build_training_set_dataset(
+        cfg,
+        TrainingSetSpec(
+            feature_set="deep_otm_v1",
+            label_set="settlement_truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01T00:16:00Z", "2026-03-01"),
+            offset=7,
+        ),
+    )
+    out = pd.read_parquet(summary["target_path"])
+
+    assert summary["rows_written"] == 1
+    assert out.iloc[0]["decision_ts"] == pd.Timestamp("2026-03-01T00:16:00Z")

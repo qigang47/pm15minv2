@@ -1,0 +1,43 @@
+{
+  "suite_name": "truth0315_sol_grid_20260326",
+  "cycle": "15m",
+  "profile": "deep_otm",
+  "model_family": "deep_otm",
+  "label_set": "truth",
+  "target": "direction",
+  "offsets": [7, 8, 9],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-15"
+  },
+  "decision_start": "2026-03-15",
+  "decision_end": "2026-03-21",
+  "stakes": [1, 3, 5, 10, 20],
+  "runtime_policy": {
+    "completed_cases": "rerun",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 4
+  },
+  "markets": {
+    "sol": {
+      "groups": {
+        "direction": {
+          "runs": [
+            {
+              "run_name": "baseline",
+              "profile": "deep_otm_baseline",
+              "feature_set": "bs_q_replace_direction",
+              "max_trades_per_market_values": [1, 3, 5, "unlimited"]
+            },
+            {
+              "run_name": "deepotm",
+              "profile": "deep_otm",
+              "feature_set": "alpha_search_direction_live",
+              "max_trades_per_market_values": [1, 3, 5, "unlimited"]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

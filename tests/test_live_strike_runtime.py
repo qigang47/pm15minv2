@@ -51,8 +51,10 @@ def _raw_klines(start: str, *, periods: int = 4) -> pd.DataFrame:
 class _FakeOracleClient:
     def __init__(self, payloads: list[dict[str, object]]) -> None:
         self.payloads = list(payloads)
+        self.calls = 0
 
     def fetch_crypto_price(self, *, symbol: str, cycle_start_ts: int, cycle_seconds: int) -> dict[str, object]:
+        self.calls += 1
         if not self.payloads:
             return {}
         return dict(self.payloads.pop(0))
@@ -203,6 +205,58 @@ def test_live_runtime_strike_resolver_falls_back_to_streams_then_cache(tmp_path:
     assert cache_only_quote is not None
     assert cache_only_quote.price == 105.0
     assert cache_only_quote.source == "strike_cache:legacy_cache"
+
+
+def test_live_runtime_strike_resolver_retries_empty_open_price_until_success(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _clear_runtime_caches()
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
+    cycle_start_ts = pd.Timestamp("2026-03-23T10:00:00Z")
+    client = _FakeOracleClient([{}, {"openPrice": None}, {"openPrice": 120.0}])
+    sleeps: list[float] = []
+    monkeypatch.setattr(strike_runtime_module.time, "sleep", lambda seconds: sleeps.append(float(seconds)))
+
+    resolver = LiveRuntimeStrikeResolver(
+        data_cfg=cfg,
+        market_slug="sol",
+        oracle_client=client,
+        cache_path=cfg.layout.cache_root / "live_oracle" / "strike_cache_sol.csv",
+    )
+    quote = resolver.strike_at(cycle_start_ts)
+
+    assert quote is not None
+    assert quote.price == 120.0
+    assert quote.source == "polymarket_open_price_api"
+    assert client.calls == 3
+    assert sleeps == [0.15, 0.3]
+
+
+def test_live_runtime_strike_resolver_does_not_cache_empty_open_price_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _clear_runtime_caches()
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
+    cycle_start_ts = pd.Timestamp("2026-03-23T10:00:00Z")
+    client = _FakeOracleClient([{}, {}, {}, {}, {}])
+    monkeypatch.setattr(strike_runtime_module.time, "sleep", lambda seconds: None)
+
+    resolver = LiveRuntimeStrikeResolver(
+        data_cfg=cfg,
+        market_slug="sol",
+        oracle_client=client,
+        cache_path=cfg.layout.cache_root / "live_oracle" / "strike_cache_sol.csv",
+        rtds_provider=_FakeRTDSProvider(None),
+    )
+    quote = resolver.strike_at(cycle_start_ts)
+    repeated = resolver.strike_at(cycle_start_ts)
+
+    assert quote is None
+    assert repeated is None
+    assert client.calls == 5
+    assert resolver.cache.get(int(cycle_start_ts.timestamp())) is None
 
 
 def test_build_live_runtime_oracle_prices_falls_back_to_existing_table_when_unresolved(tmp_path: Path) -> None:
@@ -393,6 +447,10 @@ def test_build_live_feature_frame_prefers_runtime_strike_overlay(tmp_path: Path,
         lambda data_cfg, symbol=None: btc_klines if str(symbol or "").upper() == "BTCUSDT" else raw_klines,
     )
     monkeypatch.setattr(
+        "pm15min.live.signal.utils.ensure_live_trade_inputs_fresh",
+        lambda cfg: {"status": "stubbed"},
+    )
+    monkeypatch.setattr(
         "pm15min.live.signal.utils.load_oracle_prices_table",
         lambda data_cfg: base_oracle.copy(),
     )
@@ -447,6 +505,10 @@ def test_build_live_feature_frame_exposes_legacy_live_features(tmp_path: Path, m
     monkeypatch.setattr(
         "pm15min.live.signal.utils.load_binance_klines_1m",
         lambda data_cfg, symbol=None: btc_klines if str(symbol or "").upper() == "BTCUSDT" else raw_klines,
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.ensure_live_trade_inputs_fresh",
+        lambda cfg: {"status": "stubbed"},
     )
     monkeypatch.setattr(
         "pm15min.live.signal.utils.build_live_runtime_oracle_prices",

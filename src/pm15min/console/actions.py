@@ -17,6 +17,7 @@ from pm15min.research.contracts import (
     ModelBundleSpec,
     TrainingRunSpec,
 )
+from pm15min.research.labels.sources import normalize_label_set
 from pm15min.research.layout import normalize_target, slug_token
 
 
@@ -702,7 +703,7 @@ def _build_inline_experiment_suite_payload(
     )
     model_family = slug_token(_string_value(request.get("model_family")) or "deep_otm")
     feature_set = slug_token(_string_value(request.get("feature_set")) or "deep_otm_v1")
-    label_set = slug_token(_string_value(request.get("label_set")) or "truth")
+    label_set = normalize_label_set(_string_value(request.get("label_set")) or "truth")
     target = normalize_target(_string_value(request.get("target")) or "direction")
     offsets = _normalize_offsets(request.get("offsets"), default=(7, 8, 9))
     backtest_spec = slug_token(_string_value(request.get("backtest_spec")) or "baseline_truth")

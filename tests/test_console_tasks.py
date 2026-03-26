@@ -17,6 +17,7 @@ from pm15min.console.tasks import (
     list_console_tasks,
     load_console_runtime_history,
     load_console_runtime_summary,
+    load_console_task,
     submit_console_action_task,
     submit_console_task,
 )
@@ -762,6 +763,53 @@ def test_console_task_manager_updates_heartbeat_while_running(tmp_path: Path) ->
     assert second is not None
     assert str(second["progress"]["heartbeat"]) >= first_heartbeat
     release.set()
+
+
+def test_stale_running_task_is_recovered_as_failed(tmp_path: Path) -> None:
+    root = tmp_path / "tasks"
+    root.mkdir(parents=True, exist_ok=True)
+    task_path = root / "task_stale.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "task_stale",
+                "action_id": "research_backtest_run",
+                "status": "running",
+                "created_at": "2026-03-24T10:00:00Z",
+                "updated_at": "2026-03-24T10:00:00Z",
+                "started_at": "2026-03-24T10:00:01Z",
+                "finished_at": None,
+                "request": {"market": "eth", "run_label": "stale_bt"},
+                "command_preview": "preview",
+                "result": None,
+                "error": None,
+                "progress": {
+                    "summary": "Scanning depth replay file 6/9",
+                    "current": 3,
+                    "total": 8,
+                    "current_stage": "depth_replay",
+                    "progress_pct": 38,
+                    "heartbeat": "2026-03-24T10:00:00Z",
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    recovered = load_console_task(task_id="task_stale", root=root)
+
+    assert recovered["status"] == TASK_STATUS_FAILED
+    assert recovered["finished_at"] is not None
+    assert recovered["error"]["type"] == "StaleTaskHeartbeat"
+    assert recovered["error"]["recovered"] is True
+    assert recovered["progress"]["current_stage"] == "finished"
+    assert recovered["progress"]["progress_pct"] == 100
+
+    persisted = json.loads(task_path.read_text(encoding="utf-8"))
+    assert persisted["status"] == TASK_STATUS_FAILED
+    assert persisted["error"]["type"] == "StaleTaskHeartbeat"
 
 
 def _wait_for_task(

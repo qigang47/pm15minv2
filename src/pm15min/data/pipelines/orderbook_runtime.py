@@ -43,6 +43,8 @@ def run_orderbook_recorder(
     if not loop:
         iterations = max(1, iterations)
     provider_name = str(getattr(provider, "__class__", type(provider)).__name__)
+    ok_log_interval_sec = max(0.0, float(os.getenv("PM15MIN_ORDERBOOK_OK_LOG_INTERVAL_SEC", "60")))
+    next_ok_log_at = 0.0
 
     run_started_at = _utc_now_iso()
     completed = 0
@@ -96,18 +98,26 @@ def run_orderbook_recorder(
                     "last_completed_at": _utc_now_iso(),
                 }
                 _write_state(cfg, state_payload)
-                _append_log(
-                    cfg,
-                    {
-                        "ts": iteration_started_at,
-                        "event": "iteration_ok",
-                        "iteration": iteration_no,
-                        "market": cfg.asset.slug,
-                        "cycle": cfg.cycle,
-                        "provider": provider_name,
-                        **summary,
-                    },
-                )
+                now_ts = time.time()
+                if ok_log_interval_sec <= 0 or now_ts >= next_ok_log_at or iteration_no == 1:
+                    next_ok_log_at = now_ts + ok_log_interval_sec
+                    _append_log(
+                        cfg,
+                        {
+                            "ts": iteration_started_at,
+                            "event": "iteration_ok",
+                            "iteration": iteration_no,
+                            "market": cfg.asset.slug,
+                            "cycle": cfg.cycle,
+                            "provider": provider_name,
+                            "captured_ts_ms": summary.get("captured_ts_ms"),
+                            "selected_markets": summary.get("selected_markets"),
+                            "market_start_offset": summary.get("market_start_offset"),
+                            "snapshot_rows": summary.get("snapshot_rows"),
+                            "recent_rows": summary.get("recent_rows"),
+                            "recent_window_minutes": summary.get("recent_window_minutes"),
+                        },
+                    )
             except KeyboardInterrupt:
                 _write_state(
                     cfg,

@@ -137,10 +137,24 @@ def build_truth_15m(cfg: DataConfig) -> dict[str, object]:
         out = pd.DataFrame(columns=TRUTH_COLUMNS)
     else:
         out = pd.concat(frames, ignore_index=True, sort=False)
+        # Some source imports can produce multiple candidates for the same cycle_end_ts.
+        # Prefer rows that are actually resolved/full truth before using source priority.
         out["priority"] = out["truth_source"].map({"settlement_truth": 2, "oracle_prices": 1}).fillna(0)
-        out = out.sort_values(["cycle_end_ts", "priority", "market_id"])
+        out["resolved_priority"] = out["resolved"].fillna(False).astype(int)
+        out["full_truth_priority"] = out["full_truth"].fillna(False).astype(int)
+        out["winner_side_priority"] = out["winner_side"].fillna("").astype(str).ne("").astype(int)
+        out = out.sort_values(
+            [
+                "cycle_end_ts",
+                "full_truth_priority",
+                "resolved_priority",
+                "winner_side_priority",
+                "priority",
+                "market_id",
+            ]
+        )
         out = out.drop_duplicates(subset=["asset", "cycle_end_ts"], keep="last")
-        out = out.drop(columns=["priority"])
+        out = out.drop(columns=["priority", "resolved_priority", "full_truth_priority", "winner_side_priority"])
         out = out[TRUTH_COLUMNS].reset_index(drop=True)
 
     write_parquet_atomic(out, cfg.layout.truth_table_path)

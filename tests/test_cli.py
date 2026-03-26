@@ -1591,11 +1591,27 @@ def test_data_show_layout(capsys) -> None:
 
 
 def test_data_show_config(capsys) -> None:
-    rc = main(["data", "show-config", "--market", "sol", "--cycle", "15m", "--surface", "live", "--market-depth", "2"])
+    rc = main(
+        [
+            "data",
+            "show-config",
+            "--market",
+            "sol",
+            "--cycle",
+            "15m",
+            "--surface",
+            "live",
+            "--market-depth",
+            "2",
+            "--market-start-offset",
+            "7",
+        ]
+    )
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["market"] == "sol"
     assert payload["market_depth"] == 2
+    assert payload["market_start_offset"] == 7
     assert payload["surface"] == "live"
 
 
@@ -1620,21 +1636,35 @@ def test_data_record_orderbooks_help(capsys) -> None:
 def test_data_run_orderbook_fleet(capsys, monkeypatch) -> None:
     monkeypatch.setattr(
         "pm15min.data.cli.run_orderbook_recorder_fleet",
-        lambda markets="btc,eth,sol,xrp", cycle="15m", surface="live", poll_interval_sec=0.35, orderbook_timeout_sec=1.2, recent_window_minutes=15, market_depth=1, iterations=1, loop=False, sleep_sec=None: {
+        lambda markets="btc,eth,sol,xrp", cycle="15m", surface="live", poll_interval_sec=0.35, orderbook_timeout_sec=1.2, recent_window_minutes=15, market_depth=1, market_start_offset=0, iterations=1, loop=False, sleep_sec=None: {
             "domain": "data",
             "dataset": "orderbook_recorder_fleet",
             "status": "ok",
             "markets": markets.split(","),
             "recent_window_minutes": recent_window_minutes,
             "poll_interval_sec": poll_interval_sec,
+            "market_start_offset": market_start_offset,
         },
     )
-    rc = main(["data", "run", "orderbook-fleet", "--markets", "btc,eth,sol,xrp", "--recent-window-minutes", "9"])
+    rc = main(
+        [
+            "data",
+            "run",
+            "orderbook-fleet",
+            "--markets",
+            "btc,eth,sol,xrp",
+            "--recent-window-minutes",
+            "9",
+            "--market-start-offset",
+            "7",
+        ]
+    )
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["dataset"] == "orderbook_recorder_fleet"
     assert payload["markets"] == ["btc", "eth", "sol", "xrp"]
     assert payload["recent_window_minutes"] == 9
+    assert payload["market_start_offset"] == 7
 
 
 def test_data_build_truth_help(capsys) -> None:

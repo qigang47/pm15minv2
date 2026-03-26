@@ -5,6 +5,7 @@ import pandas as pd
 
 from pm15min.research.features.base import (
     compute_log_returns,
+    decision_reference_ts,
     ema,
     realized_volatility,
     relative_strength_index,
@@ -117,12 +118,12 @@ def append_price_features(frame: pd.DataFrame) -> pd.DataFrame:
         out["rv_30"] > out["rv_30"].rolling(200).median()
     ).astype(float)
 
-    open_time = pd.to_datetime(out["open_time"], utc=True, errors="coerce")
-    hours = open_time.dt.hour.fillna(0.0)
+    ref_ts = decision_reference_ts(out)
+    hours = ref_ts.dt.hour.fillna(0.0)
     angle = 2.0 * np.pi * hours / 24.0
     out["hour_sin"] = np.sin(angle)
     out["hour_cos"] = np.cos(angle)
-    dow = open_time.dt.dayofweek.fillna(0.0)
+    dow = ref_ts.dt.dayofweek.fillna(0.0)
     dow_angle = 2.0 * np.pi * dow / 7.0
     out["dow_sin"] = np.sin(dow_angle)
     out["dow_cos"] = np.cos(dow_angle)

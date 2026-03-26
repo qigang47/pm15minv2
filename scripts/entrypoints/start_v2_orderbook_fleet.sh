@@ -15,6 +15,7 @@ Env overrides:
   V2_ORDERBOOK_FLEET_TIMEOUT_SEC      default: 1.2
   V2_ORDERBOOK_FLEET_RECENT_WINDOW_MINUTES default: 15
   V2_ORDERBOOK_FLEET_MARKET_DEPTH     default: 1
+  V2_ORDERBOOK_FLEET_MARKET_START_OFFSET default: 0
   V2_ORDERBOOK_FLEET_ITERATIONS       default: 0
   V2_ORDERBOOK_FLEET_SLEEP_SEC        default: same as poll interval
   V2_ORDERBOOK_FLEET_LOG_PATH         default: var/live/logs/entrypoints/orderbook_fleet_<cycle>_<surface>.out
@@ -76,6 +77,7 @@ POLL_SEC="${V2_ORDERBOOK_FLEET_POLL_SEC:-0.35}"
 TIMEOUT_SEC="${V2_ORDERBOOK_FLEET_TIMEOUT_SEC:-1.2}"
 RECENT_WINDOW_MINUTES="${V2_ORDERBOOK_FLEET_RECENT_WINDOW_MINUTES:-15}"
 MARKET_DEPTH="${V2_ORDERBOOK_FLEET_MARKET_DEPTH:-1}"
+MARKET_START_OFFSET="${V2_ORDERBOOK_FLEET_MARKET_START_OFFSET:-0}"
 ITERATIONS="${V2_ORDERBOOK_FLEET_ITERATIONS:-0}"
 SLEEP_SEC="${V2_ORDERBOOK_FLEET_SLEEP_SEC:-$POLL_SEC}"
 LOG_PATH="${V2_ORDERBOOK_FLEET_LOG_PATH:-$PROJECT_DIR/var/live/logs/entrypoints/orderbook_fleet_${CYCLE}_${SURFACE}.out}"
@@ -93,6 +95,7 @@ echo "Poll Sec: $POLL_SEC"
 echo "Timeout Sec: $TIMEOUT_SEC"
 echo "Recent Window Minutes: $RECENT_WINDOW_MINUTES"
 echo "Market Depth: $MARKET_DEPTH"
+echo "Market Start Offset: $MARKET_START_OFFSET"
 echo "Iterations: $ITERATIONS"
 echo "Wrapper Log: $LOG_PATH"
 echo "============================================="
@@ -110,6 +113,7 @@ cmd=(
   --timeout-sec "$TIMEOUT_SEC"
   --recent-window-minutes "$RECENT_WINDOW_MINUTES"
   --market-depth "$MARKET_DEPTH"
+  --market-start-offset "$MARKET_START_OFFSET"
   --loop
   --iterations "$ITERATIONS"
   --sleep-sec "$SLEEP_SEC"

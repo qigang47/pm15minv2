@@ -202,6 +202,114 @@ def test_load_suite_definition_expands_stake_matrix_into_execution_run_names(tmp
     assert all(spec.max_notional_usd == 8.0 for spec in specs)
 
 
+def test_load_suite_definition_expands_max_trades_and_stake_matrix_into_execution_run_names(tmp_path: Path) -> None:
+    path = tmp_path / "suite.json"
+    path.write_text(
+        json.dumps(
+            {
+                "suite_name": "backtest_grid_suite",
+                "cycle": "15m",
+                "profile": "deep_otm",
+                "model_family": "deep_otm",
+                "feature_set": "deep_otm_v1",
+                "label_set": "truth",
+                "target": "direction",
+                "offsets": [7, 8, 9],
+                "window": {"start": "2026-03-15", "end": "2026-03-21"},
+                "parity": {
+                    "regime_defense_max_trades_per_market": 9,
+                },
+                "stakes": [1.0, 5.0],
+                "markets": {
+                    "xrp": {
+                        "groups": {
+                            "core": {
+                                "runs": [
+                                    {
+                                        "run_name": "deep_grid",
+                                        "max_trades_per_market_values": [1, 3, "unlimited"],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    suite = load_suite_definition(path)
+
+    specs = sorted(
+        suite.markets,
+        key=lambda spec: (
+            spec.run_name,
+            float(spec.stake_usd or 0.0),
+        ),
+    )
+    assert [spec.run_name for spec in specs] == [
+        "deep_grid__max1__stake_1usd",
+        "deep_grid__max1__stake_5usd",
+        "deep_grid__max3__stake_1usd",
+        "deep_grid__max3__stake_5usd",
+        "deep_grid__maxu__stake_1usd",
+        "deep_grid__maxu__stake_5usd",
+    ]
+    assert [spec.matrix_parent_run_name for spec in specs] == [
+        "deep_grid__max1",
+        "deep_grid__max1",
+        "deep_grid__max3",
+        "deep_grid__max3",
+        "deep_grid__maxu",
+        "deep_grid__maxu",
+    ]
+    assert [spec.matrix_stake_label for spec in specs] == [
+        "stake_1usd",
+        "stake_5usd",
+        "stake_1usd",
+        "stake_5usd",
+        "stake_1usd",
+        "stake_5usd",
+    ]
+    assert [spec.stake_usd for spec in specs] == [1.0, 5.0, 1.0, 5.0, 1.0, 5.0]
+    assert [spec.parity.regime_defense_max_trades_per_market for spec in specs] == [1, 1, 3, 3, None, None]
+    assert all("max_trades_per_market:" in "|".join(spec.tags) for spec in specs)
+
+
+def test_load_suite_definition_parses_backtest_decision_window_fields(tmp_path: Path) -> None:
+    path = tmp_path / "suite.json"
+    path.write_text(
+        json.dumps(
+            {
+                "suite_name": "decision_window_suite",
+                "cycle": "15m",
+                "profile": "deep_otm",
+                "model_family": "deep_otm",
+                "feature_set": "deep_otm_v1",
+                "label_set": "truth",
+                "target": "direction",
+                "offsets": [7, 8, 9],
+                "window": {"start": "2025-10-27", "end": "2026-03-15"},
+                "decision_start": "2026-03-15",
+                "backtest_decision_end": "2026-03-21",
+                "markets": ["xrp"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    suite = load_suite_definition(path)
+    spec = suite.markets[0]
+
+    assert spec.decision_start == "2026-03-15"
+    assert spec.decision_end == "2026-03-21"
+
+
 def test_load_suite_definition_parses_runtime_policy_with_legacy_bool_aliases(tmp_path: Path) -> None:
     path = tmp_path / "suite.json"
     path.write_text(

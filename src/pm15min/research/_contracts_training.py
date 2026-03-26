@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pm15min.research._contracts_frames import DateWindow
+from pm15min.research.labels.sources import normalize_label_set
 from pm15min.research.layout import normalize_target, slug_token
 
 
@@ -18,7 +19,7 @@ class TrainingSetSpec:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "feature_set", slug_token(self.feature_set))
-        object.__setattr__(self, "label_set", slug_token(self.label_set))
+        object.__setattr__(self, "label_set", normalize_label_set(self.label_set))
         object.__setattr__(self, "target", normalize_target(self.target))
         object.__setattr__(self, "offset", int(self.offset))
         object.__setattr__(self, "label_source", slug_token(self.label_source or self.label_set))
@@ -62,7 +63,7 @@ class TrainingRunSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_family", slug_token(self.model_family))
         object.__setattr__(self, "feature_set", slug_token(self.feature_set))
-        object.__setattr__(self, "label_set", slug_token(self.label_set))
+        object.__setattr__(self, "label_set", normalize_label_set(self.label_set))
         object.__setattr__(self, "target", normalize_target(self.target))
         object.__setattr__(self, "run_label", slug_token(self.run_label, default="planned"))
         object.__setattr__(self, "offsets", tuple(int(offset) for offset in self.offsets))

@@ -206,6 +206,14 @@ def build_execution_snapshot(
             "selected_offset": int(selected_row["offset"]),
             "selected_side": side,
             "decision_ts": selected_row.get("decision_ts"),
+            "cycle_start_ts": selected_row.get("cycle_start_ts"),
+            "cycle_end_ts": selected_row.get("cycle_end_ts"),
+            "window_start_ts": selected_row.get("window_start_ts") or decision.get("selected_window_start_ts"),
+            "window_end_ts": selected_row.get("window_end_ts") or decision.get("selected_window_end_ts"),
+            "window_duration_seconds": (
+                float_or_none_fn(selected_row.get("window_duration_seconds"))
+                or float_or_none_fn(decision.get("selected_window_duration_seconds"))
+            ),
             "market_id": quote_row.get("market_id"),
             "condition_id": quote_row.get("condition_id"),
             "question": quote_row.get("question"),

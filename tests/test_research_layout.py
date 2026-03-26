@@ -34,3 +34,7 @@ def test_research_layout_market_paths() -> None:
 
 def test_window_label_helper() -> None:
     assert window_label("2025-10-27", "2026-03-05") == "2025-10-27_2026-03-05"
+
+
+def test_window_label_helper_supports_precise_timestamps() -> None:
+    assert window_label("2025-10-27T19:30:00Z", "2026-03-05") == "2025-10-27T19-30-00Z_2026-03-05"

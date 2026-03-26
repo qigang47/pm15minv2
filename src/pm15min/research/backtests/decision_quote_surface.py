@@ -15,6 +15,20 @@ from pm15min.research.backtests.fills import BacktestFillConfig
 from pm15min.research.backtests.replay_loader import REPLAY_KEY_COLUMNS
 
 
+DECISION_QUOTE_SURFACE_COLUMNS = (
+    "decision_quote_up_ask",
+    "decision_quote_down_ask",
+    "decision_quote_up_liquidity",
+    "decision_quote_down_liquidity",
+    "decision_quote_up_status",
+    "decision_quote_down_status",
+    "decision_quote_has_raw_depth",
+    "decision_quote_any_repriced",
+    "decision_quote_limit_reject",
+    "decision_quote_orderbook_missing",
+)
+
+
 @dataclass(frozen=True)
 class InitialSnapshotDecisionSummary:
     raw_depth_rows: int
@@ -86,18 +100,7 @@ def attach_initial_snapshot_decision_surface(
     fill_config: BacktestFillConfig,
 ) -> pd.DataFrame:
     frame = replay.copy()
-    for column in (
-        "decision_quote_up_ask",
-        "decision_quote_down_ask",
-        "decision_quote_up_liquidity",
-        "decision_quote_down_liquidity",
-        "decision_quote_up_status",
-        "decision_quote_down_status",
-        "decision_quote_has_raw_depth",
-        "decision_quote_any_repriced",
-        "decision_quote_limit_reject",
-        "decision_quote_orderbook_missing",
-    ):
+    for column in DECISION_QUOTE_SURFACE_COLUMNS:
         if column not in frame.columns:
             frame[column] = pd.NA
     if depth_replay is None or depth_replay.empty:
@@ -108,36 +111,44 @@ def attach_initial_snapshot_decision_surface(
         return frame
 
     lookup = _build_depth_candidate_lookup(depth_replay)
-    for idx, row in frame.iterrows():
-        candidates = lookup.get(_replay_key_tuple(row))
+    replay_keys = _build_replay_key_rows(frame)
+    probability_up = frame["p_up"].tolist() if "p_up" in frame.columns else [None] * len(frame)
+    probability_down = frame["p_down"].tolist() if "p_down" in frame.columns else [None] * len(frame)
+    offsets = frame["offset"].tolist() if "offset" in frame.columns else [None] * len(frame)
+    surface_values = {column: frame[column].tolist() for column in DECISION_QUOTE_SURFACE_COLUMNS}
+
+    for row_idx, replay_key in enumerate(replay_keys):
+        candidates = lookup.get(replay_key)
         if not candidates:
-            frame.at[idx, "decision_quote_has_raw_depth"] = False
-            frame.at[idx, "decision_quote_any_repriced"] = False
-            frame.at[idx, "decision_quote_limit_reject"] = False
-            frame.at[idx, "decision_quote_orderbook_missing"] = False
+            surface_values["decision_quote_has_raw_depth"][row_idx] = False
+            surface_values["decision_quote_any_repriced"][row_idx] = False
+            surface_values["decision_quote_limit_reject"][row_idx] = False
+            surface_values["decision_quote_orderbook_missing"][row_idx] = False
             continue
-        frame.at[idx, "decision_quote_has_raw_depth"] = True
+        surface_values["decision_quote_has_raw_depth"][row_idx] = True
         initial_snapshot = candidates[0]
         up_payload = _resolve_initial_side_depth_quote(
-            row=row,
+            probability=_float_or_none(probability_up[row_idx]),
+            offset=_int_or_none(offsets[row_idx]) or 0,
             raw_depth_candidate=initial_snapshot,
             side="UP",
             profile_spec=profile_spec,
             fill_config=fill_config,
         )
         down_payload = _resolve_initial_side_depth_quote(
-            row=row,
+            probability=_float_or_none(probability_down[row_idx]),
+            offset=_int_or_none(offsets[row_idx]) or 0,
             raw_depth_candidate=initial_snapshot,
             side="DOWN",
             profile_spec=profile_spec,
             fill_config=fill_config,
         )
-        frame.at[idx, "decision_quote_up_ask"] = up_payload["price"]
-        frame.at[idx, "decision_quote_down_ask"] = down_payload["price"]
-        frame.at[idx, "decision_quote_up_liquidity"] = up_payload["liquidity"]
-        frame.at[idx, "decision_quote_down_liquidity"] = down_payload["liquidity"]
-        frame.at[idx, "decision_quote_up_status"] = up_payload["status"]
-        frame.at[idx, "decision_quote_down_status"] = down_payload["status"]
+        surface_values["decision_quote_up_ask"][row_idx] = up_payload["price"]
+        surface_values["decision_quote_down_ask"][row_idx] = down_payload["price"]
+        surface_values["decision_quote_up_liquidity"][row_idx] = up_payload["liquidity"]
+        surface_values["decision_quote_down_liquidity"][row_idx] = down_payload["liquidity"]
+        surface_values["decision_quote_up_status"][row_idx] = up_payload["status"]
+        surface_values["decision_quote_down_status"][row_idx] = down_payload["status"]
         any_repriced = bool(up_payload["repriced"]) or bool(down_payload["repriced"])
         orderbook_missing = (
             str(up_payload["status"]) == "orderbook_missing"
@@ -149,22 +160,24 @@ def attach_initial_snapshot_decision_surface(
             and str(up_payload["status"]) == "orderbook_limit_reject"
             and str(down_payload["status"]) == "orderbook_limit_reject"
         )
-        frame.at[idx, "decision_quote_any_repriced"] = any_repriced
-        frame.at[idx, "decision_quote_limit_reject"] = limit_reject
-        frame.at[idx, "decision_quote_orderbook_missing"] = orderbook_missing
+        surface_values["decision_quote_any_repriced"][row_idx] = any_repriced
+        surface_values["decision_quote_limit_reject"][row_idx] = limit_reject
+        surface_values["decision_quote_orderbook_missing"][row_idx] = orderbook_missing
+    for column, values in surface_values.items():
+        frame[column] = values
     return frame
 
 
 def _resolve_initial_side_depth_quote(
     *,
-    row: pd.Series,
+    probability: float | None,
+    offset: int,
     raw_depth_candidate: dict[str, object],
     side: str,
     profile_spec: LiveProfileSpec,
     fill_config: BacktestFillConfig,
 ) -> dict[str, object]:
     side_key = "depth_up_record" if side == "UP" else "depth_down_record"
-    probability = _float_or_none(row.get("p_up")) if side == "UP" else _float_or_none(row.get("p_down"))
     if probability is None:
         return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "prob_missing"}
     record = raw_depth_candidate.get(side_key)
@@ -179,7 +192,6 @@ def _resolve_initial_side_depth_quote(
     )
     if requested_notional <= 0.0:
         return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "target_notional_nonpositive"}
-    offset = _int_or_none(row.get("offset")) or 0
     roi_threshold = profile_spec.roi_threshold_for(offset=offset)
     best_price = float(asks[0][0])
     slip = max(0.0, float(profile_spec.slippage_bps)) / 10_000.0
@@ -254,6 +266,19 @@ def _build_depth_candidate_lookup(depth_replay: pd.DataFrame) -> dict[tuple[obje
     for record in frame.to_dict(orient="records"):
         lookup.setdefault(_replay_key_tuple(record), []).append(record)
     return lookup
+
+
+def _build_replay_key_rows(frame: pd.DataFrame) -> list[tuple[object, ...]]:
+    columns: dict[str, list[object]] = {}
+    for column in REPLAY_KEY_COLUMNS:
+        if column == "offset":
+            raw_values = frame[column].tolist() if column in frame.columns else [None] * len(frame)
+            columns[column] = [_int_or_none(value) for value in raw_values]
+            continue
+        raw_series = frame[column] if column in frame.columns else pd.Series(index=frame.index, dtype="object")
+        normalized = pd.to_datetime(raw_series, utc=True, errors="coerce")
+        columns[column] = [None if pd.isna(value) else pd.Timestamp(value).isoformat() for value in normalized.tolist()]
+    return [tuple(columns[column][idx] for column in REPLAY_KEY_COLUMNS) for idx in range(len(frame))]
 
 
 def _replay_key_tuple(row: pd.Series | dict[str, object]) -> tuple[object, ...]:

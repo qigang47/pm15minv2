@@ -8,6 +8,7 @@ from typing import Any
 
 from pm15min.research.contracts import DateWindow
 from pm15min.research._contracts_runs import BacktestParitySpec
+from pm15min.research.labels.sources import normalize_label_set
 from pm15min.research.layout import slug_token
 
 
@@ -123,6 +124,8 @@ class ExperimentMarketSpec:
     offsets: tuple[int, ...]
     window: DateWindow
     backtest_spec: str = "baseline_truth"
+    decision_start: str | None = None
+    decision_end: str | None = None
     variant_label: str = "default"
     variant_notes: str = ""
     stake_usd: float | None = None
@@ -142,6 +145,10 @@ class ExperimentMarketSpec:
         payload = asdict(self)
         payload["window"] = self.window.to_dict()
         payload["offsets"] = list(self.offsets)
+        if self.decision_start is None:
+            payload.pop("decision_start", None)
+        if self.decision_end is None:
+            payload.pop("decision_end", None)
         if self.hybrid_secondary_offsets is not None:
             payload["hybrid_secondary_offsets"] = list(self.hybrid_secondary_offsets)
         payload["hybrid_fallback_reasons"] = list(self.hybrid_fallback_reasons)
@@ -190,9 +197,19 @@ def load_suite_definition(path: Path) -> ExperimentSuiteDefinition:
         "offsets": tuple(int(v) for v in (payload.get("offsets") or [7, 8, 9])),
         "window": _load_window(payload.get("window") or payload),
         "backtest_spec": str(payload.get("backtest_spec") or "baseline_truth"),
+        "decision_start": _coerce_optional_string(_first_present_value(payload, "decision_start", "backtest_decision_start")),
+        "decision_end": _coerce_optional_string(_first_present_value(payload, "decision_end", "backtest_decision_end")),
         "variant_label": str(payload.get("variant_label") or "default"),
         "variant_notes": str(payload.get("variant_notes") or ""),
         "stakes_usd": _parse_float_seq(_first_present_value(payload, "stakes_usd", "stakes")),
+        "max_trades_per_market_values": _parse_optional_trade_limit_seq(
+            _first_present_value(
+                payload,
+                "max_trades_per_market_values",
+                "regime_defense_max_trades_per_market_values",
+                "max_trades_values",
+            )
+        ),
         "max_notional_usd": _coerce_optional_float(payload.get("max_notional_usd")),
         "matrix_parent_run_name": "",
         "matrix_stake_label": "",
@@ -244,6 +261,12 @@ def _coerce_optional_float(raw: Any) -> float | None:
     return float(raw)
 
 
+def _coerce_optional_string(raw: Any) -> str | None:
+    if _is_missing_value(raw):
+        return None
+    return str(raw).strip() or None
+
+
 def _parse_float_seq(raw: Any) -> tuple[float, ...]:
     if _is_missing_value(raw):
         return ()
@@ -270,6 +293,33 @@ def _parse_string_seq(raw: Any) -> tuple[str, ...]:
     if isinstance(raw, str):
         return tuple(token.strip() for token in raw.split(",") if token.strip())
     return tuple(str(value).strip() for value in raw if str(value).strip())
+
+
+def _parse_optional_trade_limit_seq(raw: Any) -> tuple[int | None, ...]:
+    if _is_missing_value(raw):
+        return ()
+    values: list[Any]
+    if isinstance(raw, str):
+        values = [token.strip() for token in raw.split(",") if token.strip()]
+    elif isinstance(raw, Mapping):
+        raise TypeError(f"Unsupported trade-limit sequence mapping: {raw!r}")
+    else:
+        values = list(raw)
+    out: list[int | None] = []
+    for value in values:
+        normalized = _coerce_optional_trade_limit(value)
+        if normalized not in out:
+            out.append(normalized)
+    return tuple(out)
+
+
+def _coerce_optional_trade_limit(raw: Any) -> int | None:
+    if _is_missing_value(raw):
+        return None
+    token = str(raw).strip().lower()
+    if token in {"none", "null", "u", "unlimited", "inf", "infinite"}:
+        return None
+    return int(raw)
 
 
 def _is_missing_value(raw: Any) -> bool:
@@ -479,7 +529,7 @@ def _materialize_feature_set_variants(context: dict[str, Any]) -> list[Experimen
 def _materialize_variants(context: dict[str, Any]) -> list[ExperimentMarketSpec]:
     variants = tuple(context.get("backtest_variants") or ())
     if not variants:
-        return _materialize_stake_cases(context)
+        return _materialize_max_trade_cases(context)
     specs: list[ExperimentMarketSpec] = []
     for variant in variants:
         variant_context = _merge_context(
@@ -490,7 +540,35 @@ def _materialize_variants(context: dict[str, Any]) -> list[ExperimentMarketSpec]
         )
         variant_context["variant_label"] = str(variant.label or "default")
         variant_context["variant_notes"] = str(variant.notes or variant_context.get("variant_notes") or "")
-        specs.extend(_materialize_stake_cases(variant_context))
+        specs.extend(_materialize_max_trade_cases(variant_context))
+    return specs
+
+
+def _materialize_max_trade_cases(context: dict[str, Any]) -> list[ExperimentMarketSpec]:
+    values = tuple(context.get("max_trades_per_market_values") or ())
+    if not values:
+        return _materialize_stake_cases(context)
+    base_run_name = str(context.get("run_name") or "")
+    specs: list[ExperimentMarketSpec] = []
+    for value in values:
+        label = _max_trades_matrix_label(value)
+        parity_payload = (
+            context["parity"].to_dict()
+            if isinstance(context.get("parity"), BacktestParitySpec)
+            else BacktestParitySpec.from_mapping(context.get("parity")).to_dict()
+        )
+        if value is None:
+            parity_payload.pop("regime_defense_max_trades_per_market", None)
+        else:
+            parity_payload["regime_defense_max_trades_per_market"] = int(value)
+        max_context = dict(context)
+        max_context["parity"] = BacktestParitySpec.from_mapping(parity_payload)
+        max_context["run_name"] = _stake_matrix_run_name(base_run_name, label)
+        max_context["tags"] = _merge_tags(
+            context.get("tags"),
+            (f"max_trades_per_market:{'unlimited' if value is None else int(value)}",),
+        )
+        specs.extend(_materialize_stake_cases(max_context))
     return specs
 
 
@@ -523,11 +601,13 @@ def _context_to_market_spec(context: dict[str, Any]) -> ExperimentMarketSpec:
         profile=str(context["profile"]),
         model_family=str(context["model_family"]),
         feature_set=str(context["feature_set"]),
-        label_set=str(context["label_set"]),
+        label_set=normalize_label_set(str(context["label_set"])),
         target=str(context["target"]),
         offsets=tuple(int(value) for value in context["offsets"]),
         window=context["window"],
         backtest_spec=str(context["backtest_spec"]),
+        decision_start=_coerce_optional_string(context.get("decision_start")),
+        decision_end=_coerce_optional_string(context.get("decision_end")),
         variant_label=str(context["variant_label"] or "default"),
         variant_notes=str(context["variant_notes"] or ""),
         stake_usd=_coerce_optional_float(context.get("stake_usd")),
@@ -559,8 +639,29 @@ def _merge_context(
     for key in ("profile", "model_family", "feature_set", "label_set", "target", "backtest_spec"):
         if not _is_missing_value(payload.get(key)):
             merged[key] = str(payload.get(key))
+    if "decision_start" in payload or "backtest_decision_start" in payload:
+        merged["decision_start"] = _coerce_optional_string(
+            _first_present_value(payload, "decision_start", "backtest_decision_start")
+        )
+    if "decision_end" in payload or "backtest_decision_end" in payload:
+        merged["decision_end"] = _coerce_optional_string(
+            _first_present_value(payload, "decision_end", "backtest_decision_end")
+        )
     if "stakes" in payload or "stakes_usd" in payload:
         merged["stakes_usd"] = _parse_float_seq(_first_present_value(payload, "stakes_usd", "stakes"))
+    if (
+        "max_trades_per_market_values" in payload
+        or "regime_defense_max_trades_per_market_values" in payload
+        or "max_trades_values" in payload
+    ):
+        merged["max_trades_per_market_values"] = _parse_optional_trade_limit_seq(
+            _first_present_value(
+                payload,
+                "max_trades_per_market_values",
+                "regime_defense_max_trades_per_market_values",
+                "max_trades_values",
+            )
+        )
     if "max_notional_usd" in payload:
         merged["max_notional_usd"] = _coerce_optional_float(payload.get("max_notional_usd"))
     if not _is_missing_value(payload.get("offsets")):
@@ -680,6 +781,10 @@ def _stake_matrix_label(stake_usd: float, *, max_notional_usd: float | None) -> 
     if max_notional_usd is not None:
         parts.append(f"max_{_float_label_token(max_notional_usd)}usd")
     return "__".join(parts)
+
+
+def _max_trades_matrix_label(value: int | None) -> str:
+    return "maxu" if value is None else f"max{int(value)}"
 
 
 def _float_label_token(value: float) -> str:

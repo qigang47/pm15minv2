@@ -60,6 +60,7 @@ def submit_execution_payload(
     persist: bool = True,
     refresh_account_state: bool = True,
     dry_run: bool = False,
+    session_state: dict[str, Any] | None = None,
     gateway: LiveTradingGateway | None = None,
 ) -> dict[str, Any]:
     return _submit_execution_payload_impl(
@@ -68,6 +69,7 @@ def submit_execution_payload(
         persist=persist,
         refresh_account_state=refresh_account_state,
         dry_run=dry_run,
+        session_state=session_state,
         gateway=gateway,
         utc_snapshot_label_fn=utc_snapshot_label,
     )

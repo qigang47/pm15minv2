@@ -62,9 +62,37 @@ def test_attach_live_state_parity_respects_parity_resolved_profile_spec() -> Non
     assert profile_spec.liquidity_guard_baseline_minutes == 4
     assert summary.liquidity_available_rows == 2
     assert summary.liquidity_degraded_rows == 2
-    assert summary.liquidity_status_counts == {"blocked": 1, "filtered_pending": 1}
+    assert summary.liquidity_status_counts == {"degraded": 1, "filtered_pending": 1}
     assert out.loc[0, "liquidity_status"] == "filtered_pending"
     assert bool(out.loc[1, "liquidity_degraded"]) is True
-    assert out.loc[1, "liquidity_status"] == "blocked"
+    assert out.loc[1, "liquidity_status"] == "degraded"
     assert out.loc[0, "regime_reason"] == "regime_controller_disabled"
     assert out.loc[1, "regime_state"] == "NORMAL"
+
+
+def test_attach_live_state_parity_backfills_missing_regime_returns_from_klines() -> None:
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:30:00Z",
+                "offset": 7,
+                "ret_15m": None,
+                "ret_30m": None,
+            }
+        ]
+    )
+
+    out, _summary = attach_live_state_parity(
+        market="sol",
+        profile=resolve_backtest_profile_spec(profile="deep_otm", parity=BacktestParitySpec()),
+        replay=replay,
+        raw_klines=_sample_klines(
+            start="2026-03-01T00:00:00Z",
+            quote_values=[1000.0] * 40,
+            trade_values=[100.0] * 40,
+        ),
+    )
+
+    assert pd.notna(out.loc[0, "regime_checked_at"])
+    assert out.loc[0, "regime_reason"] == "regime_state_built"
+    assert out.loc[0, "regime_state"] in {"NORMAL", "CAUTION", "DEFENSE"}

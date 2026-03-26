@@ -31,6 +31,7 @@ class DataCliDeps:
     run_orderbook_recorder: Callable[..., dict[str, Any]]
     run_orderbook_recorder_fleet: Callable[..., dict[str, Any]]
     run_live_data_foundation: Callable[..., dict[str, Any]]
+    run_backtest_data_refresh: Callable[..., dict[str, Any]]
 
 
 def _print_payload(payload: dict[str, Any]) -> int:
@@ -57,6 +58,7 @@ def _handle_show_config(args: argparse.Namespace, deps: DataCliDeps) -> dict[str
         orderbook_timeout_sec=args.timeout_sec,
         recent_window_minutes=args.recent_window_minutes,
         market_depth=args.market_depth,
+        market_start_offset=args.market_start_offset,
     )
     return cfg.to_dict()
 
@@ -209,6 +211,7 @@ def _handle_record_orderbooks(args: argparse.Namespace, deps: DataCliDeps) -> di
         orderbook_timeout_sec=args.timeout_sec,
         recent_window_minutes=args.recent_window_minutes,
         market_depth=args.market_depth,
+        market_start_offset=args.market_start_offset,
     )
     return deps.run_orderbook_recorder(
         cfg,
@@ -227,6 +230,7 @@ def _handle_run_orderbook_fleet(args: argparse.Namespace, deps: DataCliDeps) -> 
         orderbook_timeout_sec=float(args.timeout_sec),
         recent_window_minutes=int(args.recent_window_minutes),
         market_depth=int(args.market_depth),
+        market_start_offset=int(args.market_start_offset),
         iterations=int(args.iterations),
         loop=bool(args.loop),
         sleep_sec=args.sleep_sec,
@@ -258,6 +262,14 @@ def _handle_run_live_foundation(args: argparse.Namespace, deps: DataCliDeps) -> 
         oracle_lookahead_hours=int(args.oracle_lookahead_hours),
         include_direct_oracle=not bool(args.no_direct_oracle),
         include_orderbooks=not bool(args.no_orderbooks),
+    )
+
+
+def _handle_run_backtest_refresh(args: argparse.Namespace, deps: DataCliDeps) -> dict[str, Any]:
+    markets = [item.strip().lower() for item in str(args.markets or "").split(",") if item.strip()]
+    return deps.run_backtest_data_refresh(
+        markets=markets or ["btc", "eth", "sol", "xrp"],
+        options=None,
     )
 
 
@@ -298,6 +310,7 @@ _RECORD_HANDLERS: dict[str, Callable[[argparse.Namespace, DataCliDeps], dict[str
 _RUN_HANDLERS: dict[str, Callable[[argparse.Namespace, DataCliDeps], dict[str, Any]]] = {
     "orderbook-fleet": _handle_run_orderbook_fleet,
     "live-foundation": _handle_run_live_foundation,
+    "backtest-refresh": _handle_run_backtest_refresh,
 }
 
 

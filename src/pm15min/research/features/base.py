@@ -55,6 +55,14 @@ def prepare_klines(raw: pd.DataFrame) -> pd.DataFrame:
     return frame.reset_index(drop=True)
 
 
+def decision_reference_ts(frame: pd.DataFrame) -> pd.Series:
+    decision_ts = pd.to_datetime(frame.get("decision_ts"), utc=True, errors="coerce")
+    if isinstance(decision_ts, pd.Series) and bool(decision_ts.notna().any()):
+        return decision_ts
+    open_time = pd.to_datetime(frame.get("open_time"), utc=True, errors="coerce")
+    return open_time + pd.Timedelta(minutes=1)
+
+
 def compute_log_returns(close: pd.Series, window: int) -> pd.Series:
     return np.log(close / close.shift(int(window)))
 

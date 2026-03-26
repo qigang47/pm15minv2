@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
@@ -100,6 +101,67 @@ def test_build_feature_frame_dataset(tmp_path: Path) -> None:
     assert "btc_ret_5m" in out.columns
     assert out["has_oracle_strike"].max() == 1
     assert out["decision_ts"].is_monotonic_increasing
+    offset_7_row = out.loc[pd.to_datetime(out["decision_ts"], utc=True, errors="coerce").eq(pd.Timestamp("2026-03-01T00:07:00Z"))]
+    assert len(offset_7_row) == 1
+    assert int(offset_7_row.iloc[0]["offset"]) == 7
+    cycle_boundary_row = out.loc[
+        pd.to_datetime(out["decision_ts"], utc=True, errors="coerce").eq(pd.Timestamp("2026-03-01T00:15:00Z"))
+    ]
+    assert len(cycle_boundary_row) == 1
+    assert int(cycle_boundary_row.iloc[0]["offset"]) == 0
+    assert cycle_boundary_row.iloc[0]["cycle_start_ts"] == pd.Timestamp("2026-03-01T00:15:00Z")
+    assert float(cycle_boundary_row.iloc[0]["ret_from_cycle_open"]) == 0.0
+    assert float(cycle_boundary_row.iloc[0]["first_half_ret"]) == 0.0
+
+
+def test_build_feature_frame_uses_decision_time_definitions(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    btc_cfg = DataConfig.build(market="btc", cycle="15m", surface="backtest", root=root)
+
+    sol_klines = _sample_klines("SOLUSDT", start="2026-03-01T23:40:00Z", periods=40, price_base=120.0)
+    btc_klines = _sample_klines("BTCUSDT", start="2026-03-01T23:40:00Z", periods=40, price_base=50000.0)
+
+    write_parquet_atomic(sol_klines, data_cfg.layout.binance_klines_path())
+    write_parquet_atomic(btc_klines, btc_cfg.layout.binance_klines_path())
+    write_parquet_atomic(
+        _sample_oracle_prices("sol", cycle_start_ts=1_772_409_300, n_cycles=4, price_base=120.0),
+        data_cfg.layout.oracle_prices_table_path,
+    )
+
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        source_surface="backtest",
+        feature_set="alpha_search_direction_live",
+        root=root,
+    )
+    build_feature_frame_dataset(cfg)
+    out = pd.read_parquet(cfg.layout.feature_frame_path(cfg.feature_set, source_surface=cfg.source_surface))
+
+    boundary_row = out.loc[
+        pd.to_datetime(out["decision_ts"], utc=True, errors="coerce").eq(pd.Timestamp("2026-03-02T00:00:00Z"))
+    ]
+    assert len(boundary_row) == 1
+    row = boundary_row.iloc[0]
+    assert row["cycle_start_ts"] == pd.Timestamp("2026-03-02T00:00:00Z")
+    assert int(row["offset"]) == 0
+    assert float(row["ret_from_cycle_open"]) == 0.0
+    assert float(row["hour_sin"]) == 0.0
+    assert float(row["hour_cos"]) == 1.0
+
+    expected_dow = pd.Timestamp("2026-03-02T00:00:00Z").dayofweek
+    expected_dow_angle = 2.0 * np.pi * expected_dow / 7.0
+    assert float(row["dow_sin"]) == pytest.approx(float(np.sin(expected_dow_angle)))
+    assert float(row["dow_cos"]) == pytest.approx(float(np.cos(expected_dow_angle)))
+
+    btc = btc_klines.copy()
+    btc["decision_ts"] = pd.to_datetime(btc["open_time"], utc=True, errors="coerce") + pd.Timedelta(minutes=1)
+    btc = btc.set_index("decision_ts")
+    btc_close = pd.to_numeric(btc["close"], errors="coerce")
+    expected_btc_ret_5m = float(btc_close.pct_change(5).loc[pd.Timestamp("2026-03-02T00:00:00Z")])
+    assert float(row["btc_ret_5m"]) == pytest.approx(expected_btc_ret_5m)
 
 
 def test_build_label_frame_dataset_truth(tmp_path: Path) -> None:
@@ -150,6 +212,65 @@ def test_build_label_frame_dataset_truth(tmp_path: Path) -> None:
     assert manifest.metadata["status"] == "ok"
     assert manifest.metadata["truth_table_rows"] == 1
     assert manifest.metadata["oracle_has_both_rows"] == 1
+
+
+def test_build_label_frame_dataset_truth_prefers_resolved_oracle_candidate(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="xrp", cycle="15m", surface="backtest", root=root)
+
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "asset": "xrp",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_324_100,
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "winner_side": "",
+                    "label_updown": "",
+                    "resolved": False,
+                    "truth_source": "settlement_truth",
+                    "full_truth": False,
+                },
+                {
+                    "asset": "xrp",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_324_100,
+                    "market_id": "",
+                    "condition_id": "",
+                    "winner_side": "DOWN",
+                    "label_updown": "DOWN",
+                    "resolved": True,
+                    "truth_source": "oracle_prices",
+                    "full_truth": True,
+                },
+            ]
+        ),
+        data_cfg.layout.truth_table_path,
+    )
+    write_parquet_atomic(
+        _sample_oracle_prices("xrp", cycle_start_ts=1_772_323_200, n_cycles=1, price_base=2.0),
+        data_cfg.layout.oracle_prices_table_path,
+    )
+
+    cfg = ResearchConfig.build(
+        market="xrp",
+        cycle="15m",
+        profile="deep_otm",
+        source_surface="backtest",
+        label_set="truth",
+        root=root,
+    )
+    summary = build_label_frame_dataset(cfg)
+    out = pd.read_parquet(cfg.layout.label_frame_path(cfg.label_set))
+
+    assert summary["rows_written"] == 1
+    assert len(out) == 1
+    assert out.iloc[0]["winner_side"] == "DOWN"
+    assert bool(out.iloc[0]["resolved"]) is True
+    assert bool(out.iloc[0]["full_truth"]) is True
+    assert out.iloc[0]["settlement_source"] == "oracle_prices"
 
 
 def test_build_training_set_dataset_direction_and_reversal(tmp_path: Path) -> None:

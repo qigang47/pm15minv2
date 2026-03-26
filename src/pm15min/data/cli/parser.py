@@ -15,6 +15,7 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
     show_config.add_argument("--timeout-sec", type=float, default=1.2)
     show_config.add_argument("--recent-window-minutes", type=int, default=15)
     show_config.add_argument("--market-depth", type=int, default=1)
+    show_config.add_argument("--market-start-offset", type=int, default=0)
 
     show_layout = data_sub.add_parser("show-layout", help="Show the canonical data layout.")
     add_market_cycle_surface_args(show_layout)
@@ -159,6 +160,7 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
     orderbooks.add_argument("--timeout-sec", type=float, default=1.2)
     orderbooks.add_argument("--recent-window-minutes", type=int, default=15)
     orderbooks.add_argument("--market-depth", type=int, default=1)
+    orderbooks.add_argument("--market-start-offset", type=int, default=0)
     orderbooks.add_argument("--sleep-sec", type=float, default=None)
     orderbooks.add_argument("--loop", action="store_true")
     orderbooks.add_argument("--iterations", type=int, default=1)
@@ -173,6 +175,7 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
     orderbook_fleet.add_argument("--timeout-sec", type=float, default=1.2)
     orderbook_fleet.add_argument("--recent-window-minutes", type=int, default=15)
     orderbook_fleet.add_argument("--market-depth", type=int, default=1)
+    orderbook_fleet.add_argument("--market-start-offset", type=int, default=0)
     orderbook_fleet.add_argument("--loop", action="store_true")
     orderbook_fleet.add_argument(
         "--iterations",
@@ -202,3 +205,6 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
     foundation.add_argument("--oracle-lookahead-hours", type=int, default=24)
     foundation.add_argument("--no-direct-oracle", action="store_true")
     foundation.add_argument("--no-orderbooks", action="store_true")
+
+    backtest_refresh = run_sub.add_parser("backtest-refresh", help="One-click refresh the canonical backtest data surface.")
+    backtest_refresh.add_argument("--markets", default="btc,eth,sol,xrp", help="Comma-separated markets, default btc,eth,sol,xrp.")

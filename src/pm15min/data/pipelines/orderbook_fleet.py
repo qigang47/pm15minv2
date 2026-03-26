@@ -44,6 +44,7 @@ def run_orderbook_recorder_fleet(
     orderbook_timeout_sec: float = 1.2,
     recent_window_minutes: int = 15,
     market_depth: int = 1,
+    market_start_offset: int = 0,
     iterations: int = 1,
     loop: bool = False,
     sleep_sec: float | None = None,
@@ -65,6 +66,7 @@ def run_orderbook_recorder_fleet(
                 orderbook_timeout_sec=orderbook_timeout_sec,
                 recent_window_minutes=recent_window_minutes,
                 market_depth=market_depth,
+                market_start_offset=market_start_offset,
                 root=root,
             )
             payload = run_orderbook_recorder_fn(
@@ -104,6 +106,7 @@ def run_orderbook_recorder_fleet(
         "poll_interval_sec": float(poll_interval_sec),
         "recent_window_minutes": int(recent_window_minutes),
         "market_depth": int(market_depth),
+        "market_start_offset": int(market_start_offset),
         "iterations": int(iterations),
         "loop": bool(loop),
         "results": payloads,

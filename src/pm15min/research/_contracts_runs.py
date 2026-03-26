@@ -163,6 +163,8 @@ class BacktestRunSpec:
     spec_name: str
     run_label: str
     target: str = "direction"
+    decision_start: str | None = None
+    decision_end: str | None = None
     bundle_label: str | None = None
     secondary_target: str | None = None
     secondary_bundle_label: str | None = None
@@ -178,6 +180,10 @@ class BacktestRunSpec:
         object.__setattr__(self, "spec_name", slug_token(self.spec_name))
         object.__setattr__(self, "run_label", slug_token(self.run_label, default="planned"))
         object.__setattr__(self, "target", normalize_target(self.target))
+        if self.decision_start is not None:
+            object.__setattr__(self, "decision_start", str(self.decision_start).strip() or None)
+        if self.decision_end is not None:
+            object.__setattr__(self, "decision_end", str(self.decision_end).strip() or None)
         if self.bundle_label is not None:
             object.__setattr__(self, "bundle_label", slug_token(self.bundle_label))
         if self.secondary_target is not None:

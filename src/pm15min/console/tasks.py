@@ -19,6 +19,7 @@ TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_SUCCEEDED = "succeeded"
 TASK_STATUS_FAILED = "failed"
+CONSOLE_TASK_STALE_HEARTBEAT_SEC = 30.0
 CONSOLE_RUNTIME_SUMMARY_RECENT_LIMIT = 12
 CONSOLE_RUNTIME_SUMMARY_GROUP_LIMIT = 6
 CONSOLE_RUNTIME_HISTORY_LIMIT = 50
@@ -899,6 +900,58 @@ def _optional_progress_pct(value: object) -> int | None:
     return int(max(0, min(100, parsed)))
 
 
+def _parse_utc_timestamp(value: object) -> datetime | None:
+    text = _optional_text(value)
+    if text is None:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _recover_stale_active_record(
+    record: ConsoleTaskRecord,
+    *,
+    now: datetime,
+) -> ConsoleTaskRecord:
+    if record.status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}:
+        return record
+    last_heartbeat = _parse_utc_timestamp(record.progress.heartbeat or record.updated_at or record.created_at)
+    if last_heartbeat is None:
+        return record
+    age_seconds = (now.astimezone(timezone.utc) - last_heartbeat).total_seconds()
+    if age_seconds < CONSOLE_TASK_STALE_HEARTBEAT_SEC:
+        return record
+    finished_at = _utc_timestamp(now)
+    existing_error = _mapping_or_none(record.error) or {}
+    stale_error = {
+        **existing_error,
+        "type": str(existing_error.get("type") or "StaleTaskHeartbeat"),
+        "message": str(
+            existing_error.get("message")
+            or "Task heartbeat expired; the task was likely interrupted before it could finish."
+        ),
+        "last_heartbeat": record.progress.heartbeat or record.updated_at or record.created_at,
+        "stale_after_sec": int(CONSOLE_TASK_STALE_HEARTBEAT_SEC),
+        "recovered": True,
+    }
+    progress = _complete_progress(
+        record.progress,
+        summary="Failed",
+        heartbeat=finished_at,
+        succeeded=False,
+    )
+    return replace(
+        record,
+        status=TASK_STATUS_FAILED,
+        updated_at=finished_at,
+        finished_at=record.finished_at or finished_at,
+        error=_json_safe(stale_error),
+        progress=progress,
+    )
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -944,7 +997,11 @@ def _load_task_record_path(path: Path) -> tuple[ConsoleTaskRecord | None, Consol
         return None, None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return ConsoleTaskRecord.from_dict(payload), None
+        record = ConsoleTaskRecord.from_dict(payload)
+        recovered = _recover_stale_active_record(record, now=_utc_now())
+        if recovered != record:
+            _write_json_atomically(path, recovered.to_dict())
+        return recovered, None
     except Exception as exc:
         return None, _scan_issue(path, exc)
 

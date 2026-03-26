@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +18,9 @@ from .utils import (
 
 
 POST_DECISION_EXECUTION_TOLERANCE_MS = 120_000
-DEFAULT_LIVE_ORDERBOOK_LEVELS = 10
+DEFAULT_LIVE_ORDERBOOK_LEVELS = 50
 DEFAULT_LIVE_ORDERBOOK_TIMEOUT_SEC = 1.2
+DEFAULT_LOCAL_ORDERBOOK_MAX_AGE_MS = 5_000
 
 
 def build_depth_execution_plan(
@@ -39,19 +43,63 @@ def build_depth_execution_plan(
     decision_dt = None if decision_ts is None else pd.to_datetime(decision_ts, utc=True, errors="coerce")
     if decision_dt is None or pd.isna(decision_dt):
         return None, "decision_ts_missing"
-    date_str = decision_dt.strftime("%Y-%m-%d")
-    depth_path = data_cfg.layout.orderbook_depth_path(date_str)
-    if not depth_path.exists():
-        return {
-            "status": "missing",
-            "depth_source_path": str(depth_path),
-        }, "depth_snapshot_missing"
-
     token_id = str(quote_row.get("token_up") if side == "UP" else quote_row.get("token_down") or "")
     market_id = str(quote_row.get("market_id") or "")
     side_slug = "up" if side == "UP" else "down"
     target_ts_ms = quote_captured_ts_ms(quote_row=quote_row, side=side)
-    if prefer_live_provider:
+
+    local_record = resolve_latest_local_depth_snapshot(
+        snapshot_path=data_cfg.layout.orderbook_latest_full_snapshot_path,
+        market_id=market_id,
+        token_id=token_id,
+        side=side_slug,
+        target_ts_ms=target_ts_ms,
+        max_age_ms=_local_orderbook_max_age_ms(),
+    )
+    if local_record is not None:
+        snapshot_ts_ms = raw_snapshot_ts_ms(local_record)
+        fill = compute_fill_from_depth_record(
+            record=local_record,
+            target_notional=requested_notional,
+            max_slippage_bps=max_slippage_bps,
+            price_cap=price_cap,
+        )
+        if fill is None:
+            return {
+                "status": "blocked",
+                "depth_source_kind": "local_latest",
+                "depth_source_path": str(data_cfg.layout.orderbook_latest_full_snapshot_path),
+                "market_id": market_id,
+                "token_id": token_id,
+                "side": side_slug,
+                "price_cap": price_cap,
+                **_snapshot_metrics(snapshot_ts_ms=snapshot_ts_ms, target_ts_ms=target_ts_ms),
+            }, "depth_fill_unavailable"
+        if float(fill["fill_ratio"]) < float(min_fill_ratio):
+            return {
+                "status": "blocked",
+                "depth_source_kind": "local_latest",
+                "depth_source_path": str(data_cfg.layout.orderbook_latest_full_snapshot_path),
+                "market_id": market_id,
+                "token_id": token_id,
+                "side": side_slug,
+                "price_cap": price_cap,
+                **_snapshot_metrics(snapshot_ts_ms=snapshot_ts_ms, target_ts_ms=target_ts_ms),
+                **fill,
+            }, "depth_fill_ratio_below_threshold"
+        return {
+            "status": "ok",
+            "depth_source_kind": "local_latest",
+            "depth_source_path": str(data_cfg.layout.orderbook_latest_full_snapshot_path),
+            "market_id": market_id,
+            "token_id": token_id,
+            "side": side_slug,
+            "price_cap": price_cap,
+            **_snapshot_metrics(snapshot_ts_ms=snapshot_ts_ms, target_ts_ms=target_ts_ms),
+            **fill,
+        }, None
+
+    if prefer_live_provider and target_ts_ms is None:
         provider_payload = build_live_depth_execution_plan_from_provider(
             market_id=market_id,
             token_id=token_id,
@@ -67,6 +115,13 @@ def build_depth_execution_plan(
         )
         if provider_payload is not None:
             return provider_payload
+    date_str = decision_dt.strftime("%Y-%m-%d")
+    depth_path = data_cfg.layout.orderbook_depth_path(date_str)
+    if not depth_path.exists():
+        return {
+            "status": "missing",
+            "depth_source_path": str(depth_path),
+        }, "depth_snapshot_missing"
     record = resolve_depth_snapshot(
         depth_path=depth_path,
         market_id=market_id,
@@ -221,6 +276,51 @@ def build_live_depth_execution_plan_from_provider(
         },
         None,
     )
+
+
+def resolve_latest_local_depth_snapshot(
+    *,
+    snapshot_path: Path,
+    market_id: str,
+    token_id: str,
+    side: str,
+    target_ts_ms: int | None,
+    max_age_ms: int,
+) -> dict[str, Any] | None:
+    if not snapshot_path.exists():
+        return None
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    records = [dict(item) for item in list(payload.get("records") or []) if isinstance(item, dict)]
+    if not records:
+        return None
+    matched = [
+        record
+        for record in records
+        if str(record.get("market_id") or "") == str(market_id)
+        and str(record.get("token_id") or "") == str(token_id)
+        and str(record.get("side") or "").lower() == str(side).lower()
+    ]
+    if not matched:
+        return None
+    record = max(matched, key=lambda item: int(raw_snapshot_ts_ms(item) or 0))
+    snapshot_ts_ms = raw_snapshot_ts_ms(record)
+    if snapshot_ts_ms is None:
+        return None
+    if target_ts_ms is not None and abs(int(snapshot_ts_ms) - int(target_ts_ms)) > POST_DECISION_EXECUTION_TOLERANCE_MS:
+        return None
+    if target_ts_ms is None and max_age_ms > 0 and int(time.time() * 1000) - int(snapshot_ts_ms) > int(max_age_ms):
+        return None
+    return record
+
+
+def _local_orderbook_max_age_ms() -> int:
+    try:
+        return max(0, int(os.getenv("PM15MIN_LOCAL_ORDERBOOK_MAX_AGE_MS", str(DEFAULT_LOCAL_ORDERBOOK_MAX_AGE_MS))))
+    except Exception:
+        return DEFAULT_LOCAL_ORDERBOOK_MAX_AGE_MS
 
 
 def resolve_depth_snapshot(

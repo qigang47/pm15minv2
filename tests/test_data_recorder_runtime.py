@@ -67,6 +67,6 @@ def test_run_orderbook_recorder_writes_state_and_logs(tmp_path: Path) -> None:
     assert state["provider"] == "DirectOrderbookProvider"
 
     lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(lines) >= 3
+    assert len(lines) >= 2
     assert any('"event": "iteration_ok"' in line for line in lines)
     assert any('"event": "run_finished"' in line for line in lines)

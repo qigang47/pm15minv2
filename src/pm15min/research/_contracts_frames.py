@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from typing import Any
 
+from pm15min.research.labels.sources import normalize_label_set
+from pm15min.research.layout_helpers import normalize_window_bound
 from pm15min.research.layout import normalize_source_surface, slug_token, window_label
 
 
@@ -14,7 +16,7 @@ class DateWindow:
 
     @classmethod
     def from_bounds(cls, start: str | date | datetime, end: str | date | datetime) -> "DateWindow":
-        return cls(start=str(start)[:10], end=str(end)[:10])
+        return cls(start=normalize_window_bound(start), end=normalize_window_bound(end))
 
     @property
     def label(self) -> str:
@@ -50,7 +52,7 @@ class LabelFrameSpec:
     label_set: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "label_set", slug_token(self.label_set))
+        object.__setattr__(self, "label_set", normalize_label_set(self.label_set))
 
     @property
     def object_type(self) -> str:

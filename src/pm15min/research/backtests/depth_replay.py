@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import pandas as pd
@@ -10,12 +11,18 @@ from pm15min.data.config import DataConfig
 from pm15min.data.io.ndjson_zst import iter_ndjson_zst
 from pm15min.data.queries.loaders import load_market_catalog
 from pm15min.research.backtests.replay_loader import REPLAY_KEY_COLUMNS
+from pm15min.research.backtests.data_surface_fallback import (
+    load_market_catalog_with_fallback,
+    resolve_orderbook_depth_path,
+)
 
 
 DEFAULT_DEPTH_REPLAY_TOLERANCE_MS = 120_000
 DEPTH_REPLAY_HEARTBEAT_INTERVAL_RECORDS = 50_000
+LEGACY_RAW_DECISION_TS_BACKSHIFT_MS = 60_000
 DEPTH_REPLAY_SURFACE_COLUMNS = [
     "depth_snapshot_rank",
+    "depth_candidate_total_count",
     "depth_snapshot_ts",
     "depth_snapshot_ts_ms",
     "depth_snapshot_status",
@@ -69,9 +76,11 @@ def build_raw_depth_replay_frame(
     data_cfg: DataConfig,
     snapshot_tolerance_ms: int = DEFAULT_DEPTH_REPLAY_TOLERANCE_MS,
     allow_token_window_fallback: bool = True,
+    max_snapshots_per_replay_row: int | None = None,
     heartbeat: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, DepthReplaySummary]:
     tolerance_ms = max(0, int(snapshot_tolerance_ms))
+    snapshot_cap = None if max_snapshots_per_replay_row is None else max(1, int(max_snapshots_per_replay_row))
     prepared, market_rows_loaded = _prepare_replay_frame(replay=replay, data_cfg=data_cfg)
     if prepared.empty:
         return _empty_depth_replay_frame(prepared), DepthReplaySummary(
@@ -95,12 +104,15 @@ def build_raw_depth_replay_frame(
         snapshot_tolerance_ms=tolerance_ms,
     )
     buckets: dict[tuple[int, int], dict[str, Any]] = {}
+    seen_bucket_keys: set[tuple[int, int]] = set()
+    row_candidate_total_counts: dict[int, int] = {}
+    row_stored_candidate_counts: dict[int, int] = {}
     raw_records_scanned = 0
     raw_record_matches = 0
     source_files_scanned = 0
 
     depth_sources = [
-        (date_str, data_cfg.layout.orderbook_depth_path(date_str))
+        (date_str, resolve_orderbook_depth_path(data_cfg, date_str))
         for date_str in sorted(date_lookups)
     ]
     existing_sources = [(date_str, depth_path) for date_str, depth_path in depth_sources if depth_path.exists()]
@@ -117,6 +129,12 @@ def build_raw_depth_replay_frame(
                     f"Scanning depth replay file {source_idx}/{len(existing_sources)}: "
                     f"{raw_records_scanned:,} raw records"
                 )
+            market_id = str(raw.get("market_id") or "").strip()
+            if not market_id or market_id not in date_lookup["market_ids"]:
+                continue
+            raw_offset = _int_or_none(raw.get("offset"))
+            if raw_offset is not None and date_lookup["offsets"] and raw_offset not in date_lookup["offsets"]:
+                continue
             matched_rows, strategy = _match_replay_rows(
                 raw,
                 decision_lookup=date_lookup["decision_lookup"],
@@ -135,22 +153,34 @@ def build_raw_depth_replay_frame(
             record_ts_ms = _record_snapshot_ts_ms(raw)
             raw_record_matches += len(matched_rows)
             for row_idx in matched_rows:
-                bucket = buckets.setdefault(
-                    (row_idx, bucket_ts_ms),
-                    {
+                bucket_key = (row_idx, bucket_ts_ms)
+                if bucket_key not in seen_bucket_keys:
+                    seen_bucket_keys.add(bucket_key)
+                    row_candidate_total_counts[int(row_idx)] = row_candidate_total_counts.get(int(row_idx), 0) + 1
+                    stored_count = row_stored_candidate_counts.get(int(row_idx), 0)
+                    if snapshot_cap is not None and stored_count >= snapshot_cap:
+                        continue
+                    row_stored_candidate_counts[int(row_idx)] = stored_count + 1
+                    buckets[bucket_key] = {
                         "source_path": str(depth_path),
                         "up": None,
                         "down": None,
                         "match_strategies": set(),
                         "up_snapshot_ts_ms": None,
                         "down_snapshot_ts_ms": None,
-                    },
-                )
+                    }
+                bucket = buckets.get(bucket_key)
+                if bucket is None:
+                    continue
                 bucket[side] = raw
                 bucket[f"{side}_snapshot_ts_ms"] = record_ts_ms
                 bucket["match_strategies"].add(strategy)
 
-    out = _build_depth_replay_output(prepared=prepared, buckets=buckets)
+    out = _build_depth_replay_output(
+        prepared=prepared,
+        buckets=buckets,
+        row_candidate_total_counts=row_candidate_total_counts,
+    )
     if out.empty:
         strategy_counts: dict[str, int] = {}
         replay_rows_with_snapshots = 0
@@ -204,7 +234,7 @@ def _prepare_replay_frame(
             frame[column] = pd.to_datetime(frame[column], utc=True, errors="coerce")
     if "offset" in frame.columns:
         frame["offset"] = pd.to_numeric(frame["offset"], errors="coerce").astype("Int64")
-    market_table = _prepare_market_table(load_market_catalog(data_cfg))
+    market_table = _prepare_market_table(load_market_catalog_with_fallback(data_cfg))
     frame = _attach_market_metadata(frame, market_table)
     for column in ("market_id", "condition_id", "token_up", "token_down", "question"):
         if column not in frame.columns:
@@ -216,8 +246,8 @@ def _build_date_lookups(
     replay: pd.DataFrame,
     *,
     snapshot_tolerance_ms: int,
-) -> dict[str, dict[str, dict[tuple[Any, ...], list[Any]]]]:
-    by_date: dict[str, dict[str, dict[tuple[Any, ...], list[Any]]]] = {}
+) -> dict[str, dict[str, Any]]:
+    by_date: dict[str, dict[str, Any]] = {}
     for row in replay.itertuples(index=True):
         decision_ts = getattr(row, "decision_ts", None)
         if decision_ts is None or pd.isna(decision_ts):
@@ -241,11 +271,15 @@ def _build_date_lookups(
                 {
                     "decision_lookup": {},
                     "token_lookup": {},
+                    "market_ids": set(),
+                    "offsets": set(),
                 },
             )
+            entry["market_ids"].add(market_id)
             if offset is not None:
-                key = (market_id, decision_ts_ms, offset)
-                entry["decision_lookup"].setdefault(key, []).append(int(row.Index))
+                entry["offsets"].add(int(offset))
+                for key in _decision_lookup_keys(market_id=market_id, decision_ts_ms=decision_ts_ms, offset=offset):
+                    entry["decision_lookup"].setdefault(key, []).append(int(row.Index))
             for side, token_id in token_pairs:
                 if not token_id:
                     continue
@@ -260,12 +294,23 @@ def _scan_dates_for_decision_ts(
     snapshot_tolerance_ms: int,
 ) -> set[str]:
     dates = {decision_ts.strftime("%Y-%m-%d")}
+    start_ts = decision_ts - pd.Timedelta(milliseconds=LEGACY_RAW_DECISION_TS_BACKSHIFT_MS)
+    if start_ts.strftime("%Y-%m-%d") != decision_ts.strftime("%Y-%m-%d"):
+        dates.add(start_ts.strftime("%Y-%m-%d"))
     if snapshot_tolerance_ms <= 0:
         return dates
     end_ts = decision_ts + pd.Timedelta(milliseconds=int(snapshot_tolerance_ms))
     if end_ts.strftime("%Y-%m-%d") != decision_ts.strftime("%Y-%m-%d"):
         dates.add(end_ts.strftime("%Y-%m-%d"))
     return dates
+
+
+def _decision_lookup_keys(*, market_id: str, decision_ts_ms: int, offset: int) -> tuple[tuple[str, int, int], ...]:
+    keys = [(market_id, int(decision_ts_ms), int(offset))]
+    shifted_decision_ts_ms = int(decision_ts_ms) - LEGACY_RAW_DECISION_TS_BACKSHIFT_MS
+    if shifted_decision_ts_ms >= 0:
+        keys.append((market_id, shifted_decision_ts_ms, int(offset)))
+    return tuple(dict.fromkeys(keys))
 
 
 def _match_replay_rows(
@@ -289,7 +334,6 @@ def _match_replay_rows(
         matches = decision_lookup.get((market_id, decision_ts_ms, offset), [])
         if matches:
             return matches, "decision_key"
-        return [], None
 
     if not allow_token_window_fallback:
         return [], None
@@ -311,6 +355,7 @@ def _build_depth_replay_output(
     *,
     prepared: pd.DataFrame,
     buckets: dict[tuple[int, int], dict[str, Any]],
+    row_candidate_total_counts: dict[int, int],
 ) -> pd.DataFrame:
     if not buckets:
         return _empty_depth_replay_frame(prepared)
@@ -330,6 +375,7 @@ def _build_depth_replay_output(
                 **replay_row,
                 "_replay_row_idx": int(row_idx),
                 "depth_snapshot_rank": 0,
+                "depth_candidate_total_count": int(row_candidate_total_counts.get(int(row_idx), 0)),
                 "depth_snapshot_ts": _iso_from_ts_ms(snapshot_ts_ms),
                 "depth_snapshot_ts_ms": int(snapshot_ts_ms),
                 "depth_snapshot_status": "ok" if not missing else "partial",
@@ -429,12 +475,17 @@ def _parse_ts_ms(value: object) -> int | None:
         if text.isdigit():
             out = int(text)
             return out if out > 0 else None
-        dt = pd.to_datetime(text, utc=True, errors="coerce")
-        if dt is None or pd.isna(dt):
-            return None
-        return int(dt.timestamp() * 1000)
+        return _parse_ts_ms_text(text)
     except Exception:
         return None
+
+
+@lru_cache(maxsize=262_144)
+def _parse_ts_ms_text(text: str) -> int | None:
+    dt = pd.to_datetime(text, utc=True, errors="coerce")
+    if dt is None or pd.isna(dt):
+        return None
+    return int(dt.timestamp() * 1000)
 
 
 def _int_or_none(value: object) -> int | None:

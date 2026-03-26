@@ -59,7 +59,7 @@ class _ExperimentCaseResult:
     training_row: dict[str, object] | None
     backtest_row: dict[str, object] | None
     failed_row: dict[str, object] | None
-    log_event: dict[str, object]
+    log_events: tuple[dict[str, object], ...]
     success: bool
 
 
@@ -112,6 +112,17 @@ def run_experiment_suite(
             current_stage="experiment_group",
             progress_pct=_suite_progress_pct(completed_cases, total_cases),
         )
+        _emit_experiment_progress(
+            reporter,
+            summary=(
+                f"Warming group {group_position}/{len(execution_groups)}: "
+                f"{execution_group.group_label} ({len(execution_group.market_specs)} cases)"
+            ),
+            current=group_position,
+            total=total_groups,
+            current_stage="experiment_group_warmup",
+            progress_pct=_suite_progress_pct(completed_cases, total_cases),
+        )
         _append_suite_log(
             log_path,
             {
@@ -119,6 +130,16 @@ def run_experiment_suite(
                 "group_key": execution_group.group_key,
                 "group_label": execution_group.group_label,
                 "cases": len(execution_group.market_specs),
+            },
+        )
+        _append_suite_log(
+            log_path,
+            {
+                "event": "execution_group_warmup_started",
+                "group_key": execution_group.group_key,
+                "group_label": execution_group.group_label,
+                "cases": len(execution_group.market_specs),
+                "parallel_case_workers": int(runtime_policy.parallel_case_workers),
             },
         )
         queued_case_contexts: list[dict[str, object]] = []
@@ -133,13 +154,6 @@ def run_experiment_suite(
                 market_spec=market_spec,
                 case_key=case_key,
                 runtime_policy=runtime_policy,
-            )
-            _emit_case_progress(
-                reporter,
-                case_position=case_position,
-                total_cases=total_cases,
-                summary=f"Running case {case_position}/{total_cases}: {case_label}",
-                case_progress=0.0,
             )
             case_reporter = _case_nested_reporter(
                 reporter,
@@ -222,6 +236,14 @@ def run_experiment_suite(
                 )
                 continue
             if runtime_policy.parallel_case_workers > 1:
+                _emit_case_progress(
+                    reporter,
+                    case_position=case_position,
+                    total_cases=total_cases,
+                    summary=f"Queued case {case_position}/{total_cases} for group warmup: {case_label}",
+                    case_progress=0.0,
+                    current_stage="experiment_group_warmup",
+                )
                 queued_case_contexts.append(
                     {
                         "market_spec": market_spec,
@@ -233,6 +255,13 @@ def run_experiment_suite(
                     }
                 )
                 continue
+            _emit_case_progress(
+                reporter,
+                case_position=case_position,
+                total_cases=total_cases,
+                summary=f"Running case {case_position}/{total_cases}: {case_label}",
+                case_progress=0.0,
+            )
 
             train_summary = None
             bundle_summary = None
@@ -242,6 +271,8 @@ def run_experiment_suite(
             bundle_reused = False
             secondary_training_reused = False
             secondary_bundle_reused = False
+            datasets_reused = False
+            secondary_datasets_reused = False
             case_succeeded = False
             failure_stage = "prepare_market_cfg"
             try:
@@ -253,12 +284,12 @@ def run_experiment_suite(
                 )
 
                 failure_stage = "prepare_datasets"
-                _ensure_market_datasets(market_cfg=market_cfg, prepared_datasets=prepared_datasets)
+                datasets_reused = _ensure_market_datasets(market_cfg=market_cfg, prepared_datasets=prepared_datasets)
                 _emit_case_progress(
                     reporter,
                     case_position=case_position,
                     total_cases=total_cases,
-                    summary=f"Prepared datasets for {case_label}",
+                    summary=_dataset_resolution_summary(case_label=case_label, reused=datasets_reused),
                     case_progress=float(case_progress_markers["datasets_ready"]),
                 )
                 failure_stage = "train_primary"
@@ -282,7 +313,7 @@ def run_experiment_suite(
                     reporter,
                     case_position=case_position,
                     total_cases=total_cases,
-                    summary=f"Resolved primary training for {case_label}",
+                    summary=_reuse_resolution_summary(case_label=case_label, label="primary training", reused=training_reused),
                     case_progress=float(case_progress_markers["primary_training_done"]),
                 )
                 failure_stage = "bundle_primary"
@@ -299,7 +330,7 @@ def run_experiment_suite(
                     reporter,
                     case_position=case_position,
                     total_cases=total_cases,
-                    summary=f"Prepared primary bundle for {case_label}",
+                    summary=_reuse_resolution_summary(case_label=case_label, label="primary bundle", reused=bundle_reused),
                     case_progress=float(case_progress_markers["primary_bundle_done"]),
                 )
                 if market_spec.hybrid_secondary_target:
@@ -313,7 +344,20 @@ def run_experiment_suite(
                         target=secondary_target,
                     )
                     failure_stage = "prepare_secondary_datasets"
-                    _ensure_market_datasets(market_cfg=secondary_cfg, prepared_datasets=prepared_datasets)
+                    secondary_datasets_reused = _ensure_market_datasets(
+                        market_cfg=secondary_cfg,
+                        prepared_datasets=prepared_datasets,
+                    )
+                    _emit_case_progress(
+                        reporter,
+                        case_position=case_position,
+                        total_cases=total_cases,
+                        summary=_dataset_resolution_summary(
+                            case_label=f"{case_label} [{secondary_target}]",
+                            reused=secondary_datasets_reused,
+                        ),
+                        case_progress=float(case_progress_markers["secondary_training"][0]),
+                    )
                     failure_stage = "train_secondary"
                     secondary_train_summary, secondary_training_reused = _resolve_training_summary(
                         market_cfg=secondary_cfg,
@@ -335,7 +379,11 @@ def run_experiment_suite(
                         reporter,
                         case_position=case_position,
                         total_cases=total_cases,
-                        summary=f"Resolved secondary training for {case_label}",
+                        summary=_reuse_resolution_summary(
+                            case_label=case_label,
+                            label="secondary training",
+                            reused=secondary_training_reused,
+                        ),
                         case_progress=float(case_progress_markers["secondary_training_done"]),
                     )
                     failure_stage = "bundle_secondary"
@@ -352,9 +400,26 @@ def run_experiment_suite(
                         reporter,
                         case_position=case_position,
                         total_cases=total_cases,
-                        summary=f"Prepared secondary bundle for {case_label}",
+                        summary=_reuse_resolution_summary(
+                            case_label=case_label,
+                            label="secondary bundle",
+                            reused=secondary_bundle_reused,
+                        ),
                         case_progress=float(case_progress_markers["secondary_bundle_done"]),
                     )
+                _append_suite_log(
+                    log_path,
+                    _build_case_cache_resolved_event(
+                        market_spec=market_spec,
+                        case_key=case_key,
+                        datasets_reused=datasets_reused,
+                        training_reused=training_reused,
+                        bundle_reused=bundle_reused,
+                        secondary_training_reused=secondary_training_reused,
+                        secondary_bundle_reused=secondary_bundle_reused,
+                        secondary_datasets_reused=secondary_datasets_reused,
+                    ),
+                )
                 failure_stage = "backtest"
                 _emit_case_progress(
                     reporter,
@@ -368,6 +433,8 @@ def run_experiment_suite(
                     spec_name=market_spec.backtest_spec,
                     run_label=_backtest_run_label(run_label=run_label, market_spec=market_spec, case_key=case_key),
                     target=market_spec.target,
+                    decision_start=getattr(market_spec, "decision_start", None),
+                    decision_end=getattr(market_spec, "decision_end", None),
                     bundle_label=str(bundle_summary["bundle_label"]),
                     secondary_target=market_spec.hybrid_secondary_target,
                     secondary_bundle_label=(
@@ -528,6 +595,46 @@ def run_experiment_suite(
             )
         if queued_case_contexts:
             first_context, *remaining_contexts = queued_case_contexts
+            _append_suite_log(
+                log_path,
+                {
+                    "event": "execution_group_warmup_completed",
+                    "group_key": execution_group.group_key,
+                    "group_label": execution_group.group_label,
+                    "queued_cases": len(queued_case_contexts),
+                },
+            )
+            _append_suite_log(
+                log_path,
+                {
+                    "event": "execution_group_seed_case_started",
+                    "group_key": execution_group.group_key,
+                    "group_label": execution_group.group_label,
+                    "case_key": first_context["case_key"],
+                    "case_label": first_context["case_label"],
+                },
+            )
+            _emit_experiment_progress(
+                reporter,
+                summary=(
+                    f"Warmup complete for {execution_group.group_label}; "
+                    f"seeding shared cache with {first_context['case_label']}"
+                ),
+                current=group_position,
+                total=total_groups,
+                current_stage="experiment_group_warmup",
+                progress_pct=_suite_progress_pct(completed_cases, total_cases),
+            )
+            _emit_case_progress(
+                reporter,
+                case_position=int(first_context["case_position"]),
+                total_cases=total_cases,
+                summary=(
+                    f"Running seed case {first_context['case_position']}/{total_cases}: "
+                    f"{first_context['case_label']}"
+                ),
+                case_progress=0.0,
+            )
             first_result = _execute_experiment_case(
                 cfg=cfg,
                 suite=suite,
@@ -562,6 +669,27 @@ def run_experiment_suite(
             )
             if remaining_contexts and first_result.success:
                 worker_count = min(int(runtime_policy.parallel_case_workers), len(remaining_contexts))
+                _append_suite_log(
+                    log_path,
+                    {
+                        "event": "execution_group_parallel_started",
+                        "group_key": execution_group.group_key,
+                        "group_label": execution_group.group_label,
+                        "worker_count": worker_count,
+                        "remaining_cases": len(remaining_contexts),
+                    },
+                )
+                _emit_experiment_progress(
+                    reporter,
+                    summary=(
+                        f"Launching {len(remaining_contexts)} parallel cases for {execution_group.group_label} "
+                        f"with {worker_count} workers"
+                    ),
+                    current=group_position,
+                    total=total_groups,
+                    current_stage="experiment_group_parallel",
+                    progress_pct=_suite_progress_pct(completed_cases, total_cases),
+                )
                 with ThreadPoolExecutor(max_workers=worker_count) as executor:
                     future_map = {
                         executor.submit(
@@ -583,7 +711,9 @@ def run_experiment_suite(
                         ): context
                         for context in remaining_contexts
                     }
+                    parallel_completed = 0
                     for future in as_completed(future_map):
+                        parallel_completed += 1
                         completed_cases = _apply_experiment_case_result(
                             completed_cases=completed_cases,
                             result=future.result(),
@@ -600,6 +730,49 @@ def run_experiment_suite(
                             reporter=reporter,
                             total_cases=total_cases,
                         )
+                        _emit_experiment_progress(
+                            reporter,
+                            summary=(
+                                f"Collected parallel case {parallel_completed}/{len(remaining_contexts)} "
+                                f"for {execution_group.group_label}"
+                            ),
+                            current=group_position,
+                            total=total_groups,
+                            current_stage="experiment_group_parallel",
+                            progress_pct=_suite_progress_pct(completed_cases, total_cases),
+                        )
+                _append_suite_log(
+                    log_path,
+                    {
+                        "event": "execution_group_parallel_completed",
+                        "group_key": execution_group.group_key,
+                        "group_label": execution_group.group_label,
+                        "worker_count": worker_count,
+                        "completed_parallel_cases": len(remaining_contexts),
+                    },
+                )
+            elif remaining_contexts:
+                _append_suite_log(
+                    log_path,
+                    {
+                        "event": "execution_group_parallel_skipped",
+                        "group_key": execution_group.group_key,
+                        "group_label": execution_group.group_label,
+                        "remaining_cases": len(remaining_contexts),
+                        "reason": "seed_case_failed",
+                    },
+                )
+                _emit_experiment_progress(
+                    reporter,
+                    summary=(
+                        f"Skipping parallel fanout for {execution_group.group_label} "
+                        f"because seed case failed"
+                    ),
+                    current=group_position,
+                    total=total_groups,
+                    current_stage="experiment_group_parallel",
+                    progress_pct=_suite_progress_pct(completed_cases, total_cases),
+                )
         _append_suite_log(
             log_path,
             {
@@ -674,6 +847,8 @@ def _execute_experiment_case(
     bundle_reused = False
     secondary_training_reused = False
     secondary_bundle_reused = False
+    datasets_reused = False
+    secondary_datasets_reused = False
     failure_stage = "prepare_market_cfg"
     try:
         market_cfg = _build_market_cfg(
@@ -683,12 +858,12 @@ def _execute_experiment_case(
             target=market_spec.target,
         )
         failure_stage = "prepare_datasets"
-        _ensure_market_datasets(market_cfg=market_cfg, prepared_datasets=prepared_datasets)
+        datasets_reused = _ensure_market_datasets(market_cfg=market_cfg, prepared_datasets=prepared_datasets)
         _emit_case_progress(
             reporter,
             case_position=case_position,
             total_cases=total_cases,
-            summary=f"Prepared datasets for {case_label}",
+            summary=_dataset_resolution_summary(case_label=case_label, reused=datasets_reused),
             case_progress=float(case_progress_markers["datasets_ready"]),
         )
         failure_stage = "train_primary"
@@ -712,7 +887,7 @@ def _execute_experiment_case(
             reporter,
             case_position=case_position,
             total_cases=total_cases,
-            summary=f"Resolved primary training for {case_label}",
+            summary=_reuse_resolution_summary(case_label=case_label, label="primary training", reused=training_reused),
             case_progress=float(case_progress_markers["primary_training_done"]),
         )
         failure_stage = "bundle_primary"
@@ -729,7 +904,7 @@ def _execute_experiment_case(
             reporter,
             case_position=case_position,
             total_cases=total_cases,
-            summary=f"Prepared primary bundle for {case_label}",
+            summary=_reuse_resolution_summary(case_label=case_label, label="primary bundle", reused=bundle_reused),
             case_progress=float(case_progress_markers["primary_bundle_done"]),
         )
         if market_spec.hybrid_secondary_target:
@@ -743,7 +918,20 @@ def _execute_experiment_case(
                 target=secondary_target,
             )
             failure_stage = "prepare_secondary_datasets"
-            _ensure_market_datasets(market_cfg=secondary_cfg, prepared_datasets=prepared_datasets)
+            secondary_datasets_reused = _ensure_market_datasets(
+                market_cfg=secondary_cfg,
+                prepared_datasets=prepared_datasets,
+            )
+            _emit_case_progress(
+                reporter,
+                case_position=case_position,
+                total_cases=total_cases,
+                summary=_dataset_resolution_summary(
+                    case_label=f"{case_label} [{secondary_target}]",
+                    reused=secondary_datasets_reused,
+                ),
+                case_progress=float(case_progress_markers["secondary_training"][0]),
+            )
             failure_stage = "train_secondary"
             secondary_train_summary, secondary_training_reused = _resolve_training_summary(
                 market_cfg=secondary_cfg,
@@ -765,7 +953,11 @@ def _execute_experiment_case(
                 reporter,
                 case_position=case_position,
                 total_cases=total_cases,
-                summary=f"Resolved secondary training for {case_label}",
+                summary=_reuse_resolution_summary(
+                    case_label=case_label,
+                    label="secondary training",
+                    reused=secondary_training_reused,
+                ),
                 case_progress=float(case_progress_markers["secondary_training_done"]),
             )
             failure_stage = "bundle_secondary"
@@ -782,7 +974,11 @@ def _execute_experiment_case(
                 reporter,
                 case_position=case_position,
                 total_cases=total_cases,
-                summary=f"Prepared secondary bundle for {case_label}",
+                summary=_reuse_resolution_summary(
+                    case_label=case_label,
+                    label="secondary bundle",
+                    reused=secondary_bundle_reused,
+                ),
                 case_progress=float(case_progress_markers["secondary_bundle_done"]),
             )
         failure_stage = "backtest"
@@ -798,6 +994,8 @@ def _execute_experiment_case(
             spec_name=market_spec.backtest_spec,
             run_label=_backtest_run_label(run_label=run_label, market_spec=market_spec, case_key=case_key),
             target=market_spec.target,
+            decision_start=getattr(market_spec, "decision_start", None),
+            decision_end=getattr(market_spec, "decision_end", None),
             bundle_label=str(bundle_summary["bundle_label"]),
             secondary_target=market_spec.hybrid_secondary_target,
             secondary_bundle_label=(
@@ -864,21 +1062,33 @@ def _execute_experiment_case(
                 **_load_backtest_metrics(Path(backtest_summary["summary_path"])),
             },
             failed_row=None,
-            log_event={
-                "event": "market_completed",
-                "market": market_spec.market,
-                "case_key": case_key,
-                "group_name": _group_name(market_spec),
-                "run_name": _run_name(market_spec),
-                "training_run_dir": train_summary["run_dir"],
-                "bundle_dir": bundle_summary["bundle_dir"],
-                "training_reused": bool(training_reused),
-                "bundle_reused": bool(bundle_reused),
-                "secondary_training_run_dir": None if secondary_train_summary is None else secondary_train_summary["run_dir"],
-                "secondary_bundle_dir": None if secondary_bundle_summary is None else secondary_bundle_summary["bundle_dir"],
-                "backtest_run_dir": backtest_summary["run_dir"],
-                "parity_spec": parity_payload,
-            },
+            log_events=(
+                _build_case_cache_resolved_event(
+                    market_spec=market_spec,
+                    case_key=case_key,
+                    datasets_reused=datasets_reused,
+                    training_reused=training_reused,
+                    bundle_reused=bundle_reused,
+                    secondary_training_reused=secondary_training_reused,
+                    secondary_bundle_reused=secondary_bundle_reused,
+                    secondary_datasets_reused=secondary_datasets_reused,
+                ),
+                {
+                    "event": "market_completed",
+                    "market": market_spec.market,
+                    "case_key": case_key,
+                    "group_name": _group_name(market_spec),
+                    "run_name": _run_name(market_spec),
+                    "training_run_dir": train_summary["run_dir"],
+                    "bundle_dir": bundle_summary["bundle_dir"],
+                    "training_reused": bool(training_reused),
+                    "bundle_reused": bool(bundle_reused),
+                    "secondary_training_run_dir": None if secondary_train_summary is None else secondary_train_summary["run_dir"],
+                    "secondary_bundle_dir": None if secondary_bundle_summary is None else secondary_bundle_summary["bundle_dir"],
+                    "backtest_run_dir": backtest_summary["run_dir"],
+                    "parity_spec": parity_payload,
+                },
+            ),
             success=True,
         )
     except Exception as exc:
@@ -919,17 +1129,29 @@ def _execute_experiment_case(
                 secondary_train_summary=secondary_train_summary,
                 secondary_bundle_summary=secondary_bundle_summary,
             ),
-            log_event={
-                "event": "market_failed",
-                "market": market_spec.market,
-                "case_key": case_key,
-                "group_name": _group_name(market_spec),
-                "run_name": _run_name(market_spec),
-                "variant_label": market_spec.variant_label,
-                "failure_stage": failure_stage,
-                "error_type": exc.__class__.__name__,
-                "error_message": str(exc),
-            },
+            log_events=(
+                _build_case_cache_resolved_event(
+                    market_spec=market_spec,
+                    case_key=case_key,
+                    datasets_reused=datasets_reused,
+                    training_reused=training_reused,
+                    bundle_reused=bundle_reused,
+                    secondary_training_reused=secondary_training_reused,
+                    secondary_bundle_reused=secondary_bundle_reused,
+                    secondary_datasets_reused=secondary_datasets_reused,
+                ),
+                {
+                    "event": "market_failed",
+                    "market": market_spec.market,
+                    "case_key": case_key,
+                    "group_name": _group_name(market_spec),
+                    "run_name": _run_name(market_spec),
+                    "variant_label": market_spec.variant_label,
+                    "failure_stage": failure_stage,
+                    "error_type": exc.__class__.__name__,
+                    "error_message": str(exc),
+                },
+            ),
             success=False,
         )
 
@@ -958,7 +1180,8 @@ def _apply_experiment_case_result(
         run_state.drop_failed_case(case_key=result.case_key)
     if result.failed_row is not None:
         run_state.set_failed_row(result.failed_row)
-    _append_suite_log(log_path, result.log_event)
+    for event in result.log_events:
+        _append_suite_log(log_path, event)
     _persist_runtime_state(
         cfg=cfg,
         suite=suite,
@@ -1077,6 +1300,49 @@ def _case_progress_markers(*, has_secondary: bool) -> dict[str, object]:
         "secondary_bundle_done": None,
         "backtest": (0.70, 0.98),
         "backtest_done": 0.98,
+    }
+
+
+def _dataset_resolution_summary(*, case_label: str, reused: bool) -> str:
+    verb = "Reused" if reused else "Built"
+    return f"{verb} prepared datasets for {case_label}"
+
+
+def _reuse_resolution_summary(*, case_label: str, label: str, reused: bool) -> str:
+    verb = "Reused" if reused else "Built"
+    return f"{verb} {label} for {case_label}"
+
+
+def _build_case_cache_resolved_event(
+    *,
+    market_spec,
+    case_key: str,
+    datasets_reused: bool,
+    training_reused: bool,
+    bundle_reused: bool,
+    secondary_training_reused: bool,
+    secondary_bundle_reused: bool,
+    secondary_datasets_reused: bool = False,
+) -> dict[str, object]:
+    return {
+        "event": "market_cache_resolved",
+        "market": market_spec.market,
+        "case_key": case_key,
+        "group_name": _group_name(market_spec),
+        "run_name": _run_name(market_spec),
+        "variant_label": market_spec.variant_label,
+        "datasets_status": "reused" if datasets_reused else "built",
+        "training_status": "reused" if training_reused else "built",
+        "bundle_status": "reused" if bundle_reused else "built",
+        "secondary_datasets_status": (
+            None if not market_spec.hybrid_secondary_target else ("reused" if secondary_datasets_reused else "built")
+        ),
+        "secondary_training_status": (
+            None if not market_spec.hybrid_secondary_target else ("reused" if secondary_training_reused else "built")
+        ),
+        "secondary_bundle_status": (
+            None if not market_spec.hybrid_secondary_target else ("reused" if secondary_bundle_reused else "built")
+        ),
     }
 
 
@@ -1245,7 +1511,7 @@ def _seed_bundle_cache(rows) -> dict[str, dict[str, object]]:
     return cache
 
 
-def _ensure_market_datasets(*, market_cfg: ResearchConfig, prepared_datasets: set[tuple[str, ...]]) -> None:
+def _ensure_market_datasets(*, market_cfg: ResearchConfig, prepared_datasets: set[tuple[str, ...]]) -> bool:
     key = (
         market_cfg.asset.slug,
         market_cfg.cycle,
@@ -1255,10 +1521,11 @@ def _ensure_market_datasets(*, market_cfg: ResearchConfig, prepared_datasets: se
         str(market_cfg.layout.storage.rewrite_root),
     )
     if key in prepared_datasets:
-        return
+        return True
     build_feature_frame_dataset(market_cfg)
     build_label_frame_dataset(market_cfg)
     prepared_datasets.add(key)
+    return False
 
 
 def _normalize_offsets(raw: object) -> tuple[int, ...]:

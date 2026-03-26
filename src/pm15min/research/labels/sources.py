@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from pm15min.research.layout import slug_token
+
 
 @dataclass(frozen=True)
 class LabelBuildPlan:
@@ -19,9 +21,12 @@ class LabelBuildPlan:
         }
 
 
+_LABEL_SET_ALIASES = {
+    "settlement_truth": "truth",
+}
+
 _TRUTH_LABEL_SETS = {
     "truth": None,
-    "settlement_truth": "settlement_truth",
 }
 
 _ORACLE_LABEL_SETS = {
@@ -33,7 +38,7 @@ _ORACLE_LABEL_SETS = {
 
 
 def resolve_label_build_plan(label_set: str) -> LabelBuildPlan:
-    key = str(label_set).strip().lower()
+    key = normalize_label_set(label_set)
     if key in _TRUTH_LABEL_SETS:
         return LabelBuildPlan(requested_label_set=key, base_label_set="truth", label_source=_TRUTH_LABEL_SETS[key])
     if key in _ORACLE_LABEL_SETS:
@@ -42,8 +47,13 @@ def resolve_label_build_plan(label_set: str) -> LabelBuildPlan:
             base_label_set="oracle_prices",
             label_source=_ORACLE_LABEL_SETS[key],
         )
-    supported = sorted(set(_TRUTH_LABEL_SETS) | set(_ORACLE_LABEL_SETS))
+    supported = sorted(set(_TRUTH_LABEL_SETS) | set(_ORACLE_LABEL_SETS) | set(_LABEL_SET_ALIASES))
     raise ValueError(f"Unsupported label_set {label_set!r}. Expected one of: {', '.join(supported)}")
+
+
+def normalize_label_set(label_set: str | None, *, default: str = "truth") -> str:
+    key = slug_token(label_set or default, default=default)
+    return _LABEL_SET_ALIASES.get(key, key)
 
 
 def filter_truth_table_by_label_source(truth_table: pd.DataFrame, *, label_source: str | None) -> pd.DataFrame:

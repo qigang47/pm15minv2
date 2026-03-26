@@ -181,8 +181,112 @@ def test_decision_accepts_when_quote_guards_pass() -> None:
 
 
 def test_decision_rejects_when_liquidity_guard_blocks() -> None:
+    blocked_spec = replace(resolve_live_profile_spec("deep_otm"), liquidity_guard_block=True)
+    original_resolver = build_decision_snapshot.__globals__["resolve_live_profile_spec"]
+    build_decision_snapshot.__globals__["resolve_live_profile_spec"] = lambda profile: blocked_spec
+    try:
+        row = _base_signal_row()
+        row["p_down"] = 0.70
+        payload = {
+            "market": "sol",
+            "profile": "deep_otm",
+            "cycle": "15m",
+            "target": "direction",
+            "active_bundle": {},
+            "active_bundle_selection_path": "/tmp/selection.json",
+            "snapshot_ts": "2026-03-19T15-00-00Z",
+            "liquidity_state": {
+                "status": "ok",
+                "reason": "spot_quote_window",
+                "guard_enabled": True,
+                "ok": False,
+                "blocked": True,
+                "reason_codes": ["spot_quote_window"],
+            },
+            "offset_signals": [row],
+        }
+        quote_payload = {
+            "snapshot_ts": "2026-03-19T15-00-10Z",
+            "quote_rows": [
+                {
+                    "offset": 7,
+                    "status": "ok",
+                    "market_id": "market-1",
+                    "quote_up_ask": 0.20,
+                    "quote_down_ask": 0.29,
+                    "quote_up_bid": 0.19,
+                    "quote_down_bid": 0.28,
+                    "reasons": [],
+                }
+            ],
+        }
+        out = build_decision_snapshot(payload, quote_payload)
+    finally:
+        build_decision_snapshot.__globals__["resolve_live_profile_spec"] = original_resolver
+    assert out["decision"]["status"] == "reject"
+    assert "liquidity_guard" in out["applied_guard_layers"]
+    assert "liquidity_guard_blocked" in out["rejected_offsets"][0]["guard_reasons"]
+    assert "liquidity_spot_quote_window" in out["rejected_offsets"][0]["guard_reasons"]
+
+
+def test_decision_rejects_when_regime_direction_pressure_blocks() -> None:
+    blocked_spec = replace(resolve_live_profile_spec("deep_otm"), liquidity_guard_block=True)
+    original_resolver = build_decision_snapshot.__globals__["resolve_live_profile_spec"]
+    build_decision_snapshot.__globals__["resolve_live_profile_spec"] = lambda profile: blocked_spec
+    try:
+        row = _base_signal_row()
+        row["p_down"] = 0.70
+        payload = {
+            "market": "sol",
+            "profile": "deep_otm",
+            "cycle": "15m",
+            "target": "direction",
+            "active_bundle": {},
+            "active_bundle_selection_path": "/tmp/selection.json",
+            "snapshot_ts": "2026-03-19T15-00-00Z",
+            "regime_state": {
+                "status": "ok",
+                "reason": "regime_state_built",
+                "enabled": True,
+                "state": "DEFENSE",
+                "target_state": "DEFENSE",
+                "pressure": "up",
+                "reason_codes": ["liquidity_blocked"],
+                "guard_hints": {
+                    "min_dir_prob_boost": 0.0,
+                    "disabled_offsets": [],
+                    "defense_force_with_pressure": True,
+                },
+            },
+            "offset_signals": [row],
+        }
+        quote_payload = {
+            "snapshot_ts": "2026-03-19T15-00-10Z",
+            "quote_rows": [
+                {
+                    "offset": 7,
+                    "status": "ok",
+                    "market_id": "market-1",
+                    "quote_up_ask": 0.20,
+                    "quote_down_ask": 0.29,
+                    "quote_up_bid": 0.19,
+                    "quote_down_bid": 0.28,
+                    "reasons": [],
+                }
+            ],
+        }
+        out = build_decision_snapshot(payload, quote_payload)
+    finally:
+        build_decision_snapshot.__globals__["resolve_live_profile_spec"] = original_resolver
+    assert out["decision"]["status"] == "reject"
+    assert "regime_controller" in out["applied_guard_layers"]
+    assert "regime_direction_pressure" in out["rejected_offsets"][0]["guard_reasons"]
+
+
+def test_decision_does_not_reject_when_liquidity_blocking_disabled() -> None:
     row = _base_signal_row()
-    row["p_down"] = 0.70
+    row["recommended_side"] = "UP"
+    row["p_up"] = 0.80
     payload = {
         "market": "sol",
         "profile": "deep_otm",
@@ -199,48 +303,13 @@ def test_decision_rejects_when_liquidity_guard_blocks() -> None:
             "blocked": True,
             "reason_codes": ["spot_quote_window"],
         },
-        "offset_signals": [row],
-    }
-    quote_payload = {
-        "snapshot_ts": "2026-03-19T15-00-10Z",
-        "quote_rows": [
-            {
-                "offset": 7,
-                "status": "ok",
-                "market_id": "market-1",
-                "quote_up_ask": 0.20,
-                "quote_down_ask": 0.29,
-                "quote_up_bid": 0.19,
-                "quote_down_bid": 0.28,
-                "reasons": [],
-            }
-        ],
-    }
-    out = build_decision_snapshot(payload, quote_payload)
-    assert out["decision"]["status"] == "reject"
-    assert "liquidity_guard" in out["applied_guard_layers"]
-    assert "liquidity_guard_blocked" in out["rejected_offsets"][0]["guard_reasons"]
-    assert "liquidity_spot_quote_window" in out["rejected_offsets"][0]["guard_reasons"]
-
-
-def test_decision_rejects_when_regime_direction_pressure_blocks() -> None:
-    row = _base_signal_row()
-    row["p_down"] = 0.70
-    payload = {
-        "market": "sol",
-        "profile": "deep_otm",
-        "cycle": "15m",
-        "target": "direction",
-        "active_bundle": {},
-        "active_bundle_selection_path": "/tmp/selection.json",
-        "snapshot_ts": "2026-03-19T15-00-00Z",
         "regime_state": {
             "status": "ok",
             "reason": "regime_state_built",
             "enabled": True,
             "state": "DEFENSE",
             "target_state": "DEFENSE",
-            "pressure": "up",
+            "pressure": "down",
             "reason_codes": ["liquidity_blocked"],
             "guard_hints": {
                 "min_dir_prob_boost": 0.0,
@@ -266,9 +335,10 @@ def test_decision_rejects_when_regime_direction_pressure_blocks() -> None:
         ],
     }
     out = build_decision_snapshot(payload, quote_payload)
-    assert out["decision"]["status"] == "reject"
-    assert "regime_controller" in out["applied_guard_layers"]
-    assert "regime_direction_pressure" in out["rejected_offsets"][0]["guard_reasons"]
+    assert out["decision"]["status"] == "accept"
+    guard_reasons = out["accepted_offsets"][0]["guard_reasons"]
+    assert "liquidity_guard_blocked" not in guard_reasons
+    assert "regime_direction_pressure" not in guard_reasons
 
 
 def test_decision_rejects_when_env_trade_count_cap_hits(monkeypatch) -> None:
@@ -315,6 +385,217 @@ def test_decision_rejects_when_env_trade_count_cap_hits(monkeypatch) -> None:
     assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_effective"] == 3
     assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_source"] == "PM15MIN_MAX_TRADES_PER_MARKET_SOL"
     monkeypatch.delenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", raising=False)
+
+
+def test_decision_rejects_when_repeat_same_decision_cap_hits_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", "")
+    monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET", "")
+    row = _base_signal_row()
+    row["p_down"] = 0.70
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.29,
+                "quote_up_bid": 0.19,
+                "quote_down_bid": 0.28,
+                "reasons": [],
+            }
+        ],
+    }
+
+    out = build_decision_snapshot(
+        payload,
+        quote_payload,
+        session_state={"market_offset_trade_count": {"market-1_7": 3}},
+    )
+
+    assert out["decision"]["status"] == "reject"
+    assert out["rejected_offsets"][0]["guard_reasons"] == ["max_trades_per_offset"]
+    assert out["rejected_offsets"][0]["account_context"]["session_trade_count"] == 3
+    assert out["rejected_offsets"][0]["account_context"]["session_trade_count_lock_side"] is False
+    assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_effective"] == 3
+    assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_source"] == "repeat_same_decision_max_trades"
+
+
+def test_decision_rejects_when_repeat_same_decision_cap_hits_per_side(monkeypatch) -> None:
+    monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", "")
+    monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET", "")
+    base_spec = resolve_live_profile_spec("deep_otm")
+    side_locked_spec = replace(base_spec, repeat_same_decision_lock_side=True)
+    monkeypatch.setattr("pm15min.live.signal.decision.resolve_live_profile_spec", lambda profile: side_locked_spec)
+
+    row = _base_signal_row()
+    row["p_down"] = 0.70
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.29,
+                "quote_up_bid": 0.19,
+                "quote_down_bid": 0.28,
+                "reasons": [],
+            }
+        ],
+    }
+
+    out = build_decision_snapshot(
+        payload,
+        quote_payload,
+        session_state={
+            "market_offset_trade_count": {"market-1_7": 3},
+            "market_offset_side_trade_count": {
+                "market-1_7_DOWN": 3,
+                "market-1_7_UP": 0,
+            },
+        },
+    )
+
+    assert out["decision"]["status"] == "reject"
+    assert out["rejected_offsets"][0]["guard_reasons"] == ["max_trades_per_offset"]
+    assert out["rejected_offsets"][0]["account_context"]["session_trade_count"] == 3
+    assert out["rejected_offsets"][0]["account_context"]["session_trade_count_key"] == "market-1_7_DOWN"
+    assert out["rejected_offsets"][0]["account_context"]["session_trade_count_lock_side"] is True
+
+
+def test_decision_allows_opposite_side_when_repeat_same_decision_cap_is_side_locked(monkeypatch) -> None:
+    monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", "")
+    monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET", "")
+    base_spec = resolve_live_profile_spec("deep_otm")
+    side_locked_spec = replace(base_spec, repeat_same_decision_lock_side=True)
+    monkeypatch.setattr("pm15min.live.signal.decision.resolve_live_profile_spec", lambda profile: side_locked_spec)
+
+    row = _base_signal_row()
+    row["recommended_side"] = "UP"
+    row["p_up"] = 0.70
+    row["p_down"] = 0.30
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.29,
+                "quote_down_ask": 0.20,
+                "quote_up_bid": 0.28,
+                "quote_down_bid": 0.19,
+                "reasons": [],
+            }
+        ],
+    }
+
+    out = build_decision_snapshot(
+        payload,
+        quote_payload,
+        session_state={"market_offset_trade_count": {"market-1_7": 3}},
+    )
+
+    assert out["decision"]["status"] == "accept"
+    assert out["accepted_offsets"][0]["account_context"]["session_trade_count"] == 0
+    assert out["accepted_offsets"][0]["account_context"]["session_trade_count_key"] == "market-1_7_UP"
+    assert out["accepted_offsets"][0]["account_context"]["session_trade_count_lock_side"] is True
+    assert out["accepted_offsets"][0]["account_context"]["session_trade_count_scope"] == "market_offset_side"
+
+
+def test_decision_repeat_same_decision_lock_side_uses_side_counts_when_available(monkeypatch) -> None:
+    monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", "")
+    monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET", "")
+    base_spec = resolve_live_profile_spec("deep_otm")
+    side_locked_spec = replace(base_spec, repeat_same_decision_lock_side=True)
+    monkeypatch.setattr("pm15min.live.signal.decision.resolve_live_profile_spec", lambda profile: side_locked_spec)
+    row = _base_signal_row()
+    row["recommended_side"] = "UP"
+    row["p_up"] = 0.70
+    row["p_down"] = 0.30
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.29,
+                "quote_down_ask": 0.20,
+                "quote_up_bid": 0.28,
+                "quote_down_bid": 0.19,
+                "reasons": [],
+            }
+        ],
+    }
+
+    rejected = build_decision_snapshot(
+        payload,
+        quote_payload,
+        session_state={"market_offset_side_trade_count": {"market-1_7_UP": 3}},
+    )
+
+    assert rejected["decision"]["status"] == "reject"
+    assert rejected["rejected_offsets"][0]["account_context"]["session_trade_count"] == 3
+    assert rejected["rejected_offsets"][0]["account_context"]["session_trade_count_key"] == "market-1_7_UP"
+    assert rejected["rejected_offsets"][0]["account_context"]["session_trade_count_scope"] == "market_offset_side"
+
+    row["recommended_side"] = "DOWN"
+    row["p_up"] = 0.30
+    row["p_down"] = 0.70
+    accepted = build_decision_snapshot(
+        payload,
+        quote_payload,
+        session_state={"market_offset_side_trade_count": {"market-1_7_UP": 3}},
+    )
+
+    assert accepted["decision"]["status"] == "accept"
+    assert accepted["accepted_offsets"][0]["account_context"]["session_trade_count"] == 0
+    assert accepted["accepted_offsets"][0]["account_context"]["session_trade_count_key"] == "market-1_7_DOWN"
+    assert accepted["accepted_offsets"][0]["account_context"]["session_trade_count_scope"] == "market_offset_side"
 
 
 def test_decision_rejects_when_regime_trade_count_cap_hits(monkeypatch) -> None:
@@ -386,7 +667,7 @@ def test_decision_rejects_when_regime_trade_count_cap_hits(monkeypatch) -> None:
     assert "max_trades_per_offset" in out["rejected_offsets"][0]["guard_reasons"]
     assert "regime_trade_count_cap" in out["rejected_offsets"][0]["guard_reasons"]
     assert out["rejected_offsets"][0]["account_context"]["session_trade_count"] == 1
-    assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_base"] == 0
+    assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_base"] == 3
     assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_effective"] == 1
 
 

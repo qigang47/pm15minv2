@@ -232,6 +232,10 @@ class MarketDataLayout:
         return self._cycle_asset_file(self.state_root, "orderbooks", filename="recent.parquet")
 
     @property
+    def orderbook_latest_full_snapshot_path(self) -> Path:
+        return self._cycle_asset_file(self.state_root, "orderbooks", filename="latest_full_depth.json")
+
+    @property
     def recorder_log_dir(self) -> Path:
         return self._cycle_asset_root(self.logs_root, "data", "recorders")
 
@@ -299,6 +303,7 @@ class MarketDataLayout:
             "oracle_prices_export_path": str(self.oracle_prices_export_path),
             "truth_export_path": str(self.truth_export_path),
             "orderbook_state_path": str(self.orderbook_state_path),
+            "orderbook_latest_full_snapshot_path": str(self.orderbook_latest_full_snapshot_path),
             "recorder_log_dir": str(self.recorder_log_dir),
             "recorder_log_path": str(self.recorder_log_path),
             "foundation_state_path": str(self.foundation_state_path),

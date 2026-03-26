@@ -81,8 +81,12 @@ def test_console_asset_manifest_and_sources_are_stable() -> None:
     assert "renderRuntimeBoard" in js
     assert "loadRecentTasks" in js
     assert "refreshRecentTasks" in js
+    assert "syncRecentTaskPolling" in js
     assert "openRecentTaskDrilldown" in js
     assert "pollConsoleTask" in js
+    assert "activeTaskPolls" in js
+    assert "TASK_POLL_INTERVAL_MS" in js
+    assert "TASK_POLL_MAX_CONSECUTIVE_ERRORS" in js
     assert "taskStatusPath" in js
     assert "tasksListPath" in js
     assert "ensureActionCatalog" in js
@@ -197,7 +201,10 @@ def test_console_asset_manifest_and_sources_are_stable() -> None:
     assert "已就绪：可重跑当前 suite 上下文" in js
     assert "实验快捷动作会使用当前 suite 输入和默认值" in js
     assert "后台任务仍在运行" in js
+    assert "直到任务进入终态并刷新当前分区" in js
     assert "后台任务执行成功。" in js
+    assert "最近心跳" in js
+    assert "心跳=" in js
     assert "正在加载所选详情..." in js
     assert "请选择一行后查看该分区的标准详情。" in js
     assert "扫参与因子结论" in js

@@ -935,6 +935,8 @@ def run_research_command(args: argparse.Namespace, *, deps: ResearchCliDeps) -> 
             spec_name=args.spec,
             run_label=args.run_label,
             target=args.target,
+            decision_start=args.decision_start,
+            decision_end=args.decision_end,
             bundle_label=args.bundle_label,
             secondary_bundle_label=args.secondary_bundle_label,
             fallback_reasons=_parse_string_list(args.fallback_reasons),

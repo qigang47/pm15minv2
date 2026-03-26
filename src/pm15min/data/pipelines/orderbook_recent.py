@@ -17,7 +17,7 @@ def update_recent_orderbook_index(
     now_ts_ms: int,
     window_minutes: int = DEFAULT_RECENT_ORDERBOOK_WINDOW_MINUTES,
 ) -> pd.DataFrame:
-    existing = read_parquet_if_exists(path)
+    existing = read_parquet_if_exists(path, recover_corrupt=True)
     if existing is None or existing.empty:
         combined = incoming.copy()
     elif incoming.empty:
@@ -45,4 +45,4 @@ def update_recent_orderbook_index(
 
 
 def load_recent_orderbook_index(path: Path) -> pd.DataFrame | None:
-    return read_parquet_if_exists(path)
+    return read_parquet_if_exists(path, recover_corrupt=True)

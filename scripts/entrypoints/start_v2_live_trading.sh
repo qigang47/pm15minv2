@@ -40,6 +40,82 @@ is_truthy() {
   esac
 }
 
+acquire_script_lock() {
+  local lock_root="$1"
+  local lock_dir="$2"
+  mkdir -p "$lock_root"
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    return 0
+  fi
+  local holder_pid=""
+  if [[ -f "$lock_dir/pid" ]]; then
+    holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+  fi
+  if [[ -n "$holder_pid" ]] && kill -0 "$holder_pid" 2>/dev/null; then
+    echo "Another start_v2_live_trading.sh is already running."
+    echo "  holder pid: $holder_pid"
+    echo "  lock: $lock_dir"
+    return 1
+  fi
+  echo "Removing stale script lock: $lock_dir"
+  rm -rf "$lock_dir"
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    return 0
+  fi
+  echo "Another start_v2_live_trading.sh is already running."
+  [[ -n "$holder_pid" ]] && echo "  holder pid: $holder_pid"
+  echo "  lock: $lock_dir"
+  return 1
+}
+
+release_script_lock() {
+  local lock_dir="$1"
+  local holder_pid=""
+  if [[ -f "$lock_dir/pid" ]]; then
+    holder_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+  fi
+  if [[ -z "$holder_pid" || "$holder_pid" == "$$" ]]; then
+    rm -rf "$lock_dir"
+  fi
+}
+
+runner_loop_pattern() {
+  local market="$1"
+  printf '%s' "pm15min live runner-loop --market ${market} --profile ${PROFILE} --cycle-minutes ${CYCLE_MINUTES} --target direction --adapter ${ADAPTER}"
+}
+
+runner_loop_pids() {
+  local market="$1"
+  local pattern
+  pattern="$(runner_loop_pattern "$market")"
+  pgrep -f -- "$pattern" || true
+}
+
+stop_runner_loop_for_market() {
+  local market="$1"
+  local pids=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(runner_loop_pids "$market")
+  if [[ ${#pids[@]} -eq 0 ]]; then
+    echo "No existing runner-loop found for market=${market}"
+    return 0
+  fi
+  echo "Stopping runner-loop market=${market} pids=${pids[*]}"
+  kill "${pids[@]}" 2>/dev/null || true
+  sleep 1
+  local remaining=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && remaining+=("$pid")
+  done < <(runner_loop_pids "$market")
+  if [[ ${#remaining[@]} -gt 0 ]]; then
+    echo "Force stopping runner-loop market=${market} pids=${remaining[*]}"
+    kill -9 "${remaining[@]}" 2>/dev/null || true
+  fi
+}
+
 ENABLE_ORDERBOOK_FLEET=0
 ENABLE_AUTO_REDEEM=0
 ENABLE_FOUNDATION=0
@@ -121,8 +197,12 @@ NO_FOUNDATION="${V2_LIVE_NO_FOUNDATION:-0}"
 NO_DIRECT_ORACLE="${V2_LIVE_NO_DIRECT_ORACLE:-0}"
 NO_ORDERBOOKS="${V2_LIVE_NO_ORDERBOOKS:-0}"
 LOG_DIR="${V2_LIVE_LOG_DIR:-$PROJECT_DIR/var/live/logs/entrypoints}"
+LOCK_ROOT="${PROJECT_DIR}/var/live/locks"
+SCRIPT_LOCK_DIR="${LOCK_ROOT}/start_v2_live_trading.profile=${PROFILE}.cycle=${CYCLE_MINUTES}.adapter=${ADAPTER}"
 
 mkdir -p "$LOG_DIR"
+acquire_script_lock "$LOCK_ROOT" "$SCRIPT_LOCK_DIR"
+trap 'release_script_lock "$SCRIPT_LOCK_DIR"' EXIT
 
 echo "============================================="
 echo "Starting v2 canonical live runner loops"
@@ -162,33 +242,36 @@ for market in "${MARKETS_LIST[@]}"; do
     --probe-open-orders \
     --probe-positions
 
-  "$PYTHON_BIN" -m pm15min live runner-once \
-    --market "$market" \
-    --profile "$PROFILE" \
-    --cycle-minutes "$CYCLE_MINUTES" \
-    --target direction \
-    --adapter "$ADAPTER" \
-    --dry-run-side-effects
-
-  "$PYTHON_BIN" -m pm15min live show-ready \
-    --market "$market" \
-    --profile "$PROFILE" \
-    --cycle-minutes "$CYCLE_MINUTES" \
-    --target direction \
+  runner_once_cmd=(
+    "$PYTHON_BIN" -m pm15min live runner-once
+    --market "$market"
+    --profile "$PROFILE"
+    --cycle-minutes "$CYCLE_MINUTES"
+    --target direction
     --adapter "$ADAPTER"
-
-  "$PYTHON_BIN" -m pm15min live show-latest-runner \
-    --market "$market" \
-    --profile "$PROFILE" \
-    --cycle-minutes "$CYCLE_MINUTES" \
-    --target direction \
-    --risk-only
+    --dry-run-side-effects
+    --no-persist
+  )
+  if is_truthy "$NO_FOUNDATION"; then
+    runner_once_cmd+=(--no-foundation)
+  fi
+  if is_truthy "$NO_DIRECT_ORACLE"; then
+    runner_once_cmd+=(--no-direct-oracle)
+  fi
+  if is_truthy "$NO_ORDERBOOKS"; then
+    runner_once_cmd+=(--no-orderbooks)
+  fi
+  if is_truthy "$NO_SIDE_EFFECTS"; then
+    runner_once_cmd+=(--no-side-effects)
+  fi
+  "${runner_once_cmd[@]}"
   echo ""
 done
 
-echo "Stopping previous v2 runner loops for profile=${PROFILE} ..."
-pkill -f "pm15min live runner-loop .*--profile ${PROFILE}" || true
-sleep 1
+echo "Stopping previous v2 runner loops ..."
+for market in "${MARKETS_LIST[@]}"; do
+  stop_runner_loop_for_market "$market"
+done
 
 for market in "${MARKETS_LIST[@]}"; do
   log_path="$LOG_DIR/runner_loop_${market}_${PROFILE}.out"
@@ -220,8 +303,23 @@ for market in "${MARKETS_LIST[@]}"; do
   fi
 
   nohup "${cmd[@]}" >> "$log_path" 2>&1 &
-  echo "started v2 runner-loop: market=${market} pid=$!"
+  pid="$!"
+  sleep 1
+  active_pids=()
+  while IFS= read -r active_pid; do
+    [[ -n "$active_pid" ]] && active_pids+=("$active_pid")
+  done < <(runner_loop_pids "$market")
+  if [[ ${#active_pids[@]} -eq 0 ]]; then
+    echo "failed to start v2 runner-loop: market=${market}"
+    exit 1
+  fi
+  if [[ ${#active_pids[@]} -gt 1 ]]; then
+    echo "duplicate runner-loop detected after start: market=${market} pids=${active_pids[*]}"
+    exit 1
+  fi
+  echo "started v2 runner-loop: market=${market} pid=${active_pids[0]} requested_pid=${pid}"
   echo "  wrapper log: $log_path"
+  echo "  match pattern: $(runner_loop_pattern "$market")"
 done
 
 if [[ "$ENABLE_AUTO_REDEEM" == "1" ]]; then
@@ -238,5 +336,6 @@ fi
 
 echo ""
 echo "Canonical operator checks:"
+echo "  preflight runner-once used --no-persist, so show-ready/show-latest-runner will reflect the new daemon after its first persisted iteration"
 echo "  PYTHONPATH=src python -m pm15min live show-ready --market sol --profile deep_otm --adapter ${ADAPTER}"
 echo "  PYTHONPATH=src python -m pm15min live show-latest-runner --market sol --profile deep_otm --risk-only"

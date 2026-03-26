@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -245,6 +247,7 @@ def test_apply_redeem_policy_reports_missing_redeem_config_without_gateway(tmp_p
 def test_submit_execution_payload_places_order(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
+    _patch_action_snapshot_labels(monkeypatch, ["2026-03-20T00-08-10Z"])
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
     gateway = FakeGateway(
         place_order_result=PlaceOrderResult(success=True, status="live", order_id="order-123")
@@ -351,6 +354,319 @@ def test_submit_execution_payload_skips_duplicate_success(tmp_path: Path, monkey
     assert len(gateway.place_order_calls) == 1
 
 
+def test_submit_execution_payload_uses_explicit_window_bounds(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setattr("pm15min.live.actions.utc_snapshot_label", lambda: "2026-03-20T00-08-10Z")
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    gateway = FakeGateway(
+        place_order_result=PlaceOrderResult(success=True, status="live", order_id="order-123")
+    )
+
+    payload = submit_execution_payload(
+        cfg,
+        execution_payload={
+            "snapshot_ts": "2026-03-20T00-00-01Z",
+            "market": "sol",
+            "profile": "deep_otm",
+            "cycle": "15m",
+            "target": "direction",
+            "execution": {
+                "status": "plan",
+                "reason": None,
+                "selected_offset": 7,
+                "selected_side": "UP",
+                "decision_ts": "2026-03-20T00:07:00+00:00",
+                "window_start_ts": "2026-03-20T00:08:00+00:00",
+                "window_end_ts": "2026-03-20T00:09:00+00:00",
+                "window_duration_seconds": 60.0,
+                "market_id": "market-1",
+                "token_id": "token-up",
+                "order_type": "FAK",
+                "entry_price": 0.20,
+                "requested_notional_usd": 1.0,
+                "requested_shares": 5.0,
+                "repriced_metrics": {
+                    "repriced_roi_net": 0.12,
+                    "repriced_roi_threshold_required": 0.0,
+                },
+            },
+        },
+        persist=True,
+        refresh_account_state=False,
+        dry_run=False,
+        gateway=gateway,
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["reason"] == "order_submitted"
+    assert payload["decision_window_source"] == "explicit_window"
+    assert payload["decision_window_start_ts"] == "2026-03-20T00:08:00+00:00"
+    assert payload["decision_window_end_ts"] == "2026-03-20T00:09:00+00:00"
+    assert payload["decision_age_seconds"] == 10.0
+    assert payload["decision_window_remaining_seconds"] == 50.0
+    assert len(gateway.place_order_calls) == 1
+
+
+def test_submit_execution_payload_serializes_duplicate_submit_under_lock(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setattr("pm15min.live.actions.utc_snapshot_label", lambda: "2026-03-20T00-08-10Z")
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    entered_event = threading.Event()
+    release_event = threading.Event()
+
+    class BlockingGateway(FakeGateway):
+        def place_order(self, request):
+            self.place_order_calls.append(request)
+            entered_event.set()
+            if not release_event.wait(timeout=2.0):
+                raise RuntimeError("lock_test_timeout")
+            return self.place_order_result
+
+    gateway = BlockingGateway(
+        place_order_result=PlaceOrderResult(success=True, status="live", order_id="order-123")
+    )
+    execution_payload = {
+        "snapshot_ts": "2026-03-20T00-00-01Z",
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "execution": {
+            "status": "plan",
+            "reason": None,
+            "selected_offset": 7,
+            "selected_side": "UP",
+            "decision_ts": "2026-03-20T00:08:00+00:00",
+            "window_start_ts": "2026-03-20T00:08:00+00:00",
+            "window_end_ts": "2026-03-20T00:09:00+00:00",
+            "window_duration_seconds": 60.0,
+            "market_id": "market-1",
+            "token_id": "token-up",
+            "order_type": "FAK",
+            "entry_price": 0.20,
+            "requested_notional_usd": 1.0,
+            "requested_shares": 5.0,
+            "repriced_metrics": {
+                "repriced_roi_net": 0.12,
+                "repriced_roi_threshold_required": 0.0,
+            },
+        },
+    }
+    results: list[dict[str, object] | None] = [None, None]
+
+    def _submit(idx: int) -> None:
+        results[idx] = submit_execution_payload(
+            cfg,
+            execution_payload=execution_payload,
+            persist=True,
+            refresh_account_state=False,
+            dry_run=False,
+            gateway=gateway,
+        )
+
+    first = threading.Thread(target=_submit, args=(0,))
+    second = threading.Thread(target=_submit, args=(1,))
+    first.start()
+    assert entered_event.wait(timeout=2.0)
+    second.start()
+    time.sleep(0.1)
+    assert len(gateway.place_order_calls) == 1
+    release_event.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert all(result is not None for result in results)
+    reasons = {str(result["reason"]) for result in results if result is not None}
+    statuses = {str(result["status"]) for result in results if result is not None}
+    assert reasons == {"order_submitted", "action_already_succeeded"}
+    assert statuses == {"ok", "skipped"}
+    assert len(gateway.place_order_calls) == 1
+
+
+def test_submit_execution_payload_preserves_duplicate_guard_across_no_action_cycles(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    _patch_action_snapshot_labels(
+        monkeypatch,
+        ["2026-03-20T00-00-00Z", "2026-03-20T00-00-01Z", "2026-03-20T00-00-02Z"],
+    )
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    gateway = FakeGateway(
+        place_order_result=PlaceOrderResult(success=True, status="live", order_id="order-123")
+    )
+    planned_payload = {
+        "snapshot_ts": "2026-03-20T00-00-01Z",
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "execution": {
+            "status": "plan",
+            "reason": None,
+            "selected_offset": 7,
+            "selected_side": "UP",
+            "decision_ts": "2026-03-20T00:08:00+00:00",
+            "market_id": "market-1",
+            "token_id": "token-up",
+            "order_type": "FAK",
+            "entry_price": 0.20,
+            "requested_notional_usd": 1.0,
+            "requested_shares": 5.0,
+            "repriced_metrics": {
+                "repriced_roi_net": 0.12,
+                "repriced_roi_threshold_required": 0.0,
+            },
+        },
+    }
+    no_action_payload = {
+        **planned_payload,
+        "execution": {
+            "status": "no_action",
+            "reason": "decision_reject",
+            "selected_offset": None,
+            "selected_side": None,
+            "decision_ts": None,
+            "market_id": None,
+            "token_id": None,
+            "order_type": None,
+            "entry_price": None,
+            "requested_notional_usd": None,
+            "requested_shares": None,
+            "repriced_metrics": {},
+        },
+    }
+
+    first = submit_execution_payload(
+        cfg,
+        execution_payload=planned_payload,
+        persist=True,
+        refresh_account_state=False,
+        dry_run=False,
+        gateway=gateway,
+    )
+    skipped = submit_execution_payload(
+        cfg,
+        execution_payload=no_action_payload,
+        persist=True,
+        refresh_account_state=False,
+        dry_run=False,
+        gateway=gateway,
+    )
+    second = submit_execution_payload(
+        cfg,
+        execution_payload=planned_payload,
+        persist=True,
+        refresh_account_state=False,
+        dry_run=False,
+        gateway=gateway,
+    )
+
+    assert first["status"] == "ok"
+    assert skipped["status"] == "skipped"
+    assert skipped["reason"] == "execution_not_plan:no_action"
+    assert second["status"] == "skipped"
+    assert second["reason"] == "action_already_succeeded"
+    assert len(gateway.place_order_calls) == 1
+
+
+def test_submit_execution_payload_uses_session_gate_state_for_nonconsecutive_duplicates(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    _patch_action_snapshot_labels(
+        monkeypatch,
+        ["2026-03-20T00-00-00Z", "2026-03-20T00-00-01Z", "2026-03-20T00-00-02Z"],
+    )
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    gateway = FakeGateway(
+        place_order_result=PlaceOrderResult(success=True, status="live", order_id="order-123")
+    )
+    session_state: dict[str, object] = {}
+    first_payload = {
+        "snapshot_ts": "2026-03-20T00-00-01Z",
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "execution": {
+            "status": "plan",
+            "reason": None,
+            "selected_offset": 7,
+            "selected_side": "UP",
+            "decision_ts": "2026-03-20T00:08:00+00:00",
+            "market_id": "market-1",
+            "token_id": "token-up",
+            "order_type": "FAK",
+            "entry_price": 0.20,
+            "requested_notional_usd": 1.0,
+            "requested_shares": 5.0,
+            "repriced_metrics": {
+                "repriced_roi_net": 0.12,
+                "repriced_roi_threshold_required": 0.0,
+            },
+        },
+    }
+    second_payload = {
+        "snapshot_ts": "2026-03-20T00-00-01Z",
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "execution": {
+            "status": "plan",
+            "reason": None,
+            "selected_offset": 8,
+            "selected_side": "DOWN",
+            "decision_ts": "2026-03-20T00:09:00+00:00",
+            "market_id": "market-1",
+            "token_id": "token-down",
+            "order_type": "FAK",
+            "entry_price": 0.18,
+            "requested_notional_usd": 1.0,
+            "requested_shares": 5.5555555556,
+            "repriced_metrics": {
+                "repriced_roi_net": 0.10,
+                "repriced_roi_threshold_required": 0.0,
+            },
+        },
+    }
+
+    first = submit_execution_payload(
+        cfg,
+        execution_payload=first_payload,
+        persist=True,
+        refresh_account_state=False,
+        dry_run=False,
+        session_state=session_state,
+        gateway=gateway,
+    )
+    second = submit_execution_payload(
+        cfg,
+        execution_payload=second_payload,
+        persist=True,
+        refresh_account_state=False,
+        dry_run=False,
+        session_state=session_state,
+        gateway=gateway,
+    )
+    third = submit_execution_payload(
+        cfg,
+        execution_payload=first_payload,
+        persist=True,
+        refresh_account_state=False,
+        dry_run=False,
+        session_state=session_state,
+        gateway=gateway,
+    )
+
+    assert first["status"] == "ok"
+    assert second["status"] == "ok"
+    assert third["status"] == "skipped"
+    assert third["reason"] == "action_already_succeeded"
+    assert len(gateway.place_order_calls) == 2
+
+
 def test_submit_execution_payload_throttles_recent_failure(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
@@ -409,6 +725,134 @@ def test_submit_execution_payload_throttles_recent_failure(tmp_path: Path, monke
     assert second["reason"] == "action_retry_throttled_recent_failure"
     assert second["attempt"] == 1
     assert len(gateway.place_order_calls) == 1
+
+
+def test_submit_execution_payload_uses_stable_window_action_key_across_reprices(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    _patch_action_snapshot_labels(
+        monkeypatch,
+        ["2026-03-20T00-08-05Z", "2026-03-20T00-08-10Z"],
+    )
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    gateway = FakeGateway(
+        place_order_result=PlaceOrderResult(success=True, status="live", order_id="order-123")
+    )
+    first_payload = {
+        "snapshot_ts": "2026-03-20T00-08-01Z",
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "execution": {
+            "status": "plan",
+            "reason": None,
+            "selected_offset": 7,
+            "selected_side": "UP",
+            "decision_ts": "2026-03-20T00:08:00+00:00",
+            "window_start_ts": "2026-03-20T00:08:00+00:00",
+            "window_end_ts": "2026-03-20T00:09:00+00:00",
+            "window_duration_seconds": 60.0,
+            "market_id": "market-1",
+            "token_id": "token-up",
+            "order_type": "FAK",
+            "entry_price": 0.20,
+            "requested_notional_usd": 1.0,
+            "requested_shares": 5.0,
+            "repriced_metrics": {
+                "repriced_roi_net": 0.12,
+                "repriced_roi_threshold_required": 0.0,
+            },
+        },
+    }
+    second_payload = {
+        **first_payload,
+        "execution": {
+            **first_payload["execution"],
+            "entry_price": 0.21,
+            "requested_shares": 4.7619047619,
+        },
+    }
+
+    first = submit_execution_payload(
+        cfg,
+        execution_payload=first_payload,
+        persist=True,
+        refresh_account_state=False,
+        dry_run=False,
+        session_state={},
+        gateway=gateway,
+    )
+    second = submit_execution_payload(
+        cfg,
+        execution_payload=second_payload,
+        persist=True,
+        refresh_account_state=False,
+        dry_run=False,
+        session_state={},
+        gateway=gateway,
+    )
+
+    assert first["status"] == "ok"
+    assert second["status"] == "skipped"
+    assert second["reason"] == "action_already_succeeded"
+    assert first["action_key"] == second["action_key"]
+    assert len(gateway.place_order_calls) == 1
+
+
+def test_submit_execution_payload_skips_stale_decision(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    _patch_action_snapshot_labels(monkeypatch, ["2026-03-20T00-10-10Z"])
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    gateway = FakeGateway(
+        place_order_result=PlaceOrderResult(success=True, status="live", order_id="order-123")
+    )
+    execution_payload = {
+        "snapshot_ts": "2026-03-20T00-10-00Z",
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "execution": {
+            "status": "plan",
+            "reason": None,
+            "selected_offset": 7,
+            "selected_side": "UP",
+            "decision_ts": "2026-03-20T00:08:00+00:00",
+            "window_start_ts": "2026-03-20T00:07:00+00:00",
+            "window_end_ts": "2026-03-20T00:08:00+00:00",
+            "window_duration_seconds": 60.0,
+            "market_id": "market-1",
+            "token_id": "token-up",
+            "order_type": "FAK",
+            "entry_price": 0.20,
+            "requested_notional_usd": 1.0,
+            "requested_shares": 5.0,
+            "repriced_metrics": {
+                "repriced_roi_net": 0.12,
+                "repriced_roi_threshold_required": 0.0,
+            },
+        },
+    }
+
+    payload = submit_execution_payload(
+        cfg,
+        execution_payload=execution_payload,
+        persist=True,
+        refresh_account_state=False,
+        dry_run=False,
+        gateway=gateway,
+    )
+
+    assert payload["status"] == "skipped"
+    assert payload["reason"] == "decision_stale"
+    assert payload["decision_window_start_ts"] == "2026-03-20T00:07:00+00:00"
+    assert payload["decision_window_end_ts"] == "2026-03-20T00:08:00+00:00"
+    assert payload["decision_age_seconds"] == 190.0
+    assert payload["decision_window_remaining_seconds"] == 0.0
+    assert payload["max_decision_age_seconds"] == 60.0
+    assert len(gateway.place_order_calls) == 0
 
 
 def test_apply_cancel_policy_throttles_recent_failure(tmp_path: Path, monkeypatch) -> None:

@@ -44,6 +44,37 @@ def test_apply_decision_engine_parity_prefers_best_roi_net_side() -> None:
     assert out.loc[0, "decision_engine_roi_net"] == pytest.approx(1.1)
 
 
+def test_apply_decision_engine_parity_supports_custom_columns_and_probability_boost() -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                "my_offset": 7,
+                "prob_up": 0.56,
+                "prob_down": 0.44,
+                "up_ask": 0.30,
+                "down_ask": 0.40,
+                "boost": 0.05,
+            }
+        ]
+    )
+
+    out = apply_decision_engine_parity(
+        rows,
+        config=DecisionEngineParityConfig(min_dir_prob_default=0.52),
+        offset_column="my_offset",
+        p_up_column="prob_up",
+        p_down_column="prob_down",
+        up_price_columns=("up_ask",),
+        down_price_columns=("down_ask",),
+        min_dir_prob_boost_column="boost",
+    )
+
+    assert out.loc[0, "decision_engine_action"] == "reject"
+    assert out.loc[0, "decision_engine_reason"] == "direction_prob"
+    assert pd.isna(out.loc[0, "decision_engine_side"])
+    assert out.loc[0, "decision_engine_probability_gap"] == pytest.approx(0.12)
+
+
 def test_evaluate_decision_engine_side_breaks_roi_net_ties_on_probability() -> None:
     decision = evaluate_decision_engine_side(
         offset=7,

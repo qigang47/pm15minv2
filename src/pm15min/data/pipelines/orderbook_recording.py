@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -9,6 +10,7 @@ import pandas as pd
 from ..config import DataConfig
 from ..contracts import OrderbookIndexRow, OrderbookSnapshotRecord
 from ..io.ndjson_zst import append_ndjson_zst, iter_ndjson_zst
+from ..io.json_files import write_json_atomic
 from ..io.parquet import read_parquet_if_exists, upsert_parquet
 from .market_catalog import sync_market_catalog
 from .orderbook_recent import update_recent_orderbook_index
@@ -16,6 +18,11 @@ from ..sources.orderbook_provider import DirectOrderbookProvider, OrderbookProvi
 from ..sources.polymarket_clob import PolymarketClobClient, normalize_book
 from ..sources.polymarket_gamma import GammaEventsClient
 
+
+DEFAULT_LIVE_MARKET_CATALOG_MAX_AGE_SECONDS = 300.0
+DEFAULT_LIVE_MARKET_CATALOG_NO_LIVE_RETRY_SECONDS = 60.0
+DEFAULT_LIVE_MARKET_CATALOG_LOOKBACK_HOURS = 24
+DEFAULT_LIVE_MARKET_CATALOG_LOOKAHEAD_HOURS = 24
 
 MARKET_TABLE_REQUIRED = [
     "market_id",
@@ -42,21 +49,26 @@ def _day_str_from_ts_ms(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
-def _select_markets(df: pd.DataFrame, *, now_ts: int, market_depth: int) -> pd.DataFrame:
+def _select_markets(
+    df: pd.DataFrame,
+    *,
+    now_ts: int,
+    market_depth: int,
+    market_start_offset: int = 0,
+) -> pd.DataFrame:
     active = df[(df["cycle_start_ts"] <= now_ts) & (df["cycle_end_ts"] > now_ts)].copy()
     future = df[df["cycle_start_ts"] > now_ts].copy().sort_values(["cycle_start_ts", "market_id"])
-
-    if len(active) >= market_depth:
-        selected = active.sort_values(["cycle_start_ts", "market_id"]).head(market_depth)
-    else:
-        needed = max(0, int(market_depth) - len(active))
-        selected = pd.concat(
-            [
-                active.sort_values(["cycle_start_ts", "market_id"]),
-                future.head(needed),
-            ],
-            ignore_index=True,
-        )
+    ordered = pd.concat(
+        [
+            active.sort_values(["cycle_start_ts", "market_id"]),
+            future,
+        ],
+        ignore_index=True,
+    )
+    offset = max(0, int(market_start_offset))
+    if offset > 0:
+        ordered = ordered.iloc[offset:].copy()
+    selected = ordered.head(max(1, int(market_depth))).copy()
     return selected.reset_index(drop=True)
 
 
@@ -112,26 +124,91 @@ def _load_market_table(
     captured_ts_ms: int | None = None,
     gamma_client: GammaEventsClient | None = None,
 ) -> pd.DataFrame:
-    df = read_parquet_if_exists(cfg.layout.market_catalog_table_path)
-    if (df is None or df.empty) and cfg.surface == "live":
-        now = datetime.fromtimestamp((captured_ts_ms or int(time.time() * 1000)) / 1000.0, tz=timezone.utc)
+    target_path = cfg.layout.market_catalog_table_path
+    captured_ts_ms = int(captured_ts_ms or time.time() * 1000)
+    now = datetime.fromtimestamp(captured_ts_ms / 1000.0, tz=timezone.utc)
+    now_ts = int(captured_ts_ms // 1000)
+    df = read_parquet_if_exists(target_path)
+    if cfg.surface == "live" and _live_market_catalog_refresh_reason(
+        target_path=target_path,
+        frame=df,
+        now_ts=now_ts,
+        now_utc=now,
+    ):
         sync_market_catalog(
             cfg,
-            start_ts=int((now - pd.Timedelta(hours=24)).timestamp()),
-            end_ts=int((now + pd.Timedelta(hours=24)).timestamp()),
+            start_ts=int((now - pd.Timedelta(hours=DEFAULT_LIVE_MARKET_CATALOG_LOOKBACK_HOURS)).timestamp()),
+            end_ts=int((now + pd.Timedelta(hours=DEFAULT_LIVE_MARKET_CATALOG_LOOKAHEAD_HOURS)).timestamp()),
             client=gamma_client,
             now=now,
         )
-        df = read_parquet_if_exists(cfg.layout.market_catalog_table_path)
+        df = read_parquet_if_exists(target_path)
     if df is None or df.empty:
         raise FileNotFoundError(
-            f"Missing canonical market catalog: {cfg.layout.market_catalog_table_path}. "
+            f"Missing canonical market catalog: {target_path}. "
             "Run `pm15min data sync market-catalog` first."
         )
     missing = [column for column in MARKET_TABLE_REQUIRED if column not in df.columns]
     if missing:
         raise KeyError(f"Market catalog missing required columns: {missing}")
+    if cfg.surface == "live" and not _has_active_or_future_rows(df, now_ts=now_ts):
+        raise RuntimeError(
+            f"live market catalog has no active or future markets: {target_path}"
+        )
     return df.copy()
+
+
+def _live_market_catalog_refresh_reason(
+    *,
+    target_path,
+    frame: pd.DataFrame | None,
+    now_ts: int,
+    now_utc: datetime,
+) -> str | None:
+    if frame is None or frame.empty:
+        return "missing_or_empty"
+    age_seconds = _path_age_seconds(target_path=target_path, now_utc=now_utc)
+    max_age_seconds = _env_float(
+        "PM15MIN_LIVE_MARKET_CATALOG_MAX_AGE_SECONDS",
+        default=DEFAULT_LIVE_MARKET_CATALOG_MAX_AGE_SECONDS,
+    )
+    if age_seconds is None or age_seconds > max(0.0, float(max_age_seconds)):
+        return "stale"
+    if _has_active_or_future_rows(frame, now_ts=now_ts):
+        return None
+    no_live_retry_seconds = _env_float(
+        "PM15MIN_ORDERBOOK_MARKET_CATALOG_NO_LIVE_RETRY_SECONDS",
+        default=DEFAULT_LIVE_MARKET_CATALOG_NO_LIVE_RETRY_SECONDS,
+    )
+    if age_seconds >= max(0.0, float(no_live_retry_seconds)):
+        return "no_active_or_future_rows"
+    return None
+
+
+def _has_active_or_future_rows(frame: pd.DataFrame, *, now_ts: int) -> bool:
+    if frame.empty:
+        return False
+    cycle_end_ts = pd.to_numeric(frame.get("cycle_end_ts"), errors="coerce")
+    return bool(cycle_end_ts.gt(int(now_ts)).fillna(False).any())
+
+
+def _path_age_seconds(*, target_path, now_utc: datetime) -> float | None:
+    try:
+        if not target_path.exists():
+            return None
+        return max(0.0, float(now_utc.timestamp() - target_path.stat().st_mtime))
+    except Exception:
+        return None
+
+
+def _env_float(name: str, *, default: float) -> float:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
 
 
 def _parse_ts_ms(value: object) -> int | None:
@@ -240,7 +317,12 @@ def record_orderbooks_once(
         captured_ts_ms=captured_ts_ms,
         gamma_client=gamma_client,
     )
-    selected = _select_markets(markets, now_ts=now_ts, market_depth=cfg.market_depth)
+    selected = _select_markets(
+        markets,
+        now_ts=now_ts,
+        market_depth=cfg.market_depth,
+        market_start_offset=cfg.market_start_offset,
+    )
     selected_tokens = sorted(
         {
             str(token_id).strip()
@@ -301,6 +383,7 @@ def record_orderbooks_once(
         incoming=index_df,
         key_columns=["captured_ts_ms", "market_id", "token_id", "side"],
         sort_columns=["captured_ts_ms", "market_id", "token_id", "side"],
+        recover_existing_read_errors=True,
     )
     recent_df = update_recent_orderbook_index(
         path=cfg.layout.orderbook_recent_path,
@@ -308,6 +391,17 @@ def record_orderbooks_once(
         now_ts_ms=captured_ts_ms,
         window_minutes=recent_window_minutes,
     )
+    latest_full_snapshot_payload = {
+        "dataset": "orderbook_latest_full_snapshot",
+        "market": cfg.asset.slug,
+        "cycle": cfg.cycle,
+        "captured_ts_ms": int(captured_ts_ms),
+        "selected_markets": int(len(selected)),
+        "market_start_offset": int(cfg.market_start_offset),
+        "selected_market_ids": selected["market_id"].astype(str).tolist(),
+        "records": [snapshot.to_row() for snapshot in snapshots],
+    }
+    write_json_atomic(latest_full_snapshot_payload, cfg.layout.orderbook_latest_full_snapshot_path)
 
     return {
         "dataset": "orderbook_depth",
@@ -315,10 +409,13 @@ def record_orderbooks_once(
         "cycle": cfg.cycle,
         "captured_ts_ms": captured_ts_ms,
         "selected_markets": int(len(selected)),
+        "market_start_offset": int(cfg.market_start_offset),
+        "selected_market_ids": selected["market_id"].astype(str).tolist(),
         "snapshot_rows": int(len(snapshots)),
         "depth_path": str(cfg.layout.orderbook_depth_path(date_str)),
         "index_path": str(cfg.layout.orderbook_index_path(date_str)),
         "recent_path": str(cfg.layout.orderbook_recent_path),
+        "latest_full_snapshot_path": str(cfg.layout.orderbook_latest_full_snapshot_path),
         "recent_rows": int(len(recent_df)),
         "recent_window_minutes": int(recent_window_minutes),
     }
@@ -348,6 +445,7 @@ def build_orderbook_index_from_depth(
         incoming=index_df,
         key_columns=["captured_ts_ms", "market_id", "token_id", "side"],
         sort_columns=["captured_ts_ms", "market_id", "token_id", "side"],
+        recover_existing_read_errors=True,
     )
     return {
         "dataset": "orderbook_index",

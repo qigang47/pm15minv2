@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import pm15min.research.backtests.orderbook_surface as orderbook_surface_module
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.backtests.guard_parity import apply_live_guard_parity
@@ -53,7 +54,7 @@ def _sample_oracle_prices(asset: str, *, cycle_start_ts: int, n_cycles: int, pri
     return pd.DataFrame(rows)
 
 
-def test_attach_canonical_quote_surface_reads_orderbook_index(tmp_path: Path) -> None:
+def test_attach_canonical_quote_surface_reads_orderbook_index_once_per_date(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
     write_parquet_atomic(
@@ -100,6 +101,15 @@ def test_attach_canonical_quote_surface_reads_orderbook_index(tmp_path: Path) ->
         data_cfg.layout.orderbook_index_path("2026-03-01"),
     )
 
+    load_count = {"value": 0}
+    original_loader = orderbook_surface_module.load_orderbook_index_frame
+
+    def _counting_loader(*, index_path, recent_path=None):
+        load_count["value"] += 1
+        return original_loader(index_path=index_path, recent_path=recent_path)
+
+    monkeypatch.setattr(orderbook_surface_module, "load_orderbook_index_frame", _counting_loader)
+
     replay = pd.DataFrame(
         [
             {
@@ -109,13 +119,22 @@ def test_attach_canonical_quote_surface_reads_orderbook_index(tmp_path: Path) ->
                 "offset": 7,
                 "market_id": "m-1",
                 "condition_id": "c-1",
+            },
+            {
+                "decision_ts": "2026-03-01T00:02:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 8,
+                "market_id": "m-1",
+                "condition_id": "c-1",
             }
         ]
     )
 
     out, summary = attach_canonical_quote_surface(replay=replay, data_cfg=data_cfg)
 
-    assert summary.quote_ready_rows == 1
+    assert load_count["value"] == 1
+    assert summary.quote_ready_rows == 2
     assert out.loc[0, "quote_status"] == "ok"
     assert out.loc[0, "token_up"] == "tok-up"
     assert float(out.loc[0, "quote_up_ask"]) == 0.41

@@ -106,6 +106,7 @@ def test_build_raw_depth_replay_frame_pairs_legacy_multi_snapshot_buckets(tmp_pa
 
     assert len(out) == 3
     assert out["depth_snapshot_rank"].tolist() == [1, 2, 3]
+    assert out["depth_candidate_total_count"].tolist() == [3, 3, 3]
     assert out["depth_snapshot_status"].tolist() == ["ok", "ok", "partial"]
     assert out["depth_snapshot_reason"].tolist() == ["", "", "down_snapshot_missing"]
     assert out["depth_match_strategy"].tolist() == ["decision_key", "decision_key", "decision_key"]
@@ -127,6 +128,260 @@ def test_build_raw_depth_replay_frame_pairs_legacy_multi_snapshot_buckets(tmp_pa
     assert summary.replay_rows_with_snapshots == 1
     assert summary.replay_rows_without_snapshots == 0
     assert heartbeats == ["Scanning depth replay file 1/1: 2026-03-01"]
+
+
+def test_build_raw_depth_replay_frame_matches_legacy_one_minute_shifted_decision_key(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    append_ndjson_zst(
+        data_cfg.layout.orderbook_depth_path("2026-03-01"),
+        [
+            {
+                "logged_at": "2026-03-01T00:07:00.100000+00:00",
+                "market_id": "m-shift",
+                "token_id": "tok-up",
+                "side": "up",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:07:00Z",
+                "asks": [[0.41, 10.0]],
+                "bids": [[0.39, 6.0]],
+            },
+            {
+                "logged_at": "2026-03-01T00:07:00.100000+00:00",
+                "market_id": "m-shift",
+                "token_id": "tok-down",
+                "side": "down",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:07:00Z",
+                "asks": [[0.59, 9.0]],
+                "bids": [[0.57, 5.0]],
+            },
+        ],
+    )
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:08:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-shift",
+                "token_up": "tok-up",
+                "token_down": "tok-down",
+            }
+        ]
+    )
+
+    out, summary = build_raw_depth_replay_frame(
+        replay=replay,
+        data_cfg=data_cfg,
+    )
+
+    assert len(out) == 1
+    assert out.iloc[0]["depth_match_strategy"] == "decision_key"
+    assert out.iloc[0]["depth_snapshot_status"] == "ok"
+    assert summary.raw_record_matches == 2
+    assert summary.replay_rows_with_snapshots == 1
+
+
+def test_build_raw_depth_replay_frame_scans_previous_day_for_shifted_midnight_key(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    append_ndjson_zst(
+        data_cfg.layout.orderbook_depth_path("2026-03-01"),
+        [
+            {
+                "logged_at": "2026-03-01T23:59:00.100000+00:00",
+                "market_id": "m-midnight",
+                "token_id": "tok-up",
+                "side": "up",
+                "offset": 0,
+                "decision_ts": "2026-03-01T23:59:00Z",
+                "asks": [[0.41, 10.0]],
+                "bids": [[0.39, 6.0]],
+            },
+            {
+                "logged_at": "2026-03-01T23:59:00.100000+00:00",
+                "market_id": "m-midnight",
+                "token_id": "tok-down",
+                "side": "down",
+                "offset": 0,
+                "decision_ts": "2026-03-01T23:59:00Z",
+                "asks": [[0.59, 9.0]],
+                "bids": [[0.57, 5.0]],
+            },
+        ],
+    )
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-02T00:00:00Z",
+                "cycle_start_ts": "2026-03-01T23:45:00Z",
+                "cycle_end_ts": "2026-03-02T00:00:00Z",
+                "offset": 0,
+                "market_id": "m-midnight",
+                "token_up": "tok-up",
+                "token_down": "tok-down",
+            }
+        ]
+    )
+
+    out, summary = build_raw_depth_replay_frame(
+        replay=replay,
+        data_cfg=data_cfg,
+    )
+
+    assert len(out) == 1
+    assert out.iloc[0]["depth_match_strategy"] == "decision_key"
+    assert summary.source_files_scanned == 1
+    assert summary.replay_rows_with_snapshots == 1
+
+
+def test_build_raw_depth_replay_frame_caps_retained_snapshots_per_replay_row(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    append_ndjson_zst(
+        data_cfg.layout.orderbook_depth_path("2026-03-01"),
+        [
+            {
+                "logged_at": "2026-03-01T00:05:00.300000+00:00",
+                "market_id": "m-1",
+                "token_id": "tok-up",
+                "side": "up",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "asks": [[0.41, 10.0]],
+                "bids": [[0.39, 6.0]],
+            },
+            {
+                "logged_at": "2026-03-01T00:05:00.300000+00:00",
+                "market_id": "m-1",
+                "token_id": "tok-down",
+                "side": "down",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "asks": [[0.59, 9.0]],
+                "bids": [[0.57, 5.0]],
+            },
+            {
+                "logged_at": "2026-03-01T00:05:01.200000+00:00",
+                "market_id": "m-1",
+                "token_id": "tok-up",
+                "side": "up",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "asks": [[0.42, 11.0]],
+                "bids": [[0.40, 7.0]],
+            },
+            {
+                "logged_at": "2026-03-01T00:05:01.200000+00:00",
+                "market_id": "m-1",
+                "token_id": "tok-down",
+                "side": "down",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "asks": [[0.60, 8.0]],
+                "bids": [[0.56, 4.0]],
+            },
+            {
+                "logged_at": "2026-03-01T00:05:02.000000+00:00",
+                "market_id": "m-1",
+                "token_id": "tok-up",
+                "side": "up",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "asks": [[0.43, 12.0]],
+                "bids": [[0.41, 8.0]],
+            },
+        ],
+    )
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-1",
+                "token_up": "tok-up",
+                "token_down": "tok-down",
+            }
+        ]
+    )
+
+    out, summary = build_raw_depth_replay_frame(
+        replay=replay,
+        data_cfg=data_cfg,
+        max_snapshots_per_replay_row=2,
+    )
+
+    assert len(out) == 2
+    assert out["depth_snapshot_rank"].tolist() == [1, 2]
+    assert out["depth_candidate_total_count"].tolist() == [3, 3]
+    assert summary.raw_record_matches == 5
+    assert summary.snapshot_rows == 2
+
+
+def test_build_raw_depth_replay_frame_matches_legacy_raw_decision_ts_backshift(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    append_ndjson_zst(
+        data_cfg.layout.orderbook_depth_path("2026-03-01"),
+        [
+            {
+                "logged_at": "2026-03-01T00:07:00.300000+00:00",
+                "orderbook_ts": "2026-03-01T00:07:00.310000+00:00",
+                "market_id": "m-legacy",
+                "token_id": "tok-up-legacy",
+                "side": "up",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:07:00Z",
+                "asks": [[0.41, 10.0]],
+                "bids": [[0.39, 6.0]],
+            },
+            {
+                "logged_at": "2026-03-01T00:07:00.300000+00:00",
+                "orderbook_ts": "2026-03-01T00:07:00.320000+00:00",
+                "market_id": "m-legacy",
+                "token_id": "tok-down-legacy",
+                "side": "down",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:07:00Z",
+                "asks": [[0.59, 9.0]],
+                "bids": [[0.57, 5.0]],
+            },
+        ],
+    )
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:08:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-legacy",
+                "token_up": "tok-up-legacy",
+                "token_down": "tok-down-legacy",
+            }
+        ]
+    )
+
+    out, summary = build_raw_depth_replay_frame(
+        replay=replay,
+        data_cfg=data_cfg,
+    )
+
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert row["depth_snapshot_status"] == "ok"
+    assert row["depth_match_strategy"] == "decision_key"
+    assert row["depth_candidate_total_count"] == 1
+    assert row["depth_up_record"]["decision_ts"] == "2026-03-01T00:07:00Z"
+    assert row["depth_down_record"]["decision_ts"] == "2026-03-01T00:07:00Z"
+    assert summary.raw_record_matches == 2
+    assert summary.snapshot_rows == 1
+    assert summary.replay_rows_with_snapshots == 1
+    assert summary.replay_rows_without_snapshots == 0
 
 
 def test_build_raw_depth_replay_frame_uses_token_window_fallback_with_catalog_metadata(tmp_path: Path) -> None:

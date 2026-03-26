@@ -3,6 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from pm15min.data.config import DataConfig
+from ..session_state import (
+    build_market_offset_side_trade_count_key,
+    build_market_offset_trade_count_key,
+)
 
 
 def build_runner_iteration(
@@ -91,6 +95,7 @@ def build_runner_iteration(
                 persist=persist_execution,
                 refresh_account_state=False,
                 dry_run=side_effect_dry_run,
+                session_state=session_state,
                 gateway=gateway,
             )
         except Exception as exc:
@@ -230,7 +235,7 @@ def _record_session_trade_count(
     if str(order_action_payload.get("status") or "").strip().lower() != "ok":
         return
     reason = str(order_action_payload.get("reason") or "").strip().lower()
-    if reason not in {"dry_run", "order_submitted"}:
+    if reason != "order_submitted":
         return
     execution = execution_payload.get("execution") if isinstance(execution_payload, dict) else {}
     decision = decision_payload.get("decision") if isinstance(decision_payload, dict) else {}
@@ -245,31 +250,77 @@ def _record_session_trade_count(
     if not market_id or offset is None:
         return
     counts = _session_trade_count_map(session_state)
-    key = f"{market_id}_{offset}"
-    counts[key] = int_or_none(counts.get(key)) or 0
-    counts[key] = int(counts[key]) + 1
+    key = build_market_offset_trade_count_key(market_id=market_id, offset=offset)
+    if key is not None:
+        counts[key] = int(int_or_none(counts.get(key)) or 0) + 1
+    side_counts = _session_trade_count_map(session_state, side_aware=True)
+    side_key = build_market_offset_side_trade_count_key(
+        market_id=market_id,
+        offset=offset,
+        side=(execution or {}).get("selected_side") or (decision or {}).get("selected_side"),
+    )
+    if side_key is not None:
+        side_counts[side_key] = int(int_or_none(side_counts.get(side_key)) or 0) + 1
 
 
 def _build_session_state_payload(session_state: dict[str, Any] | None) -> dict[str, object]:
     counts = _session_trade_count_map(session_state)
+    side_counts = _session_trade_count_map(session_state, side_aware=True)
     return {
         "market_offset_trade_count": {
             str(key): int(int_or_none(value) or 0)
             for key, value in sorted(counts.items(), key=lambda item: str(item[0]))
         },
+        "market_offset_side_trade_count": {
+            str(key): int(int_or_none(value) or 0)
+            for key, value in sorted(side_counts.items(), key=lambda item: str(item[0]))
+        },
         "tracked_market_offset_count": int(len(counts)),
+        "tracked_market_offset_side_count": int(len(side_counts)),
+        "action_gate_state": _action_gate_state_payload(session_state),
     }
 
 
-def _session_trade_count_map(session_state: dict[str, Any] | None) -> dict[str, Any]:
+def _session_trade_count_map(session_state: dict[str, Any] | None, *, side_aware: bool = False) -> dict[str, Any]:
     if not isinstance(session_state, dict):
         return {}
-    counts = session_state.get("market_offset_trade_count")
+    state_key = "market_offset_side_trade_count" if side_aware else "market_offset_trade_count"
+    counts = session_state.get(state_key)
     if isinstance(counts, dict):
         return counts
     counts = {}
-    session_state["market_offset_trade_count"] = counts
+    session_state[state_key] = counts
     return counts
+
+
+def _action_gate_state_payload(session_state: dict[str, Any] | None) -> dict[str, object]:
+    if not isinstance(session_state, dict):
+        return {}
+    raw = session_state.get("action_gate_state")
+    if not isinstance(raw, dict):
+        return {}
+    payload: dict[str, object] = {}
+    for action_type, action_map in sorted(raw.items(), key=lambda item: str(item[0])):
+        if not isinstance(action_map, dict) or not action_map:
+            continue
+        rows: dict[str, object] = {}
+        for action_key, state in sorted(action_map.items(), key=lambda item: str(item[0])):
+            if not isinstance(state, dict):
+                continue
+            rows[str(action_key)] = {
+                "action_key": str(state.get("action_key") or action_key),
+                "snapshot_ts": state.get("snapshot_ts"),
+                "status": state.get("status"),
+                "reason": state.get("reason"),
+                "attempt": int(int_or_none(state.get("attempt")) or 0),
+                "last_attempt_snapshot_ts": state.get("last_attempt_snapshot_ts"),
+                "last_attempt_status": state.get("last_attempt_status"),
+                "last_attempt_reason": state.get("last_attempt_reason"),
+                "dry_run": bool(state.get("dry_run")),
+            }
+        if rows:
+            payload[str(action_type)] = rows
+    return payload
 
 
 def int_or_none(value) -> int | None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -32,6 +33,9 @@ class BacktestFillConfig:
     prefer_depth: bool = True
     fill_model: str = "canonical_quote_depth"
     profile_spec: LiveProfileSpec | None = None
+
+
+FILLS_HEARTBEAT_INTERVAL_ROWS = 500
 
 
 @dataclass
@@ -183,6 +187,8 @@ def build_canonical_fills(
     config: BacktestFillConfig | None = None,
     profile_spec: LiveProfileSpec | None = None,
     depth_replay: pd.DataFrame | None = None,
+    depth_candidate_lookup: dict[tuple[object, ...], list[dict[str, object]]] | None = None,
+    heartbeat: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     return _build_fills_impl(
         accepted,
@@ -190,6 +196,8 @@ def build_canonical_fills(
         config=(config if config is not None else BacktestFillConfig(profile_spec=profile_spec)),
         profile_spec=profile_spec,
         depth_replay=depth_replay,
+        depth_candidate_lookup=depth_candidate_lookup,
+        heartbeat=heartbeat,
     )
 
 
@@ -200,12 +208,15 @@ def _build_fills_impl(
     config: BacktestFillConfig,
     profile_spec: LiveProfileSpec | None = None,
     depth_replay: pd.DataFrame | None = None,
+    depth_candidate_lookup: dict[tuple[object, ...], list[dict[str, object]]] | None = None,
+    heartbeat: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cfg = config or BacktestFillConfig()
     effective_profile_spec = profile_spec or cfg.profile_spec
     if effective_profile_spec is not cfg.profile_spec:
         cfg = replace(cfg, profile_spec=effective_profile_spec)
-    depth_candidates = _build_depth_candidate_lookup(depth_replay)
+    depth_candidates = depth_candidate_lookup if depth_candidate_lookup is not None else build_depth_candidate_lookup(depth_replay)
+    depth_lookup_complete = depth_replay is not None
     planned = build_fill_plan_frame(
         accepted,
         base_stake=cfg.base_stake,
@@ -220,17 +231,27 @@ def _build_fills_impl(
         profile_spec=effective_profile_spec,
     )
     if not planned.empty:
-        planned = pd.DataFrame(
-            [
+        planned_records = planned.to_dict(orient="records")
+        planned_keys = [_replay_key_tuple(record) for record in planned_records]
+        materialized_rows: list[dict[str, object]] = []
+        total_rows = len(planned_records)
+        if heartbeat is not None:
+            heartbeat(f"Materializing canonical fills: 0/{total_rows:,} decisions")
+        for row_index, (record, replay_key) in enumerate(zip(planned_records, planned_keys, strict=False), start=1):
+            materialized_rows.append(
                 _materialize_fill_row(
-                    row,
+                    record,
                     data_cfg=data_cfg,
                     config=cfg,
-                    raw_depth_candidates=depth_candidates.get(_replay_key_tuple(row)),
+                    raw_depth_candidates=depth_candidates.get(replay_key, [] if depth_lookup_complete else None),
                 )
-                for _, row in planned.iterrows()
-            ]
-        )
+            )
+            if heartbeat is not None and (
+                row_index == total_rows
+                or row_index % FILLS_HEARTBEAT_INTERVAL_ROWS == 0
+            ):
+                heartbeat(f"Materializing canonical fills: {row_index:,}/{total_rows:,} decisions")
+        planned = pd.DataFrame.from_records(materialized_rows)
     filled = planned.loc[planned["fill_valid"]].copy().reset_index(drop=True)
     rejected = planned.loc[~planned["fill_valid"], [*REPLAY_KEY_COLUMNS, "fill_reason"]].copy()
     source_rows = planned.loc[~planned["fill_valid"]].copy()
@@ -377,13 +398,13 @@ def _predicted_side_series(frame: pd.DataFrame) -> pd.Series:
 
 
 def _materialize_fill_row(
-    row: pd.Series,
+    row: Mapping[str, object],
     *,
     data_cfg: DataConfig | None,
     config: BacktestFillConfig,
     raw_depth_candidates: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    out = row.to_dict()
+    out = dict(row)
     requested_notional = max(0.0, _float_or_none(row.get("stake")) or 0.0)
     entry_price = _float_or_none(row.get("entry_price"))
     price_cap = _float_or_none(row.get("price_cap"))
@@ -470,7 +491,7 @@ def _materialize_fill_row(
 
 def _resolve_depth_fill(
     *,
-    row: pd.Series,
+    row: Mapping[str, object],
     data_cfg: DataConfig,
     config: BacktestFillConfig,
     raw_depth_candidates: list[dict[str, object]] | None = None,
@@ -499,17 +520,39 @@ def _resolve_depth_fill(
     if side not in {"UP", "DOWN"} or requested_notional <= 0.0:
         return None, "fill_invalid"
     max_slippage_bps, min_fill_ratio = _resolve_depth_constraints(config)
-    if raw_depth_candidates:
-        return _resolve_raw_depth_fill(
-            row=row,
-            config=config,
-            raw_depth_candidates=raw_depth_candidates,
-            side=side,
-            requested_notional=requested_notional,
-            price_cap=_float_or_none(row.get("price_cap")),
-            max_slippage_bps=max_slippage_bps,
-            min_fill_ratio=min_fill_ratio,
-        )
+    if raw_depth_candidates is not None:
+        if raw_depth_candidates:
+            return _resolve_raw_depth_fill(
+                row=row,
+                config=config,
+                raw_depth_candidates=raw_depth_candidates,
+                side=side,
+                requested_notional=requested_notional,
+                price_cap=_float_or_none(row.get("price_cap")),
+                max_slippage_bps=max_slippage_bps,
+                min_fill_ratio=min_fill_ratio,
+            )
+        target_ts_ms = _row_decision_ts_ms(row)
+        return {
+            "status": "missing",
+            "depth_source_path": str(row.get("depth_source_path") or row.get("quote_source_path") or ""),
+            "price_cap": _float_or_none(row.get("price_cap")),
+            **_snapshot_metrics(snapshot_ts_ms=None, target_ts_ms=target_ts_ms),
+            "candidate_count": 0,
+            "candidate_total_count": 0,
+            "candidate_progress_count": 0,
+            "chain_mode": "precomputed_missing",
+            "queue_turnover_count": 0,
+            "time_turnover_count": 0,
+            "retry_refresh_count": 0,
+            "retry_budget": 0,
+            "retry_budget_exhausted": False,
+            "retry_trigger_reason": "",
+            "retry_stage": "",
+            "retry_exit_reason": "depth_snapshot_missing",
+            "retry_budget_source": "",
+            "retry_snapshot_unchanged_count": 0,
+        }, "depth_snapshot_missing"
     return build_depth_execution_plan(
         data_cfg=data_cfg,
         quote_row=quote_row,
@@ -523,7 +566,7 @@ def _resolve_depth_fill(
 
 def _resolve_quote_fill(
     *,
-    row: pd.Series,
+    row: Mapping[str, object],
     requested_notional: float,
     fee_rate: float,
     config: BacktestFillConfig,
@@ -588,7 +631,7 @@ def _resolve_quote_fill(
 
 def _resolve_raw_depth_fill(
     *,
-    row: pd.Series,
+    row: Mapping[str, object],
     config: BacktestFillConfig,
     raw_depth_candidates: list[dict[str, object]],
     side: str,
@@ -616,7 +659,7 @@ def _resolve_raw_depth_fill(
     last_payload: dict[str, object] | None = None
     last_reason: str | None = None
     candidate_count = len(raw_depth_candidates)
-    candidate_total_count = candidate_count
+    candidate_total_count = _raw_depth_candidate_total_count(raw_depth_candidates)
     progress_count = 0
     queue_turnover_count = 0
     time_turnover_count = 0
@@ -734,7 +777,7 @@ def _resolve_raw_depth_fill(
 
 def _resolve_raw_depth_fak_refresh_fill(
     *,
-    row: pd.Series,
+    row: Mapping[str, object],
     config: BacktestFillConfig,
     raw_depth_candidates: list[dict[str, object]],
     side: str,
@@ -749,9 +792,13 @@ def _resolve_raw_depth_fak_refresh_fill(
     limited_candidates, retry_budget_meta = limit_legacy_pre_submit_orderbook_retry_candidates(
         raw_depth_candidates,
         spec=config.profile_spec,
+        candidate_total_count=_raw_depth_candidate_total_count(raw_depth_candidates),
     )
     candidate_count = len(limited_candidates)
-    candidate_total_count = int(retry_budget_meta.get("candidate_total_count") or candidate_count)
+    candidate_total_count = max(
+        _raw_depth_candidate_total_count(raw_depth_candidates),
+        int(retry_budget_meta.get("candidate_total_count") or candidate_count),
+    )
     retry_budget = int(retry_budget_meta.get("retry_budget") or candidate_count)
     retry_budget_exhausted = bool(retry_budget_meta.get("budget_exhausted", False))
     retry_budget_source = str(retry_budget_meta.get("retry_budget_source") or "")
@@ -915,7 +962,7 @@ def _build_depth_fill_values(
 
 def _resolve_raw_depth_reprice_guard_reason(
     *,
-    row: pd.Series,
+    row: Mapping[str, object],
     depth_fill: dict[str, object],
     config: BacktestFillConfig,
     raw_depth_candidates: list[dict[str, object]] | None,
@@ -1259,7 +1306,7 @@ def _resolve_depth_constraints(config: BacktestFillConfig) -> tuple[float, float
     return max(0.0, max_slippage_bps), max(0.0, min_fill_ratio)
 
 
-def _build_depth_candidate_lookup(depth_replay: pd.DataFrame | None) -> dict[tuple[object, ...], list[dict[str, object]]]:
+def build_depth_candidate_lookup(depth_replay: pd.DataFrame | None) -> dict[tuple[object, ...], list[dict[str, object]]]:
     if depth_replay is None or depth_replay.empty:
         return {}
     frame = depth_replay.copy()
@@ -1272,10 +1319,21 @@ def _build_depth_candidate_lookup(depth_replay: pd.DataFrame | None) -> dict[tup
     return lookup
 
 
-def _replay_key_tuple(row: pd.Series | dict[str, object]) -> tuple[object, ...]:
+def _raw_depth_candidate_total_count(raw_depth_candidates: list[dict[str, object]] | None) -> int:
+    if not raw_depth_candidates:
+        return 0
+    first = raw_depth_candidates[0]
+    if isinstance(first, Mapping):
+        total = _int_or_none(first.get("depth_candidate_total_count"))
+        if total is not None and total > 0:
+            return int(total)
+    return int(len(raw_depth_candidates))
+
+
+def _replay_key_tuple(row: Mapping[str, object] | pd.Series) -> tuple[object, ...]:
     out: list[object] = []
     for column in REPLAY_KEY_COLUMNS:
-        value = row.get(column) if isinstance(row, dict) else row.get(column)
+        value = row.get(column)
         if column == "offset":
             out.append(_int_or_none(value))
         else:
@@ -1284,7 +1342,7 @@ def _replay_key_tuple(row: pd.Series | dict[str, object]) -> tuple[object, ...]:
     return tuple(out)
 
 
-def _row_decision_ts_ms(row: pd.Series) -> int | None:
+def _row_decision_ts_ms(row: Mapping[str, object]) -> int | None:
     ts = pd.to_datetime(row.get("decision_ts"), utc=True, errors="coerce")
     if pd.isna(ts):
         return None

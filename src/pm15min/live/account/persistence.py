@@ -15,7 +15,12 @@ def persist_open_orders_snapshot(*, rewrite_root: Path, payload: dict[str, Any])
         market=str(payload["market"]),
         snapshot_ts=str(payload["snapshot_ts"]),
     )
-    return write_live_payload_pair(payload=payload, latest_path=latest_path, snapshot_path=snapshot_path)
+    return write_live_payload_pair(
+        payload=payload,
+        latest_path=latest_path,
+        snapshot_path=snapshot_path,
+        write_snapshot_history=False,
+    )
 
 
 def persist_positions_snapshot(*, rewrite_root: Path, payload: dict[str, Any]) -> dict[str, Path]:
@@ -25,7 +30,12 @@ def persist_positions_snapshot(*, rewrite_root: Path, payload: dict[str, Any]) -
         market=str(payload["market"]),
         snapshot_ts=str(payload["snapshot_ts"]),
     )
-    return write_live_payload_pair(payload=payload, latest_path=latest_path, snapshot_path=snapshot_path)
+    return write_live_payload_pair(
+        payload=payload,
+        latest_path=latest_path,
+        snapshot_path=snapshot_path,
+        write_snapshot_history=False,
+    )
 
 
 def load_latest_open_orders_snapshot(*, rewrite_root: Path, market: str) -> dict[str, Any] | None:

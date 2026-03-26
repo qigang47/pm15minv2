@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from dataclasses import replace
+
 import pandas as pd
 
 from pm15min.research._contracts_runs import BacktestParitySpec
@@ -308,11 +310,47 @@ def test_attach_backtest_regime_parity_drives_regime_guard_rejects() -> None:
         market="sol",
         profile="deep_otm",
         decisions=attached,
-        profile_spec=profile_spec,
+        profile_spec=replace(profile_spec, liquidity_guard_block=True),
     )
 
     assert attached.loc[1, "regime_state"] == "DEFENSE"
-    assert summary.blocked_rows == 1
-    assert out.loc[0, "policy_action"] == "trade"
+    assert summary.blocked_rows == 2
+    assert out.loc[0, "policy_action"] == "reject"
+    assert out.loc[0, "guard_primary_reason"] == "ret30m_up_floor"
     assert out.loc[1, "policy_action"] == "reject"
     assert out.loc[1, "guard_primary_reason"] == "regime_direction_pressure"
+
+
+def test_apply_live_guard_parity_keeps_tail_space_guard_from_row_features() -> None:
+    decisions = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "offset": 7,
+                "p_up": 0.80,
+                "p_down": 0.20,
+                "score_valid": True,
+                "score_reason": "",
+                "policy_action": "trade",
+                "policy_reason": "trade",
+                "trade_decision": True,
+                "quote_status": "ok",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.80,
+                "quote_up_bid": 0.19,
+                "quote_down_bid": 0.79,
+                "ret_from_strike": -0.02,
+                "move_z_strike": 2.5,
+            }
+        ]
+    )
+
+    out, summary = apply_live_guard_parity(
+        market="sol",
+        profile="deep_otm",
+        decisions=decisions,
+    )
+
+    assert summary.blocked_rows == 1
+    assert out.loc[0, "policy_action"] == "reject"
+    assert out.loc[0, "guard_primary_reason"] == "tail_space_too_far"

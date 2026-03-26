@@ -54,7 +54,7 @@ class DecisionEngineParityConfig:
     fee_curve_k: float = 0.0
 
     def min_dir_prob_for(self, *, offset: int, boost: float = 0.0) -> float | None:
-        if self.supported_offsets is not None and int(offset) not in set(self.supported_offsets):
+        if self.supported_offsets is not None and int(offset) not in self.supported_offsets:
             return None
         value = self.min_dir_prob_by_offset.get(int(offset), self.min_dir_prob_default)
         return min(1.0, max(0.0, float(value) + max(0.0, float(boost))))
@@ -301,19 +301,26 @@ def apply_decision_engine_parity(
             out[column] = pd.Series(dtype="object" if column.endswith(("action", "reason", "side", "rationale")) else "float64")
         return out
 
+    column_positions = {str(column): idx for idx, column in enumerate(out.columns)}
+    offset_idx = column_positions.get(offset_column)
+    p_up_idx = column_positions.get(p_up_column)
+    p_down_idx = column_positions.get(p_down_column)
+    boost_idx = column_positions.get(min_dir_prob_boost_column) if min_dir_prob_boost_column else None
+
     records: list[dict[str, object]] = []
-    for _, row in out.iterrows():
-        boost = _float_or_none(row.get(min_dir_prob_boost_column)) if min_dir_prob_boost_column else 0.0
+    append_record = records.append
+    for row in out.itertuples(index=False, name=None):
+        boost = _float_or_none(row[boost_idx]) if boost_idx is not None else 0.0
         decision = evaluate_decision_engine_side(
-            offset=int(row.get(offset_column) or 0),
-            p_up=_float_or_none(row.get(p_up_column)),
-            p_down=_float_or_none(row.get(p_down_column)),
-            up_price=_resolve_first_numeric(row, up_price_columns),
-            down_price=_resolve_first_numeric(row, down_price_columns),
+            offset=int(_tuple_value(row, offset_idx) or 0),
+            p_up=_float_or_none(_tuple_value(row, p_up_idx)),
+            p_down=_float_or_none(_tuple_value(row, p_down_idx)),
+            up_price=_resolve_first_numeric_tuple(row, column_positions, up_price_columns),
+            down_price=_resolve_first_numeric_tuple(row, column_positions, down_price_columns),
             config=cfg,
             min_dir_prob_boost=float(boost or 0.0),
         )
-        records.append(decision.as_record())
+        append_record(decision.as_record())
 
     parity = pd.DataFrame.from_records(records, index=out.index)
     return pd.concat([out, parity], axis=1)
@@ -414,6 +421,27 @@ def _resolve_first_numeric(row: pd.Series, columns: Sequence[str]) -> float | No
         if value is not None:
             return value
     return None
+
+
+def _resolve_first_numeric_tuple(
+    row: tuple[object, ...],
+    column_positions: dict[str, int],
+    columns: Sequence[str],
+) -> float | None:
+    for column in columns:
+        idx = column_positions.get(str(column))
+        if idx is None:
+            continue
+        value = _float_or_none(row[idx])
+        if value is not None:
+            return value
+    return None
+
+
+def _tuple_value(row: tuple[object, ...], idx: int | None) -> object:
+    if idx is None:
+        return None
+    return row[idx]
 
 
 def _float_or_none(value: object) -> float | None:

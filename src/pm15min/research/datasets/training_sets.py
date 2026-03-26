@@ -6,6 +6,7 @@ from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import TrainingSetSpec
 from pm15min.research.datasets.loaders import load_feature_frame, load_label_frame
+from pm15min.research.layout_helpers import normalize_window_bound, window_bound_is_date_only
 from pm15min.research.labels.alignment import merge_feature_and_label_frames
 from pm15min.research.labels.direction import build_direction_target
 from pm15min.research.labels.reversal import build_reversal_target
@@ -108,9 +109,9 @@ def build_training_set_dataset(cfg: ResearchConfig, spec: TrainingSetSpec) -> di
 
 def _filter_training_window(frame: pd.DataFrame, *, start: str, end: str, offset: int) -> pd.DataFrame:
     out = frame.copy()
-    start_ts = pd.Timestamp(start).tz_localize("UTC") if pd.Timestamp(start).tzinfo is None else pd.Timestamp(start).tz_convert("UTC")
-    end_ts = pd.Timestamp(end).tz_localize("UTC") if pd.Timestamp(end).tzinfo is None else pd.Timestamp(end).tz_convert("UTC")
-    end_bound = end_ts + pd.Timedelta(days=1)
+    start_ts = _window_bound_timestamp(start)
+    end_ts = _window_bound_timestamp(end)
+    end_bound = end_ts + pd.Timedelta(days=1) if window_bound_is_date_only(end) else end_ts
     mask = (
         out["decision_ts"].notna()
         & (out["decision_ts"] >= start_ts)
@@ -118,6 +119,11 @@ def _filter_training_window(frame: pd.DataFrame, *, start: str, end: str, offset
         & (pd.to_numeric(out["offset"], errors="coerce") == int(offset))
     )
     return out.loc[mask].copy()
+
+
+def _window_bound_timestamp(value: str) -> pd.Timestamp:
+    ts = pd.Timestamp(normalize_window_bound(value))
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 
 def _build_target_frame(frame: pd.DataFrame, *, target: str) -> tuple[pd.DataFrame, dict[str, object]]:

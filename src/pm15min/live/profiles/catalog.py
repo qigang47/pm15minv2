@@ -133,6 +133,7 @@ DEEP_OTM_LIVE_PROFILE_SPEC = LiveProfileSpec(
             "repeat_same_decision_max_trades": 3,
             "repeat_same_decision_max_stake_usd": 3.0,
             "repeat_same_decision_stake_multiple": 3.0,
+            "repeat_same_decision_lock_side": False,
             "ret_30m_up_floor_by_asset": {
                 "sol": 0.0,
                 "xrp": 0.0,
@@ -149,6 +150,7 @@ DEEP_OTM_LIVE_PROFILE_SPEC = LiveProfileSpec(
                 "xrp": ("ret_5m", "ma_gap_5"),
             },
             "liquidity_guard_enabled": True,
+            "liquidity_guard_block": False,
             "liquidity_min_spot_quote_volume_ratio_by_asset": {"default": 0.0},
             "liquidity_min_perp_quote_volume_ratio_by_asset": {"default": 0.0},
             "liquidity_min_spot_trades_ratio_by_asset": {"default": 0.0},
@@ -218,7 +220,21 @@ DEEP_OTM_LIVE_PROFILE_SPEC = LiveProfileSpec(
     )
 )
 
+DEEP_OTM_BASELINE_LIVE_PROFILE_SPEC = LiveProfileSpec(
+    **(
+        DEEP_OTM_LIVE_PROFILE_SPEC.to_dict()
+        | {
+            "profile": "deep_otm_baseline",
+            "ret_30m_up_floor_by_asset": {
+                "sol": -0.04,
+                "xrp": -0.04,
+            },
+        }
+    )
+)
+
 LIVE_PROFILE_SPECS = {
     "default": DEFAULT_LIVE_PROFILE_SPEC,
     "deep_otm": DEEP_OTM_LIVE_PROFILE_SPEC,
+    "deep_otm_baseline": DEEP_OTM_BASELINE_LIVE_PROFILE_SPEC,
 }

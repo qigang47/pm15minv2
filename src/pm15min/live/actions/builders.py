@@ -107,6 +107,20 @@ def build_redeem_action_signature(*, candidates: list[dict[str, Any]]) -> dict[s
     return {"candidates": rows}
 
 
+def build_order_action_signature(*, order_request: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(order_request.get("metadata") or {})
+    return {
+        "action": str(order_request.get("action") or "BUY").strip().upper(),
+        "market_id": str(order_request.get("market_id") or "").strip(),
+        "token_id": str(order_request.get("token_id") or "").strip(),
+        "side": str(order_request.get("side") or "").strip().upper(),
+        "order_type": str(order_request.get("order_type") or "").strip().upper(),
+        "offset": int_or_none(metadata.get("offset")),
+        "window_start_ts": order_request.get("window_start_ts") or metadata.get("window_start_ts"),
+        "window_end_ts": order_request.get("window_end_ts") or metadata.get("window_end_ts"),
+    }
+
+
 def parse_market_cycle_end(value: object) -> pd.Timestamp | None:
     if value is None:
         return None
@@ -127,6 +141,7 @@ def build_order_request_from_execution(*, execution: dict[str, Any]) -> tuple[di
     limit_price = float_or_none(execution.get("entry_price"))
     requested_notional = float_or_none(execution.get("requested_notional_usd"))
     decision_ts = execution.get("decision_ts")
+    window_start_ts, window_end_ts, window_duration_seconds = resolve_execution_window_bounds(execution=execution)
     if not market_id:
         return None, "market_id_missing"
     if not token_id:
@@ -157,13 +172,47 @@ def build_order_request_from_execution(*, execution: dict[str, Any]) -> tuple[di
         "price": float(limit_price),
         "size": float(submitted_shares),
         "decision_ts": decision_ts,
+        "window_start_ts": window_start_ts,
+        "window_end_ts": window_end_ts,
+        "window_duration_seconds": window_duration_seconds,
         "metadata": {
             "stake": float(requested_notional),
             "offset": execution.get("selected_offset"),
             "roi": float_or_none(repriced.get("repriced_roi_net")) or float_or_none(execution.get("roi_net_vs_quote")) or 0.0,
             "roi_threshold": float_or_none(repriced.get("repriced_roi_threshold_required")) or 0.0,
+            "window_start_ts": window_start_ts,
+            "window_end_ts": window_end_ts,
+            "window_duration_seconds": window_duration_seconds,
         },
     }, None
+
+
+def resolve_execution_window_bounds(*, execution: dict[str, Any]) -> tuple[str | None, str | None, float | None]:
+    window_start = snapshot_label_to_timestamp(execution.get("window_start_ts"))
+    window_end = snapshot_label_to_timestamp(execution.get("window_end_ts"))
+    duration_seconds = float_or_none(execution.get("window_duration_seconds"))
+    if window_start is None:
+        cycle_start = snapshot_label_to_timestamp(execution.get("cycle_start_ts"))
+        selected_offset = int_or_none(execution.get("selected_offset"))
+        if cycle_start is not None and selected_offset is not None:
+            window_start = cycle_start + pd.to_timedelta(int(selected_offset), unit="m")
+    if window_end is None and window_start is not None and duration_seconds is not None and duration_seconds > 0.0:
+        window_end = window_start + pd.to_timedelta(duration_seconds, unit="s")
+    if window_end is None:
+        decision_ts = snapshot_label_to_timestamp(execution.get("decision_ts"))
+        if decision_ts is not None:
+            if window_start is None:
+                window_start = decision_ts
+            if duration_seconds is None or duration_seconds <= 0.0:
+                duration_seconds = 60.0
+            window_end = decision_ts + pd.to_timedelta(duration_seconds, unit="s")
+    if duration_seconds is None and window_start is not None and window_end is not None:
+        duration_seconds = max(0.0, float((window_end - window_start).total_seconds()))
+    return (
+        None if window_start is None else window_start.isoformat(),
+        None if window_end is None else window_end.isoformat(),
+        duration_seconds,
+    )
 
 
 def resolve_submitted_shares(*, execution: dict[str, Any], limit_price: float, requested_notional: float) -> float | None:

@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
+
+DEFAULT_OFFSET_WINDOW_SECONDS = 60.0
+
 
 @dataclass(frozen=True)
 class OffsetScoreContext:
@@ -92,6 +97,23 @@ def build_missing_score_signal(*, offset: int, coverage: dict[str, object]) -> d
     return {
         "offset": offset,
         "status": "missing_score_row",
+        "score_valid": False,
+        "score_reason": "missing_score_row",
+        "coverage": coverage,
+    }
+
+
+def build_inactive_score_signal(
+    *,
+    offset: int,
+    coverage: dict[str, object],
+    status: str,
+) -> dict[str, object]:
+    return {
+        "offset": offset,
+        "status": str(status or "inactive_score_row"),
+        "score_valid": False,
+        "score_reason": str(status or "inactive_score_row"),
         "coverage": coverage,
     }
 
@@ -117,6 +139,14 @@ def build_scored_signal(
     extract_feature_snapshot_fn,
     iso_or_none_fn,
 ) -> dict[str, object]:
+    decision_ts = iso_or_none_fn(row.get("decision_ts"))
+    window_start_ts, window_end_ts, window_duration_seconds = build_offset_window(
+        offset=ctx.offset,
+        cycle_start_ts=row.get("cycle_start_ts"),
+        cycle_end_ts=row.get("cycle_end_ts"),
+        decision_ts=row.get("decision_ts"),
+        iso_or_none_fn=iso_or_none_fn,
+    )
     p_up = float(row["p_up"])
     p_down = float(row["p_down"])
     score_valid, score_reason = normalize_score_validity(
@@ -127,15 +157,24 @@ def build_scored_signal(
     feature_snapshot = extract_feature_snapshot_fn(ctx.features, offset=ctx.offset, decision_ts=row.get("decision_ts"))
     return {
         "offset": ctx.offset,
-        "decision_ts": iso_or_none_fn(row.get("decision_ts")),
+        "decision_ts": decision_ts,
+        "window_start_ts": window_start_ts,
+        "window_end_ts": window_end_ts,
+        "window_duration_seconds": window_duration_seconds,
         "cycle_start_ts": iso_or_none_fn(row.get("cycle_start_ts")),
         "cycle_end_ts": iso_or_none_fn(row.get("cycle_end_ts")),
         "signal_target": str(ctx.bundle_cfg.get("signal_target") or selected_target),
         "score_valid": score_valid,
         "score_reason": score_reason,
+        "p_lgb": float(row.get("p_lgb", p_up)),
+        "p_lr": float(row.get("p_lr", p_up)),
         "p_signal": float(row.get("p_signal", p_up)),
+        "w_lgb": float(row.get("w_lgb", 0.5)),
+        "w_lr": float(row.get("w_lr", 0.5)),
         "p_up": p_up,
         "p_down": p_down,
+        "probability_mode": str(row.get("probability_mode") or ""),
+        "model_context": row.get("model_context"),
         "recommended_side": "UP" if p_up >= p_down else "DOWN",
         "confidence": max(p_up, p_down),
         "edge": abs(p_up - p_down),
@@ -146,25 +185,72 @@ def build_scored_signal(
     }
 
 
-def build_offset_signal(
+def build_offset_window(
     *,
-    selected_target: str,
+    offset: int,
+    cycle_start_ts: object,
+    cycle_end_ts: object,
+    decision_ts: object,
+    iso_or_none_fn,
+) -> tuple[str | None, str | None, float]:
+    decision_dt = pd.to_datetime(decision_ts, utc=True, errors="coerce")
+    cycle_start_dt = pd.to_datetime(cycle_start_ts, utc=True, errors="coerce")
+    cycle_end_dt = pd.to_datetime(cycle_end_ts, utc=True, errors="coerce")
+    if decision_dt is not None and not pd.isna(decision_dt):
+        start_dt = decision_dt
+        end_dt = start_dt + pd.to_timedelta(DEFAULT_OFFSET_WINDOW_SECONDS, unit="s")
+        if cycle_end_dt is not None and not pd.isna(cycle_end_dt):
+            end_dt = min(end_dt, cycle_end_dt)
+        return (
+            iso_or_none_fn(start_dt),
+            iso_or_none_fn(end_dt),
+            float(DEFAULT_OFFSET_WINDOW_SECONDS),
+        )
+    if cycle_start_dt is not None and not pd.isna(cycle_start_dt):
+        start_dt = cycle_start_dt + pd.to_timedelta(int(offset), unit="m")
+        end_dt = start_dt + pd.to_timedelta(DEFAULT_OFFSET_WINDOW_SECONDS, unit="s")
+        if cycle_end_dt is not None and not pd.isna(cycle_end_dt):
+            end_dt = min(end_dt, cycle_end_dt)
+        return (
+            iso_or_none_fn(start_dt),
+            iso_or_none_fn(end_dt),
+            float(DEFAULT_OFFSET_WINDOW_SECONDS),
+        )
+    if decision_dt is None or pd.isna(decision_dt):
+        return None, None, float(DEFAULT_OFFSET_WINDOW_SECONDS)
+    start_dt = decision_dt
+    end_dt = start_dt + pd.to_timedelta(DEFAULT_OFFSET_WINDOW_SECONDS, unit="s")
+    return (
+        iso_or_none_fn(start_dt),
+        iso_or_none_fn(end_dt),
+        float(DEFAULT_OFFSET_WINDOW_SECONDS),
+    )
+
+
+def _resolve_latest_live_row(
+    *,
     ctx: OffsetScoreContext,
+    now_utc: pd.Timestamp,
     feature_coverage_fn,
     latest_nan_feature_columns_fn,
-    extract_feature_snapshot_fn,
     iso_or_none_fn,
-) -> dict[str, object]:
-    latest_row = ctx.scored.sort_values("decision_ts").tail(1)
+) -> tuple[object | None, dict[str, object], str | None]:
     base_coverage = build_offset_coverage(
         ctx=ctx,
         nan_feature_columns=[],
         feature_coverage_fn=feature_coverage_fn,
     )
-    if latest_row.empty:
-        return build_missing_score_signal(offset=ctx.offset, coverage=base_coverage)
-
-    row = latest_row.iloc[0]
+    scored = ctx.scored.copy()
+    if scored.empty or "decision_ts" not in scored.columns:
+        return None, base_coverage, "missing_score_row"
+    scored["decision_ts"] = pd.to_datetime(scored.get("decision_ts"), utc=True, errors="coerce")
+    scored = scored.dropna(subset=["decision_ts"]).sort_values("decision_ts")
+    if scored.empty:
+        return None, base_coverage, "missing_score_row"
+    scored = scored.loc[scored["decision_ts"].le(now_utc)].copy()
+    if scored.empty:
+        return None, base_coverage, "offset_not_yet_open"
+    row = scored.iloc[-1]
     nan_feature_columns = latest_nan_feature_columns_fn(
         features=ctx.features,
         offset=ctx.offset,
@@ -176,6 +262,48 @@ def build_offset_signal(
         nan_feature_columns=nan_feature_columns,
         feature_coverage_fn=feature_coverage_fn,
     )
+    _, window_end_ts, _ = build_offset_window(
+        offset=ctx.offset,
+        cycle_start_ts=row.get("cycle_start_ts"),
+        cycle_end_ts=row.get("cycle_end_ts"),
+        decision_ts=row.get("decision_ts"),
+        iso_or_none_fn=iso_or_none_fn,
+    )
+    window_end_dt = pd.to_datetime(window_end_ts, utc=True, errors="coerce")
+    if window_end_dt is None or pd.isna(window_end_dt):
+        return row, coverage, None
+    if now_utc >= window_end_dt:
+        return None, coverage, "offset_window_expired"
+    return row, coverage, None
+
+
+def build_offset_signal(
+    *,
+    selected_target: str,
+    ctx: OffsetScoreContext,
+    feature_coverage_fn,
+    latest_nan_feature_columns_fn,
+    extract_feature_snapshot_fn,
+    iso_or_none_fn,
+    now_utc: pd.Timestamp,
+) -> dict[str, object]:
+    row, coverage, inactive_reason = _resolve_latest_live_row(
+        ctx=ctx,
+        now_utc=now_utc,
+        feature_coverage_fn=feature_coverage_fn,
+        latest_nan_feature_columns_fn=latest_nan_feature_columns_fn,
+        iso_or_none_fn=iso_or_none_fn,
+    )
+    if row is None:
+        if inactive_reason == "missing_score_row":
+            return build_missing_score_signal(offset=ctx.offset, coverage=coverage)
+        return build_inactive_score_signal(
+            offset=ctx.offset,
+            coverage=coverage,
+            status=str(inactive_reason or "inactive_score_row"),
+        )
+
+    nan_feature_columns = list(coverage.get("nan_feature_columns") or [])
     return build_scored_signal(
         selected_target=selected_target,
         ctx=ctx,
@@ -202,8 +330,14 @@ def score_offset_signals(
     latest_nan_feature_columns_fn,
     extract_feature_snapshot_fn,
     iso_or_none_fn,
+    now_utc: pd.Timestamp | None = None,
 ) -> list[dict[str, object]]:
     profile_blacklist = list(profile_spec.blacklist_for(cfg.asset.slug))
+    now_utc = pd.Timestamp(now_utc) if now_utc is not None else pd.Timestamp.now(tz="UTC")
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.tz_localize("UTC")
+    else:
+        now_utc = now_utc.tz_convert("UTC")
     offset_signals: list[dict[str, object]] = []
     for offset_dir in resolve_offset_dirs(bundle_dir):
         offset = int(offset_dir.name.split("=", 1)[1])
@@ -225,6 +359,7 @@ def score_offset_signals(
                 latest_nan_feature_columns_fn=latest_nan_feature_columns_fn,
                 extract_feature_snapshot_fn=extract_feature_snapshot_fn,
                 iso_or_none_fn=iso_or_none_fn,
+                now_utc=now_utc,
             )
         )
     return offset_signals

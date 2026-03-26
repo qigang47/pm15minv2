@@ -104,7 +104,7 @@ def test_quote_snapshot_accepts_small_post_decision_orderbook_delay(tmp_path: Pa
     assert row["quote_age_ms_up"] == -30000
 
 
-def test_quote_snapshot_prefers_next_market_for_direction_live_flow(tmp_path: Path, monkeypatch) -> None:
+def test_quote_snapshot_rejects_expired_signal_window(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
@@ -192,15 +192,12 @@ def test_quote_snapshot_prefers_next_market_for_direction_live_flow(tmp_path: Pa
         now=pd.Timestamp("2026-03-20T12:48:00Z"),
     )
     row = quote["quote_rows"][0]
-    assert row["status"] == "ok"
-    assert row["market_id"] == "market-next"
-    assert row["condition_id"] == "cond-next"
-    assert row["feature_cycle_start_ts"] == feature_cycle_start.isoformat()
-    assert row["feature_cycle_end_ts"] == feature_cycle_end.isoformat()
-    assert row["trade_cycle_start_ts"] == trade_cycle_start.isoformat()
-    assert row["cycle_end_ts"] == trade_cycle_end.isoformat()
-    assert row["quote_up_ask"] == 0.22
-    assert row["quote_down_ask"] == 0.78
+    assert row["status"] == "missing_quote_inputs"
+    assert row["market_id"] is None
+    assert row["condition_id"] is None
+    assert row["quote_up_ask"] is None
+    assert row["quote_down_ask"] is None
+    assert row["reasons"] == ["signal_window_expired"]
 
 
 def test_quote_snapshot_uses_recent_orderbook_cache_when_daily_index_missing(tmp_path: Path, monkeypatch) -> None:
@@ -386,3 +383,85 @@ def test_quote_snapshot_prefers_provider_over_stale_index(tmp_path: Path, monkey
     assert row["quote_up_ask"] == 0.31
     assert row["quote_down_ask"] == 0.69
     assert provider.calls == ["token-up", "token-down"]
+
+
+def test_quote_snapshot_prefers_local_recent_over_provider_when_available(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    cycle_start = pd.Timestamp("2026-03-21T16:45:00Z")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    captured_ts = pd.Timestamp("2026-03-21T16:54:10Z")
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "question": "Sol up or down",
+                    "source_snapshot_ts": "2026-03-21T16-45-00Z",
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "captured_ts_ms": int(captured_ts.timestamp() * 1000),
+                    "market_id": "market-1",
+                    "token_id": "token-up",
+                    "side": "up",
+                    "best_ask": 0.24,
+                    "best_bid": 0.23,
+                    "ask_size_1": 9.0,
+                    "bid_size_1": 8.0,
+                    "spread": 0.01,
+                },
+                {
+                    "captured_ts_ms": int(captured_ts.timestamp() * 1000),
+                    "market_id": "market-1",
+                    "token_id": "token-down",
+                    "side": "down",
+                    "best_ask": 0.76,
+                    "best_bid": 0.75,
+                    "ask_size_1": 10.0,
+                    "bid_size_1": 11.0,
+                    "spread": 0.01,
+                },
+            ]
+        ),
+        data_cfg.layout.orderbook_recent_path,
+    )
+    provider = _FakeOrderbookProvider()
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 8,
+                    "decision_ts": "2026-03-21T16:54:00+00:00",
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                }
+            ],
+        },
+        persist=False,
+        now=pd.Timestamp("2026-03-21T16:54:15Z"),
+        orderbook_provider=provider,
+    )
+    row = quote["quote_rows"][0]
+    assert row["status"] == "ok"
+    assert row["quote_up_ask"] == 0.24
+    assert row["quote_down_ask"] == 0.76
+    assert provider.calls == []

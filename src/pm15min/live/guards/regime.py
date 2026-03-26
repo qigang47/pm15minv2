@@ -3,6 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 from ..profiles import LiveProfileSpec, resolve_max_trades_per_market
+from ..session_state import (
+    build_market_offset_side_trade_count_key,
+    build_market_offset_trade_count_key,
+    normalize_trade_side,
+)
 
 
 def liquidity_guard_reasons(
@@ -11,6 +16,8 @@ def liquidity_guard_reasons(
     liquidity_state: dict[str, Any] | None,
 ) -> list[str]:
     if not bool(profile_spec.liquidity_guard_enabled):
+        return []
+    if not bool(profile_spec.liquidity_guard_block):
         return []
     state = liquidity_state or {}
     if not isinstance(state, dict):
@@ -34,6 +41,8 @@ def regime_guard_reasons(
     chosen_prob: float,
 ) -> list[str]:
     if not bool(profile_spec.regime_controller_enabled):
+        return []
+    if not bool(profile_spec.liquidity_guard_block):
         return []
     state = regime_state or {}
     if not isinstance(state, dict):
@@ -107,14 +116,21 @@ def build_account_context(
         market=market,
         regime_state=regime_state,
     )
-    trade_count_key = None if market_id is None or offset is None else f"{market_id}_{offset}"
-    session_trade_count = 0
-    if trade_count_key is not None:
-        session_trade_count = int_or_none(_session_trade_count_map(session_state).get(trade_count_key)) or 0
+    selected_side = normalize_trade_side(signal_row.get("recommended_side"))
+    session_trade_count, trade_count_key, trade_count_scope = resolve_session_trade_count(
+        cap_context=cap_context,
+        session_state=session_state,
+        market_id=market_id,
+        offset=offset,
+        side=selected_side,
+    )
     base_context = {
         "selected_offset": offset,
+        "selected_side": selected_side,
         "session_trade_count": int(session_trade_count),
         "session_trade_count_key": trade_count_key,
+        "session_trade_count_scope": trade_count_scope,
+        "session_trade_count_lock_side": trade_count_scope == "market_offset_side",
         "max_trades_per_market_base": int(cap_context["base_cap"]),
         "max_trades_per_market_effective": int(cap_context["effective_cap"]),
         "max_trades_per_market_source": cap_context["base_cap_source"],
@@ -189,6 +205,15 @@ def _resolve_trade_count_context(
     regime_state: dict[str, Any] | None,
 ) -> dict[str, Any]:
     base_cap, base_cap_source = resolve_max_trades_per_market(profile_spec=profile_spec, market=market)
+    repeat_cap = (
+        max(0, int_or_none(getattr(profile_spec, "repeat_same_decision_max_trades", 0)) or 0)
+        if bool(getattr(profile_spec, "repeat_same_decision_enabled", False))
+        else 0
+    )
+    if repeat_cap > 0:
+        if base_cap <= 0 or repeat_cap < int(base_cap):
+            base_cap = int(repeat_cap)
+            base_cap_source = "repeat_same_decision_max_trades"
     effective_cap = int(base_cap)
     defense_cap = max(0, int(profile_spec.regime_defense_max_trades_per_market))
     defense_cap_applied = False
@@ -203,19 +228,53 @@ def _resolve_trade_count_context(
         elif defense_cap < effective_cap:
             effective_cap = defense_cap
             defense_cap_applied = True
+    count_scope = "market_offset"
+    if (
+        base_cap_source == "repeat_same_decision_max_trades"
+        and not defense_cap_applied
+        and bool(profile_spec.repeat_same_decision_lock_side)
+    ):
+        count_scope = "market_offset_side"
     return {
         "base_cap": int(base_cap),
         "base_cap_source": base_cap_source,
         "effective_cap": int(effective_cap),
         "defense_cap": int(defense_cap),
         "defense_cap_applied": bool(defense_cap_applied),
+        "count_scope": count_scope,
     }
 
 
-def _session_trade_count_map(session_state: dict[str, Any] | None) -> dict[str, Any]:
+def resolve_session_trade_count(
+    *,
+    cap_context: dict[str, Any],
+    session_state: dict[str, Any] | None,
+    market_id: object,
+    offset: object,
+    side: object,
+) -> tuple[int, str | None, str]:
+    counts = _session_trade_count_map(session_state)
+    side_counts = _session_trade_count_map(session_state, side_aware=True)
+    base_key = build_market_offset_trade_count_key(market_id=market_id, offset=offset)
+    if base_key is None:
+        return 0, None, str(cap_context.get("count_scope") or "market_offset")
+    count_scope = str(cap_context.get("count_scope") or "market_offset")
+    if count_scope == "market_offset_side":
+        side_key = build_market_offset_side_trade_count_key(
+            market_id=market_id,
+            offset=offset,
+            side=side,
+        )
+        if side_key is not None:
+            return int(int_or_none(side_counts.get(side_key)) or 0), side_key, count_scope
+    return int(int_or_none(counts.get(base_key)) or 0), base_key, "market_offset"
+
+
+def _session_trade_count_map(session_state: dict[str, Any] | None, *, side_aware: bool = False) -> dict[str, Any]:
     if not isinstance(session_state, dict):
         return {}
-    counts = session_state.get("market_offset_trade_count")
+    state_key = "market_offset_side_trade_count" if side_aware else "market_offset_trade_count"
+    counts = session_state.get(state_key)
     if isinstance(counts, dict):
         return counts
     return {}

@@ -969,6 +969,9 @@ def build_console_js() -> str:
   const tableSortState = {};
   const detailFilterStateBySection = {};
   const detailViewStateBySection = {};
+  const activeTaskPolls = {};
+  const TASK_POLL_INTERVAL_MS = 1500;
+  const TASK_POLL_MAX_CONSECUTIVE_ERRORS = 5;
   const SECTION_LABELS = {
     home: "首页",
     data_overview: "数据总览",
@@ -1109,6 +1112,7 @@ def build_console_js() -> str:
     "Rows Total": "总样本数",
     subject: "对象",
     stage: "阶段",
+    heartbeat: "最近心跳",
     progress: "进度",
     started_at: "开始时间",
     finished_at: "结束时间",
@@ -1423,6 +1427,78 @@ def build_console_js() -> str:
       .replaceAll("Failed", "失败")
       .replaceAll("stage=", "阶段=")
       .replaceAll("output=", "输出=");
+  }
+
+  function isTaskActiveStatus(status) {
+    const normalized = String(status || "").trim();
+    return normalized === "queued" || normalized === "running";
+  }
+
+  function isTaskTerminalStatus(status) {
+    const normalized = String(status || "").trim();
+    return normalized === "succeeded" || normalized === "failed" || normalized === "ok" || normalized === "error";
+  }
+
+  function taskIdFromPayload(payload) {
+    return String((payload || {}).task_id || "").trim();
+  }
+
+  function formatConsoleTimestamp(value) {
+    const token = String(value || "").trim();
+    if (!token) {
+      return "";
+    }
+    const parsed = new Date(token);
+    if (Number.isNaN(parsed.getTime())) {
+      return token;
+    }
+    return parsed.toLocaleString("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+  }
+
+  function heartbeatAgeText(value) {
+    const token = String(value || "").trim();
+    if (!token) {
+      return "";
+    }
+    const parsed = new Date(token);
+    if (Number.isNaN(parsed.getTime())) {
+      return "";
+    }
+    const ageMs = Math.max(0, Date.now() - parsed.getTime());
+    const ageSec = Math.floor(ageMs / 1000);
+    if (ageSec < 60) {
+      return String(ageSec) + " 秒前";
+    }
+    const ageMin = Math.floor(ageSec / 60);
+    if (ageMin < 60) {
+      return String(ageMin) + " 分钟前";
+    }
+    const ageHour = Math.floor(ageMin / 60);
+    return String(ageHour) + " 小时前";
+  }
+
+  function progressHeartbeatText(progress) {
+    if (!progress || typeof progress !== "object") {
+      return "";
+    }
+    const heartbeat = String(progress.heartbeat || "").trim();
+    if (!heartbeat) {
+      return "";
+    }
+    const age = heartbeatAgeText(heartbeat);
+    const formatted = formatConsoleTimestamp(heartbeat);
+    if (age && formatted) {
+      return age + " · " + formatted;
+    }
+    return age || formatted || heartbeat;
   }
 
   function normalizeSection(sectionId) {
@@ -4241,7 +4317,7 @@ def build_console_js() -> str:
         context.jsonNode.textContent = JSON.stringify(payload, null, 2);
       }
       if (response.ok && executionMode === "async" && payload.task_id) {
-        refreshRecentTasks(sectionId);
+        refreshRecentTasks(sectionId, { silent: true });
         pollConsoleTask({
           sectionId: sectionId,
           taskId: String(payload.task_id),
@@ -4273,29 +4349,80 @@ def build_console_js() -> str:
     if (!taskId) {
       return;
     }
-    for (let attempt = 0; attempt < 120; attempt += 1) {
-      try {
-        const response = await fetch(taskStatusPath(taskId));
-        const payload = await response.json();
-        actionResultsBySection[context.sectionId] = payload;
-        if (context.actionResultContext) {
-          renderActionResult(context.actionResultContext, payload);
-        }
-        refreshRecentTasks(context.sectionId);
-        if (context.jsonNode) {
-          context.jsonNode.textContent = JSON.stringify(payload, null, 2);
-        }
-        if (context.statusNode) {
-          context.statusNode.textContent = taskStatusSummary(payload);
-        }
-        if (["succeeded", "failed", "ok", "error"].includes(String(payload.status || ""))) {
-          return;
-        }
-      } catch (_error) {
-        return;
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    const existing = activeTaskPolls[taskId];
+    if (existing) {
+      existing.context = context;
+      return existing.promise;
     }
+    const entry = {
+      context: context,
+      consecutiveErrors: 0,
+      promise: null
+    };
+    activeTaskPolls[taskId] = entry;
+    entry.promise = (async function () {
+      while (activeTaskPolls[taskId] === entry) {
+        const currentContext = entry.context || context;
+        const sectionId = normalizeSection(currentContext.sectionId);
+        const shouldRefreshSection = shell.dataset.activeSection === sectionId;
+        let terminalPayload = null;
+        let shouldStopPolling = false;
+        let encounteredError = null;
+        let shouldRetry = false;
+        try {
+          const response = await fetch(taskStatusPath(taskId));
+          const payload = await response.json();
+          entry.consecutiveErrors = 0;
+          actionResultsBySection[sectionId] = payload;
+          if (currentContext.actionResultContext) {
+            renderActionResult(currentContext.actionResultContext, payload);
+          }
+          refreshRecentTasks(sectionId, { silent: true });
+          if (currentContext.jsonNode) {
+            currentContext.jsonNode.textContent = JSON.stringify(payload, null, 2);
+          }
+          if (currentContext.statusNode) {
+            currentContext.statusNode.textContent = taskStatusSummary(payload);
+          }
+          const status = String(payload.status || "").trim();
+          if (isTaskTerminalStatus(status)) {
+            terminalPayload = payload;
+            shouldStopPolling = true;
+          } else {
+            shouldRetry = isTaskActiveStatus(status);
+            if (!shouldRetry) {
+              shouldStopPolling = true;
+            }
+          }
+        } catch (error) {
+          entry.consecutiveErrors += 1;
+          encounteredError = error;
+          if (entry.consecutiveErrors >= TASK_POLL_MAX_CONSECUTIVE_ERRORS) {
+            shouldStopPolling = true;
+          } else {
+            shouldRetry = true;
+          }
+        }
+        if (terminalPayload && shouldRefreshSection) {
+          await loadSection(sectionId);
+          reloadSelectedDetail(sectionId);
+        }
+        if (shouldStopPolling) {
+          delete activeTaskPolls[taskId];
+          if (encounteredError && currentContext.statusNode) {
+            currentContext.statusNode.textContent = "轮询任务状态失败：" + String(encounteredError);
+          }
+          return terminalPayload;
+        }
+        if (!shouldRetry) {
+          delete activeTaskPolls[taskId];
+          return null;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, TASK_POLL_INTERVAL_MS));
+      }
+      return null;
+    })();
+    return entry.promise;
   }
 
   function buildActionRequest(actionId, options) {
@@ -4510,6 +4637,7 @@ def build_console_js() -> str:
       const linkedObject = linkedObjectSummary(payload);
       const linkedObjectDetail = linkedObjectDetailSummary(payload);
       const errorDetail = errorDetailSummary(payload);
+      const heartbeat = progressHeartbeatText((payload || {}).progress || {});
       [
         ["section", context.sectionId],
         ["status", displayStatus(payload.status_label || status)],
@@ -4518,6 +4646,7 @@ def build_console_js() -> str:
         ["subject", subject],
         ["stage", (payload.progress || {}).current_stage],
         ["progress", translateProgressText(payload.progress_summary || progressSnapshotText(payload.progress || {}))],
+        ["heartbeat", heartbeat],
         ["started_at", payload.started_at],
         ["result", payload.result_summary || (resultPayload && typeof resultPayload === "object" ? resultPayload.dataset : undefined)],
         ["linked_object", linkedObject],
@@ -5133,31 +5262,61 @@ def build_console_js() -> str:
     };
   }
 
-  function refreshRecentTasks(sectionId) {
+  function refreshRecentTasks(sectionId, options) {
     const context = recentTasksContextForSection(sectionId);
     if (!context) {
       return;
     }
-    loadRecentTasks(context).catch(function () {
+    loadRecentTasks(context, options).catch(function () {
       renderRecentTasks(context, null, false);
     });
   }
 
-  async function loadRecentTasks(context) {
+  async function loadRecentTasks(context, options) {
     if (!context || !context.node) {
       return;
     }
+    const silent = Boolean(options && options.silent);
     const actionIds = sectionTaskActionIds(context.sectionId);
     if (!actionIds.length) {
       renderRecentTasks(context, { rows: [], row_count: 0, status_counts: {} }, true);
       return;
     }
     const loadingPayload = recentTasksBySection[context.sectionId] || null;
-    renderRecentTasks(context, loadingPayload, true, { loading: true });
+    if (!silent) {
+      renderRecentTasks(context, loadingPayload, true, { loading: true });
+    }
     const response = await fetch(tasksListPath(actionIds, 6));
     const payload = await response.json();
     recentTasksBySection[context.sectionId] = payload;
     renderRecentTasks(context, payload, response.ok);
+    if (response.ok) {
+      syncRecentTaskPolling(context, payload);
+    }
+  }
+
+  function syncRecentTaskPolling(context, payload) {
+    const rows = Array.isArray((payload || {}).rows) ? payload.rows : [];
+    const activeRow = rows.find((row) => isTaskActiveStatus((row || {}).status));
+    if (!activeRow) {
+      return;
+    }
+    const activeTaskId = taskIdFromPayload(activeRow);
+    if (!activeTaskId) {
+      return;
+    }
+    const currentTaskId = taskIdFromPayload(actionResultsBySection[context.sectionId] || {});
+    const currentStatus = String(((actionResultsBySection[context.sectionId] || {}).status) || "").trim();
+    if (currentTaskId && currentTaskId !== activeTaskId && !isTaskActiveStatus(currentStatus)) {
+      return;
+    }
+    pollConsoleTask({
+      sectionId: context.sectionId,
+      taskId: activeTaskId,
+      statusNode: context.statusNode,
+      jsonNode: context.jsonNode,
+      actionResultContext: context.actionResultContext
+    });
   }
 
   function taskMetaValues(row) {
@@ -5165,11 +5324,13 @@ def build_console_js() -> str:
     const taskId = String((row || {}).task_id || "").trim();
     const status = displayStatus((row || {}).status_label || (row || {}).status || "");
     const progress = translateProgressText((row || {}).progress_summary || "");
+    const stage = String((((row || {}).progress || {}).current_stage) || "").trim();
+    const heartbeat = progressHeartbeatText((row || {}).progress || {});
     const result = String((row || {}).result_summary || "").trim();
     const error = String((row || {}).error_summary || "").trim();
     const output = String((row || {}).primary_output_path || "").trim();
     const updatedAt = String((row || {}).updated_at || "").trim();
-    [taskId, status, progress, result, error].forEach((value) => {
+    [taskId, status, stage ? ("阶段=" + stage) : "", progress, heartbeat ? ("心跳=" + heartbeat) : "", result, error].forEach((value) => {
       if (value) {
         values.push(value);
       }
@@ -5659,8 +5820,13 @@ def build_console_js() -> str:
     }
     if (progress.current !== undefined && progress.current !== null && progress.total !== undefined && progress.total !== null) {
       parts.push(String(progress.current) + "/" + String(progress.total));
-    } else if (progress.progress_pct !== undefined && progress.progress_pct !== null) {
+    }
+    if (progress.progress_pct !== undefined && progress.progress_pct !== null) {
       parts.push(String(progress.progress_pct) + "%");
+    }
+    const heartbeat = progressHeartbeatText(progress);
+    if (heartbeat) {
+      parts.push("心跳=" + heartbeat);
     }
     return parts.join(" · ");
   }
@@ -5735,6 +5901,8 @@ def build_console_js() -> str:
 
   function taskRowCopy(sectionId, row) {
     const progress = translateProgressText((row || {}).progress_summary || "");
+    const progressStage = String((((row || {}).progress || {}).current_stage) || "").trim();
+    const heartbeat = progressHeartbeatText((row || {}).progress || {});
     const result = String((row || {}).result_summary || "").trim();
     const error = String((row || {}).error_summary || "").trim();
     const output = String((row || {}).primary_output_path || "").trim();
@@ -5744,11 +5912,14 @@ def build_console_js() -> str:
     if (error) {
       return error + (outputText ? (" | " + outputText) : "") + (request ? (" | " + request) : "");
     }
+    const progressDetails = [progress, progressStage ? ("阶段=" + progressStage) : "", heartbeat ? ("心跳=" + heartbeat) : ""]
+      .filter(Boolean)
+      .join(" | ");
     if (progress && result) {
-      return progress + " | " + result + (outputText ? (" | " + outputText) : "") + (request ? (" | " + request) : "");
+      return progressDetails + " | " + result + (outputText ? (" | " + outputText) : "") + (request ? (" | " + request) : "");
     }
-    if (progress) {
-      return progress + (outputText ? (" | " + outputText) : "") + (request ? (" | " + request) : "");
+    if (progressDetails) {
+      return progressDetails + (outputText ? (" | " + outputText) : "") + (request ? (" | " + request) : "");
     }
     if (result) {
       return result + (outputText ? (" | " + outputText) : "") + (request ? (" | " + request) : "");
@@ -5790,6 +5961,7 @@ def build_console_js() -> str:
   function actionResultLeadCopy(sectionId, payload) {
     const status = actionResultStatusValue(payload);
     const progressText = String((payload || {}).progress_summary || "").trim() || progressSnapshotText((payload || {}).progress || {});
+    const heartbeatText = progressHeartbeatText((payload || {}).progress || {});
     const subject = String((payload || {}).subject_summary || "").trim() || actionRequestSubject(sectionId, payload);
     const subjectText = subject ? (" 请求对象：" + subject + "。") : "";
     const drilldownSignals = [];
@@ -5806,7 +5978,12 @@ def build_console_js() -> str:
       ? (" 下方可继续钻取：" + drilldownSignals.join(" · ") + "。")
       : "";
     if (status === "queued" || status === "running") {
-      return "后台任务仍在运行" + (progressText ? ("：" + translateProgressText(progressText) + "。") : "。") + " 这个面板会自动轮询任务状态。" + subjectText + drilldownText;
+      return "后台任务仍在运行" +
+        (progressText ? ("：" + translateProgressText(progressText) + "。") : "。") +
+        (heartbeatText ? (" 最近心跳：" + heartbeatText + "。") : "") +
+        " 这个面板会自动轮询任务状态，直到任务进入终态并刷新当前分区。" +
+        subjectText +
+        drilldownText;
     }
     if (status === "succeeded") {
       const resultSummary = String((payload || {}).result_summary || "").trim();
@@ -5938,12 +6115,17 @@ def build_console_js() -> str:
     const taskId = String((payload || {}).task_id || "");
     const status = actionResultStatusValue(payload);
     const progressText = String((payload || {}).progress_summary || "").trim() || progressSnapshotText((payload || {}).progress || {});
+    const heartbeatText = progressHeartbeatText((payload || {}).progress || {});
     const prefix = taskId ? ("任务 " + taskId) : "任务";
     if (status === "queued" || status === "running") {
-      return prefix + " " + displayStatus(status) + (progressText ? ("：" + translateProgressText(progressText)) : "");
+      return prefix + " " + displayStatus(status) +
+        (progressText ? ("：" + translateProgressText(progressText)) : "") +
+        (heartbeatText ? (" · 最近心跳 " + heartbeatText) : "");
     }
     if (status === "succeeded") {
-      return prefix + " 已完成" + (progressText ? ("：" + translateProgressText(progressText)) : "");
+      return prefix + " 已完成" +
+        (progressText ? ("：" + translateProgressText(progressText)) : "") +
+        (heartbeatText ? (" · 最近心跳 " + heartbeatText) : "");
     }
     if (status === "failed") {
       const error = String((payload || {}).error_summary || "").trim() || actionErrorSummary(payload);

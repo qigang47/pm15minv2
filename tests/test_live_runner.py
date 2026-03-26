@@ -4,8 +4,9 @@ import json
 from pathlib import Path
 
 from pm15min.core.config import LiveConfig
+from pm15min.live.layout import LiveStateLayout
 from pm15min.live.runner import run_live_runner
-from pm15min.live.runner.runtime import _resolve_iteration_limit
+from pm15min.live.runner.runtime import _load_persisted_session_state, _resolve_iteration_limit
 
 
 def _patch_v2_roots(monkeypatch, root: Path) -> None:
@@ -101,9 +102,328 @@ def test_run_live_runner_writes_summary_and_log(tmp_path: Path, monkeypatch) -> 
 
     lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert any('"event": "runner_iteration"' in line for line in lines)
+    assert any('"runner_log_tracked": true' in line for line in lines)
 
 
-def test_run_live_runner_carries_session_trade_count_between_iterations(tmp_path: Path, monkeypatch) -> None:
+def test_run_live_runner_skips_normal_log_for_untracked_offset(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.delenv("PM15MIN_RUNNER_UNTRACKED_LOG_INTERVAL_SEC", raising=False)
+    monkeypatch.delenv("PM15MIN_RUNNER_LOG_OFFSETS", raising=False)
+
+    monkeypatch.setattr("pm15min.live.runner.run_live_data_foundation", lambda *args, **kwargs: {"status": "ok"})
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_liquidity_state_snapshot",
+        lambda *args, **kwargs: {"snapshot_ts": "2026-03-20T00-00-00Z", "status": "ok", "blocked": False, "reason": "ok"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.decide_live_latest",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-00Z",
+            "decision": {"status": "accept", "selected_offset": 5, "selected_side": "DOWN", "selected_quote_market_id": "market-1"},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_execution_snapshot",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-01Z",
+            "execution": {"status": "plan", "order_type": "FAK", "market_id": "market-1", "selected_offset": 5},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.persist_execution_snapshot",
+        lambda *args, **kwargs: {"latest": root / "latest.json", "snapshot": root / "snapshot.json"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.submit_execution_payload",
+        lambda *args, **kwargs: {"status": "ok", "reason": "order_submitted", "order_response": {"status": "live"}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_account_state_snapshot",
+        lambda *args, **kwargs: {"snapshot_ts": "2026-03-20T00-00-02Z", "open_orders": {"status": "ok"}, "positions": {"status": "ok"}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_cancel_policy",
+        lambda *args, **kwargs: {"status": "ok", "reason": "cancel_policy_applied", "summary": {"cancelled_orders": 0}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_redeem_policy",
+        lambda *args, **kwargs: {"status": "ok", "reason": "redeem_policy_applied", "summary": {"redeemed_conditions": 0}},
+    )
+
+    run_live_runner(cfg, iterations=2, loop=True, sleep_sec=0.0, persist=True)
+
+    log_path = root / "var" / "live" / "logs" / "runner" / "cycle=15m" / "asset=sol" / "profile=deep_otm" / "target=direction" / "runner.jsonl"
+    assert not log_path.exists()
+
+
+def test_run_live_runner_can_raise_log_frequency_for_tracked_offsets(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_RUNNER_TRACKED_LOG_INTERVAL_SEC", "0")
+
+    monkeypatch.setattr("pm15min.live.runner.run_live_data_foundation", lambda *args, **kwargs: {"status": "ok"})
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_liquidity_state_snapshot",
+        lambda *args, **kwargs: {"snapshot_ts": "2026-03-20T00-00-00Z", "status": "ok", "blocked": False, "reason": "ok"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.decide_live_latest",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-00Z",
+            "decision": {"status": "accept", "selected_offset": 7, "selected_side": "DOWN", "selected_quote_market_id": "market-1"},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_execution_snapshot",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-01Z",
+            "execution": {"status": "plan", "order_type": "FAK", "market_id": "market-1", "selected_offset": 7},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.persist_execution_snapshot",
+        lambda *args, **kwargs: {"latest": root / "latest.json", "snapshot": root / "snapshot.json"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.submit_execution_payload",
+        lambda *args, **kwargs: {"status": "ok", "reason": "order_submitted", "order_response": {"status": "live"}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_account_state_snapshot",
+        lambda *args, **kwargs: {"snapshot_ts": "2026-03-20T00-00-02Z", "open_orders": {"status": "ok"}, "positions": {"status": "ok"}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_cancel_policy",
+        lambda *args, **kwargs: {"status": "ok", "reason": "cancel_policy_applied", "summary": {"cancelled_orders": 0}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_redeem_policy",
+        lambda *args, **kwargs: {"status": "ok", "reason": "redeem_policy_applied", "summary": {"redeemed_conditions": 0}},
+    )
+
+    run_live_runner(cfg, iterations=2, loop=True, sleep_sec=0.0, persist=True)
+
+    log_path = root / "var" / "live" / "logs" / "runner" / "cycle=15m" / "asset=sol" / "profile=deep_otm" / "target=direction" / "runner.jsonl"
+    lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 2
+
+
+def test_run_live_runner_writes_compact_audit_log(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+
+    bundle_dir = root / "research" / "model_bundles" / "cycle=15m" / "asset=sol" / "profile=deep_otm" / "target=direction" / "bundle=test_bundle"
+    diagnostics_dir = bundle_dir / "offsets" / "offset=7" / "diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    (diagnostics_dir / "logreg_coefficients.json").write_text(
+        json.dumps(
+            {
+                "intercept": -0.1,
+                "rows": [
+                    {"feature": "move_z", "coefficient": 0.45, "abs_coefficient": 0.45, "direction": "positive", "rank": 1},
+                    {"feature": "ret_5m", "coefficient": -0.12, "abs_coefficient": 0.12, "direction": "negative", "rank": 2},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (diagnostics_dir / "lgb_feature_importance.json").write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {"feature": "move_z", "gain_importance": 120.0, "gain_share": 0.6, "split_importance": 15, "split_share": 0.3, "rank": 1},
+                    {"feature": "ret_5m", "gain_importance": 40.0, "gain_share": 0.2, "split_importance": 8, "split_share": 0.16, "rank": 2},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (diagnostics_dir / "factor_direction_summary.json").write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {"feature": "move_z", "direction_score": 0.51, "direction": "positive", "target_correlation": 0.51, "logreg_coefficient": 0.45, "lgb_gain_importance": 120.0, "rank": 1},
+                    {"feature": "ret_5m", "direction_score": -0.19, "direction": "negative", "target_correlation": -0.19, "logreg_coefficient": -0.12, "lgb_gain_importance": 40.0, "rank": 2},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("pm15min.live.runner.run_live_data_foundation", lambda *args, **kwargs: {"status": "ok"})
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_liquidity_state_snapshot",
+        lambda *args, **kwargs: {"snapshot_ts": "2026-03-20T00-00-00Z", "status": "ok", "blocked": False, "reason": "ok"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.decide_live_latest",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-00Z",
+            "bundle_dir": str(bundle_dir),
+            "bundle_label": "test_bundle",
+            "builder_feature_set": "v6_user_core",
+            "bundle_feature_set": "v6_user_core",
+            "active_bundle_selection_path": str(root / "selection.json"),
+            "active_bundle": {"bundle_label": "test_bundle"},
+            "decision": {
+                "status": "accept",
+                "selected_offset": 7,
+                "selected_side": "UP",
+                "selected_confidence": 0.82,
+                "selected_edge": 0.64,
+                "selected_decision_ts": "2026-03-20T00:08:00+00:00",
+                "selected_quote_market_id": "market-1",
+                "selected_entry_price": 0.31,
+                "selected_roi_net_vs_quote": 1.1,
+                "selected_p_lgb": 0.84,
+                "selected_p_lr": 0.78,
+                "selected_p_signal": 0.816,
+                "selected_w_lgb": 0.6,
+                "selected_w_lr": 0.4,
+                "selected_probability_mode": "raw_blend",
+            },
+            "accepted_offsets": [
+                {
+                    "offset": 7,
+                    "decision_ts": "2026-03-20T00:08:00+00:00",
+                    "signal_target": "direction",
+                    "recommended_side": "UP",
+                    "threshold": 0.55,
+                    "score_valid": True,
+                    "score_reason": "",
+                    "confidence": 0.82,
+                    "edge": 0.64,
+                    "p_lgb": 0.84,
+                    "p_lr": 0.78,
+                    "p_signal": 0.816,
+                    "w_lgb": 0.6,
+                    "w_lr": 0.4,
+                    "p_up": 0.82,
+                    "p_down": 0.18,
+                    "probability_mode": "raw_blend",
+                    "guard_reasons": [],
+                    "coverage": {"effective_missing_feature_count": 0, "not_allowed_blacklist_count": 0, "nan_feature_count": 0},
+                    "quote_row": {"status": "ok", "market_id": "market-1", "condition_id": "cond-1", "question": "Will SOL go up?", "token_up": "token-up", "token_down": "token-down"},
+                    "quote_metrics": {"entry_price": 0.31, "roi_net_vs_quote": 1.1, "price_cap": 0.42},
+                    "feature_snapshot": {"move_z": 1.8, "ret_5m": 0.01},
+                    "account_context": {"cash_balance_usd": 100.0},
+                }
+            ],
+            "rejected_offsets": [
+                {
+                    "offset": 8,
+                    "decision_ts": "2026-03-20T00:08:00+00:00",
+                    "signal_target": "direction",
+                    "recommended_side": "UP",
+                    "threshold": 0.55,
+                    "score_valid": True,
+                    "score_reason": "",
+                    "confidence": 0.58,
+                    "edge": 0.16,
+                    "p_lgb": 0.59,
+                    "p_lr": 0.57,
+                    "p_signal": 0.582,
+                    "w_lgb": 0.6,
+                    "w_lr": 0.4,
+                    "p_up": 0.58,
+                    "p_down": 0.42,
+                    "probability_mode": "raw_blend",
+                    "guard_reasons": ["entry_price_above_max"],
+                    "coverage": {"effective_missing_feature_count": 0, "not_allowed_blacklist_count": 0, "nan_feature_count": 0},
+                    "quote_row": {"status": "ok", "market_id": "market-2"},
+                    "quote_metrics": {"entry_price": 0.74},
+                    "feature_snapshot": {"move_z": 0.9, "ret_5m": 0.002},
+                    "account_context": {"cash_balance_usd": 100.0},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_execution_snapshot",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-01Z",
+            "execution": {
+                "status": "plan",
+                "reason": None,
+                "execution_reasons": [],
+                "order_type": "FAK",
+                "market_id": "market-1",
+                "selected_offset": 7,
+                "selected_side": "UP",
+                "decision_ts": "2026-03-20T00:08:00+00:00",
+                "entry_price": 0.31,
+                "requested_notional_usd": 25.0,
+                "price_cap": 0.42,
+                "depth_plan": {"status": "ok", "max_price": 0.32},
+                "retry_policy": {"should_retry": False},
+                "cancel_policy": {"mode": "none"},
+                "redeem_policy": {"mode": "none"},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.persist_execution_snapshot",
+        lambda *args, **kwargs: {"latest": root / "latest.json", "snapshot": root / "snapshot.json"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.submit_execution_payload",
+        lambda *args, **kwargs: {
+            "status": "ok",
+            "reason": "order_submitted",
+            "dry_run": False,
+            "attempt": 1,
+            "attempted": True,
+            "action_key": "action-1",
+            "gate": {"decision": "allow", "reason": "first_attempt"},
+            "order_request": {"token_id": "token-up", "side": "BUY", "price": 0.31, "size": 80.0},
+            "order_response": {"success": True, "status": "live", "order_id": "order-1", "message": None},
+            "trading_gateway": {"adapter": "direct"},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_account_state_snapshot",
+        lambda *args, **kwargs: {"snapshot_ts": "2026-03-20T00-00-02Z", "open_orders": {"status": "ok"}, "positions": {"status": "ok"}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_cancel_policy",
+        lambda *args, **kwargs: {"status": "ok", "reason": "cancel_policy_applied", "summary": {"cancelled_orders": 0}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_redeem_policy",
+        lambda *args, **kwargs: {"status": "ok", "reason": "redeem_policy_applied", "summary": {"redeemed_conditions": 0}},
+    )
+
+    summary = run_live_runner(cfg, iterations=2, loop=True, sleep_sec=0.0, persist=True)
+
+    audit_path = root / "var" / "live" / "logs" / "runner" / "cycle=15m" / "asset=sol" / "profile=deep_otm" / "target=direction" / "audit.jsonl"
+    assert summary["runner_audit_log_path"] == str(audit_path)
+    assert audit_path.exists()
+
+    events = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [event["event"] for event in events] == ["decision_state", "order_action"]
+    decision_event = events[0]
+    assert decision_event["signal_bundle"]["bundle_label"] == "test_bundle"
+    assert decision_event["decision"]["selected_p_signal"] == 0.816
+    assert decision_event["decision"]["selected_w_lgb"] == 0.6
+    assert decision_event["selected_offset_context"]["feature_snapshot"]["move_z"] == 1.8
+    assert decision_event["selected_model_context"]["top_logreg_coefficients"][0]["feature"] == "move_z"
+    assert decision_event["selected_model_context"]["top_lgb_feature_importance"][0]["feature"] == "move_z"
+    assert decision_event["selected_factor_snapshot"]["top_positive_factors"][0]["feature"] == "move_z"
+    assert decision_event["selected_factor_snapshot"]["top_positive_factors"][0]["live_value"] == 1.8
+    assert decision_event["rejected_offset_summaries"][0]["guard_reasons"] == ["entry_price_above_max"]
+
+    order_event = events[1]
+    assert order_event["order_action"]["reason"] == "order_submitted"
+    assert order_event["order_action"]["order_response"]["order_id"] == "order-1"
+    assert order_event["execution"]["selected_offset"] == 7
+    assert order_event["selected_factor_snapshot"]["top_negative_factors"][0]["feature"] == "ret_5m"
+
+
+def test_run_live_runner_does_not_count_dry_run_between_iterations(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
@@ -168,8 +488,251 @@ def test_run_live_runner_carries_session_trade_count_between_iterations(tmp_path
 
     summary = run_live_runner(cfg, iterations=2, loop=True, sleep_sec=0.0, persist=True)
 
+    assert observed_counts == [{}, {}]
+    assert summary["session_state"]["market_offset_trade_count"] == {}
+    assert summary["session_state"]["market_offset_side_trade_count"] == {}
+
+
+def test_run_live_runner_does_not_restore_dry_run_trade_count_after_restart(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    observed_counts: list[dict[str, int]] = []
+
+    monkeypatch.setattr("pm15min.live.runner.run_live_data_foundation", lambda *args, **kwargs: {"status": "ok"})
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_liquidity_state_snapshot",
+        lambda *args, **kwargs: {"snapshot_ts": "2026-03-20T00-00-00Z", "status": "ok", "blocked": False, "reason": "ok"},
+    )
+
+    def _decide(*args, **kwargs):
+        session_state = kwargs.get("session_state") or {}
+        observed_counts.append(dict(session_state.get("market_offset_trade_count") or {}))
+        return {
+            "snapshot_ts": "2026-03-20T00-00-00Z",
+            "decision": {
+                "status": "accept",
+                "selected_offset": 7,
+                "selected_side": "DOWN",
+                "selected_quote_market_id": "market-1",
+            },
+        }
+
+    monkeypatch.setattr("pm15min.live.runner.decide_live_latest", _decide)
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_execution_snapshot",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-01Z",
+            "execution": {
+                "status": "plan",
+                "order_type": "FAK",
+                "market_id": "market-1",
+                "selected_offset": 7,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.persist_execution_snapshot",
+        lambda *args, **kwargs: {"latest": root / "latest.json", "snapshot": root / "snapshot.json"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.submit_execution_payload",
+        lambda *args, **kwargs: {"status": "ok", "reason": "dry_run", "order_response": {"status": "dry_run"}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_account_state_snapshot",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-02Z",
+            "open_orders": {"status": "ok"},
+            "positions": {"status": "ok"},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_cancel_policy",
+        lambda *args, **kwargs: {"status": "ok", "reason": "cancel_policy_applied", "summary": {"cancelled_orders": 0}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_redeem_policy",
+        lambda *args, **kwargs: {"status": "ok", "reason": "redeem_policy_applied", "summary": {"redeemed_conditions": 0}},
+    )
+
+    first = run_live_runner(cfg, iterations=1, loop=False, sleep_sec=0.0, persist=True)
+    second = run_live_runner(cfg, iterations=1, loop=False, sleep_sec=0.0, persist=True)
+
+    assert first["session_state"]["market_offset_trade_count"] == {}
+    assert second["session_state"]["market_offset_trade_count"] == {}
+    assert first["session_state"]["market_offset_side_trade_count"] == {}
+    assert second["session_state"]["market_offset_side_trade_count"] == {}
+    assert observed_counts == [{}, {}]
+
+
+def test_run_live_runner_restores_session_trade_count_from_audit_log(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    observed_counts: list[dict[str, int]] = []
+
+    monkeypatch.setattr("pm15min.live.runner.run_live_data_foundation", lambda *args, **kwargs: {"status": "ok"})
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_liquidity_state_snapshot",
+        lambda *args, **kwargs: {"snapshot_ts": "2026-03-20T00-00-00Z", "status": "ok", "blocked": False, "reason": "ok"},
+    )
+
+    def _decide(*args, **kwargs):
+        session_state = kwargs.get("session_state") or {}
+        observed_counts.append(dict(session_state.get("market_offset_trade_count") or {}))
+        return {
+            "snapshot_ts": "2026-03-20T00-00-00Z",
+            "decision": {
+                "status": "accept",
+                "selected_offset": 7,
+                "selected_side": "DOWN",
+                "selected_quote_market_id": "market-1",
+            },
+        }
+
+    monkeypatch.setattr("pm15min.live.runner.decide_live_latest", _decide)
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_execution_snapshot",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-01Z",
+            "execution": {
+                "status": "plan",
+                "order_type": "FAK",
+                "market_id": "market-1",
+                "selected_offset": 7,
+                "selected_side": "DOWN",
+                "decision_ts": "2026-03-20T00:08:00+00:00",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.persist_execution_snapshot",
+        lambda *args, **kwargs: {"latest": root / "latest.json", "snapshot": root / "snapshot.json"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.submit_execution_payload",
+        lambda *args, **kwargs: {
+            "status": "ok",
+            "reason": "order_submitted",
+            "attempted": True,
+            "action_key": "action-1",
+            "attempt": 1,
+            "dry_run": False,
+            "order_request": {"side": "DOWN", "price": 0.2, "size": 5.0, "token_id": "token-down"},
+            "order_response": {"status": "live", "order_id": "order-1", "success": True},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_account_state_snapshot",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-02Z",
+            "open_orders": {"status": "ok"},
+            "positions": {"status": "ok"},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_cancel_policy",
+        lambda *args, **kwargs: {"status": "ok", "reason": "cancel_policy_applied", "summary": {"cancelled_orders": 0}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_redeem_policy",
+        lambda *args, **kwargs: {"status": "ok", "reason": "redeem_policy_applied", "summary": {"redeemed_conditions": 0}},
+    )
+
+    first = run_live_runner(cfg, iterations=1, loop=False, sleep_sec=0.0, persist=True)
+    latest_runner = root / "var" / "live" / "state" / "runner" / "cycle=15m" / "asset=sol" / "profile=deep_otm" / "target=direction" / "latest.json"
+    latest_runner.unlink()
+    second = run_live_runner(cfg, iterations=1, loop=False, sleep_sec=0.0, persist=True)
+
+    assert first["session_state"]["market_offset_trade_count"] == {"market-1_7": 1}
+    assert first["session_state"]["market_offset_side_trade_count"] == {"market-1_7_DOWN": 1}
+    assert second["session_state"]["market_offset_trade_count"] == {"market-1_7": 2}
+    assert second["session_state"]["market_offset_side_trade_count"] == {"market-1_7_DOWN": 2}
     assert observed_counts == [{}, {"market-1_7": 1}]
-    assert summary["session_state"]["market_offset_trade_count"] == {"market-1_7": 2}
+
+
+def test_load_persisted_session_state_ignores_dry_run_audit_entries(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    layout = LiveStateLayout.discover(root=root)
+    audit_path = layout.runner_audit_log_path(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        target="direction",
+    )
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event": "order_action",
+                        "snapshot_ts": "2026-03-20T00-00-00Z",
+                        "execution": {
+                            "market_id": "market-1",
+                            "selected_offset": 7,
+                            "selected_side": "UP",
+                        },
+                        "order_action": {
+                            "status": "ok",
+                            "reason": "dry_run",
+                            "action_key": "dry-run-action",
+                            "attempt": 1,
+                            "dry_run": True,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "order_action",
+                        "snapshot_ts": "2026-03-20T00-00-05Z",
+                        "execution": {
+                            "market_id": "market-1",
+                            "selected_offset": 7,
+                            "selected_side": "DOWN",
+                        },
+                        "order_action": {
+                            "status": "ok",
+                            "reason": "order_submitted",
+                            "action_key": "real-action",
+                            "attempt": 1,
+                            "dry_run": False,
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    state = _load_persisted_session_state(
+        layout=layout,
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        target="direction",
+    )
+
+    assert state["market_offset_trade_count"] == {"market-1_7": 1}
+    assert state["market_offset_side_trade_count"] == {"market-1_7_DOWN": 1}
+    assert state["action_gate_state"] == {
+        "order": {
+            "real-action": {
+                "action_key": "real-action",
+                "snapshot_ts": "2026-03-20T00-00-05Z",
+                "status": "ok",
+                "reason": "order_submitted",
+                "attempt": 1,
+                "last_attempt_snapshot_ts": "2026-03-20T00-00-05Z",
+                "last_attempt_status": "ok",
+                "last_attempt_reason": "order_submitted",
+                "dry_run": False,
+            }
+        }
+    }
 
 
 def test_run_live_runner_can_disable_side_effects(tmp_path: Path, monkeypatch) -> None:

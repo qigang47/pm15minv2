@@ -113,10 +113,27 @@ def _build_truth_label_frame(
             how="left",
         )
 
+    truth = truth.reindex(columns=LABEL_FRAME_COLUMNS)
+    truth["source_priority"] = truth["label_source"].map(
+        {"settlement_truth": 2, "streams": 2, "chainlink_mixed": 2, "datafeeds": 2, "oracle_prices": 1}
+    ).fillna(0)
+    truth["resolved_priority"] = truth["resolved"].fillna(False).astype(int)
+    truth["full_truth_priority"] = truth["full_truth"].fillna(False).astype(int)
+    truth["winner_side_priority"] = truth["winner_side"].fillna("").astype(str).ne("").astype(int)
+
     return (
-        truth.reindex(columns=LABEL_FRAME_COLUMNS)
-        .sort_values(["cycle_start_ts"])
+        truth.sort_values(
+            [
+                "cycle_start_ts",
+                "full_truth_priority",
+                "resolved_priority",
+                "winner_side_priority",
+                "source_priority",
+                "market_id",
+            ]
+        )
         .drop_duplicates(subset=["asset", "cycle_start_ts"], keep="last")
+        .drop(columns=["source_priority", "resolved_priority", "full_truth_priority", "winner_side_priority"])
         .reset_index(drop=True)
     )
 
