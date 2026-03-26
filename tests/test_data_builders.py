@@ -7,6 +7,7 @@ import pandas as pd
 from pm15min.data.config import DataConfig
 from pm15min.data.io.ndjson_zst import append_ndjson_zst
 from pm15min.data.io.parquet import write_parquet_atomic
+from pm15min.data.pipelines.direct_oracle_prices import sync_polymarket_oracle_prices_direct
 from pm15min.data.pipelines.oracle_prices import build_oracle_prices_15m
 from pm15min.data.pipelines.orderbook_recording import build_orderbook_index_from_depth
 from pm15min.data.pipelines.source_ingest import (
@@ -342,6 +343,222 @@ def test_build_truth_prefers_full_truth_settlement_candidate_for_same_cycle(tmp_
     assert truth.iloc[0]["winner_side"] == "DOWN"
     assert bool(truth.iloc[0]["resolved"]) is True
     assert bool(truth.iloc[0]["full_truth"]) is True
+
+
+def test_build_truth_marks_settlement_winner_side_resolved_without_full_truth(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=tmp_path / "v2")
+
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": 1700000000,
+                    "cycle_end_ts": 1700000900,
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "slug": "sol-up-or-down-15m-1700000000",
+                    "question": "Sol Up or Down",
+                    "resolution_source": "https://data.chain.link/streams/sol-usd",
+                    "event_id": "event-1",
+                    "event_slug": "slug-1",
+                    "event_title": "title-1",
+                    "series_slug": "sol-up-or-down-15m",
+                    "closed_ts": None,
+                    "source_snapshot_ts": "2026-03-19T09-00-00Z",
+                }
+            ]
+        ),
+        cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": 1700000000,
+                    "cycle_end_ts": 1700000900,
+                    "winner_side": "UP",
+                    "label_updown": "UP",
+                    "full_truth": False,
+                }
+            ]
+        ),
+        cfg.layout.settlement_truth_source_path,
+    )
+
+    truth_summary = build_truth_15m(cfg)
+    truth = pd.read_parquet(cfg.layout.truth_table_path)
+
+    assert truth_summary["rows_written"] == 1
+    assert len(truth) == 1
+    assert truth.iloc[0]["winner_side"] == "UP"
+    assert bool(truth.iloc[0]["resolved"]) is True
+    assert bool(truth.iloc[0]["full_truth"]) is False
+    assert truth.iloc[0]["truth_source"] == "settlement_truth"
+
+
+def test_sync_direct_oracle_prefers_more_complete_single_fetch_candidate(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=tmp_path / "v2")
+    cycle_start_ts = 1700000000
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": cycle_start_ts,
+                    "cycle_end_ts": cycle_start_ts + 900,
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "slug": "sol-up-or-down-15m-1700000000",
+                    "question": "Sol Up or Down",
+                    "resolution_source": "https://data.chain.link/streams/sol-usd",
+                    "event_id": "event-1",
+                    "event_slug": "slug-1",
+                    "event_title": "title-1",
+                    "series_slug": "sol-up-or-down-15m",
+                    "closed_ts": None,
+                    "source_snapshot_ts": "2026-03-19T09-00-00Z",
+                }
+            ]
+        ),
+        cfg.layout.market_catalog_table_path,
+    )
+
+    class _FakeClient:
+        def fetch_past_results_batch(self, **kwargs):
+            return [
+                {
+                    "startTime": "2023-11-14T22:13:20Z",
+                    "openPrice": 100.0,
+                    "closePrice": None,
+                    "completed": False,
+                    "incomplete": True,
+                    "cached": False,
+                    "timestamp": 1700000000000,
+                }
+            ]
+
+        def fetch_crypto_price(self, **kwargs):
+            return {
+                "openPrice": 100.0,
+                "closePrice": 101.0,
+                "completed": True,
+                "incomplete": False,
+                "cached": False,
+                "timestamp": 1700000900000,
+            }
+
+    summary = sync_polymarket_oracle_prices_direct(
+        cfg,
+        start_ts=cycle_start_ts,
+        end_ts=cycle_start_ts,
+        max_requests=1,
+        client=_FakeClient(),
+    )
+    direct = pd.read_parquet(cfg.layout.direct_oracle_source_path)
+
+    assert summary["rows_imported"] == 1
+    assert len(direct) == 1
+    assert bool(direct.iloc[0]["has_both"]) is True
+    assert float(direct.iloc[0]["final_price"]) == 101.0
+    assert direct.iloc[0]["source"] == "polymarket_api_crypto_price"
+
+
+def test_sync_direct_oracle_overwrites_existing_incomplete_row_with_complete_candidate(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=tmp_path / "v2")
+    cycle_start_ts = 1700000000
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": cycle_start_ts,
+                    "cycle_end_ts": cycle_start_ts + 900,
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "slug": "sol-up-or-down-15m-1700000000",
+                    "question": "Sol Up or Down",
+                    "resolution_source": "https://data.chain.link/streams/sol-usd",
+                    "event_id": "event-1",
+                    "event_slug": "slug-1",
+                    "event_title": "title-1",
+                    "series_slug": "sol-up-or-down-15m",
+                    "closed_ts": None,
+                    "source_snapshot_ts": "2026-03-19T09-00-00Z",
+                }
+            ]
+        ),
+        cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": cycle_start_ts,
+                    "cycle_end_ts": cycle_start_ts + 900,
+                    "price_to_beat": None,
+                    "final_price": None,
+                    "has_price_to_beat": False,
+                    "has_final_price": False,
+                    "has_both": False,
+                    "completed": False,
+                    "incomplete": True,
+                    "cached": False,
+                    "api_timestamp_ms": 1700000000000,
+                    "http_status": 200,
+                    "source": "polymarket_api_crypto_price",
+                    "source_priority": 3,
+                    "fetched_at": "2026-03-19T09:00:00Z",
+                }
+            ]
+        ),
+        cfg.layout.direct_oracle_source_path,
+    )
+
+    class _FakeClient:
+        def fetch_past_results_batch(self, **kwargs):
+            return []
+
+        def fetch_crypto_price(self, **kwargs):
+            return {
+                "openPrice": 100.0,
+                "closePrice": 101.0,
+                "completed": True,
+                "incomplete": False,
+                "cached": False,
+                "timestamp": 1700000900000,
+            }
+
+    summary = sync_polymarket_oracle_prices_direct(
+        cfg,
+        start_ts=cycle_start_ts,
+        end_ts=cycle_start_ts,
+        max_requests=0,
+        client=_FakeClient(),
+    )
+    direct = pd.read_parquet(cfg.layout.direct_oracle_source_path)
+
+    assert summary["rows_imported"] == 1
+    assert len(direct) == 1
+    assert bool(direct.iloc[0]["has_both"]) is True
+    assert float(direct.iloc[0]["price_to_beat"]) == 100.0
+    assert float(direct.iloc[0]["final_price"]) == 101.0
+    assert direct.iloc[0]["fetched_at"] != "2026-03-19T09:00:00Z"
 
 
 def test_import_legacy_market_catalog_builds_canonical_table(tmp_path: Path) -> None:

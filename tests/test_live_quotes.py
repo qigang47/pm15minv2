@@ -6,6 +6,7 @@ import pandas as pd
 
 from pm15min.core.config import LiveConfig
 from pm15min.data.config import DataConfig
+from pm15min.data.io.json_files import write_json_atomic
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.live.quotes import build_quote_snapshot
 
@@ -385,7 +386,122 @@ def test_quote_snapshot_prefers_provider_over_stale_index(tmp_path: Path, monkey
     assert provider.calls == ["token-up", "token-down"]
 
 
-def test_quote_snapshot_prefers_local_recent_over_provider_when_available(tmp_path: Path, monkeypatch) -> None:
+def test_quote_snapshot_prefers_latest_full_snapshot_over_provider_and_recent_index(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    cycle_start = pd.Timestamp("2026-03-21T16:45:00Z")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    captured_ts = pd.Timestamp("2026-03-21T16:54:10Z")
+    latest_full_ts_ms = int(pd.Timestamp("2026-03-21T16:54:12Z").timestamp() * 1000)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "question": "Sol up or down",
+                    "source_snapshot_ts": "2026-03-21T16-45-00Z",
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "captured_ts_ms": int(captured_ts.timestamp() * 1000),
+                    "market_id": "market-1",
+                    "token_id": "token-up",
+                    "side": "up",
+                    "best_ask": 0.24,
+                    "best_bid": 0.23,
+                    "ask_size_1": 9.0,
+                    "bid_size_1": 8.0,
+                    "spread": 0.01,
+                },
+                {
+                    "captured_ts_ms": int(captured_ts.timestamp() * 1000),
+                    "market_id": "market-1",
+                    "token_id": "token-down",
+                    "side": "down",
+                    "best_ask": 0.76,
+                    "best_bid": 0.75,
+                    "ask_size_1": 10.0,
+                    "bid_size_1": 11.0,
+                    "spread": 0.01,
+                },
+            ]
+        ),
+        data_cfg.layout.orderbook_recent_path,
+    )
+    write_json_atomic(
+        {
+            "dataset": "orderbook_latest_full_snapshot",
+            "market": "sol",
+            "cycle": "15m",
+            "captured_ts_ms": latest_full_ts_ms,
+            "records": [
+                {
+                    "captured_ts_ms": latest_full_ts_ms,
+                    "source_ts_ms": latest_full_ts_ms,
+                    "market_id": "market-1",
+                    "token_id": "token-up",
+                    "side": "up",
+                    "asks": [{"price": 0.27, "size": 7.0}],
+                    "bids": [{"price": 0.26, "size": 6.0}],
+                },
+                {
+                    "captured_ts_ms": latest_full_ts_ms,
+                    "source_ts_ms": latest_full_ts_ms,
+                    "market_id": "market-1",
+                    "token_id": "token-down",
+                    "side": "down",
+                    "asks": [{"price": 0.73, "size": 8.0}],
+                    "bids": [{"price": 0.72, "size": 5.0}],
+                },
+            ],
+        },
+        data_cfg.layout.orderbook_latest_full_snapshot_path,
+    )
+    provider = _FakeOrderbookProvider()
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 8,
+                    "decision_ts": "2026-03-21T16:54:00+00:00",
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                }
+            ],
+        },
+        persist=False,
+        now=pd.Timestamp("2026-03-21T16:54:15Z"),
+        orderbook_provider=provider,
+    )
+    row = quote["quote_rows"][0]
+    assert row["status"] == "ok"
+    assert row["quote_up_ask"] == 0.27
+    assert row["quote_down_ask"] == 0.73
+    assert provider.calls == []
+    assert row["quote_source_path"] == str(data_cfg.layout.orderbook_latest_full_snapshot_path)
+
+
+def test_quote_snapshot_loads_index_once_per_iteration(tmp_path: Path, monkeypatch) -> None:
+    import pm15min.live.quotes.orderbook as orderbook_module
+
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
@@ -439,9 +555,17 @@ def test_quote_snapshot_prefers_local_recent_over_provider_when_available(tmp_pa
                 },
             ]
         ),
-        data_cfg.layout.orderbook_recent_path,
+        data_cfg.layout.orderbook_index_path("2026-03-21"),
     )
-    provider = _FakeOrderbookProvider()
+    original_loader = orderbook_module.load_orderbook_index_frame
+    calls = {"count": 0}
+
+    def _counting_loader(*, index_path, recent_path=None):
+        calls["count"] += 1
+        return original_loader(index_path=index_path, recent_path=recent_path)
+
+    monkeypatch.setattr(orderbook_module, "load_orderbook_index_frame", _counting_loader)
+
     quote = build_quote_snapshot(
         cfg=cfg,
         signal_payload={
@@ -449,19 +573,28 @@ def test_quote_snapshot_prefers_local_recent_over_provider_when_available(tmp_pa
             "snapshot_ts": "manual",
             "offset_signals": [
                 {
+                    "offset": 7,
+                    "decision_ts": "2026-03-21T16:54:00+00:00",
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                },
+                {
                     "offset": 8,
                     "decision_ts": "2026-03-21T16:54:00+00:00",
                     "cycle_start_ts": cycle_start.isoformat(),
                     "cycle_end_ts": cycle_end.isoformat(),
-                }
+                },
+                {
+                    "offset": 9,
+                    "decision_ts": "2026-03-21T16:54:00+00:00",
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                },
             ],
         },
         persist=False,
         now=pd.Timestamp("2026-03-21T16:54:15Z"),
-        orderbook_provider=provider,
     )
-    row = quote["quote_rows"][0]
-    assert row["status"] == "ok"
-    assert row["quote_up_ask"] == 0.24
-    assert row["quote_down_ask"] == 0.76
-    assert provider.calls == []
+
+    assert [row["status"] for row in quote["quote_rows"]] == ["ok", "ok", "ok"]
+    assert calls["count"] == 1

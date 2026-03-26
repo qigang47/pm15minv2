@@ -44,6 +44,8 @@ def build_offset_quote_row(
     now: pd.Timestamp,
     orderbook_provider: OrderbookProvider | None = None,
     provider_frame_cache: dict[tuple[str, str, str], pd.DataFrame] | None = None,
+    index_frame_cache: dict[tuple[str, str | None], pd.DataFrame] | None = None,
+    latest_full_snapshot_cache: dict[str, dict[str, object] | None] | None = None,
 ) -> dict[str, Any]:
     return build_offset_quote_row_impl(
         data_cfg=data_cfg,
@@ -53,4 +55,6 @@ def build_offset_quote_row(
         now=now,
         orderbook_provider=orderbook_provider,
         provider_frame_cache=provider_frame_cache,
+        index_frame_cache=index_frame_cache,
+        latest_full_snapshot_cache=latest_full_snapshot_cache,
     )

@@ -78,7 +78,8 @@ def build_truth_15m(cfg: DataConfig) -> dict[str, object]:
         st = settlement.copy()
         st["winner_side"] = st["winner_side"].fillna(st["label_updown"]).astype(str).str.upper()
         st["label_updown"] = st["label_updown"].fillna(st["winner_side"]).astype(str).str.upper()
-        st["resolved"] = st["full_truth"].fillna(False).astype(bool)
+        settlement_has_side = st["winner_side"].ne("") | st["label_updown"].ne("")
+        st["resolved"] = settlement_has_side | st["full_truth"].fillna(False).astype(bool)
         st["truth_source"] = "settlement_truth"
         st = st[
             [

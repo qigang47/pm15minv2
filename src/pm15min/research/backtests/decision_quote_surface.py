@@ -193,44 +193,39 @@ def _resolve_window_side_depth_quote(
         if fill_config.depth_max_slippage_bps is not None
         else float(profile_spec.orderbook_max_slippage_bps)
     )
-    saw_book = False
-    for raw_depth_candidate in raw_depth_candidates:
-        record = raw_depth_candidate.get(side_key)
-        if not isinstance(record, dict):
-            continue
-        asks = normalize_levels(record.get("asks"))
-        if not asks:
-            continue
-        saw_book = True
-        best_price = float(asks[0][0])
-        slip = max(0.0, float(profile_spec.slippage_bps)) / 10_000.0
-        fee_rate = float(profile_spec.fee_rate(price=best_price * (1.0 + slip)))
-        price_cap = _resolve_probability_price_cap(
-            probability=probability,
-            roi_threshold=roi_threshold,
-            fee_rate=fee_rate,
-            slippage_bps=float(profile_spec.slippage_bps),
-        )
-        fill = compute_fill_from_depth_record(
-            record=record,
-            target_notional=requested_notional,
-            max_slippage_bps=max_slippage_bps,
-            price_cap=price_cap,
-        )
-        if fill is None:
-            continue
-        max_price = _float_or_none(fill.get("max_price"))
-        total_cost = _float_or_none(fill.get("total_cost")) or 0.0
-        liquidity = 0.0 if not max_price or max_price <= 0 else float(total_cost / max_price)
-        return {
-            "price": float(max_price or 1.0),
-            "liquidity": float(liquidity),
-            "repriced": True,
-            "status": str(fill.get("stop_reason") or "ok"),
-        }
-    if saw_book:
+    first_candidate = raw_depth_candidates[0]
+    record = first_candidate.get(side_key)
+    if not isinstance(record, dict):
+        return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "orderbook_missing"}
+    asks = normalize_levels(record.get("asks"))
+    if not asks:
+        return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "orderbook_missing"}
+    best_price = float(asks[0][0])
+    slip = max(0.0, float(profile_spec.slippage_bps)) / 10_000.0
+    fee_rate = float(profile_spec.fee_rate(price=best_price * (1.0 + slip)))
+    price_cap = _resolve_probability_price_cap(
+        probability=probability,
+        roi_threshold=roi_threshold,
+        fee_rate=fee_rate,
+        slippage_bps=float(profile_spec.slippage_bps),
+    )
+    fill = compute_fill_from_depth_record(
+        record=record,
+        target_notional=requested_notional,
+        max_slippage_bps=max_slippage_bps,
+        price_cap=price_cap,
+    )
+    if fill is None:
         return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "orderbook_limit_reject"}
-    return {"price": 1.0, "liquidity": 0.0, "repriced": False, "status": "orderbook_missing"}
+    max_price = _float_or_none(fill.get("max_price"))
+    total_cost = _float_or_none(fill.get("total_cost")) or 0.0
+    liquidity = 0.0 if not max_price or max_price <= 0 else float(total_cost / max_price)
+    return {
+        "price": float(max_price or 1.0),
+        "liquidity": float(liquidity),
+        "repriced": True,
+        "status": str(fill.get("stop_reason") or "ok"),
+    }
 
 
 def build_empty_initial_snapshot_decision_summary() -> InitialSnapshotDecisionSummary:

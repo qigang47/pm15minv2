@@ -79,6 +79,19 @@ def test_resolve_backtest_profile_spec_applies_parity_overrides() -> None:
     assert spec.liquidity_guard_soft_fail_min_count == 4
 
 
+def test_resolve_backtest_profile_spec_can_disable_ret_30m_direction_guard() -> None:
+    spec = resolve_backtest_profile_spec(
+        market="xrp",
+        profile="deep_otm",
+        parity=BacktestParitySpec(disable_ret_30m_direction_guard=True),
+    )
+
+    assert spec.ret_30m_up_floor_for("xrp") == -1.0e9
+    assert spec.ret_30m_down_ceiling_for("xrp") == 1.0e9
+    assert spec.ret_30m_up_floor_for("sol") == 0.0
+    assert spec.ret_30m_down_ceiling_for("sol") == 0.002
+
+
 def test_build_backtest_regime_state_stays_normal_with_proxy_liquidity_status() -> None:
     spec = replace(
         resolve_live_profile_spec("deep_otm"),

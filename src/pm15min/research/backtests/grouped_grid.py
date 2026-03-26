@@ -16,6 +16,7 @@ from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.backtests.engine import run_research_backtest
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import BacktestRunSpec
+from pm15min.research._contracts_runs import BacktestParitySpec
 from pm15min.research.layout import slug_token
 
 
@@ -53,6 +54,7 @@ class GroupedBacktestGridSpec:
     stake_usd_values: tuple[float, ...]
     max_trades_per_market_values: tuple[int | None, ...]
     bundles: tuple[GroupedBacktestBundleSpec, ...]
+    parity: BacktestParitySpec
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "GroupedBacktestGridSpec":
@@ -69,6 +71,7 @@ class GroupedBacktestGridSpec:
                 payload.get("max_trades_per_market_values") or payload.get("max_trades_values") or (None,)
             ),
             bundles=tuple(GroupedBacktestBundleSpec.from_mapping(item) for item in bundles_raw),
+            parity=BacktestParitySpec.from_mapping(payload.get("parity")),
         )
 
 
@@ -108,9 +111,12 @@ class GroupedBacktestGroup:
     stake_usd_values: tuple[float, ...]
     group_label: str
     case_run_labels: tuple[str, ...]
+    parity: BacktestParitySpec
 
     def to_payload(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["parity"] = self.parity.to_dict()
+        return payload
 
 
 def load_grouped_backtest_grid_spec(path: Path) -> GroupedBacktestGridSpec:
@@ -151,6 +157,7 @@ def expand_grouped_backtest_groups(spec: GroupedBacktestGridSpec) -> tuple[Group
                     stake_usd_values=tuple(spec.stake_usd_values),
                     group_label=group_label,
                     case_run_labels=case_labels,
+                    parity=spec.parity,
                 )
             )
     return tuple(groups)
@@ -245,6 +252,9 @@ def run_grouped_backtest_grid(
 
 def _run_group_worker(group_payload: dict[str, object], root_text: str) -> dict[str, object]:
     os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "pm15min_mpl"))
+    if "parity" in group_payload and not isinstance(group_payload.get("parity"), BacktestParitySpec):
+        group_payload = dict(group_payload)
+        group_payload["parity"] = BacktestParitySpec.from_mapping(group_payload.get("parity"))
     group = GroupedBacktestGroup(**group_payload)
     root = Path(root_text)
     cfg = ResearchConfig.build(
@@ -260,7 +270,7 @@ def _run_group_worker(group_payload: dict[str, object], root_text: str) -> dict[
     )
     rows: list[dict[str, object]] = []
     for stake_usd, run_label in zip(group.stake_usd_values, group.case_run_labels, strict=True):
-        parity = {}
+        parity = group.parity.to_dict()
         if group.max_trades_per_market is not None:
             parity["regime_defense_max_trades_per_market"] = int(group.max_trades_per_market)
         try:

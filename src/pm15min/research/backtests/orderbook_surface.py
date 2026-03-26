@@ -9,8 +9,8 @@ from pm15min.data.config import DataConfig
 from pm15min.data.queries.loaders import load_market_catalog
 from pm15min.live.quotes.orderbook import load_orderbook_index_frame, resolve_orderbook_row
 from pm15min.research.backtests.data_surface_fallback import (
+    ensure_orderbook_index_path,
     load_market_catalog_with_fallback,
-    resolve_orderbook_index_path,
 )
 
 
@@ -249,7 +249,7 @@ def _load_orderbook_cache_entry(
     cached = orderbook_cache.get(date_str)
     if cached is not None:
         return cached
-    index_path = resolve_orderbook_index_path(data_cfg, date_str)
+    index_path = ensure_orderbook_index_path(data_cfg, date_str)
     index_frame = load_orderbook_index_frame(index_path=index_path)
     token_lookup, market_side_lookup = _prepare_orderbook_lookup(index_frame)
     payload = (str(index_path), index_frame, token_lookup, market_side_lookup)

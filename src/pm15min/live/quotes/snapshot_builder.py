@@ -31,6 +31,8 @@ def build_quote_snapshot_impl(
     now_ts = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
     quote_now = now_ts.tz_convert("UTC") if now_ts.tzinfo is not None else now_ts.tz_localize("UTC")
     provider_frame_cache: dict[tuple[str, str, str], pd.DataFrame] = {}
+    index_frame_cache: dict[tuple[str, str | None], pd.DataFrame] = {}
+    latest_full_snapshot_cache: dict[str, dict[str, object] | None] = {}
     quote_rows = [
         build_offset_quote_row_impl(
             data_cfg=data_cfg,
@@ -40,6 +42,8 @@ def build_quote_snapshot_impl(
             now=quote_now,
             orderbook_provider=orderbook_provider,
             provider_frame_cache=provider_frame_cache,
+            index_frame_cache=index_frame_cache,
+            latest_full_snapshot_cache=latest_full_snapshot_cache,
         )
         for row in (signal_payload.get("offset_signals") or [])
     ]

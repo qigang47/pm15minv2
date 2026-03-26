@@ -96,6 +96,17 @@ def resolve_backtest_profile_spec(
         updates["liquidity_guard_baseline_minutes"] = int(resolved.liquidity_baseline_minutes)
     if resolved.liquidity_soft_fail_min_count is not None:
         updates["liquidity_guard_soft_fail_min_count"] = int(resolved.liquidity_soft_fail_min_count)
+    if resolved.disable_ret_30m_direction_guard:
+        updates["ret_30m_up_floor_by_asset"] = _with_market_threshold(
+            getattr(spec, "ret_30m_up_floor_by_asset"),
+            market=market_token,
+            value=-1.0e9,
+        )
+        updates["ret_30m_down_ceiling_by_asset"] = _with_market_threshold(
+            getattr(spec, "ret_30m_down_ceiling_by_asset"),
+            market=market_token,
+            value=1.0e9,
+        )
     for field_name, attr_name in (
         ("liquidity_min_spot_quote_volume_ratio", "liquidity_min_spot_quote_volume_ratio_by_asset"),
         ("liquidity_min_perp_quote_volume_ratio", "liquidity_min_perp_quote_volume_ratio_by_asset"),

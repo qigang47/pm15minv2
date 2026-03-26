@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -137,6 +138,202 @@ def test_attach_canonical_quote_surface_reads_orderbook_index_once_per_date(tmp_
     assert summary.quote_ready_rows == 2
     assert out.loc[0, "quote_status"] == "ok"
     assert out.loc[0, "token_up"] == "tok-up"
+    assert float(out.loc[0, "quote_up_ask"]) == 0.41
+    assert float(out.loc[0, "quote_down_ask"]) == 0.59
+
+
+def test_attach_canonical_quote_surface_rebuilds_stale_orderbook_index(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "m-1",
+                    "condition_id": "c-1",
+                    "token_up": "tok-up",
+                    "token_down": "tok-down",
+                    "question": "SOL up?",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_324_100,
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    depth_path = data_cfg.layout.orderbook_depth_path("2026-03-01")
+    depth_path.parent.mkdir(parents=True, exist_ok=True)
+    depth_path.write_text("placeholder", encoding="utf-8")
+    stale_index = data_cfg.layout.orderbook_index_path("2026-03-01")
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "captured_ts_ms": 1,
+                    "market_id": "stale",
+                    "token_id": "stale",
+                    "side": "up",
+                    "best_ask": 0.99,
+                    "best_bid": 0.01,
+                    "ask_size_1": 1.0,
+                    "bid_size_1": 1.0,
+                }
+            ]
+        ),
+        stale_index,
+    )
+    os.utime(stale_index, (1, 1))
+    os.utime(depth_path, None)
+
+    rebuild_calls = {"count": 0}
+
+    def _rebuild(cfg, *, date_str):
+        rebuild_calls["count"] += 1
+        write_parquet_atomic(
+            pd.DataFrame(
+                [
+                    {
+                        "captured_ts_ms": 1_772_323_250_000,
+                        "market_id": "m-1",
+                        "token_id": "tok-up",
+                        "side": "up",
+                        "best_ask": 0.41,
+                        "best_bid": 0.39,
+                        "ask_size_1": 15.0,
+                        "bid_size_1": 10.0,
+                    },
+                    {
+                        "captured_ts_ms": 1_772_323_250_000,
+                        "market_id": "m-1",
+                        "token_id": "tok-down",
+                        "side": "down",
+                        "best_ask": 0.59,
+                        "best_bid": 0.57,
+                        "ask_size_1": 13.0,
+                        "bid_size_1": 11.0,
+                    },
+                ]
+            ),
+            cfg.layout.orderbook_index_path(date_str),
+        )
+
+    monkeypatch.setattr("pm15min.research.backtests.data_surface_fallback._rebuild_orderbook_index", _rebuild)
+
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+            }
+        ]
+    )
+
+    out, summary = attach_canonical_quote_surface(replay=replay, data_cfg=data_cfg)
+
+    assert rebuild_calls["count"] == 1
+    assert summary.quote_ready_rows == 1
+    assert out.loc[0, "quote_status"] == "ok"
+    assert float(out.loc[0, "quote_up_ask"]) == 0.41
+    assert float(out.loc[0, "quote_down_ask"]) == 0.59
+
+
+def test_attach_canonical_quote_surface_rebuilds_sparse_orderbook_index(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "m-1",
+                    "condition_id": "c-1",
+                    "token_up": "tok-up",
+                    "token_down": "tok-down",
+                    "question": "SOL up?",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_324_100,
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    depth_path = data_cfg.layout.orderbook_depth_path("2026-03-01")
+    depth_path.parent.mkdir(parents=True, exist_ok=True)
+    depth_path.write_bytes(b"x" * 1_200_000)
+    sparse_index = data_cfg.layout.orderbook_index_path("2026-03-01")
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "captured_ts_ms": 1,
+                    "market_id": "stale",
+                    "token_id": "stale",
+                    "side": "up",
+                    "best_ask": 0.99,
+                    "best_bid": 0.01,
+                    "ask_size_1": 1.0,
+                    "bid_size_1": 1.0,
+                }
+            ]
+        ),
+        sparse_index,
+    )
+
+    rebuild_calls = {"count": 0}
+
+    def _rebuild(cfg, *, date_str):
+        rebuild_calls["count"] += 1
+        write_parquet_atomic(
+            pd.DataFrame(
+                [
+                    {
+                        "captured_ts_ms": 1_772_323_250_000,
+                        "market_id": "m-1",
+                        "token_id": "tok-up",
+                        "side": "up",
+                        "best_ask": 0.41,
+                        "best_bid": 0.39,
+                        "ask_size_1": 15.0,
+                        "bid_size_1": 10.0,
+                    },
+                    {
+                        "captured_ts_ms": 1_772_323_250_000,
+                        "market_id": "m-1",
+                        "token_id": "tok-down",
+                        "side": "down",
+                        "best_ask": 0.59,
+                        "best_bid": 0.57,
+                        "ask_size_1": 13.0,
+                        "bid_size_1": 11.0,
+                    },
+                ]
+            ),
+            cfg.layout.orderbook_index_path(date_str),
+        )
+
+    monkeypatch.setattr("pm15min.research.backtests.data_surface_fallback._rebuild_orderbook_index", _rebuild)
+
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+            }
+        ]
+    )
+
+    out, summary = attach_canonical_quote_surface(replay=replay, data_cfg=data_cfg)
+
+    assert rebuild_calls["count"] == 1
+    assert summary.quote_ready_rows == 1
+    assert out.loc[0, "quote_status"] == "ok"
     assert float(out.loc[0, "quote_up_ask"]) == 0.41
     assert float(out.loc[0, "quote_down_ask"]) == 0.59
 

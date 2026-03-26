@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 
 from ..config import DataConfig
-from ..io.parquet import upsert_parquet, write_parquet_atomic
+from ..io.parquet import read_parquet_if_exists, write_parquet_atomic
 from ..queries.loaders import load_market_catalog
 from ..sources.polymarket_oracle_api import PolymarketOracleApiClient
 
@@ -33,6 +34,88 @@ DIRECT_ORACLE_COLUMNS = [
 
 def _utc_now_label() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _candidate_has_number(value: object) -> bool:
+    try:
+        parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    except Exception:
+        return False
+    return bool(pd.notna(parsed))
+
+
+def _candidate_rank(row: dict[str, object]) -> tuple[int, int, int, int, str]:
+    has_price = _candidate_has_number(row.get("price_to_beat"))
+    has_final = _candidate_has_number(row.get("final_price"))
+    return (
+        int(has_price and has_final),
+        int(has_final),
+        int(has_price),
+        int(row.get("source_priority") or 0),
+        str(row.get("fetched_at") or ""),
+    )
+
+
+def _merge_candidate(
+    fetched: dict[int, dict[str, object]],
+    *,
+    cycle_start_ts: int,
+    candidate: dict[str, object],
+) -> None:
+    existing = fetched.get(int(cycle_start_ts))
+    if existing is None or _candidate_rank(candidate) > _candidate_rank(existing):
+        fetched[int(cycle_start_ts)] = candidate
+
+
+def _candidate_rank_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    out["price_to_beat"] = pd.to_numeric(out.get("price_to_beat"), errors="coerce")
+    out["final_price"] = pd.to_numeric(out.get("final_price"), errors="coerce")
+    if "has_price_to_beat" not in out.columns:
+        out["has_price_to_beat"] = out["price_to_beat"].notna()
+    else:
+        out["has_price_to_beat"] = out["has_price_to_beat"].fillna(out["price_to_beat"].notna()).astype(bool)
+    if "has_final_price" not in out.columns:
+        out["has_final_price"] = out["final_price"].notna()
+    else:
+        out["has_final_price"] = out["has_final_price"].fillna(out["final_price"].notna()).astype(bool)
+    if "has_both" not in out.columns:
+        out["has_both"] = out["has_price_to_beat"] & out["has_final_price"]
+    else:
+        out["has_both"] = out["has_both"].fillna(out["has_price_to_beat"] & out["has_final_price"]).astype(bool)
+    out["candidate_has_both"] = out["has_both"].astype(int)
+    out["candidate_has_final_price"] = out["has_final_price"].astype(int)
+    out["candidate_has_price_to_beat"] = out["has_price_to_beat"].astype(int)
+    out["source_priority"] = pd.to_numeric(out.get("source_priority"), errors="coerce").fillna(0).astype(int)
+    out["fetched_at"] = out.get("fetched_at", "").fillna("").astype(str)
+    return out
+
+
+def _write_direct_oracle_canonical(*, target_path: Path, incoming: pd.DataFrame) -> pd.DataFrame:
+    existing = read_parquet_if_exists(target_path)
+    if existing is None or existing.empty:
+        combined = incoming.copy()
+    elif incoming.empty:
+        combined = existing.copy()
+    else:
+        combined = pd.concat([existing, incoming], ignore_index=True, sort=False)
+    if combined.empty:
+        write_parquet_atomic(combined, target_path)
+        return combined
+    ranked = _candidate_rank_columns(combined)
+    ranked = ranked.sort_values(
+        [
+            "cycle_start_ts",
+            "candidate_has_both",
+            "candidate_has_final_price",
+            "candidate_has_price_to_beat",
+            "source_priority",
+            "fetched_at",
+        ]
+    ).drop_duplicates(subset=["asset", "cycle_start_ts"], keep="last")
+    canonical = ranked.reindex(columns=DIRECT_ORACLE_COLUMNS).reset_index(drop=True)
+    write_parquet_atomic(canonical, target_path)
+    return canonical
 
 
 def _parse_iso_to_ts(raw: str | None) -> int | None:
@@ -113,8 +196,11 @@ def sync_polymarket_oracle_prices_direct(
             if st is None:
                 continue
             batch_cycle_starts.append(int(st))
-            if st in cycle_starts and st not in fetched:
-                fetched[int(st)] = {
+            if st in cycle_starts:
+                _merge_candidate(
+                    fetched,
+                    cycle_start_ts=int(st),
+                    candidate={
                     "asset": cfg.asset.slug,
                     "cycle": cfg.cycle,
                     "cycle_start_ts": int(st),
@@ -129,7 +215,8 @@ def sync_polymarket_oracle_prices_direct(
                     "source": "polymarket_api_past_results",
                     "source_priority": 2,
                     "fetched_at": _utc_now_label(),
-                }
+                    },
+                )
 
         if not batch_cycle_starts or min(batch_cycle_starts) <= min(cycle_starts):
             break
@@ -139,7 +226,7 @@ def sync_polymarket_oracle_prices_direct(
     if fallback_single:
         for cycle_start_ts in cycle_starts:
             existing = fetched.get(int(cycle_start_ts))
-            if existing and existing.get("price_to_beat") not in ("", None):
+            if existing and _candidate_rank(existing)[0] > 0:
                 continue
             obj = client.fetch_crypto_price(
                 symbol=symbol,
@@ -149,22 +236,26 @@ def sync_polymarket_oracle_prices_direct(
             )
             if not obj:
                 continue
-            fetched[int(cycle_start_ts)] = {
-                "asset": cfg.asset.slug,
-                "cycle": cfg.cycle,
-                "cycle_start_ts": int(cycle_start_ts),
-                "cycle_end_ts": int(cycle_start_ts + cfg.layout.cycle_seconds),
-                "price_to_beat": obj.get("openPrice"),
-                "final_price": obj.get("closePrice"),
-                "completed": obj.get("completed"),
-                "incomplete": obj.get("incomplete"),
-                "cached": obj.get("cached"),
-                "api_timestamp_ms": obj.get("timestamp"),
-                "http_status": 200,
-                "source": "polymarket_api_crypto_price",
-                "source_priority": 3,
-                "fetched_at": _utc_now_label(),
-            }
+            _merge_candidate(
+                fetched,
+                cycle_start_ts=int(cycle_start_ts),
+                candidate={
+                    "asset": cfg.asset.slug,
+                    "cycle": cfg.cycle,
+                    "cycle_start_ts": int(cycle_start_ts),
+                    "cycle_end_ts": int(cycle_start_ts + cfg.layout.cycle_seconds),
+                    "price_to_beat": obj.get("openPrice"),
+                    "final_price": obj.get("closePrice"),
+                    "completed": obj.get("completed"),
+                    "incomplete": obj.get("incomplete"),
+                    "cached": obj.get("cached"),
+                    "api_timestamp_ms": obj.get("timestamp"),
+                    "http_status": 200,
+                    "source": "polymarket_api_crypto_price",
+                    "source_priority": 3,
+                    "fetched_at": _utc_now_label(),
+                },
+            )
 
     out = pd.DataFrame(list(fetched.values()), columns=DIRECT_ORACLE_COLUMNS)
     if out.empty:
@@ -181,16 +272,22 @@ def sync_polymarket_oracle_prices_direct(
     out["has_price_to_beat"] = out["price_to_beat"].notna()
     out["has_final_price"] = out["final_price"].notna()
     out["has_both"] = out["has_price_to_beat"] & out["has_final_price"]
-    out = out.sort_values(["cycle_start_ts", "source_priority", "fetched_at"]).drop_duplicates(
-        subset=["asset", "cycle_start_ts"], keep="last"
-    )
-    out = out.reset_index(drop=True)
+    out = _candidate_rank_columns(out)
+    out = out.sort_values(
+        [
+            "cycle_start_ts",
+            "candidate_has_both",
+            "candidate_has_final_price",
+            "candidate_has_price_to_beat",
+            "source_priority",
+            "fetched_at",
+        ]
+    ).drop_duplicates(subset=["asset", "cycle_start_ts"], keep="last")
+    out = out.reindex(columns=DIRECT_ORACLE_COLUMNS).reset_index(drop=True)
 
-    canonical = upsert_parquet(
-        path=cfg.layout.direct_oracle_source_path,
+    canonical = _write_direct_oracle_canonical(
+        target_path=cfg.layout.direct_oracle_source_path,
         incoming=out,
-        key_columns=["asset", "cycle_start_ts"],
-        sort_columns=["cycle_start_ts", "source_priority", "fetched_at"],
     )
     return {
         "dataset": "polymarket_direct_oracle_prices",

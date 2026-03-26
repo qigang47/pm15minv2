@@ -59,6 +59,7 @@ from pm15min.research.bundles.loader import (
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import BacktestRunSpec
 from pm15min.research.datasets.loaders import load_feature_frame, load_label_frame
+from pm15min.research.freshness import ensure_research_artifacts_aligned
 from pm15min.research.inference.scorer import score_bundle_offset
 from pm15min.research.labels.sources import normalize_label_set
 from pm15min.research.labels.runtime import build_truth_runtime_summary
@@ -164,6 +165,11 @@ def run_research_backtest(
     bundle_manifest = read_model_bundle_manifest(bundle_dir)
     feature_set = str(bundle_manifest.spec.get("feature_set") or cfg.feature_set)
     label_set = normalize_label_set(str(bundle_manifest.spec.get("label_set") or cfg.label_set))
+    ensure_research_artifacts_aligned(
+        cfg,
+        feature_set=feature_set,
+        label_set=label_set,
+    )
 
     data_cfg = DataConfig.build(
         market=cfg.asset.slug,

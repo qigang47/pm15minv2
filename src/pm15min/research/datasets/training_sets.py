@@ -6,6 +6,7 @@ from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import TrainingSetSpec
 from pm15min.research.datasets.loaders import load_feature_frame, load_label_frame
+from pm15min.research.freshness import ensure_research_artifacts_aligned
 from pm15min.research.layout_helpers import normalize_window_bound, window_bound_is_date_only
 from pm15min.research.labels.alignment import merge_feature_and_label_frames
 from pm15min.research.labels.direction import build_direction_target
@@ -38,7 +39,18 @@ TRAINING_SET_META_COLUMNS = [
 ]
 
 
-def build_training_set_dataset(cfg: ResearchConfig, spec: TrainingSetSpec) -> dict[str, object]:
+def build_training_set_dataset(
+    cfg: ResearchConfig,
+    spec: TrainingSetSpec,
+    *,
+    skip_freshness: bool = False,
+) -> dict[str, object]:
+    if not skip_freshness:
+        ensure_research_artifacts_aligned(
+            cfg,
+            feature_set=spec.feature_set,
+            label_set=spec.label_set,
+        )
     features = load_feature_frame(cfg, feature_set=spec.feature_set)
     labels = load_label_frame(cfg, label_set=spec.label_set)
 

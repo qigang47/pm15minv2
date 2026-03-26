@@ -12,6 +12,7 @@ _PARITY_BOOL_FIELDS = (
     "regime_apply_stake_scale",
     "regime_defense_force_with_pressure",
     "raw_depth_fak_refresh_enabled",
+    "disable_ret_30m_direction_guard",
 )
 _PARITY_FLOAT_FIELDS = (
     "regime_caution_stake_multiplier",
@@ -48,6 +49,7 @@ _PARITY_FIELD_ALIASES = {
     "liquidity_guard_lookback_minutes": "liquidity_lookback_minutes",
     "liquidity_guard_baseline_minutes": "liquidity_baseline_minutes",
     "liquidity_guard_soft_fail_min_count": "liquidity_soft_fail_min_count",
+    "disable_ret30m_direction_guard": "disable_ret_30m_direction_guard",
 }
 
 
@@ -57,6 +59,7 @@ class BacktestParitySpec:
     regime_apply_stake_scale: bool | None = None
     regime_defense_force_with_pressure: bool | None = None
     raw_depth_fak_refresh_enabled: bool | None = None
+    disable_ret_30m_direction_guard: bool | None = None
     regime_caution_stake_multiplier: float | None = None
     regime_defense_stake_multiplier: float | None = None
     regime_caution_min_dir_prob_boost: float | None = None

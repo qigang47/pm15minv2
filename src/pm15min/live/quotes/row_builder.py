@@ -11,8 +11,10 @@ from .orderbook import (
     ORDERBOOK_INDEX_COLUMNS,
     build_orderbook_frame_from_provider,
     float_or_none,
-    load_orderbook_index_frame,
+    load_latest_full_snapshot_cached,
+    load_orderbook_index_frame_cached,
     resolve_orderbook_row,
+    resolve_latest_full_snapshot_row,
     resolve_orderbook_row_within_window,
 )
 
@@ -26,6 +28,8 @@ def build_offset_quote_row_impl(
     now: pd.Timestamp,
     orderbook_provider: OrderbookProvider | None = None,
     provider_frame_cache: dict[tuple[str, str, str], pd.DataFrame] | None = None,
+    index_frame_cache: dict[tuple[str, str | None], pd.DataFrame] | None = None,
+    latest_full_snapshot_cache: dict[str, dict[str, object] | None] | None = None,
 ) -> dict[str, Any]:
     decision_ts = pd.to_datetime(signal_row.get("decision_ts"), utc=True, errors="coerce")
     window_start_ts = pd.to_datetime(
@@ -120,8 +124,13 @@ def build_offset_quote_row_impl(
         reference_ts_ms = None
     index_path = data_cfg.layout.orderbook_index_path(date_str)
     recent_path = data_cfg.layout.orderbook_recent_path
-    out["quote_source_path"] = str(index_path)
-    if not index_path.exists() and not recent_path.exists():
+    latest_full_snapshot_path = data_cfg.layout.orderbook_latest_full_snapshot_path
+    if (
+        not latest_full_snapshot_path.exists()
+        and not index_path.exists()
+        and not recent_path.exists()
+        and orderbook_provider is None
+    ):
         out["reasons"].append("orderbook_index_missing")
         return out
 
@@ -130,18 +139,16 @@ def build_offset_quote_row_impl(
         str(out["token_up"]),
         str(out["token_down"]),
     )
-    local_index_df = load_orderbook_index_frame(index_path=index_path, recent_path=recent_path)
-    index_df = local_index_df
-    if index_df.empty:
-        up_row = None
-        down_row = None
-    else:
-        missing_cols = sorted(ORDERBOOK_INDEX_COLUMNS - set(index_df.columns))
-        if missing_cols:
-            out["reasons"].append(f"orderbook_index_missing_columns:{','.join(missing_cols)}")
-            return out
-        up_row = resolve_orderbook_row_within_window(
-            index_df,
+
+    up_row = None
+    down_row = None
+    latest_snapshot = load_latest_full_snapshot_cached(
+        snapshot_path=latest_full_snapshot_path,
+        cache=latest_full_snapshot_cache,
+    )
+    if latest_snapshot is not None:
+        up_row = resolve_latest_full_snapshot_row(
+            latest_snapshot,
             market_id=out["market_id"],
             token_id=out["token_up"],
             side="up",
@@ -149,8 +156,8 @@ def build_offset_quote_row_impl(
             window_start_ts_ms=window_start_ts_ms,
             window_end_ts_ms=window_end_ts_ms,
         )
-        down_row = resolve_orderbook_row_within_window(
-            index_df,
+        down_row = resolve_latest_full_snapshot_row(
+            latest_snapshot,
             market_id=out["market_id"],
             token_id=out["token_down"],
             side="down",
@@ -158,6 +165,9 @@ def build_offset_quote_row_impl(
             window_start_ts_ms=window_start_ts_ms,
             window_end_ts_ms=window_end_ts_ms,
         )
+        if up_row is not None and down_row is not None:
+            out["quote_source_path"] = str(latest_full_snapshot_path)
+
     if (up_row is None or down_row is None) and orderbook_provider is not None:
         if provider_frame_cache is not None and provider_key in provider_frame_cache:
             index_df = provider_frame_cache[provider_key]
@@ -194,6 +204,40 @@ def build_offset_quote_row_impl(
                 window_start_ts_ms=window_start_ts_ms,
                 window_end_ts_ms=window_end_ts_ms,
             )
+            if up_row is not None and down_row is not None:
+                out["quote_source_path"] = "provider"
+    if up_row is None or down_row is None:
+        local_index_df = load_orderbook_index_frame_cached(
+            index_path=index_path,
+            recent_path=recent_path,
+            cache=index_frame_cache,
+        )
+        index_df = local_index_df
+        if not index_df.empty:
+            missing_cols = sorted(ORDERBOOK_INDEX_COLUMNS - set(index_df.columns))
+            if missing_cols:
+                out["reasons"].append(f"orderbook_index_missing_columns:{','.join(missing_cols)}")
+                return out
+            up_row = resolve_orderbook_row_within_window(
+                index_df,
+                market_id=out["market_id"],
+                token_id=out["token_up"],
+                side="up",
+                reference_ts_ms=reference_ts_ms,
+                window_start_ts_ms=window_start_ts_ms,
+                window_end_ts_ms=window_end_ts_ms,
+            )
+            down_row = resolve_orderbook_row_within_window(
+                index_df,
+                market_id=out["market_id"],
+                token_id=out["token_down"],
+                side="down",
+                reference_ts_ms=reference_ts_ms,
+                window_start_ts_ms=window_start_ts_ms,
+                window_end_ts_ms=window_end_ts_ms,
+            )
+            if out["quote_source_path"] is None and (up_row is not None or down_row is not None):
+                out["quote_source_path"] = str(index_path)
     if up_row is None:
         out["reasons"].append("up_quote_missing")
     else:
