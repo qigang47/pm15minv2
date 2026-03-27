@@ -19,6 +19,7 @@ Env overrides:
   V2_ORDERBOOK_FLEET_ITERATIONS       default: 0
   V2_ORDERBOOK_FLEET_SLEEP_SEC        default: same as poll interval
   V2_ORDERBOOK_FLEET_LOG_PATH         default: var/live/logs/entrypoints/orderbook_fleet_<cycle>_<surface>.out
+  MALLOC_ARENA_MAX                    default: 2
 EOF
 }
 
@@ -81,6 +82,7 @@ MARKET_START_OFFSET="${V2_ORDERBOOK_FLEET_MARKET_START_OFFSET:-0}"
 ITERATIONS="${V2_ORDERBOOK_FLEET_ITERATIONS:-0}"
 SLEEP_SEC="${V2_ORDERBOOK_FLEET_SLEEP_SEC:-$POLL_SEC}"
 LOG_PATH="${V2_ORDERBOOK_FLEET_LOG_PATH:-$PROJECT_DIR/var/live/logs/entrypoints/orderbook_fleet_${CYCLE}_${SURFACE}.out}"
+ALLOCATOR_ARENAS="${MALLOC_ARENA_MAX:-2}"
 
 mkdir -p "$(dirname "$LOG_PATH")"
 touch "$LOG_PATH"
@@ -97,6 +99,7 @@ echo "Recent Window Minutes: $RECENT_WINDOW_MINUTES"
 echo "Market Depth: $MARKET_DEPTH"
 echo "Market Start Offset: $MARKET_START_OFFSET"
 echo "Iterations: $ITERATIONS"
+echo "MALLOC_ARENA_MAX: $ALLOCATOR_ARENAS"
 echo "Wrapper Log: $LOG_PATH"
 echo "============================================="
 
@@ -119,7 +122,7 @@ cmd=(
   --sleep-sec "$SLEEP_SEC"
 )
 
-nohup "${cmd[@]}" >> "$LOG_PATH" 2>&1 &
+nohup env MALLOC_ARENA_MAX="$ALLOCATOR_ARENAS" "${cmd[@]}" >> "$LOG_PATH" 2>&1 &
 
 echo "started v2 orderbook fleet: pid=$!"
 echo "  wrapper log: $LOG_PATH"

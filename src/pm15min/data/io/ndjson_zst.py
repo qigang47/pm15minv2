@@ -6,36 +6,39 @@ from pathlib import Path
 from typing import Iterator
 
 
-def _compress_zstd(payload: bytes, level: int) -> bytes:
-    try:
-        import zstandard as zstd  # type: ignore
-
-        compressor = zstd.ZstdCompressor(level=int(level))
-        return compressor.compress(payload)
-    except Exception:
-        cmd = ["zstd", "-q", "-c", f"-{int(level)}", "-T1"]
-        try:
-            proc = subprocess.run(cmd, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        except FileNotFoundError as exc:
-            raise RuntimeError("zstd is not available; install zstd or python-zstandard") from exc
-        if proc.returncode != 0:
-            stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
-            raise RuntimeError(f"zstd compression failed: {stderr}")
-        return proc.stdout
+def _iter_ndjson_lines(records: list[dict[str, object]]) -> Iterator[bytes]:
+    for record in records:
+        yield json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
 
 
 def append_ndjson_zst(path: Path, records: list[dict[str, object]], *, level: int = 7) -> Path:
     if not records:
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = "".join(
-        json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-        for record in records
-    ).encode("utf-8")
-    compressed = _compress_zstd(payload, level=level)
-    with path.open("ab") as fh:
-        fh.write(compressed)
-    return path
+    try:
+        import zstandard as zstd  # type: ignore
+
+        compressor = zstd.ZstdCompressor(level=int(level))
+        with path.open("ab") as fh, compressor.stream_writer(fh) as writer:
+            for line in _iter_ndjson_lines(records):
+                writer.write(line)
+        return path
+    except Exception:
+        cmd = ["zstd", "-q", "-c", f"-{int(level)}", "-T1"]
+        try:
+            with path.open("ab") as fh:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=fh, stderr=subprocess.PIPE)
+                assert proc.stdin is not None
+                for line in _iter_ndjson_lines(records):
+                    proc.stdin.write(line)
+                proc.stdin.close()
+                stderr = proc.stderr.read() if proc.stderr is not None else b""
+                returncode = proc.wait()
+        except FileNotFoundError as exc:
+            raise RuntimeError("zstd is not available; install zstd or python-zstandard") from exc
+        if returncode != 0:
+            raise RuntimeError(f"zstd compression failed: {stderr.decode('utf-8', errors='replace')}")
+        return path
 
 
 def iter_ndjson_zst(path: Path) -> Iterator[dict[str, object]]:

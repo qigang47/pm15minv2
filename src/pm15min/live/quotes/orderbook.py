@@ -24,6 +24,31 @@ POST_DECISION_QUOTE_TOLERANCE_MS = 120_000
 DEFAULT_LATEST_FULL_SNAPSHOT_MAX_AGE_MS = 5_000
 
 
+def _orderbook_index_journal_path(index_path: Path) -> Path:
+    return index_path.with_name(f"{index_path.name}.journal.jsonl")
+
+
+def _load_orderbook_index_journal_frame(journal_path: Path) -> pd.DataFrame:
+    if not journal_path.exists():
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    try:
+        with journal_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    payload = json.loads(text)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    rows.append(payload)
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
 def resolve_orderbook_row(
     index_df: pd.DataFrame,
     *,
@@ -78,8 +103,6 @@ def resolve_orderbook_row_within_window(
     df = df.dropna(subset=["captured_ts_ms"])
     if df.empty:
         return None
-    if window_start_ts_ms is not None:
-        df = df[df["captured_ts_ms"] >= int(window_start_ts_ms)]
     if window_end_ts_ms is not None:
         df = df[df["captured_ts_ms"] < int(window_end_ts_ms)]
     if df.empty:
@@ -88,7 +111,13 @@ def resolve_orderbook_row_within_window(
         df = df[df["captured_ts_ms"] <= int(reference_ts_ms)]
         if df.empty:
             return None
-    return df.sort_values("captured_ts_ms").iloc[-1].to_dict()
+    df = df.sort_values("captured_ts_ms")
+    if window_start_ts_ms is None:
+        return df.iloc[-1].to_dict()
+    in_window = df[df["captured_ts_ms"] >= int(window_start_ts_ms)]
+    if not in_window.empty:
+        return in_window.iloc[-1].to_dict()
+    return df.iloc[-1].to_dict()
 
 
 def load_orderbook_index_frame(
@@ -101,6 +130,9 @@ def load_orderbook_index_frame(
         frames.append(pd.read_parquet(recent_path))
     if index_path.exists():
         frames.append(pd.read_parquet(index_path))
+    journal_df = _load_orderbook_index_journal_frame(_orderbook_index_journal_path(index_path))
+    if not journal_df.empty:
+        frames.append(journal_df)
     if not frames:
         return pd.DataFrame()
     combined = pd.concat(frames, ignore_index=True, sort=False)
@@ -176,6 +208,8 @@ def resolve_latest_full_snapshot_row(
 
     best_record: dict[str, Any] | None = None
     best_ts_ms: int | None = None
+    best_pre_window_record: dict[str, Any] | None = None
+    best_pre_window_ts_ms: int | None = None
     default_ts_ms = _int_or_none(snapshot_payload.get("captured_ts_ms"))
     for record in list(snapshot_payload.get("records") or []):
         if str(record.get("market_id") or "").strip() != selected_market_id:
@@ -187,8 +221,6 @@ def resolve_latest_full_snapshot_row(
         captured_ts_ms = _record_snapshot_ts_ms(record, default_ts_ms=default_ts_ms)
         if captured_ts_ms is None:
             continue
-        if window_start_ts_ms is not None and captured_ts_ms < int(window_start_ts_ms):
-            continue
         if window_end_ts_ms is not None and captured_ts_ms >= int(window_end_ts_ms):
             continue
         if reference_ts_ms is not None and captured_ts_ms > int(reference_ts_ms):
@@ -199,9 +231,17 @@ def resolve_latest_full_snapshot_row(
             and int(reference_ts_ms) - captured_ts_ms > int(max_age_ms)
         ):
             continue
+        if window_start_ts_ms is not None and captured_ts_ms < int(window_start_ts_ms):
+            if best_pre_window_record is None or best_pre_window_ts_ms is None or captured_ts_ms > best_pre_window_ts_ms:
+                best_pre_window_record = record
+                best_pre_window_ts_ms = captured_ts_ms
+            continue
         if best_record is None or best_ts_ms is None or captured_ts_ms > best_ts_ms:
             best_record = record
             best_ts_ms = captured_ts_ms
+    if best_record is None or best_ts_ms is None:
+        best_record = best_pre_window_record
+        best_ts_ms = best_pre_window_ts_ms
     if best_record is None or best_ts_ms is None:
         return None
 

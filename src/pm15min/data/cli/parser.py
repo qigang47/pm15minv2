@@ -191,11 +191,17 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
     foundation.add_argument("--timeout-sec", type=float, default=1.2)
     foundation.add_argument("--recent-window-minutes", type=int, default=15)
     foundation.add_argument("--loop", action="store_true")
-    foundation.add_argument("--iterations", type=int, default=1)
+    foundation.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+        help="Max loop iterations; use 0 with --loop to run forever.",
+    )
     foundation.add_argument("--sleep-sec", type=float, default=1.0)
     foundation.add_argument("--market-catalog-refresh-sec", type=float, default=300.0)
-    foundation.add_argument("--binance-refresh-sec", type=float, default=30.0)
+    foundation.add_argument("--binance-refresh-sec", type=float, default=60.0)
     foundation.add_argument("--oracle-refresh-sec", type=float, default=60.0)
+    foundation.add_argument("--streams-refresh-sec", type=float, default=300.0)
     foundation.add_argument("--orderbook-refresh-sec", type=float, default=0.35)
     foundation.add_argument("--market-catalog-lookback-hours", type=int, default=24)
     foundation.add_argument("--market-catalog-lookahead-hours", type=int, default=24)

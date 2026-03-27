@@ -253,6 +253,7 @@ def _handle_run_live_foundation(args: argparse.Namespace, deps: DataCliDeps) -> 
         market_catalog_refresh_sec=float(args.market_catalog_refresh_sec),
         binance_refresh_sec=float(args.binance_refresh_sec),
         oracle_refresh_sec=float(args.oracle_refresh_sec),
+        streams_refresh_sec=float(args.streams_refresh_sec),
         orderbook_refresh_sec=float(args.orderbook_refresh_sec),
         market_catalog_lookback_hours=int(args.market_catalog_lookback_hours),
         market_catalog_lookahead_hours=int(args.market_catalog_lookahead_hours),

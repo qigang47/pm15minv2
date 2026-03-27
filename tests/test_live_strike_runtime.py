@@ -207,16 +207,16 @@ def test_live_runtime_strike_resolver_falls_back_to_streams_then_cache(tmp_path:
     assert cache_only_quote.source == "strike_cache:legacy_cache"
 
 
-def test_live_runtime_strike_resolver_retries_empty_open_price_until_success(
+def test_live_runtime_strike_resolver_retries_open_price_only_after_retry_window(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     _clear_runtime_caches()
     cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
     cycle_start_ts = pd.Timestamp("2026-03-23T10:00:00Z")
-    client = _FakeOracleClient([{}, {"openPrice": None}, {"openPrice": 120.0}])
-    sleeps: list[float] = []
-    monkeypatch.setattr(strike_runtime_module.time, "sleep", lambda seconds: sleeps.append(float(seconds)))
+    client = _FakeOracleClient([{}, {"openPrice": 120.0}])
+    clock = {"now": 100.0}
+    monkeypatch.setattr(strike_runtime_module.time, "monotonic", lambda: float(clock["now"]))
 
     resolver = LiveRuntimeStrikeResolver(
         data_cfg=cfg,
@@ -224,13 +224,17 @@ def test_live_runtime_strike_resolver_retries_empty_open_price_until_success(
         oracle_client=client,
         cache_path=cfg.layout.cache_root / "live_oracle" / "strike_cache_sol.csv",
     )
-    quote = resolver.strike_at(cycle_start_ts)
+    first = resolver.strike_at(cycle_start_ts)
+    second = resolver.strike_at(cycle_start_ts)
+    clock["now"] += 60.0
+    third = resolver.strike_at(cycle_start_ts)
 
-    assert quote is not None
-    assert quote.price == 120.0
-    assert quote.source == "polymarket_open_price_api"
-    assert client.calls == 3
-    assert sleeps == [0.15, 0.3]
+    assert first is None
+    assert second is None
+    assert third is not None
+    assert third.price == 120.0
+    assert third.source == "polymarket_open_price_api"
+    assert client.calls == 2
 
 
 def test_live_runtime_strike_resolver_does_not_cache_empty_open_price_failure(
@@ -240,8 +244,9 @@ def test_live_runtime_strike_resolver_does_not_cache_empty_open_price_failure(
     _clear_runtime_caches()
     cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
     cycle_start_ts = pd.Timestamp("2026-03-23T10:00:00Z")
-    client = _FakeOracleClient([{}, {}, {}, {}, {}])
-    monkeypatch.setattr(strike_runtime_module.time, "sleep", lambda seconds: None)
+    client = _FakeOracleClient([{}, {}])
+    clock = {"now": 100.0}
+    monkeypatch.setattr(strike_runtime_module.time, "monotonic", lambda: float(clock["now"]))
 
     resolver = LiveRuntimeStrikeResolver(
         data_cfg=cfg,
@@ -252,10 +257,13 @@ def test_live_runtime_strike_resolver_does_not_cache_empty_open_price_failure(
     )
     quote = resolver.strike_at(cycle_start_ts)
     repeated = resolver.strike_at(cycle_start_ts)
+    clock["now"] += 60.0
+    after_retry_window = resolver.strike_at(cycle_start_ts)
 
     assert quote is None
     assert repeated is None
-    assert client.calls == 5
+    assert after_retry_window is None
+    assert client.calls == 2
     assert resolver.cache.get(int(cycle_start_ts.timestamp())) is None
 
 

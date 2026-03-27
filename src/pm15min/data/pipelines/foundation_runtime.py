@@ -4,11 +4,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+import pandas as pd
+
 from ..config import DataConfig
 from ..io.json_files import append_jsonl, write_json_atomic
 from .binance_klines import sync_binance_klines_1m
 from .direct_sync import sync_streams_from_rpc
-from .direct_oracle_prices import sync_polymarket_oracle_prices_direct
+from ..queries.loaders import load_direct_oracle_source
+from .direct_oracle_prices import sync_polymarket_oracle_price_window
 from .market_catalog import sync_market_catalog
 from .oracle_prices import build_oracle_prices_15m
 from .orderbook_runtime import run_orderbook_recorder
@@ -16,6 +19,8 @@ from ..sources.binance_spot import BinanceSpotKlinesClient
 from ..sources.polymarket_clob import PolymarketClobClient
 from ..sources.polymarket_gamma import GammaEventsClient
 from ..sources.polymarket_oracle_api import PolymarketOracleApiClient
+
+_CURRENT_CYCLE_DIRECT_ORACLE_LAST_ATTEMPT: dict[tuple[str, int], float] = {}
 
 
 def _utc_now(now_provider: Callable[[], datetime] | None = None) -> datetime:
@@ -38,10 +43,9 @@ def _append_log(cfg: DataConfig, payload: dict[str, Any]) -> None:
 
 
 def _binance_markets_for_foundation(cfg: DataConfig) -> list[str]:
-    markets = [cfg.asset.slug]
-    if cfg.asset.slug != "btc":
-        markets.append("btc")
-    return markets
+    # Keep foundation focused on the market's primary 1m feed. Cross-asset BTC
+    # klines are refreshed on demand in the live signal path when actually needed.
+    return [cfg.asset.slug]
 
 
 def _run_market_catalog_step(
@@ -103,15 +107,15 @@ def _run_oracle_step(
     client: PolymarketOracleApiClient | None,
     lookback_days: int,
     lookahead_hours: int,
+    min_retry_seconds: float,
 ) -> dict[str, object]:
-    start_ts = int((now - timedelta(days=max(1, int(lookback_days)))).timestamp())
-    end_ts = int((now + timedelta(hours=max(1, int(lookahead_hours)))).timestamp())
-    direct_summary = sync_polymarket_oracle_prices_direct(
+    cycle_seconds = int(cfg.layout.cycle_seconds)
+    current_cycle_start_ts = int(now.timestamp()) // cycle_seconds * cycle_seconds
+    direct_summary = _sync_live_current_cycle_oracle_open_price(
         cfg,
-        start_ts=start_ts,
-        end_ts=end_ts,
-        lookback_days=lookback_days,
+        cycle_start_ts=current_cycle_start_ts,
         client=client,
+        min_retry_seconds=min_retry_seconds,
     )
     table_summary = build_oracle_prices_15m(cfg)
     return {
@@ -121,6 +125,70 @@ def _run_oracle_step(
         "direct_summary": direct_summary,
         "table_summary": table_summary,
     }
+
+
+def _sync_live_current_cycle_oracle_open_price(
+    cfg: DataConfig,
+    *,
+    cycle_start_ts: int,
+    client: PolymarketOracleApiClient | None,
+    min_retry_seconds: float,
+) -> dict[str, object]:
+    existing = load_direct_oracle_source(cfg)
+    if _has_direct_open_price(existing, cycle_start_ts=cycle_start_ts):
+        return {
+            "dataset": "polymarket_direct_oracle_price_window",
+            "market": cfg.asset.slug,
+            "surface": cfg.surface,
+            "cycle_start_ts": int(cycle_start_ts),
+            "rows_imported": 0,
+            "canonical_rows": int(len(existing)),
+            "target_path": str(cfg.layout.direct_oracle_source_path),
+            "status": "cached",
+            "reason": "current_cycle_open_price_reused",
+        }
+
+    retry_key = (str(cfg.layout.direct_oracle_source_path), int(cycle_start_ts))
+    now_monotonic = time.monotonic()
+    retry_window_seconds = max(60.0, float(min_retry_seconds))
+    last_attempt = _CURRENT_CYCLE_DIRECT_ORACLE_LAST_ATTEMPT.get(retry_key, 0.0)
+    if last_attempt > 0.0 and now_monotonic - last_attempt < retry_window_seconds:
+        return {
+            "dataset": "polymarket_direct_oracle_price_window",
+            "market": cfg.asset.slug,
+            "surface": cfg.surface,
+            "cycle_start_ts": int(cycle_start_ts),
+            "rows_imported": 0,
+            "canonical_rows": int(len(existing)),
+            "target_path": str(cfg.layout.direct_oracle_source_path),
+            "status": "deferred",
+            "reason": "current_cycle_open_price_retry_deferred",
+            "retry_in_seconds": max(0.0, retry_window_seconds - (now_monotonic - last_attempt)),
+        }
+
+    _CURRENT_CYCLE_DIRECT_ORACLE_LAST_ATTEMPT[retry_key] = now_monotonic
+    summary = sync_polymarket_oracle_price_window(
+        cfg,
+        cycle_start_ts=int(cycle_start_ts),
+        client=client,
+        max_retries=1,
+        sleep_sec=0.0,
+    )
+    rows_imported = int(summary.get("rows_imported") or 0)
+    summary["status"] = "ok" if rows_imported > 0 else "missing"
+    summary["reason"] = "current_cycle_open_price_fetched" if rows_imported > 0 else "current_cycle_open_price_missing"
+    return summary
+
+
+def _has_direct_open_price(frame: pd.DataFrame, *, cycle_start_ts: int) -> bool:
+    if frame.empty:
+        return False
+    cycle_series = pd.to_numeric(frame.get("cycle_start_ts"), errors="coerce")
+    price_series = pd.to_numeric(frame.get("price_to_beat"), errors="coerce")
+    if cycle_series.empty or price_series.empty:
+        return False
+    mask = cycle_series.eq(int(cycle_start_ts)) & price_series.notna()
+    return bool(mask.any())
 
 
 def _run_streams_step(
@@ -237,9 +305,9 @@ def run_live_data_foundation(
     loop: bool = False,
     sleep_sec: float = 1.0,
     market_catalog_refresh_sec: float = 300.0,
-    binance_refresh_sec: float = 30.0,
+    binance_refresh_sec: float = 60.0,
     oracle_refresh_sec: float = 60.0,
-    streams_refresh_sec: float = 60.0,
+    streams_refresh_sec: float = 300.0,
     orderbook_refresh_sec: float = 0.35,
     market_catalog_lookback_hours: int = 24,
     market_catalog_lookahead_hours: int = 24,
@@ -257,7 +325,9 @@ def run_live_data_foundation(
     if cfg.cycle != "15m":
         raise ValueError("live foundation runtime currently requires cycle=15m.")
 
-    iterations = max(1, int(iterations))
+    requested_iterations = int(iterations)
+    run_forever = loop and requested_iterations <= 0
+    iterations = max(1, requested_iterations)
     sleep_sec = max(0.0, float(sleep_sec))
     run_started_at = _utc_now_iso(now_provider)
     completed = 0
@@ -288,7 +358,7 @@ def run_live_data_foundation(
     )
 
     while True:
-        if completed >= iterations:
+        if not run_forever and completed >= iterations:
             break
 
         now = _utc_now(now_provider)
@@ -353,6 +423,7 @@ def run_live_data_foundation(
                         client=oracle_client,
                         lookback_days=oracle_lookback_days,
                         lookahead_hours=oracle_lookahead_hours,
+                        min_retry_seconds=max(60.0, float(oracle_refresh_sec)),
                     ),
                 )
             )
@@ -460,7 +531,7 @@ def run_live_data_foundation(
         _write_state(
             cfg,
             {
-                "status": "running" if loop and completed < iterations else "ok",
+                "status": "running" if loop and (run_forever or completed < iterations) else "ok",
                 "market": cfg.asset.slug,
                 "cycle": cfg.cycle,
                 "surface": cfg.surface,
@@ -473,7 +544,7 @@ def run_live_data_foundation(
             },
         )
 
-        if loop and completed < iterations and sleep_sec > 0:
+        if loop and (run_forever or completed < iterations) and sleep_sec > 0:
             time.sleep(sleep_sec)
 
     _append_log(

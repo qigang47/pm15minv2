@@ -1667,6 +1667,55 @@ def test_data_run_orderbook_fleet(capsys, monkeypatch) -> None:
     assert payload["market_start_offset"] == 7
 
 
+def test_data_run_live_foundation_passes_refresh_intervals(capsys, monkeypatch) -> None:
+    captured: dict[str, float] = {}
+
+    def fake_run_live_data_foundation(cfg, **kwargs):
+        captured.update(kwargs)
+        return {
+            "domain": "data",
+            "dataset": "live_foundation",
+            "status": "ok",
+            "market": cfg.asset.slug,
+            "binance_refresh_sec": kwargs["binance_refresh_sec"],
+            "oracle_refresh_sec": kwargs["oracle_refresh_sec"],
+            "streams_refresh_sec": kwargs["streams_refresh_sec"],
+        }
+
+    monkeypatch.setattr(
+        "pm15min.data.cli.run_live_data_foundation",
+        fake_run_live_data_foundation,
+    )
+    rc = main(
+        [
+            "data",
+            "run",
+            "live-foundation",
+            "--market",
+            "sol",
+            "--cycle",
+            "15m",
+            "--surface",
+            "live",
+            "--binance-refresh-sec",
+            "60",
+            "--oracle-refresh-sec",
+            "60",
+            "--streams-refresh-sec",
+            "300",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dataset"] == "live_foundation"
+    assert payload["market"] == "sol"
+    assert payload["binance_refresh_sec"] == 60.0
+    assert payload["oracle_refresh_sec"] == 60.0
+    assert payload["streams_refresh_sec"] == 300.0
+    assert captured["include_direct_oracle"] is True
+    assert captured["include_orderbooks"] is True
+
+
 def test_data_build_truth_help(capsys) -> None:
     try:
         main(["data", "build", "truth-15m", "--help"])

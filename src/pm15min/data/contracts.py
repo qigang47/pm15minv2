@@ -42,7 +42,19 @@ class OrderbookSnapshotRecord:
     source: str = "clob"
 
     def to_row(self) -> dict[str, Any]:
-        return asdict(self)
+        # Avoid recursive copies of large full-depth asks/bids payloads.
+        return {
+            "captured_ts_ms": self.captured_ts_ms,
+            "source_ts_ms": self.source_ts_ms,
+            "market_id": self.market_id,
+            "token_id": self.token_id,
+            "side": self.side,
+            "asset": self.asset,
+            "cycle": self.cycle,
+            "asks": self.asks,
+            "bids": self.bids,
+            "source": self.source,
+        }
 
 
 @dataclass(frozen=True)
@@ -58,4 +70,14 @@ class OrderbookIndexRow:
     spread: float | None
 
     def to_row(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "captured_ts_ms": self.captured_ts_ms,
+            "market_id": self.market_id,
+            "token_id": self.token_id,
+            "side": self.side,
+            "best_ask": self.best_ask,
+            "best_bid": self.best_bid,
+            "ask_size_1": self.ask_size_1,
+            "bid_size_1": self.bid_size_1,
+            "spread": self.spread,
+        }

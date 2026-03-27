@@ -181,9 +181,9 @@ fi
 MARKETS_CSV="$(IFS=,; echo "${MARKETS_LIST[*]}")"
 
 PROFILE="${V2_LIVE_PROFILE:-deep_otm}"
-if [[ "$PROFILE" != "deep_otm" ]]; then
+if [[ "$PROFILE" != "deep_otm" && "$PROFILE" != "deep_otm_baseline" ]]; then
   echo "❌ Unsupported v2 canonical live profile: $PROFILE"
-  echo "   Canonical v2 live scope only supports: deep_otm"
+  echo "   Canonical v2 live scope only supports: deep_otm, deep_otm_baseline"
   exit 1
 fi
 

@@ -56,6 +56,7 @@ def test_run_orderbook_recorder_writes_state_and_logs(tmp_path: Path) -> None:
 
     assert summary["status"] == "ok"
     assert summary["completed_iterations"] == 2
+    assert summary["last_completed_at"]
     state_path = Path(summary["state_path"])
     log_path = Path(summary["log_path"])
     assert state_path.exists()
@@ -65,6 +66,7 @@ def test_run_orderbook_recorder_writes_state_and_logs(tmp_path: Path) -> None:
     assert state["status"] == "ok"
     assert state["completed_iterations"] == 2
     assert state["provider"] == "DirectOrderbookProvider"
+    assert state["last_completed_at"] == summary["last_completed_at"]
 
     lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) >= 2

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -10,7 +12,6 @@ import pandas as pd
 from ..config import DataConfig
 from ..contracts import OrderbookIndexRow, OrderbookSnapshotRecord
 from ..io.ndjson_zst import append_ndjson_zst, iter_ndjson_zst
-from ..io.json_files import write_json_atomic
 from ..io.parquet import read_parquet_if_exists, upsert_parquet
 from .market_catalog import sync_market_catalog
 from .orderbook_recent import update_recent_orderbook_index
@@ -23,6 +24,10 @@ DEFAULT_LIVE_MARKET_CATALOG_MAX_AGE_SECONDS = 300.0
 DEFAULT_LIVE_MARKET_CATALOG_NO_LIVE_RETRY_SECONDS = 60.0
 DEFAULT_LIVE_MARKET_CATALOG_LOOKBACK_HOURS = 24
 DEFAULT_LIVE_MARKET_CATALOG_LOOKAHEAD_HOURS = 24
+DEFAULT_ORDERBOOK_INDEX_COMPACT_SECONDS = 5.0
+DEFAULT_ORDERBOOK_INDEX_COMPACT_MAX_PENDING_ROWS = 128
+
+_ORDERBOOK_INDEX_COMPACT_STATE: dict[str, dict[str, float]] = {}
 
 MARKET_TABLE_REQUIRED = [
     "market_id",
@@ -43,6 +48,111 @@ ORDERBOOK_INDEX_COLUMNS = [
     "bid_size_1",
     "spread",
 ]
+
+
+def _write_json_atomic_compact(payload: dict[str, Any], path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+    return path
+
+
+def _orderbook_index_journal_path(index_path: Path) -> Path:
+    return index_path.with_name(f"{index_path.name}.journal.jsonl")
+
+
+def _append_jsonl_rows(path: Path, rows: list[dict[str, object]]) -> Path:
+    if not rows:
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return path
+
+
+def _read_jsonl_rows(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, object]] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                rows.append(payload)
+    return rows
+
+
+def _compact_due_for_index(index_path: Path, *, rows_added: int) -> bool:
+    state = _ORDERBOOK_INDEX_COMPACT_STATE.setdefault(
+        str(index_path),
+        {"pending_rows": 0.0, "last_compact_monotonic": 0.0},
+    )
+    state["pending_rows"] = float(state.get("pending_rows", 0.0)) + float(max(0, rows_added))
+    now_monotonic = time.monotonic()
+    interval_seconds = max(
+        0.0,
+        _env_float(
+            "PM15MIN_ORDERBOOK_INDEX_COMPACT_SECONDS",
+            default=DEFAULT_ORDERBOOK_INDEX_COMPACT_SECONDS,
+        ),
+    )
+    max_pending_rows = max(
+        1,
+        int(
+            _env_float(
+                "PM15MIN_ORDERBOOK_INDEX_COMPACT_MAX_PENDING_ROWS",
+                default=float(DEFAULT_ORDERBOOK_INDEX_COMPACT_MAX_PENDING_ROWS),
+            )
+        ),
+    )
+    if not index_path.exists():
+        return True
+    if interval_seconds <= 0.0:
+        return True
+    if int(state["pending_rows"]) >= max_pending_rows:
+        return True
+    return now_monotonic - float(state.get("last_compact_monotonic", 0.0)) >= interval_seconds
+
+
+def _compact_orderbook_index(
+    *,
+    index_path: Path,
+    index_rows: list[dict[str, object]],
+) -> None:
+    journal_path = _orderbook_index_journal_path(index_path)
+    _append_jsonl_rows(journal_path, index_rows)
+    if not _compact_due_for_index(index_path, rows_added=len(index_rows)):
+        return
+
+    pending_rows = _read_jsonl_rows(journal_path)
+    incoming = pd.DataFrame(pending_rows, columns=ORDERBOOK_INDEX_COLUMNS)
+    if not incoming.empty:
+        upsert_parquet(
+            path=index_path,
+            incoming=incoming,
+            key_columns=["captured_ts_ms", "market_id", "token_id", "side"],
+            sort_columns=["captured_ts_ms", "market_id", "token_id", "side"],
+            recover_existing_read_errors=True,
+        )
+    if journal_path.exists():
+        journal_path.unlink()
+    state = _ORDERBOOK_INDEX_COMPACT_STATE.setdefault(
+        str(index_path),
+        {"pending_rows": 0.0, "last_compact_monotonic": 0.0},
+    )
+    state["pending_rows"] = 0.0
+    state["last_compact_monotonic"] = time.monotonic()
 
 
 def _day_str_from_ts_ms(ts_ms: int) -> str:
@@ -323,11 +433,13 @@ def record_orderbooks_once(
         market_depth=cfg.market_depth,
         market_start_offset=cfg.market_start_offset,
     )
+    selected_rows = list(selected.itertuples(index=False))
+    selected_market_ids = [str(getattr(row, "market_id")) for row in selected_rows]
     selected_tokens = sorted(
         {
             str(token_id).strip()
-            for row in selected.to_dict("records")
-            for token_id in (row.get("token_up"), row.get("token_down"))
+            for row in selected_rows
+            for token_id in (getattr(row, "token_up", None), getattr(row, "token_down", None))
             if str(token_id or "").strip()
         }
     )
@@ -342,10 +454,12 @@ def record_orderbooks_once(
     except Exception:
         pass
 
-    snapshots: list[OrderbookSnapshotRecord] = []
-    for row in selected.to_dict("records"):
+    snapshot_rows: list[dict[str, object]] = []
+    index_rows: list[dict[str, object]] = []
+    for row in selected_rows:
+        market_id = str(getattr(row, "market_id"))
         for side, token_col in (("up", "token_up"), ("down", "token_down")):
-            token_id = str(row.get(token_col) or "").strip()
+            token_id = str(getattr(row, token_col, "") or "").strip()
             if not token_id:
                 continue
             book = provider.get_orderbook_summary(
@@ -356,35 +470,27 @@ def record_orderbooks_once(
             )
             if not isinstance(book, dict):
                 continue
-            snapshots.append(
-                _snapshot_record(
-                    captured_ts_ms=captured_ts_ms,
-                    market_id=str(row["market_id"]),
-                    token_id=token_id,
-                    side=side,
-                    asset=cfg.asset.slug,
-                    cycle=cfg.cycle,
-                    book=book,
-                )
+            snapshot = _snapshot_record(
+                captured_ts_ms=captured_ts_ms,
+                market_id=market_id,
+                token_id=token_id,
+                side=side,
+                asset=cfg.asset.slug,
+                cycle=cfg.cycle,
+                book=book,
             )
+            snapshot_rows.append(snapshot.to_row())
+            index_rows.append(_index_row_from_snapshot(snapshot).to_row())
 
     append_ndjson_zst(
         cfg.layout.orderbook_depth_path(date_str),
-        [snapshot.to_row() for snapshot in snapshots],
+        snapshot_rows,
         level=7,
     )
 
-    index_df = pd.DataFrame(
-        [_index_row_from_snapshot(snapshot).to_row() for snapshot in snapshots],
-        columns=ORDERBOOK_INDEX_COLUMNS,
-    )
-    upsert_parquet(
-        path=cfg.layout.orderbook_index_path(date_str),
-        incoming=index_df,
-        key_columns=["captured_ts_ms", "market_id", "token_id", "side"],
-        sort_columns=["captured_ts_ms", "market_id", "token_id", "side"],
-        recover_existing_read_errors=True,
-    )
+    index_path = cfg.layout.orderbook_index_path(date_str)
+    index_df = pd.DataFrame(index_rows, columns=ORDERBOOK_INDEX_COLUMNS)
+    _compact_orderbook_index(index_path=index_path, index_rows=index_rows)
     recent_df = update_recent_orderbook_index(
         path=cfg.layout.orderbook_recent_path,
         incoming=index_df,
@@ -398,10 +504,10 @@ def record_orderbooks_once(
         "captured_ts_ms": int(captured_ts_ms),
         "selected_markets": int(len(selected)),
         "market_start_offset": int(cfg.market_start_offset),
-        "selected_market_ids": selected["market_id"].astype(str).tolist(),
-        "records": [snapshot.to_row() for snapshot in snapshots],
+        "selected_market_ids": selected_market_ids,
+        "records": snapshot_rows,
     }
-    write_json_atomic(latest_full_snapshot_payload, cfg.layout.orderbook_latest_full_snapshot_path)
+    _write_json_atomic_compact(latest_full_snapshot_payload, cfg.layout.orderbook_latest_full_snapshot_path)
 
     return {
         "dataset": "orderbook_depth",
@@ -410,10 +516,10 @@ def record_orderbooks_once(
         "captured_ts_ms": captured_ts_ms,
         "selected_markets": int(len(selected)),
         "market_start_offset": int(cfg.market_start_offset),
-        "selected_market_ids": selected["market_id"].astype(str).tolist(),
-        "snapshot_rows": int(len(snapshots)),
+        "selected_market_ids": selected_market_ids,
+        "snapshot_rows": int(len(snapshot_rows)),
         "depth_path": str(cfg.layout.orderbook_depth_path(date_str)),
-        "index_path": str(cfg.layout.orderbook_index_path(date_str)),
+        "index_path": str(index_path),
         "recent_path": str(cfg.layout.orderbook_recent_path),
         "latest_full_snapshot_path": str(cfg.layout.orderbook_latest_full_snapshot_path),
         "recent_rows": int(len(recent_df)),

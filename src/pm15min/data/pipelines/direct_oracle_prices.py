@@ -297,3 +297,73 @@ def sync_polymarket_oracle_prices_direct(
         "canonical_rows": int(len(canonical)),
         "target_path": str(cfg.layout.direct_oracle_source_path),
     }
+
+
+def sync_polymarket_oracle_price_window(
+    cfg: DataConfig,
+    *,
+    cycle_start_ts: int,
+    timeout_sec: float = 20.0,
+    sleep_sec: float = 0.0,
+    max_retries: int = 1,
+    client: PolymarketOracleApiClient | None = None,
+) -> dict[str, object]:
+    if cfg.cycle != "15m":
+        raise ValueError("direct oracle window sync currently requires cycle=15m.")
+
+    client = client or PolymarketOracleApiClient(timeout_sec=timeout_sec)
+    cycle_start_ts = int(cycle_start_ts)
+    obj = client.fetch_crypto_price(
+        symbol=cfg.asset.slug.upper(),
+        cycle_start_ts=cycle_start_ts,
+        cycle_seconds=cfg.layout.cycle_seconds,
+        sleep_sec=float(sleep_sec),
+        max_retries=max(1, int(max_retries)),
+    )
+    fetched_at = _utc_now_label()
+    candidate = pd.DataFrame(
+        [
+            {
+                "asset": cfg.asset.slug,
+                "cycle": cfg.cycle,
+                "cycle_start_ts": cycle_start_ts,
+                "cycle_end_ts": int(cycle_start_ts + cfg.layout.cycle_seconds),
+                "price_to_beat": None if not isinstance(obj, dict) else obj.get("openPrice"),
+                "final_price": None if not isinstance(obj, dict) else obj.get("closePrice"),
+                "has_price_to_beat": False,
+                "has_final_price": False,
+                "has_both": False,
+                "completed": None if not isinstance(obj, dict) else obj.get("completed"),
+                "incomplete": None if not isinstance(obj, dict) else obj.get("incomplete"),
+                "cached": None if not isinstance(obj, dict) else obj.get("cached"),
+                "api_timestamp_ms": None if not isinstance(obj, dict) else obj.get("timestamp"),
+                "http_status": 200 if isinstance(obj, dict) and obj else None,
+                "source": "polymarket_api_crypto_price",
+                "source_priority": 3,
+                "fetched_at": fetched_at,
+            }
+        ],
+        columns=DIRECT_ORACLE_COLUMNS,
+    )
+    candidate["price_to_beat"] = pd.to_numeric(candidate["price_to_beat"], errors="coerce")
+    candidate["final_price"] = pd.to_numeric(candidate["final_price"], errors="coerce")
+    candidate["has_price_to_beat"] = candidate["price_to_beat"].notna()
+    candidate["has_final_price"] = candidate["final_price"].notna()
+    candidate["has_both"] = candidate["has_price_to_beat"] & candidate["has_final_price"]
+    rows_imported = int(candidate["has_price_to_beat"].sum())
+    canonical_rows = 0
+    if rows_imported > 0:
+        canonical = _write_direct_oracle_canonical(
+            target_path=cfg.layout.direct_oracle_source_path,
+            incoming=candidate,
+        )
+        canonical_rows = int(len(canonical))
+    return {
+        "dataset": "polymarket_direct_oracle_price_window",
+        "market": cfg.asset.slug,
+        "surface": cfg.surface,
+        "cycle_start_ts": cycle_start_ts,
+        "rows_imported": rows_imported,
+        "canonical_rows": canonical_rows,
+        "target_path": str(cfg.layout.direct_oracle_source_path),
+    }

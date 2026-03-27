@@ -227,6 +227,36 @@ def build_offset_window(
     )
 
 
+def _feature_cycle_context(
+    *,
+    ctx: OffsetScoreContext,
+    now_utc: pd.Timestamp,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None, pd.Timestamp | None]:
+    features = ctx.features
+    if not isinstance(features, pd.DataFrame) or features.empty:
+        return None, None, None
+
+    decision_ts = pd.to_datetime(features.get("decision_ts"), utc=True, errors="coerce")
+    latest_feature_decision_ts = None
+    if isinstance(decision_ts, pd.Series):
+        latest_feature_decision_ts = decision_ts.dropna().max()
+        if pd.isna(latest_feature_decision_ts):
+            latest_feature_decision_ts = None
+
+    cycle_start = pd.to_datetime(features.get("cycle_start_ts"), utc=True, errors="coerce")
+    cycle_end = pd.to_datetime(features.get("cycle_end_ts"), utc=True, errors="coerce")
+    if not isinstance(cycle_start, pd.Series) or not isinstance(cycle_end, pd.Series):
+        return None, None, latest_feature_decision_ts
+
+    active = cycle_start.notna() & cycle_end.notna() & cycle_start.le(now_utc) & cycle_end.gt(now_utc)
+    if not bool(active.any()):
+        return None, None, latest_feature_decision_ts
+
+    active_cycle_start = cycle_start.loc[active].max()
+    active_cycle_end = cycle_end.loc[active & cycle_start.eq(active_cycle_start)].max()
+    return active_cycle_start, active_cycle_end, latest_feature_decision_ts
+
+
 def _resolve_latest_live_row(
     *,
     ctx: OffsetScoreContext,
@@ -247,6 +277,27 @@ def _resolve_latest_live_row(
     scored = scored.dropna(subset=["decision_ts"]).sort_values("decision_ts")
     if scored.empty:
         return None, base_coverage, "missing_score_row"
+
+    active_cycle_start, active_cycle_end, latest_feature_decision_ts = _feature_cycle_context(
+        ctx=ctx,
+        now_utc=now_utc,
+    )
+    if active_cycle_start is not None:
+        cycle_start = pd.to_datetime(scored.get("cycle_start_ts"), utc=True, errors="coerce")
+        cycle_end = pd.to_datetime(scored.get("cycle_end_ts"), utc=True, errors="coerce")
+        if isinstance(cycle_start, pd.Series) and isinstance(cycle_end, pd.Series):
+            current_cycle_mask = cycle_start.eq(active_cycle_start)
+            if active_cycle_end is not None:
+                current_cycle_mask &= cycle_end.eq(active_cycle_end)
+            current_cycle_scored = scored.loc[current_cycle_mask].copy()
+
+            expected_open_ts = active_cycle_start + pd.to_timedelta(int(ctx.offset), unit="m")
+            if latest_feature_decision_ts is None or latest_feature_decision_ts < expected_open_ts:
+                return None, base_coverage, "offset_not_yet_open"
+            if current_cycle_scored.empty:
+                return None, base_coverage, "missing_score_row"
+            scored = current_cycle_scored
+
     scored = scored.loc[scored["decision_ts"].le(now_utc)].copy()
     if scored.empty:
         return None, base_coverage, "offset_not_yet_open"

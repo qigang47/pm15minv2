@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -103,6 +104,98 @@ def test_quote_snapshot_uses_latest_in_window_orderbook_row(tmp_path: Path, monk
     assert row["quote_up_ask"] == 0.51
     assert row["quote_down_bid"] == 0.39
     assert row["quote_age_ms_up"] == 15000
+
+
+def test_quote_snapshot_uses_latest_pre_decision_full_snapshot_at_window_open(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    cycle_start = pd.Timestamp("2026-03-12T15:00:00Z")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    decision_ts = pd.Timestamp("2026-03-12T15:07:00Z")
+    captured_ts = pd.Timestamp("2026-03-12T15:06:59.850Z")
+    now = pd.Timestamp("2026-03-12T15:07:00.200Z")
+    captured_ts_ms = int(captured_ts.timestamp() * 1000)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "slug": f"sol-up-or-down-15m-{int(cycle_start.timestamp())}",
+                    "question": "Sol up or down",
+                    "resolution_source": "https://data.chain.link/streams/sol-usd",
+                    "event_id": "event-1",
+                    "event_slug": "slug-1",
+                    "event_title": "title-1",
+                    "series_slug": "sol-up-or-down-15m",
+                    "closed_ts": None,
+                    "source_snapshot_ts": "2026-03-19T00-00-00Z",
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    write_json_atomic(
+        {
+            "dataset": "orderbook_latest_full_snapshot",
+            "market": "sol",
+            "cycle": "15m",
+            "captured_ts_ms": captured_ts_ms,
+            "records": [
+                {
+                    "captured_ts_ms": captured_ts_ms,
+                    "source_ts_ms": captured_ts_ms,
+                    "market_id": "market-1",
+                    "token_id": "token-up",
+                    "side": "up",
+                    "asks": [{"price": 0.51, "size": 10.0}],
+                    "bids": [{"price": 0.49, "size": 11.0}],
+                },
+                {
+                    "captured_ts_ms": captured_ts_ms,
+                    "source_ts_ms": captured_ts_ms,
+                    "market_id": "market-1",
+                    "token_id": "token-down",
+                    "side": "down",
+                    "asks": [{"price": 0.61, "size": 12.0}],
+                    "bids": [{"price": 0.39, "size": 13.0}],
+                },
+            ],
+        },
+        data_cfg.layout.orderbook_latest_full_snapshot_path,
+    )
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 7,
+                    "decision_ts": decision_ts.isoformat(),
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                }
+            ],
+        },
+        persist=False,
+        now=now,
+    )
+    row = quote["quote_rows"][0]
+    assert row["status"] == "ok"
+    assert row["quote_source_path"] == str(data_cfg.layout.orderbook_latest_full_snapshot_path)
+    assert row["quote_captured_ts_ms_up"] == captured_ts_ms
+    assert row["quote_captured_ts_ms_down"] == captured_ts_ms
+    assert row["quote_age_ms_up"] == 350
+    assert row["quote_age_ms_down"] == 350
 
 
 def test_quote_snapshot_rejects_expired_signal_window(tmp_path: Path, monkeypatch) -> None:
@@ -276,6 +369,105 @@ def test_quote_snapshot_uses_recent_orderbook_cache_when_daily_index_missing(tmp
     )
     row = quote["quote_rows"][0]
     assert row["status"] == "ok"
+    assert row["quote_up_ask"] == 0.24
+    assert row["quote_down_ask"] == 0.76
+
+
+def test_quote_snapshot_uses_journal_rows_despite_malformed_line_at_window_open(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    cycle_start = pd.Timestamp("2026-03-21T16:45:00Z")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    decision_ts = pd.Timestamp("2026-03-21T16:54:00Z")
+    captured_ts = pd.Timestamp("2026-03-21T16:53:59.900Z")
+    now = pd.Timestamp("2026-03-21T16:54:00.250Z")
+    captured_ts_ms = int(captured_ts.timestamp() * 1000)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "question": "Sol up or down",
+                    "source_snapshot_ts": "2026-03-21T16-45-00Z",
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(columns=["captured_ts_ms", "market_id", "token_id", "side", "best_ask", "best_bid", "ask_size_1", "bid_size_1", "spread"]),
+        data_cfg.layout.orderbook_index_path("2026-03-21"),
+    )
+    journal_path = data_cfg.layout.orderbook_index_path("2026-03-21").with_name(
+        f"{data_cfg.layout.orderbook_index_path('2026-03-21').name}.journal.jsonl"
+    )
+    journal_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "captured_ts_ms": captured_ts_ms,
+                        "market_id": "market-1",
+                        "token_id": "token-up",
+                        "side": "up",
+                        "best_ask": 0.24,
+                        "best_bid": 0.23,
+                        "ask_size_1": 9.0,
+                        "bid_size_1": 8.0,
+                        "spread": 0.01,
+                    }
+                ),
+                '{"captured_ts_ms":',
+                json.dumps(
+                    {
+                        "captured_ts_ms": captured_ts_ms,
+                        "market_id": "market-1",
+                        "token_id": "token-down",
+                        "side": "down",
+                        "best_ask": 0.76,
+                        "best_bid": 0.75,
+                        "ask_size_1": 10.0,
+                        "bid_size_1": 11.0,
+                        "spread": 0.01,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 8,
+                    "decision_ts": decision_ts.isoformat(),
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                }
+            ],
+        },
+        persist=False,
+        now=now,
+    )
+    row = quote["quote_rows"][0]
+    assert row["status"] == "ok"
+    assert row["quote_source_path"] == str(data_cfg.layout.orderbook_index_path("2026-03-21"))
+    assert row["quote_captured_ts_ms_up"] == captured_ts_ms
+    assert row["quote_captured_ts_ms_down"] == captured_ts_ms
     assert row["quote_up_ask"] == 0.24
     assert row["quote_down_ask"] == 0.76
 

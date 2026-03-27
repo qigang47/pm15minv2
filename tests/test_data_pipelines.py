@@ -13,6 +13,7 @@ from pm15min.data.pipelines.binance_klines import sync_binance_klines_1m
 from pm15min.data.pipelines.market_catalog import sync_market_catalog
 from pm15min.data.pipelines.orderbook_recording import _select_markets, record_orderbooks_once
 from pm15min.data.pipelines.orderbook_recent import update_recent_orderbook_index
+from pm15min.live.quotes.orderbook import load_orderbook_index_frame
 
 
 class _FakeGammaClient:
@@ -432,6 +433,60 @@ def test_record_orderbooks_once_recovers_corrupt_orderbook_index(tmp_path: Path)
     rebuilt_index_path = Path(summary["index_path"])
     assert len(pd.read_parquet(rebuilt_index_path)) == 2
     assert len(list(rebuilt_index_path.parent.glob("data.parquet.corrupt.*"))) == 1
+
+
+def test_record_orderbooks_once_keeps_recent_index_rows_visible_via_journal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", root=tmp_path / "v2", market_depth=1)
+    market_table = pd.DataFrame(
+        [
+            {
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "asset": "sol",
+                "cycle": "15m",
+                "cycle_start_ts": 1_710_000_000,
+                "cycle_end_ts": 1_910_000_000,
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "slug": "sol-up-or-down-15m-1710000000",
+                "question": "Sol up or down",
+                "resolution_source": "https://data.chain.link/streams/sol-usd",
+                "event_id": "event-1",
+                "event_slug": "event-slug",
+                "event_title": "title",
+                "series_slug": "sol-up-or-down-15m",
+                "closed_ts": None,
+                "source_snapshot_ts": "2026-03-19T09-00-00Z",
+            }
+        ]
+    )
+    write_parquet_atomic(market_table, cfg.layout.market_catalog_table_path)
+    monkeypatch.setenv("PM15MIN_ORDERBOOK_INDEX_COMPACT_SECONDS", "3600")
+    monkeypatch.setenv("PM15MIN_ORDERBOOK_INDEX_COMPACT_MAX_PENDING_ROWS", "128")
+
+    record_orderbooks_once(
+        cfg,
+        client=_FakeClobClient(),
+        captured_ts_ms=1_742_374_800_000,
+    )
+    summary = record_orderbooks_once(
+        cfg,
+        client=_FakeClobClient(),
+        captured_ts_ms=1_742_374_860_000,
+    )
+
+    index_path = Path(summary["index_path"])
+    journal_path = index_path.with_name(f"{index_path.name}.journal.jsonl")
+    stored_index_df = pd.read_parquet(index_path)
+    visible_index_df = load_orderbook_index_frame(index_path=index_path)
+
+    assert len(stored_index_df) == 2
+    assert journal_path.exists()
+    assert len(visible_index_df) == 4
+    assert set(visible_index_df["captured_ts_ms"]) == {1_742_374_800_000, 1_742_374_860_000}
 
 
 def test_select_markets_honors_start_offset() -> None:

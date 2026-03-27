@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
+import time
 
 import pandas as pd
 
@@ -20,7 +22,7 @@ def read_parquet_if_exists(path: Path, *, recover_corrupt: bool = False) -> pd.D
 
 def write_parquet_atomic(df: pd.DataFrame, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     df.to_parquet(tmp_path, index=False)
     tmp_path.replace(path)
     return path

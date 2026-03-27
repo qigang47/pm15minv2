@@ -8,8 +8,10 @@ import pandas as pd
 import pytest
 
 from pm15min.data.config import DataConfig
+from pm15min.data.io.parquet import read_parquet_if_exists
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.data.pipelines.foundation_runtime import run_live_data_foundation
+import pm15min.data.pipelines.foundation_runtime as foundation_runtime_module
 
 
 def test_run_live_data_foundation_writes_state_and_logs(tmp_path: Path, monkeypatch) -> None:
@@ -29,7 +31,32 @@ def test_run_live_data_foundation_writes_state_and_logs(tmp_path: Path, monkeypa
     def fake_direct_oracle(*args, **kwargs):
         target_cfg = args[0]
         calls.append(("direct_oracle", target_cfg.asset.slug))
-        return {"dataset": "polymarket_direct_oracle_prices"}
+        existing = read_parquet_if_exists(target_cfg.layout.direct_oracle_source_path)
+        incoming = pd.DataFrame(
+            [
+                {
+                    "asset": target_cfg.asset.slug,
+                    "cycle": target_cfg.cycle,
+                    "cycle_start_ts": int(pd.Timestamp("2026-03-20T00:00:00Z").timestamp()),
+                    "cycle_end_ts": int(pd.Timestamp("2026-03-20T00:15:00Z").timestamp()),
+                    "price_to_beat": 100.0,
+                    "final_price": pd.NA,
+                    "has_price_to_beat": True,
+                    "has_final_price": False,
+                    "has_both": False,
+                    "completed": False,
+                    "incomplete": True,
+                    "cached": False,
+                    "api_timestamp_ms": None,
+                    "http_status": 200,
+                    "source": "polymarket_api_crypto_price",
+                    "source_priority": 3,
+                    "fetched_at": "2026-03-20T00:00:00Z",
+                }
+            ]
+        )
+        write_parquet_atomic(incoming if existing is None else pd.concat([existing, incoming], ignore_index=True), target_cfg.layout.direct_oracle_source_path)
+        return {"dataset": "polymarket_direct_oracle_price_window", "rows_imported": 1}
 
     def fake_streams(*args, **kwargs):
         target_cfg = args[0]
@@ -52,7 +79,7 @@ def test_run_live_data_foundation_writes_state_and_logs(tmp_path: Path, monkeypa
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_market_catalog", fake_market_catalog)
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_binance_klines_1m", fake_binance)
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_streams_from_rpc", fake_streams)
-    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_polymarket_oracle_prices_direct", fake_direct_oracle)
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_polymarket_oracle_price_window", fake_direct_oracle)
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.build_oracle_prices_15m", fake_build_oracle)
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.run_orderbook_recorder", fake_orderbooks)
 
@@ -68,10 +95,11 @@ def test_run_live_data_foundation_writes_state_and_logs(tmp_path: Path, monkeypa
     assert summary["status"] == "ok"
     assert summary["completed_iterations"] == 2
     assert ("binance", "sol") in calls
-    assert ("binance", "btc") in calls
+    assert ("binance", "btc") not in calls
     assert calls.count(("market_catalog", "sol")) == 2
+    assert calls.count(("binance", "sol")) == 2
     assert calls.count(("streams", "sol")) == 2
-    assert calls.count(("direct_oracle", "sol")) == 2
+    assert calls.count(("direct_oracle", "sol")) == 1
     assert calls.count(("oracle_table", "sol")) == 2
     assert calls.count(("orderbooks", "sol")) == 2
 
@@ -121,7 +149,7 @@ def test_run_live_data_foundation_allows_oracle_fail_open_with_existing_table(tm
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_market_catalog", lambda *args, **kwargs: {"dataset": "market_catalog"})
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_binance_klines_1m", lambda *args, **kwargs: {"dataset": "binance_klines_1m"})
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_streams_from_rpc", lambda *args, **kwargs: {"dataset": "chainlink_streams_rpc"})
-    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_polymarket_oracle_prices_direct", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("429 too many requests")))
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_polymarket_oracle_price_window", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("429 too many requests")))
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.build_oracle_prices_15m", lambda *args, **kwargs: {"dataset": "oracle_prices_15m"})
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.run_orderbook_recorder", lambda *args, **kwargs: {"status": "ok", "dataset": "orderbook_depth"})
 
@@ -160,7 +188,7 @@ def test_run_live_data_foundation_persists_error_metadata_before_raise(tmp_path:
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_binance_klines_1m", lambda *args, **kwargs: {"dataset": "binance_klines_1m"})
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_streams_from_rpc", lambda *args, **kwargs: {"dataset": "chainlink_streams_rpc"})
     monkeypatch.setattr(
-        "pm15min.data.pipelines.foundation_runtime.sync_polymarket_oracle_prices_direct",
+        "pm15min.data.pipelines.foundation_runtime.sync_polymarket_oracle_price_window",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("oracle down")),
     )
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.build_oracle_prices_15m", lambda *args, **kwargs: {"dataset": "oracle_prices_15m"})
@@ -182,3 +210,97 @@ def test_run_live_data_foundation_persists_error_metadata_before_raise(tmp_path:
     assert state["last_task_results"]["oracle"]["status"] == "error"
     assert state["last_task_results"]["oracle"]["error"] == "oracle down"
     assert state["finished_at"]
+
+
+def test_run_live_data_foundation_retries_missing_current_cycle_open_price_only_after_retry_window(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
+    foundation_runtime_module._CURRENT_CYCLE_DIRECT_ORACLE_LAST_ATTEMPT.clear()
+    calls = {"direct_oracle": 0}
+    clock = {"now": 100.0}
+
+    monkeypatch.setattr(foundation_runtime_module.time, "monotonic", lambda: float(clock["now"]))
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_market_catalog", lambda *args, **kwargs: {"dataset": "market_catalog"})
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_binance_klines_1m", lambda *args, **kwargs: {"dataset": "binance_klines_1m"})
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_streams_from_rpc", lambda *args, **kwargs: {"dataset": "chainlink_streams_rpc"})
+
+    def fake_direct_oracle(*args, **kwargs):
+        calls["direct_oracle"] += 1
+        return {
+            "dataset": "polymarket_direct_oracle_price_window",
+            "rows_imported": 0,
+            "canonical_rows": 0,
+            "target_path": str(cfg.layout.direct_oracle_source_path),
+        }
+
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_polymarket_oracle_price_window", fake_direct_oracle)
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.build_oracle_prices_15m", lambda *args, **kwargs: {"dataset": "oracle_prices_15m"})
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.run_orderbook_recorder", lambda *args, **kwargs: {"status": "ok", "dataset": "orderbook_depth"})
+
+    now = datetime(2026, 3, 20, 0, 0, tzinfo=timezone.utc)
+    first = run_live_data_foundation(cfg, iterations=1, loop=False, now_provider=lambda: now)
+    second = run_live_data_foundation(cfg, iterations=1, loop=False, now_provider=lambda: now + timedelta(seconds=10))
+    clock["now"] += 60.0
+    third = run_live_data_foundation(cfg, iterations=1, loop=False, now_provider=lambda: now + timedelta(seconds=70))
+
+    assert calls["direct_oracle"] == 2
+    assert first["last_results"]["oracle"]["direct_summary"]["status"] == "missing"
+    assert second["last_results"]["oracle"]["direct_summary"]["status"] == "deferred"
+    assert second["last_results"]["oracle"]["direct_summary"]["reason"] == "current_cycle_open_price_retry_deferred"
+    assert third["last_results"]["oracle"]["direct_summary"]["status"] == "missing"
+
+
+def test_run_live_data_foundation_loop_zero_iterations_runs_until_stopped(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class StopLoop(RuntimeError):
+        pass
+
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
+    calls = {"market_catalog": 0, "binance": 0}
+    clock = {"tick": 0}
+    sleep_calls = {"count": 0}
+
+    def fake_now() -> datetime:
+        value = datetime(2026, 3, 20, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=clock["tick"])
+        clock["tick"] += 1
+        return value
+
+    def fake_sleep(_seconds: float) -> None:
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= 2:
+            raise StopLoop("stop after confirming repeated loop iterations")
+
+    monkeypatch.setattr(foundation_runtime_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        "pm15min.data.pipelines.foundation_runtime.sync_market_catalog",
+        lambda *args, **kwargs: calls.__setitem__("market_catalog", calls["market_catalog"] + 1) or {"dataset": "market_catalog"},
+    )
+    monkeypatch.setattr(
+        "pm15min.data.pipelines.foundation_runtime.sync_binance_klines_1m",
+        lambda *args, **kwargs: calls.__setitem__("binance", calls["binance"] + 1) or {"dataset": "binance_klines_1m"},
+    )
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_streams_from_rpc", lambda *args, **kwargs: {"dataset": "chainlink_streams_rpc"})
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_polymarket_oracle_price_window", lambda *args, **kwargs: {"dataset": "polymarket_direct_oracle_price_window", "rows_imported": 0, "canonical_rows": 0, "target_path": str(cfg.layout.direct_oracle_source_path)})
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.build_oracle_prices_15m", lambda *args, **kwargs: {"dataset": "oracle_prices_15m"})
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.run_orderbook_recorder", lambda *args, **kwargs: {"status": "ok", "dataset": "orderbook_depth"})
+
+    with pytest.raises(StopLoop):
+        run_live_data_foundation(
+            cfg,
+            iterations=0,
+            loop=True,
+            sleep_sec=1.0,
+            market_catalog_refresh_sec=0.0,
+            binance_refresh_sec=0.0,
+            include_streams=False,
+            include_direct_oracle=False,
+            include_orderbooks=False,
+            now_provider=fake_now,
+        )
+
+    assert calls["market_catalog"] >= 2
+    assert calls["binance"] >= 2

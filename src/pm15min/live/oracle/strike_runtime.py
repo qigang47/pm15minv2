@@ -30,8 +30,8 @@ DEFAULT_CHAINLINK_SYMBOL: dict[str, str] = {
 }
 _EXACT_CACHE_SOURCES = {"polymarket_open_price_api", "streams_parquet"}
 _STREAMS_REFRESH_SECONDS = 60.0
-_OPEN_PRICE_MIN_REFRESH_SECONDS = 30.0
-_OPEN_PRICE_EMPTY_RETRY_MAX_ATTEMPTS = 5
+_OPEN_PRICE_MIN_REFRESH_SECONDS = 60.0
+_OPEN_PRICE_EMPTY_RETRY_MAX_ATTEMPTS = 1
 _OPEN_PRICE_EMPTY_RETRY_BASE_SECONDS = 0.15
 _OPEN_PRICE_EMPTY_RETRY_MAX_SECONDS = 1.2
 _OPEN_PRICE_EMPTY_RETRY_MULTIPLIER = 2.0
@@ -290,11 +290,14 @@ def _resolve_open_price_quote(
         default=_OPEN_PRICE_EMPTY_RETRY_MAX_ATTEMPTS,
     )
     for attempt in range(max(1, int(max_attempts))):
-        payload = oracle_client.fetch_crypto_price(
-            symbol=symbol,
-            cycle_start_ts=cycle_start_sec,
-            cycle_seconds=int(cycle_seconds),
-        )
+        try:
+            payload = oracle_client.fetch_crypto_price(
+                symbol=symbol,
+                cycle_start_ts=cycle_start_sec,
+                cycle_seconds=int(cycle_seconds),
+            )
+        except Exception:
+            return None
         open_price = pd.to_numeric(payload.get("openPrice"), errors="coerce")
         if not pd.isna(open_price) and float(open_price) > 0.0:
             quote = StrikeQuote(

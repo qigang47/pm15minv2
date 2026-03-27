@@ -50,6 +50,7 @@ def run_orderbook_recorder(
     completed = 0
     errors = 0
     last_summary: dict[str, Any] | None = None
+    last_completed_at: str | None = None
 
     _write_state(
         cfg,
@@ -84,6 +85,7 @@ def run_orderbook_recorder(
                 )
                 completed += 1
                 last_summary = summary
+                last_completed_at = _utc_now_iso()
                 state_payload = {
                     "status": "running" if loop and (iterations <= 0 or completed < iterations) else "ok",
                     "market": cfg.asset.slug,
@@ -95,7 +97,7 @@ def run_orderbook_recorder(
                     "errors": errors,
                     "last_summary": summary,
                     "last_error": None,
-                    "last_completed_at": _utc_now_iso(),
+                    "last_completed_at": last_completed_at,
                 }
                 _write_state(cfg, state_payload)
                 now_ts = time.time()
@@ -132,6 +134,7 @@ def run_orderbook_recorder(
                         "errors": errors,
                         "last_summary": last_summary,
                         "last_error": "KeyboardInterrupt",
+                        "last_completed_at": last_completed_at,
                         "stopped_at": _utc_now_iso(),
                     },
                 )
@@ -169,6 +172,7 @@ def run_orderbook_recorder(
                     "errors": errors,
                     "last_summary": last_summary,
                     "last_error": f"{type(exc).__name__}: {exc}",
+                    "last_completed_at": last_completed_at,
                     "last_error_at": _utc_now_iso(),
                 }
                 _write_state(cfg, error_payload)
@@ -201,6 +205,7 @@ def run_orderbook_recorder(
             "errors": errors,
             "last_summary": last_summary,
             "last_error": None if errors == 0 else None,
+            "last_completed_at": last_completed_at,
             "finished_at": _utc_now_iso(),
         }
         _write_state(cfg, final_payload)
@@ -226,6 +231,7 @@ def run_orderbook_recorder(
             "state_path": str(cfg.layout.orderbook_state_path),
             "log_path": str(cfg.layout.recorder_log_path),
             "last_summary": last_summary,
+            "last_completed_at": last_completed_at,
         }
     except Exception:
         raise
