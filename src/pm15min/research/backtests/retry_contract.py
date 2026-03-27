@@ -11,6 +11,8 @@ from pm15min.live.execution.retry_policy import (
 )
 from pm15min.live.profiles.spec import LiveProfileSpec
 
+FULL_BACKTEST_CANDIDATE_SCAN = "backtest_full_candidate_scan"
+
 
 PRE_SUBMIT_ORDERBOOK_RETRY_COLUMNS: tuple[str, ...] = (
     "pre_submit_orderbook_retry_armed",
@@ -118,20 +120,11 @@ def limit_legacy_pre_submit_orderbook_retry_candidates(
     candidate_total_count: int | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     total_count = max(int(len(raw_depth_candidates)), int(candidate_total_count or 0))
-    if spec is None:
-        return list(raw_depth_candidates), {
-            "candidate_total_count": total_count,
-            "retry_budget": total_count,
-            "budget_exhausted": False,
-            "retry_budget_source": "",
-        }
-    contract = build_backtest_retry_contract(spec)
-    capped = list(raw_depth_candidates[: contract.max_pre_submit_orderbook_retry_candidates])
-    return capped, {
+    return list(raw_depth_candidates), {
         "candidate_total_count": total_count,
-        "retry_budget": int(contract.max_pre_submit_orderbook_retry_candidates),
-        "budget_exhausted": bool(total_count > len(capped)),
-        "retry_budget_source": "orderbook_fast_retry_max",
+        "retry_budget": total_count,
+        "budget_exhausted": False,
+        "retry_budget_source": FULL_BACKTEST_CANDIDATE_SCAN if spec is not None else "",
     }
 
 

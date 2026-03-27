@@ -62,6 +62,8 @@ def resolve_backtest_profile_spec(
     resolved = _coerce_parity(parity)
     market_token = str(market or "").strip().lower() or "default"
     updates: dict[str, object] = {}
+    if market_token != "default":
+        updates["active_markets"] = tuple(dict.fromkeys((*spec.active_markets, market_token)))
     if resolved.regime_enabled is not None:
         updates["regime_controller_enabled"] = bool(resolved.regime_enabled)
     if resolved.regime_apply_stake_scale is not None:

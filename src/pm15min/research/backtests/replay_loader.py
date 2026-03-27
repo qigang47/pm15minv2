@@ -83,9 +83,11 @@ def build_replay_frame(
     labels: pd.DataFrame,
     score_frames: list[pd.DataFrame],
     available_offsets: list[int],
+    scoped_offsets: list[int] | None = None,
 ) -> tuple[pd.DataFrame, ReplayLoadSummary]:
-    merged, alignment_metadata = merge_feature_and_label_frames(features, labels)
-    score_frame = build_score_frame(score_frames)
+    scoped_feature_frame = _scope_frame_to_offsets(features, scoped_offsets)
+    merged, alignment_metadata = merge_feature_and_label_frames(scoped_feature_frame, labels)
+    score_frame = _scope_frame_to_offsets(build_score_frame(score_frames), scoped_offsets)
     replay = merged.merge(score_frame, on=REPLAY_KEY_COLUMNS, how="left")
     replay["bundle_offset_available"] = pd.to_numeric(replay["offset"], errors="coerce").isin(
         [int(offset) for offset in available_offsets]
@@ -144,6 +146,14 @@ def _append_replay_window_columns(frame: pd.DataFrame) -> pd.DataFrame:
     out["window_end_ts"] = window_end_ts
     out["window_duration_seconds"] = duration_seconds.astype(float)
     return out
+
+
+def _scope_frame_to_offsets(frame: pd.DataFrame, scoped_offsets: list[int] | None) -> pd.DataFrame:
+    if frame.empty or not scoped_offsets or "offset" not in frame.columns:
+        return frame.copy()
+    allowed_offsets = {int(value) for value in scoped_offsets}
+    offset_values = pd.to_numeric(frame["offset"], errors="coerce")
+    return frame.loc[offset_values.isin(allowed_offsets)].copy()
 
 
 def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:

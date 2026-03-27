@@ -86,6 +86,7 @@ def build_backtest_summary(
     max_notional_usd: float | None = None,
     fallback_reasons: Sequence[str] = (),
     parity: dict[str, object] | None = None,
+    orderbook_preflight_summary: dict[str, object] | None = None,
 ) -> dict[str, object]:
     reject_counts = build_reject_reason_counts(rejects)
     stake_sum = float(_numeric_series(trades, "stake").fillna(0.0).sum()) if not trades.empty else 0.0
@@ -105,6 +106,10 @@ def build_backtest_summary(
         "feature_set": feature_set,
         "label_set": label_set,
         "available_offsets": available_offsets,
+        **{
+            f"orderbook_preflight_{key}": value
+            for key, value in dict(orderbook_preflight_summary or {}).items()
+        },
         **dict(replay_summary or {}),
         **{
             f"raw_depth_{key}": value
@@ -181,6 +186,21 @@ def render_backtest_report(
         f"- stake_sum: `{summary.get('stake_sum')}`",
         f"- roi_pct: `{summary.get('roi_pct')}`",
         f"- decision_source_counts: `{summary.get('decision_source_counts', {})}`",
+        "",
+        "## Orderbook Preflight",
+        "",
+        f"- orderbook_preflight_requested_date_count: `{summary.get('orderbook_preflight_requested_date_count', 0)}`",
+        f"- orderbook_preflight_ready_date_count: `{summary.get('orderbook_preflight_ready_date_count', 0)}`",
+        f"- orderbook_preflight_rebuilt_date_count: `{summary.get('orderbook_preflight_rebuilt_date_count', 0)}`",
+        f"- orderbook_preflight_refreshed_date_count: `{summary.get('orderbook_preflight_refreshed_date_count', 0)}`",
+        f"- orderbook_preflight_missing_depth_date_count: `{summary.get('orderbook_preflight_missing_depth_date_count', 0)}`",
+        f"- orderbook_preflight_empty_depth_source_date_count: `{summary.get('orderbook_preflight_empty_depth_source_date_count', 0)}`",
+        f"- orderbook_preflight_index_missing_date_count: `{summary.get('orderbook_preflight_index_missing_date_count', 0)}`",
+        f"- orderbook_preflight_status_counts: `{summary.get('orderbook_preflight_status_counts', {})}`",
+        f"- orderbook_preflight_missing_depth_dates: `{summary.get('orderbook_preflight_missing_depth_dates', [])}`",
+        f"- orderbook_preflight_empty_depth_source_dates: `{summary.get('orderbook_preflight_empty_depth_source_dates', [])}`",
+        f"- orderbook_preflight_index_missing_dates: `{summary.get('orderbook_preflight_index_missing_dates', [])}`",
+        f"- orderbook_preflight_used_live_surface_dates: `{summary.get('orderbook_preflight_used_live_surface_dates', [])}`",
         "",
         "## Replay Coverage",
         "",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -8,8 +9,10 @@ import pandas as pd
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.backtests.retry_contract import (
+    FULL_BACKTEST_CANDIDATE_SCAN,
     attach_pre_submit_orderbook_retry_contract,
     build_backtest_retry_contract,
+    limit_legacy_pre_submit_orderbook_retry_candidates,
 )
 from pm15min.research.backtests.regime_parity import resolve_backtest_profile_spec
 from pm15min.research.labels.runtime import build_label_runtime_summary, build_truth_runtime_summary
@@ -37,6 +40,15 @@ def test_build_backtest_retry_contract_reflects_live_profile_retry_fields() -> N
     assert "no orders found to match" in summary["post_submit_fak_retry_message_hints"]
 
 
+def test_resolve_backtest_profile_spec_marks_current_market_active() -> None:
+    profile_spec = resolve_backtest_profile_spec(market="btc", profile="deep_otm_baseline")
+
+    assert profile_spec.active_markets == ("sol", "xrp", "btc")
+    assert profile_spec.entry_price_min == 0.01
+    assert profile_spec.entry_price_max == 0.30
+    assert profile_spec.threshold_for(market="btc", offset=7) == 0.60
+
+
 def test_attach_pre_submit_orderbook_retry_contract_arms_only_orderbook_limit_reject() -> None:
     profile_spec = resolve_backtest_profile_spec(profile="deep_otm")
     rows = pd.DataFrame(
@@ -54,6 +66,23 @@ def test_attach_pre_submit_orderbook_retry_contract_arms_only_orderbook_limit_re
     assert float(out.loc[0, "pre_submit_orderbook_retry_interval_sec"]) == profile_spec.orderbook_fast_retry_interval_seconds
     assert int(out.loc[0, "pre_submit_orderbook_retry_max"]) == profile_spec.orderbook_fast_retry_max
     assert out.loc[0, "pre_submit_orderbook_retry_state_key"] == "orderbook_retry_count"
+
+
+def test_limit_legacy_pre_submit_orderbook_retry_candidates_preserves_all_candidates() -> None:
+    profile_spec = replace(resolve_backtest_profile_spec(profile="deep_otm"), orderbook_fast_retry_max=2)
+    raw_depth_candidates = [{"rank": 1}, {"rank": 2}, {"rank": 3}]
+
+    limited, meta = limit_legacy_pre_submit_orderbook_retry_candidates(
+        raw_depth_candidates,
+        spec=profile_spec,
+        candidate_total_count=3,
+    )
+
+    assert limited == raw_depth_candidates
+    assert meta["candidate_total_count"] == 3
+    assert meta["retry_budget"] == 3
+    assert meta["budget_exhausted"] is False
+    assert meta["retry_budget_source"] == FULL_BACKTEST_CANDIDATE_SCAN
 
 
 def test_build_label_runtime_summary_tracks_truth_and_oracle_metadata(tmp_path: Path) -> None:

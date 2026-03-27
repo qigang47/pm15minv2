@@ -26,13 +26,8 @@ def build_retry_policy(
     order_type: str,
 ) -> dict[str, object]:
     order_type_norm = str(order_type or spec.default_order_type).upper()
-    pre_submit_depth_retry_enabled = bool(
-        execution_status == "blocked" and any(reason in ORDERBOOK_RETRYABLE_REASONS for reason in execution_reasons)
-    )
     post_submit_retry_enabled = bool(execution_status == "plan")
     same_decision_enabled = bool(post_submit_retry_enabled and spec.repeat_same_decision_enabled)
-    orderbook_retry_interval = float(spec.orderbook_fast_retry_interval_seconds)
-    orderbook_retry_max = int(spec.orderbook_fast_retry_max)
     order_retry_interval = float(spec.order_retry_interval_seconds)
     fast_retry_interval = float(spec.fast_retry_interval_seconds)
     order_retry_max = int(spec.max_order_retries)
@@ -40,9 +35,6 @@ def build_retry_policy(
     if post_submit_retry_enabled:
         status = "armed"
         reason = "post_submit_retry_ready"
-    elif pre_submit_depth_retry_enabled:
-        status = "armed"
-        reason = "pre_submit_orderbook_recheck"
     else:
         status = "inactive"
         reason = execution_reasons[0] if execution_reasons else execution_status
@@ -51,12 +43,13 @@ def build_retry_policy(
         "status": status,
         "reason": reason,
         "pre_submit_depth_retry": {
-            "enabled": pre_submit_depth_retry_enabled,
-            "retry_interval_sec": orderbook_retry_interval,
-            "max_retries": orderbook_retry_max,
-            "retry_state_key": "orderbook_retry_count",
-            "trigger_statuses": ["blocked"],
+            "enabled": False,
+            "retry_interval_sec": 0.0,
+            "max_retries": 0,
+            "retry_state_key": "",
+            "trigger_statuses": [],
             "retryable_reasons": sorted(ORDERBOOK_RETRYABLE_REASONS),
+            "mode": "runner_loop_window_rechecks",
         },
         "post_submit_order_retry": {
             "enabled": post_submit_retry_enabled,

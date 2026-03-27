@@ -157,6 +157,71 @@ def test_build_replay_frame_tracks_coverage() -> None:
     assert replay["bundle_offset_available"].tolist() == [True, False, True]
 
 
+def test_build_bundle_replay_scopes_replay_to_bundle_offsets(tmp_path: Path, monkeypatch) -> None:
+    bundle_dir = tmp_path / "bundle"
+    (bundle_dir / "offsets" / "offset=7").mkdir(parents=True)
+    features = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "ret_1m": 0.1,
+            },
+            {
+                "decision_ts": "2026-03-01T00:16:00Z",
+                "cycle_start_ts": "2026-03-01T00:15:00Z",
+                "cycle_end_ts": "2026-03-01T00:30:00Z",
+                "offset": 8,
+                "ret_1m": -0.1,
+            },
+        ]
+    )
+    labels = pd.DataFrame(
+        [
+            {
+                "asset": "sol",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "label_set": "truth",
+                "resolved": True,
+                "winner_side": "UP",
+            }
+        ]
+    )
+
+    def _fake_score_bundle_offset(_bundle_dir: Path, feature_frame: pd.DataFrame, *, offset: int) -> pd.DataFrame:
+        assert set(feature_frame["offset"].tolist()) == {7, 8}
+        assert offset == 7
+        return pd.DataFrame(
+            [
+                {
+                    "decision_ts": "2026-03-01T00:01:00Z",
+                    "cycle_start_ts": "2026-03-01T00:00:00Z",
+                    "cycle_end_ts": "2026-03-01T00:15:00Z",
+                    "offset": 7,
+                    "p_up": 0.74,
+                    "p_down": 0.26,
+                    "score_valid": True,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(backtest_engine, "score_bundle_offset", _fake_score_bundle_offset)
+
+    replay, summary, available_offsets = backtest_engine._build_bundle_replay(
+        bundle_dir=bundle_dir,
+        features=features,
+        labels=labels,
+    )
+
+    assert available_offsets == [7]
+    assert replay["offset"].tolist() == [7]
+    assert summary.feature_rows == 1
+    assert summary.bundle_offset_missing_rows == 0
+
+
 def test_policy_fill_and_hybrid_helpers() -> None:
     replay = pd.DataFrame(
         [
@@ -337,6 +402,7 @@ def test_run_research_backtest_writes_parity_artifacts(tmp_path: Path) -> None:
     assert payload["fallback_reasons"] == ["direction_prob", "policy_low_confidence"]
     assert payload["liquidity_available_rows"] >= 1
     assert isinstance(payload["regime_state_counts"], dict)
+    assert "orderbook_preflight_status_counts" in payload
     assert "regime_state" in decisions.columns
     assert "liquidity_status" in decisions.columns
     stake_sweep = pd.read_parquet(run_dir / "stake_sweep.parquet")
@@ -349,6 +415,7 @@ def test_run_research_backtest_writes_parity_artifacts(tmp_path: Path) -> None:
     assert stage_sequence == [
         "load_inputs",
         "bundle_replay",
+        "orderbook_preflight",
         "depth_replay",
         "quote_surface",
         "live_state_surface",
@@ -360,7 +427,7 @@ def test_run_research_backtest_writes_parity_artifacts(tmp_path: Path) -> None:
     ]
     assert reporter_events[0]["summary"] == "Loading backtest inputs"
     assert reporter_events[0]["current"] == 1
-    assert reporter_events[0]["total"] == 9
+    assert reporter_events[0]["total"] == 10
     assert reporter_events[0]["progress_pct"] == 0
     assert reporter_events[-1]["summary"] == "Backtest completed"
     assert reporter_events[-1]["progress_pct"] == 100

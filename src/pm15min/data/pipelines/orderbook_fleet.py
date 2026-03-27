@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import inspect
-import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -81,41 +81,32 @@ def run_orderbook_recorder_fleet(
         for market, cfg in cfgs.items()
     } if supports_provider else {}
 
-    iteration_limit: int | None
-    if loop and int(iterations) <= 0:
-        iteration_limit = None
-    else:
-        iteration_limit = max(1, int(iterations))
+    iteration_limit = 0 if loop and int(iterations) <= 0 else max(1, int(iterations))
     sleep_sec_resolved = max(0.0, float(poll_interval_sec if sleep_sec is None else sleep_sec))
-    completed_rounds = 0
+    completed_rounds = iteration_limit
 
-    while True:
-        if iteration_limit is not None and completed_rounds >= iteration_limit:
-            break
-        completed_rounds += 1
-        for market in market_list:
+    def _run_market(market: str) -> dict[str, Any]:
+        call_kwargs = {
+            "iterations": iteration_limit,
+            "loop": bool(loop),
+            "sleep_sec": sleep_sec_resolved,
+        }
+        if supports_provider:
+            call_kwargs["provider"] = providers[market]
+        return run_orderbook_recorder_fn(
+            cfgs[market],
+            **call_kwargs,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(market_list)) as executor:
+        future_to_market = {executor.submit(_run_market, market): market for market in market_list}
+        for future in as_completed(future_to_market):
+            market = future_to_market[future]
             try:
-                call_kwargs = {
-                    "iterations": 1,
-                    "loop": False,
-                    "sleep_sec": 0.0,
-                }
-                if supports_provider:
-                    call_kwargs["provider"] = providers[market]
-                payload = run_orderbook_recorder_fn(
-                    cfgs[market],
-                    **call_kwargs,
-                )
-                results[market].payload = payload
+                results[market].payload = future.result()
                 results[market].error = None
             except Exception as exc:
                 results[market].error = f"{type(exc).__name__}: {exc}"
-        if not loop:
-            break
-        if iteration_limit is not None and completed_rounds >= iteration_limit:
-            break
-        if sleep_sec_resolved > 0:
-            time.sleep(sleep_sec_resolved)
 
     payloads = {market: row.payload for market, row in results.items() if row.payload is not None}
     errors = {market: row.error for market, row in results.items() if row.error is not None}
@@ -138,7 +129,7 @@ def run_orderbook_recorder_fleet(
         "market_start_offset": int(market_start_offset),
         "iterations": int(iterations),
         "loop": bool(loop),
-        "scheduler_mode": "round_robin",
+        "scheduler_mode": "parallel_per_market",
         "completed_rounds": int(completed_rounds),
         "results": payloads,
         "errors": errors,

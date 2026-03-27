@@ -23,6 +23,13 @@ DEFAULT_LIVE_ORDERBOOK_TIMEOUT_SEC = 1.2
 DEFAULT_LOCAL_ORDERBOOK_MAX_AGE_MS = 5_000
 
 
+def _provider_only_orderbooks_enabled() -> bool:
+    raw = os.getenv("PM15MIN_LIVE_ORDERBOOK_PROVIDER_ONLY")
+    if raw in (None, ""):
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def build_depth_execution_plan(
     *,
     data_cfg: DataConfig,
@@ -47,7 +54,35 @@ def build_depth_execution_plan(
     market_id = str(quote_row.get("market_id") or "")
     side_slug = "up" if side == "UP" else "down"
     target_ts_ms = quote_captured_ts_ms(quote_row=quote_row, side=side)
+    provider_only = bool(prefer_live_provider and _provider_only_orderbooks_enabled())
 
+    if prefer_live_provider:
+        provider_payload = build_live_depth_execution_plan_from_provider(
+            market_id=market_id,
+            token_id=token_id,
+            side=side_slug,
+            target_ts_ms=target_ts_ms,
+            requested_notional=requested_notional,
+            price_cap=price_cap,
+            max_slippage_bps=max_slippage_bps,
+            min_fill_ratio=min_fill_ratio,
+            orderbook_provider=orderbook_provider,
+            provider_levels=provider_levels,
+            provider_timeout_sec=provider_timeout_sec,
+        )
+        if provider_payload is not None:
+            return provider_payload
+        if provider_only:
+            return {
+                "status": "missing",
+                "depth_source_kind": "provider",
+                "depth_source_path": "provider",
+                "market_id": market_id,
+                "token_id": token_id,
+                "side": side_slug,
+                "price_cap": price_cap,
+                **_snapshot_metrics(snapshot_ts_ms=None, target_ts_ms=target_ts_ms),
+            }, "depth_provider_missing"
     local_record = resolve_latest_local_depth_snapshot(
         snapshot_path=data_cfg.layout.orderbook_latest_full_snapshot_path,
         market_id=market_id,
@@ -98,23 +133,6 @@ def build_depth_execution_plan(
             **_snapshot_metrics(snapshot_ts_ms=snapshot_ts_ms, target_ts_ms=target_ts_ms),
             **fill,
         }, None
-
-    if prefer_live_provider and target_ts_ms is None:
-        provider_payload = build_live_depth_execution_plan_from_provider(
-            market_id=market_id,
-            token_id=token_id,
-            side=side_slug,
-            target_ts_ms=target_ts_ms,
-            requested_notional=requested_notional,
-            price_cap=price_cap,
-            max_slippage_bps=max_slippage_bps,
-            min_fill_ratio=min_fill_ratio,
-            orderbook_provider=orderbook_provider,
-            provider_levels=provider_levels,
-            provider_timeout_sec=provider_timeout_sec,
-        )
-        if provider_payload is not None:
-            return provider_payload
     date_str = decision_dt.strftime("%Y-%m-%d")
     depth_path = data_cfg.layout.orderbook_depth_path(date_str)
     if not depth_path.exists():

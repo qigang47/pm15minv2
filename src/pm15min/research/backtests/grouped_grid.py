@@ -13,6 +13,7 @@ from typing import Any
 import pandas as pd
 
 from pm15min.data.io.parquet import write_parquet_atomic
+from pm15min.research.backtests.build_signature import backtest_build_signature
 from pm15min.research.backtests.engine import run_research_backtest
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import BacktestRunSpec
@@ -273,6 +274,15 @@ def _run_group_worker(group_payload: dict[str, object], root_text: str) -> dict[
         parity = group.parity.to_dict()
         if group.max_trades_per_market is not None:
             parity["regime_defense_max_trades_per_market"] = int(group.max_trades_per_market)
+        existing_row = _load_existing_case_row(
+            cfg=cfg,
+            group=group,
+            stake_usd=float(stake_usd),
+            run_label=run_label,
+        )
+        if existing_row is not None:
+            rows.append(existing_row)
+            continue
         try:
             summary = run_research_backtest(
                 cfg,
@@ -321,6 +331,114 @@ def _run_group_worker(group_payload: dict[str, object], root_text: str) -> dict[
                 }
             )
     return {"group_label": group.group_label, "rows": rows}
+
+
+def _load_existing_case_row(
+    *,
+    cfg: ResearchConfig,
+    group: GroupedBacktestGroup,
+    stake_usd: float,
+    run_label: str,
+) -> dict[str, object] | None:
+    run_dir = cfg.layout.backtest_run_dir(
+        profile=group.profile,
+        spec_name=group.spec_name,
+        run_label_text=run_label,
+    )
+    summary_path = run_dir / "summary.json"
+    manifest_path = run_dir / "manifest.json"
+    if not summary_path.exists() or not manifest_path.exists():
+        return None
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or not isinstance(manifest_payload, dict):
+        return None
+    if not _grouped_case_cache_matches(
+        cfg=cfg,
+        group=group,
+        stake_usd=stake_usd,
+        run_label=run_label,
+        summary_payload=payload,
+        manifest_payload=manifest_payload,
+    ):
+        return None
+    return {
+        "status": "completed",
+        "reused_existing": True,
+        "group_label": group.group_label,
+        "market": group.market,
+        "profile": group.profile,
+        "bundle_label": group.bundle_label,
+        "max_trades_per_market": group.max_trades_per_market,
+        "stake_usd": float(stake_usd),
+        "run_label": run_label,
+        "summary_path": str(summary_path),
+        "run_dir": str(run_dir),
+        **payload,
+    }
+
+
+def _grouped_case_cache_matches(
+    *,
+    cfg: ResearchConfig,
+    group: GroupedBacktestGroup,
+    stake_usd: float,
+    run_label: str,
+    summary_payload: dict[str, object],
+    manifest_payload: dict[str, object],
+) -> bool:
+    if summary_payload.get("backtest_build_signature") != backtest_build_signature():
+        return False
+
+    expected_parity = group.parity.to_dict()
+    if group.max_trades_per_market is not None:
+        expected_parity["regime_defense_max_trades_per_market"] = int(group.max_trades_per_market)
+
+    expected_summary = {
+        "market": cfg.asset.slug,
+        "cycle": cfg.cycle,
+        "profile": group.profile,
+        "spec_name": group.spec_name,
+        "target": group.target,
+        "bundle_label": group.bundle_label,
+        "feature_set": group.feature_set,
+        "label_set": group.label_set,
+        "run_label": run_label,
+        "stake_usd": float(stake_usd),
+        "parity": expected_parity,
+    }
+    for key, value in expected_summary.items():
+        if summary_payload.get(key) != value:
+            return False
+
+    manifest_spec = manifest_payload.get("spec")
+    if not isinstance(manifest_spec, dict):
+        return False
+    expected_manifest_spec = {
+        "profile": group.profile,
+        "spec_name": group.spec_name,
+        "run_label": run_label,
+        "target": group.target,
+        "decision_start": group.decision_start,
+        "decision_end": group.decision_end,
+        "bundle_label": group.bundle_label,
+        "stake_usd": float(stake_usd),
+        "parity": expected_parity,
+        "feature_set": group.feature_set,
+        "label_set": group.label_set,
+    }
+    for key, value in expected_manifest_spec.items():
+        if manifest_spec.get(key) != value:
+            return False
+
+    if manifest_payload.get("market") != cfg.asset.slug:
+        return False
+    if manifest_payload.get("cycle") != cfg.cycle:
+        return False
+    return True
 
 
 def _case_run_label(
@@ -402,7 +520,31 @@ def _append_log(path: Path, payload: dict[str, object]) -> None:
 
 def _write_results(path: Path, rows: list[dict[str, object]]) -> None:
     frame = pd.DataFrame(rows)
+    for column in list(frame.columns):
+        if frame[column].dtype != "object":
+            continue
+        if not frame[column].map(_needs_json_string).any():
+            continue
+        frame[column] = frame[column].map(_to_json_string)
     write_parquet_atomic(frame, path)
+
+
+def _needs_json_string(value: object) -> bool:
+    return isinstance(value, (dict, list, tuple, set))
+
+
+def _to_json_string(value: object) -> object:
+    if not _needs_json_string(value):
+        return value
+    return json.dumps(_json_ready(value), ensure_ascii=False, sort_keys=True)
+
+
+def _json_ready(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_ready(item) for item in value]
+    return value
 
 
 __all__ = [

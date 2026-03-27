@@ -1132,7 +1132,7 @@ def test_build_canonical_fills_default_uses_legacy_fak_refresh_mode(tmp_path) ->
     assert row["depth_retry_refresh_count"] == 1
 
 
-def test_build_canonical_fills_legacy_fak_refresh_caps_candidates_by_orderbook_retry_budget(tmp_path) -> None:
+def test_build_canonical_fills_legacy_fak_refresh_scans_all_candidates(tmp_path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
     accepted = pd.DataFrame(
@@ -1234,14 +1234,15 @@ def test_build_canonical_fills_legacy_fak_refresh_caps_candidates_by_orderbook_r
     assert rejects.empty
     assert len(fills) == 1
     capped_row = fills.iloc[0]
-    assert capped_row["fill_model"] == "canonical_quote"
-    assert capped_row["depth_candidate_count"] == 2
+    assert capped_row["fill_model"] == "canonical_depth"
+    assert capped_row["depth_candidate_count"] == 3
     assert capped_row["depth_candidate_total_count"] == 3
-    assert capped_row["depth_retry_budget"] == 2
-    assert bool(capped_row["depth_retry_budget_exhausted"]) is True
-    assert capped_row["depth_retry_budget_source"] == "orderbook_fast_retry_max"
+    assert capped_row["depth_retry_budget"] == 3
+    assert bool(capped_row["depth_retry_budget_exhausted"]) is False
+    assert capped_row["depth_retry_budget_source"] == "backtest_full_candidate_scan"
     assert capped_row["depth_retry_stage"] == "pre_submit_orderbook_recheck"
-    assert capped_row["depth_retry_exit_reason"] == "retry_budget_exhausted"
+    assert capped_row["depth_retry_exit_reason"] == "filled_target"
+    assert capped_row["depth_retry_refresh_count"] == 2
 
     fills_all, rejects_all = build_canonical_fills(
         accepted,
@@ -1266,6 +1267,7 @@ def test_build_canonical_fills_legacy_fak_refresh_caps_candidates_by_orderbook_r
     assert row["depth_candidate_total_count"] == 3
     assert row["depth_retry_budget"] == 3
     assert bool(row["depth_retry_budget_exhausted"]) is False
+    assert row["depth_retry_budget_source"] == "backtest_full_candidate_scan"
     assert row["depth_retry_stage"] == "pre_submit_orderbook_recheck"
 
 
@@ -1358,7 +1360,7 @@ def test_build_canonical_fills_legacy_fak_refresh_captures_retry_trigger_reason(
     assert row["depth_retry_trigger_reason"] == "depth_fill_unavailable"
     assert row["depth_retry_stage"] == "pre_submit_orderbook_recheck"
     assert row["depth_retry_exit_reason"] == "filled_target"
-    assert row["depth_retry_budget_source"] == "orderbook_fast_retry_max"
+    assert row["depth_retry_budget_source"] == "backtest_full_candidate_scan"
 
 
 def test_build_canonical_fills_legacy_retry_stops_when_snapshot_marker_is_unchanged(tmp_path) -> None:

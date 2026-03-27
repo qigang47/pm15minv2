@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import json
 import os
 import time
@@ -48,6 +50,36 @@ ORDERBOOK_INDEX_COLUMNS = [
     "bid_size_1",
     "spread",
 ]
+
+
+@dataclass(frozen=True)
+class CapturedOrderbookBatch:
+    captured_ts_ms: int
+    date_str: str
+    selected_markets: int
+    market_start_offset: int
+    selected_market_ids: list[str]
+    recent_window_minutes: int
+    snapshot_rows: list[dict[str, object]]
+    index_rows: list[dict[str, object]]
+
+
+def summarize_captured_orderbook_batch(
+    cfg: DataConfig,
+    *,
+    batch: CapturedOrderbookBatch,
+) -> dict[str, object]:
+    return {
+        "dataset": "orderbook_depth",
+        "market": cfg.asset.slug,
+        "cycle": cfg.cycle,
+        "captured_ts_ms": int(batch.captured_ts_ms),
+        "selected_markets": int(batch.selected_markets),
+        "market_start_offset": int(batch.market_start_offset),
+        "selected_market_ids": list(batch.selected_market_ids),
+        "snapshot_rows": int(len(batch.snapshot_rows)),
+        "recent_window_minutes": int(batch.recent_window_minutes),
+    }
 
 
 def _write_json_atomic_compact(payload: dict[str, Any], path: Path) -> Path:
@@ -408,7 +440,7 @@ def _index_row_from_raw_depth(raw: dict[str, Any]) -> dict[str, object] | None:
     }
 
 
-def record_orderbooks_once(
+def capture_orderbooks_once(
     cfg: DataConfig,
     *,
     client: PolymarketClobClient | None = None,
@@ -416,7 +448,7 @@ def record_orderbooks_once(
     gamma_client: GammaEventsClient | None = None,
     captured_ts_ms: int | None = None,
     recent_window_minutes: int = 15,
-) -> dict[str, object]:
+) -> CapturedOrderbookBatch:
     provider = provider or DirectOrderbookProvider(client=client or PolymarketClobClient())
     captured_ts_ms = int(captured_ts_ms or time.time() * 1000)
     now_ts = captured_ts_ms // 1000
@@ -456,75 +488,123 @@ def record_orderbooks_once(
 
     snapshot_rows: list[dict[str, object]] = []
     index_rows: list[dict[str, object]] = []
+    fetch_specs: list[tuple[str, str, str]] = []
     for row in selected_rows:
         market_id = str(getattr(row, "market_id"))
         for side, token_col in (("up", "token_up"), ("down", "token_down")):
             token_id = str(getattr(row, token_col, "") or "").strip()
             if not token_id:
                 continue
-            book = provider.get_orderbook_summary(
-                token_id,
-                levels=0,
-                timeout=cfg.orderbook_timeout_sec,
-                force_refresh=False,
-            )
-            if not isinstance(book, dict):
-                continue
-            snapshot = _snapshot_record(
-                captured_ts_ms=captured_ts_ms,
-                market_id=market_id,
-                token_id=token_id,
-                side=side,
-                asset=cfg.asset.slug,
-                cycle=cfg.cycle,
-                book=book,
-            )
-            snapshot_rows.append(snapshot.to_row())
-            index_rows.append(_index_row_from_snapshot(snapshot).to_row())
+            fetch_specs.append((market_id, side, token_id))
 
+    fetched_books: dict[tuple[str, str, str], dict[str, Any] | None] = {}
+    if fetch_specs:
+        with ThreadPoolExecutor(max_workers=len(fetch_specs)) as executor:
+            future_map = {
+                (market_id, side, token_id): executor.submit(
+                    provider.get_orderbook_summary,
+                    token_id,
+                    levels=0,
+                    timeout=cfg.orderbook_timeout_sec,
+                    force_refresh=False,
+                )
+                for market_id, side, token_id in fetch_specs
+            }
+            for spec, future in future_map.items():
+                try:
+                    payload = future.result()
+                except Exception:
+                    payload = None
+                fetched_books[spec] = payload if isinstance(payload, dict) else None
+
+    for market_id, side, token_id in fetch_specs:
+        book = fetched_books.get((market_id, side, token_id))
+        if not isinstance(book, dict):
+            continue
+        snapshot = _snapshot_record(
+            captured_ts_ms=captured_ts_ms,
+            market_id=market_id,
+            token_id=token_id,
+            side=side,
+            asset=cfg.asset.slug,
+            cycle=cfg.cycle,
+            book=book,
+        )
+        snapshot_rows.append(snapshot.to_row())
+        index_rows.append(_index_row_from_snapshot(snapshot).to_row())
+
+    return CapturedOrderbookBatch(
+        captured_ts_ms=int(captured_ts_ms),
+        date_str=str(date_str),
+        selected_markets=int(len(selected)),
+        market_start_offset=int(cfg.market_start_offset),
+        selected_market_ids=selected_market_ids,
+        recent_window_minutes=int(recent_window_minutes),
+        snapshot_rows=snapshot_rows,
+        index_rows=index_rows,
+    )
+
+
+def persist_captured_orderbooks_once(
+    cfg: DataConfig,
+    *,
+    batch: CapturedOrderbookBatch,
+) -> dict[str, object]:
     append_ndjson_zst(
-        cfg.layout.orderbook_depth_path(date_str),
-        snapshot_rows,
+        cfg.layout.orderbook_depth_path(batch.date_str),
+        batch.snapshot_rows,
         level=7,
     )
 
-    index_path = cfg.layout.orderbook_index_path(date_str)
-    index_df = pd.DataFrame(index_rows, columns=ORDERBOOK_INDEX_COLUMNS)
-    _compact_orderbook_index(index_path=index_path, index_rows=index_rows)
+    index_path = cfg.layout.orderbook_index_path(batch.date_str)
+    index_df = pd.DataFrame(batch.index_rows, columns=ORDERBOOK_INDEX_COLUMNS)
+    _compact_orderbook_index(index_path=index_path, index_rows=batch.index_rows)
     recent_df = update_recent_orderbook_index(
         path=cfg.layout.orderbook_recent_path,
         incoming=index_df,
-        now_ts_ms=captured_ts_ms,
-        window_minutes=recent_window_minutes,
+        now_ts_ms=batch.captured_ts_ms,
+        window_minutes=batch.recent_window_minutes,
     )
     latest_full_snapshot_payload = {
         "dataset": "orderbook_latest_full_snapshot",
         "market": cfg.asset.slug,
         "cycle": cfg.cycle,
-        "captured_ts_ms": int(captured_ts_ms),
-        "selected_markets": int(len(selected)),
-        "market_start_offset": int(cfg.market_start_offset),
-        "selected_market_ids": selected_market_ids,
-        "records": snapshot_rows,
+        "captured_ts_ms": int(batch.captured_ts_ms),
+        "selected_markets": int(batch.selected_markets),
+        "market_start_offset": int(batch.market_start_offset),
+        "selected_market_ids": list(batch.selected_market_ids),
+        "records": batch.snapshot_rows,
     }
     _write_json_atomic_compact(latest_full_snapshot_payload, cfg.layout.orderbook_latest_full_snapshot_path)
 
     return {
-        "dataset": "orderbook_depth",
-        "market": cfg.asset.slug,
-        "cycle": cfg.cycle,
-        "captured_ts_ms": captured_ts_ms,
-        "selected_markets": int(len(selected)),
-        "market_start_offset": int(cfg.market_start_offset),
-        "selected_market_ids": selected_market_ids,
-        "snapshot_rows": int(len(snapshot_rows)),
-        "depth_path": str(cfg.layout.orderbook_depth_path(date_str)),
+        **summarize_captured_orderbook_batch(cfg, batch=batch),
+        "depth_path": str(cfg.layout.orderbook_depth_path(batch.date_str)),
         "index_path": str(index_path),
         "recent_path": str(cfg.layout.orderbook_recent_path),
         "latest_full_snapshot_path": str(cfg.layout.orderbook_latest_full_snapshot_path),
         "recent_rows": int(len(recent_df)),
-        "recent_window_minutes": int(recent_window_minutes),
     }
+
+
+def record_orderbooks_once(
+    cfg: DataConfig,
+    *,
+    client: PolymarketClobClient | None = None,
+    provider: OrderbookProvider | None = None,
+    gamma_client: GammaEventsClient | None = None,
+    captured_ts_ms: int | None = None,
+    recent_window_minutes: int = 15,
+) -> dict[str, object]:
+    batch = capture_orderbooks_once(
+        cfg,
+        client=client,
+        provider=provider,
+        gamma_client=gamma_client,
+        captured_ts_ms=captured_ts_ms,
+        recent_window_minutes=recent_window_minutes,
+    )
+    return persist_captured_orderbooks_once(cfg, batch=batch)
 
 
 def build_orderbook_index_from_depth(

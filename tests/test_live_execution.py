@@ -533,14 +533,17 @@ def test_execution_snapshot_blocks_when_depth_fill_ratio_is_too_small(tmp_path: 
     out = build_execution_snapshot(cfg, payload)
     assert out["execution"]["status"] == "blocked"
     assert "depth_fill_ratio_below_threshold" in out["execution"]["execution_reasons"]
-    assert out["execution"]["retry_policy"]["status"] == "armed"
-    assert out["execution"]["retry_policy"]["reason"] == "pre_submit_orderbook_recheck"
-    assert out["execution"]["retry_policy"]["pre_submit_depth_retry"]["enabled"] is True
-    assert out["execution"]["retry_policy"]["pre_submit_depth_retry"]["retry_state_key"] == "orderbook_retry_count"
-    assert out["execution"]["retry_policy"]["pre_submit_depth_retry"]["trigger_statuses"] == ["blocked"]
+    assert out["execution"]["retry_policy"]["status"] == "inactive"
+    assert out["execution"]["retry_policy"]["reason"] == "depth_fill_ratio_below_threshold"
+    assert out["execution"]["retry_policy"]["pre_submit_depth_retry"]["enabled"] is False
+    assert out["execution"]["retry_policy"]["pre_submit_depth_retry"]["retry_interval_sec"] == 0.0
+    assert out["execution"]["retry_policy"]["pre_submit_depth_retry"]["max_retries"] == 0
+    assert out["execution"]["retry_policy"]["pre_submit_depth_retry"]["retry_state_key"] == ""
+    assert out["execution"]["retry_policy"]["pre_submit_depth_retry"]["trigger_statuses"] == []
+    assert out["execution"]["retry_policy"]["pre_submit_depth_retry"]["mode"] == "runner_loop_window_rechecks"
 
 
-def test_execution_snapshot_does_not_use_provider_fallback_for_time_bound_live_decision(tmp_path: Path, monkeypatch) -> None:
+def test_execution_snapshot_prefers_provider_for_time_bound_live_decision(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
@@ -596,9 +599,95 @@ def test_execution_snapshot_does_not_use_provider_fallback_for_time_bound_live_d
     }
 
     out = build_execution_snapshot(cfg, payload, orderbook_provider=provider, prefer_live_depth=True)
+    assert out["execution"]["status"] == "plan"
+    assert out["execution"]["depth_plan"]["status"] == "ok"
+    assert out["execution"]["depth_plan"]["depth_source_kind"] == "provider"
+    assert provider.calls == ["token-up"]
+
+
+def test_execution_snapshot_provider_only_skips_local_depth_fallback(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setenv("PM15MIN_LIVE_ORDERBOOK_PROVIDER_ONLY", "1")
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    captured_ts_ms = int(pd.Timestamp("2026-03-20T00:08:30Z").timestamp() * 1000)
+    write_json_atomic(
+        {
+            "dataset": "orderbook_latest_full_snapshot",
+            "market": "sol",
+            "cycle": "15m",
+            "captured_ts_ms": captured_ts_ms,
+            "records": [
+                {
+                    "captured_ts_ms": captured_ts_ms,
+                    "source_ts_ms": captured_ts_ms,
+                    "market_id": "market-1",
+                    "token_id": "token-up",
+                    "side": "up",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "asks": [{"price": 0.20, "size": 1.0}, {"price": 0.2005, "size": 5.0}],
+                    "bids": [{"price": 0.19, "size": 2.0}],
+                    "source": "clob",
+                }
+            ],
+        },
+        data_cfg.layout.orderbook_latest_full_snapshot_path,
+    )
+
+    class _Provider:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            self.calls.append(str(token_id))
+            return None
+
+    provider = _Provider()
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "snapshot_ts": "2026-03-20T00-00-00Z",
+        "decision": {"status": "accept", "selected_offset": 7, "selected_side": "UP"},
+        "accepted_offsets": [
+            {
+                "offset": 7,
+                "recommended_side": "UP",
+                "decision_ts": "2026-03-20T00:08:00+00:00",
+                "p_up": 0.80,
+                "confidence": 0.80,
+                "quote_metrics": {
+                    "entry_price": 0.20,
+                    "fee_rate": 0.01,
+                    "slippage_bps": 0.0,
+                    "roi_net_vs_quote": 0.20,
+                },
+                "quote_row": {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "cycle_end_ts": "2026-03-20T00:15:00+00:00",
+                    "question": "test",
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "decision_ts": "2026-03-20T00:08:00+00:00",
+                    "quote_up_ask": 0.20,
+                    "quote_up_bid": 0.19,
+                    "quote_up_ask_size_1": 10.0,
+                    "quote_captured_ts_ms_up": captured_ts_ms,
+                },
+            }
+        ],
+    }
+
+    out = build_execution_snapshot(cfg, payload, orderbook_provider=provider, prefer_live_depth=True)
     assert out["execution"]["status"] == "blocked"
-    assert "depth_snapshot_missing" in out["execution"]["execution_reasons"]
-    assert provider.calls == []
+    assert "depth_provider_missing" in out["execution"]["execution_reasons"]
+    assert out["execution"]["depth_plan"]["status"] == "missing"
+    assert out["execution"]["depth_plan"]["depth_source_kind"] == "provider"
+    assert provider.calls == ["token-up"]
 
 
 def test_execution_snapshot_plans_when_full_depth_is_sufficient(tmp_path: Path, monkeypatch) -> None:

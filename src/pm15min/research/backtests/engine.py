@@ -12,6 +12,7 @@ import pandas as pd
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.data.queries.loaders import load_binance_klines_1m
+from pm15min.research.backtests.build_signature import backtest_build_signature
 from pm15min.research.backtests.decision_quote_surface import (
     InitialSnapshotDecisionSummary,
     apply_initial_snapshot_decision_parity,
@@ -24,6 +25,7 @@ from pm15min.research.backtests.decision_engine_parity import (
     build_profile_decision_engine_parity_config,
 )
 from pm15min.research.backtests.depth_replay import build_raw_depth_replay_frame
+from pm15min.research.backtests.data_surface_fallback import preflight_orderbook_index_dates
 from pm15min.research.backtests.fills import BacktestFillConfig, build_canonical_fills, build_depth_candidate_lookup
 from pm15min.research.backtests.guard_parity import apply_live_guard_parity
 from pm15min.research.backtests.hybrid import apply_hybrid_fallback
@@ -184,6 +186,7 @@ def run_research_backtest(
     )
     liquidity_proxy_mode = str(spec.parity.liquidity_proxy_mode or "spot_kline_mirror")
     retry_contract_summary = build_backtest_retry_contract(profile_spec)
+    orderbook_preflight_summary: dict[str, object] | None = None
     prepared_runtime = _load_cached_primary_runtime(
         cfg=cfg,
         spec=spec,
@@ -209,11 +212,18 @@ def run_research_backtest(
             decision_start=spec.decision_start,
             decision_end=spec.decision_end,
         )
+        preflight_stage_index, preflight_stage_name = _start_stage("orderbook_preflight", "Preflighting orderbook coverage")
+        orderbook_preflight_summary = _build_orderbook_preflight_summary(
+            data_cfg=data_cfg,
+            replay=replay,
+            decision_start=spec.decision_start,
+            decision_end=spec.decision_end,
+            heartbeat=progress.heartbeat(stage_index=preflight_stage_index, stage_name=preflight_stage_name),
+        )
         depth_stage_index, depth_stage_name = _start_stage("depth_replay", "Replaying raw depth snapshots")
         depth_replay, depth_replay_summary = build_raw_depth_replay_frame(
             replay=replay,
             data_cfg=data_cfg,
-            max_snapshots_per_replay_row=retry_contract_summary.max_pre_submit_orderbook_retry_candidates,
             heartbeat=progress.heartbeat(stage_index=depth_stage_index, stage_name=depth_stage_name),
         )
         depth_candidate_lookup = build_depth_candidate_lookup(depth_replay)
@@ -288,9 +298,19 @@ def run_research_backtest(
         decision_start=spec.decision_start,
         decision_end=spec.decision_end,
     )
+    if orderbook_preflight_summary is None:
+        preflight_stage_index, preflight_stage_name = _start_stage("orderbook_preflight", "Preflighting orderbook coverage")
+        orderbook_preflight_summary = _build_orderbook_preflight_summary(
+            data_cfg=data_cfg,
+            replay=replay,
+            decision_start=spec.decision_start,
+            decision_end=spec.decision_end,
+            heartbeat=progress.heartbeat(stage_index=preflight_stage_index, stage_name=preflight_stage_name),
+        )
     fill_config = _build_backtest_fill_config(spec=spec, profile_spec=profile_spec)
     label_runtime_summary = _load_label_runtime_summary(cfg=cfg, label_set=label_set)
     truth_runtime_summary = build_truth_runtime_summary(data_cfg)
+    build_signature = backtest_build_signature()
     policy_stage_index, policy_stage_name = _start_stage("policy_decisions", "Building policy decisions")
     decisions, guard_summary, decision_quote_summary = _build_guarded_policy_decisions(
         replay=replay,
@@ -410,8 +430,10 @@ def run_research_backtest(
         max_notional_usd=spec.max_notional_usd,
         fallback_reasons=spec.fallback_reasons,
         parity=spec.parity.to_dict(),
+        orderbook_preflight_summary=orderbook_preflight_summary,
     )
     summary["run_label"] = spec.run_label
+    summary["backtest_build_signature"] = build_signature
     summary["shared_runtime_cache_status"] = runtime_cache_status
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     stake_sweep = build_stake_sweep_frame(summary=summary)
@@ -496,6 +518,7 @@ def run_research_backtest(
             "trades": int(len(trades)),
             "rejects": int(len(rejects)),
             "ready_rows": int(summary.get("ready_rows", 0)),
+            "backtest_build_signature": build_signature,
             "shared_runtime_cache_status": runtime_cache_status,
         },
     )
@@ -522,6 +545,7 @@ def run_research_backtest(
         "shared_runtime_cache_status": runtime_cache_status,
         "trades": int(len(trades)),
         "rejects": int(len(rejects)),
+        "orderbook_preflight_summary": dict(orderbook_preflight_summary or {}),
         "run_dir": str(run_dir),
         "summary_path": str(summary_path),
         "report_path": str(report_path),
@@ -530,7 +554,74 @@ def run_research_backtest(
 
 
 def _backtest_stage_total(*, spec: BacktestRunSpec) -> int:
-    return 10 if spec.secondary_bundle_label else 9
+    return 11 if spec.secondary_bundle_label else 10
+
+
+def _build_orderbook_preflight_summary(
+    *,
+    data_cfg: DataConfig,
+    replay: pd.DataFrame,
+    decision_start: str | None,
+    decision_end: str | None,
+    heartbeat: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    date_strings = _resolve_orderbook_preflight_dates(
+        replay=replay,
+        decision_start=decision_start,
+        decision_end=decision_end,
+    )
+    if heartbeat is not None and date_strings:
+        heartbeat(f"Checking orderbook coverage for {len(date_strings)} date(s)")
+    return preflight_orderbook_index_dates(data_cfg, date_strings=date_strings)
+
+
+def _resolve_orderbook_preflight_dates(
+    *,
+    replay: pd.DataFrame,
+    decision_start: str | None,
+    decision_end: str | None,
+) -> list[str]:
+    replay_dates = _replay_decision_dates(replay)
+    if decision_start is None and decision_end is None:
+        return replay_dates
+
+    start_day = None
+    end_day = None
+    start_bound = _parse_window_bound(decision_start, is_end=False)
+    if start_bound is not None:
+        start_day = start_bound.normalize()
+
+    end_bound = _parse_window_bound(decision_end, is_end=True)
+    if end_bound is not None:
+        end_day = (end_bound - pd.Timedelta(days=1)).normalize() if _looks_like_date_only(decision_end) else end_bound.normalize()
+
+    if start_day is None and replay_dates:
+        start_day = _date_start_bound(replay_dates[0]).normalize()
+    if end_day is None and replay_dates:
+        end_day = _date_start_bound(replay_dates[-1]).normalize()
+    if start_day is None and end_day is not None:
+        start_day = end_day
+    if end_day is None and start_day is not None:
+        end_day = start_day
+    if start_day is None or end_day is None:
+        return replay_dates
+    if end_day < start_day:
+        return []
+    return [ts.strftime("%Y-%m-%d") for ts in pd.date_range(start_day, end_day, freq="D", tz="UTC")]
+
+
+def _replay_decision_dates(replay: pd.DataFrame) -> list[str]:
+    if replay.empty:
+        return []
+    decision_ts = pd.to_datetime(replay.get("decision_ts"), utc=True, errors="coerce")
+    if decision_ts.empty:
+        return []
+    normalized = decision_ts.dropna().dt.strftime("%Y-%m-%d")
+    return sorted({str(value) for value in normalized.tolist() if str(value)})
+
+
+def _date_start_bound(date_text: str) -> pd.Timestamp:
+    return pd.Timestamp(str(date_text)).tz_localize("UTC")
 
 
 def _filter_replay_window(
@@ -728,6 +819,7 @@ def _build_bundle_replay(
         labels=labels,
         score_frames=[scores] if not scores.empty else [],
         available_offsets=available_offsets,
+        scoped_offsets=available_offsets,
     )
     return replay, replay_summary, available_offsets
 

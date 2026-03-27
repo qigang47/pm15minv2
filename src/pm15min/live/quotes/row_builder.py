@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import pandas as pd
@@ -17,6 +18,13 @@ from .orderbook import (
     resolve_latest_full_snapshot_row,
     resolve_orderbook_row_within_window,
 )
+
+
+def _provider_only_orderbooks_enabled() -> bool:
+    raw = os.getenv("PM15MIN_LIVE_ORDERBOOK_PROVIDER_ONLY")
+    if raw in (None, ""):
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def build_offset_quote_row_impl(
@@ -139,36 +147,11 @@ def build_offset_quote_row_impl(
         str(out["token_up"]),
         str(out["token_down"]),
     )
+    provider_only = bool(orderbook_provider is not None and _provider_only_orderbooks_enabled())
 
     up_row = None
     down_row = None
-    latest_snapshot = load_latest_full_snapshot_cached(
-        snapshot_path=latest_full_snapshot_path,
-        cache=latest_full_snapshot_cache,
-    )
-    if latest_snapshot is not None:
-        up_row = resolve_latest_full_snapshot_row(
-            latest_snapshot,
-            market_id=out["market_id"],
-            token_id=out["token_up"],
-            side="up",
-            reference_ts_ms=reference_ts_ms,
-            window_start_ts_ms=window_start_ts_ms,
-            window_end_ts_ms=window_end_ts_ms,
-        )
-        down_row = resolve_latest_full_snapshot_row(
-            latest_snapshot,
-            market_id=out["market_id"],
-            token_id=out["token_down"],
-            side="down",
-            reference_ts_ms=reference_ts_ms,
-            window_start_ts_ms=window_start_ts_ms,
-            window_end_ts_ms=window_end_ts_ms,
-        )
-        if up_row is not None and down_row is not None:
-            out["quote_source_path"] = str(latest_full_snapshot_path)
-
-    if (up_row is None or down_row is None) and orderbook_provider is not None:
+    if orderbook_provider is not None:
         if provider_frame_cache is not None and provider_key in provider_frame_cache:
             index_df = provider_frame_cache[provider_key]
         else:
@@ -206,7 +189,33 @@ def build_offset_quote_row_impl(
             )
             if up_row is not None and down_row is not None:
                 out["quote_source_path"] = "provider"
-    if up_row is None or down_row is None:
+    if not provider_only and (up_row is None or down_row is None):
+        latest_snapshot = load_latest_full_snapshot_cached(
+            snapshot_path=latest_full_snapshot_path,
+            cache=latest_full_snapshot_cache,
+        )
+        if latest_snapshot is not None:
+            up_row = resolve_latest_full_snapshot_row(
+                latest_snapshot,
+                market_id=out["market_id"],
+                token_id=out["token_up"],
+                side="up",
+                reference_ts_ms=reference_ts_ms,
+                window_start_ts_ms=window_start_ts_ms,
+                window_end_ts_ms=window_end_ts_ms,
+            )
+            down_row = resolve_latest_full_snapshot_row(
+                latest_snapshot,
+                market_id=out["market_id"],
+                token_id=out["token_down"],
+                side="down",
+                reference_ts_ms=reference_ts_ms,
+                window_start_ts_ms=window_start_ts_ms,
+                window_end_ts_ms=window_end_ts_ms,
+            )
+            if up_row is not None and down_row is not None:
+                out["quote_source_path"] = str(latest_full_snapshot_path)
+    if not provider_only and (up_row is None or down_row is None):
         local_index_df = load_orderbook_index_frame_cached(
             index_path=index_path,
             recent_path=recent_path,
