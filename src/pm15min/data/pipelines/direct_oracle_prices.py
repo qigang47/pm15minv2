@@ -145,9 +145,6 @@ def sync_polymarket_oracle_prices_direct(
     fallback_single: bool = True,
     client: PolymarketOracleApiClient | None = None,
 ) -> dict[str, object]:
-    if cfg.cycle != "15m":
-        raise ValueError("direct oracle sync currently requires cycle=15m.")
-
     markets = load_market_catalog(cfg)
     if markets.empty:
         raise FileNotFoundError(
@@ -184,6 +181,7 @@ def sync_polymarket_oracle_prices_direct(
         batch = client.fetch_past_results_batch(
             symbol=symbol,
             current_event_start_time=datetime.fromtimestamp(current_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            cycle_seconds=cfg.layout.cycle_seconds,
             count=int(count),
             sleep_sec=float(sleep_sec),
         )
@@ -308,9 +306,6 @@ def sync_polymarket_oracle_price_window(
     max_retries: int = 1,
     client: PolymarketOracleApiClient | None = None,
 ) -> dict[str, object]:
-    if cfg.cycle != "15m":
-        raise ValueError("direct oracle window sync currently requires cycle=15m.")
-
     client = client or PolymarketOracleApiClient(timeout_sec=timeout_sec)
     cycle_start_ts = int(cycle_start_ts)
     obj = client.fetch_crypto_price(

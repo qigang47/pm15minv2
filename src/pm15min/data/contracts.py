@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any
+
+from .layout.helpers import cycle_seconds
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,13 @@ class OrderbookSnapshotRecord:
     source: str = "clob"
 
     def to_row(self) -> dict[str, Any]:
+        decision_ts_ms = int(self.captured_ts_ms // 60_000) * 60_000
+        cycle_minutes = max(1, int(cycle_seconds(self.cycle) // 60))
+        offset = int((decision_ts_ms // 60_000) % cycle_minutes)
+        logged_at = datetime.fromtimestamp(self.captured_ts_ms / 1000.0, tz=timezone.utc).isoformat()
+        decision_ts = datetime.fromtimestamp(decision_ts_ms / 1000.0, tz=timezone.utc).isoformat()
+        orderbook_ts_ms = int(self.source_ts_ms) if self.source_ts_ms is not None else int(self.captured_ts_ms)
+        orderbook_ts = datetime.fromtimestamp(orderbook_ts_ms / 1000.0, tz=timezone.utc).isoformat()
         # Avoid recursive copies of large full-depth asks/bids payloads.
         return {
             "captured_ts_ms": self.captured_ts_ms,
@@ -49,6 +59,10 @@ class OrderbookSnapshotRecord:
             "market_id": self.market_id,
             "token_id": self.token_id,
             "side": self.side,
+            "logged_at": logged_at,
+            "orderbook_ts": orderbook_ts,
+            "decision_ts": decision_ts,
+            "offset": offset,
             "asset": self.asset,
             "cycle": self.cycle,
             "asks": self.asks,

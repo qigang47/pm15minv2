@@ -219,6 +219,7 @@ def test_resolve_latest_live_row_prefers_current_cycle_row_once_offset_opens() -
     previous_cycle_start = pd.Timestamp("2026-03-27T09:00:00Z")
     previous_cycle_end = pd.Timestamp("2026-03-27T09:15:00Z")
     current_decision_ts = pd.Timestamp("2026-03-27T09:22:00Z")
+    latest_closed_feature_ts = pd.Timestamp("2026-03-27T09:21:00Z")
 
     ctx = OffsetScoreContext(
         offset=7,
@@ -229,7 +230,7 @@ def test_resolve_latest_live_row_prefers_current_cycle_row_once_offset_opens() -
         features=pd.DataFrame(
             [
                 {
-                    "decision_ts": pd.Timestamp("2026-03-27T09:22:00Z"),
+                    "decision_ts": latest_closed_feature_ts,
                     "cycle_start_ts": current_cycle_start,
                     "cycle_end_ts": current_cycle_end,
                     "offset": 7,

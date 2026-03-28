@@ -205,8 +205,14 @@ def build_live_feature_frame(
     *,
     feature_set: str,
     retain_offsets: tuple[int, ...] | None = None,
+    allow_preview_open_bar: bool = False,
 ) -> pd.DataFrame:
-    return _build_live_feature_frame_impl(cfg, feature_set=feature_set, retain_offsets=retain_offsets)
+    return _build_live_feature_frame_impl(
+        cfg,
+        feature_set=feature_set,
+        retain_offsets=retain_offsets,
+        allow_preview_open_bar=allow_preview_open_bar,
+    )
 
 
 def load_live_account_context(

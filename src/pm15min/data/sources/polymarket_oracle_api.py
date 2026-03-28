@@ -25,13 +25,14 @@ class PolymarketOracleApiClient:
         *,
         symbol: str,
         current_event_start_time: str,
+        cycle_seconds: int = 900,
         count: int = 50,
         sleep_sec: float = 0.15,
         max_retries: int = 6,
     ) -> list[dict[str, Any]]:
         params = {
             "symbol": symbol.upper(),
-            "variant": "fifteen",
+            "variant": "fiveminute" if int(cycle_seconds) == 300 else "fifteen",
             "assetType": "crypto",
             "currentEventStartTime": current_event_start_time,
             "count": int(count),

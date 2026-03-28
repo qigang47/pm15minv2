@@ -49,12 +49,18 @@ def sync_market_catalog(
     end_ts: int,
     client: GammaEventsClient | None = None,
     now: datetime | None = None,
+    selection_mode: str | None = None,
 ) -> dict[str, object]:
     snapshot_ts = utc_snapshot_label(now)
     client = client or GammaEventsClient()
+    mode = str(selection_mode or "").strip().lower()
+    if mode not in {"", "surface_default", "active_markets", "closed_events"}:
+        raise ValueError(f"unsupported market catalog selection_mode: {selection_mode}")
+    if mode in {"", "surface_default"}:
+        mode = "active_markets" if cfg.surface == "live" else "closed_events"
     source_mode = "gamma_closed_events"
     fetched_rows = 0
-    if cfg.surface == "live":
+    if mode == "active_markets":
         markets = client.fetch_active_markets(
             start_ts=start_ts,
             end_ts=end_ts,

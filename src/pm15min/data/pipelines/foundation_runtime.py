@@ -263,6 +263,71 @@ def _binance_boundary_offsets(*, cycle_minutes: int) -> tuple[int, ...]:
     return valid
 
 
+def _binance_boundary_initial_delay_sec() -> float:
+    return _env_float("PM15MIN_LIVE_FOUNDATION_BINANCE_BOUNDARY_DELAY_SEC", default=0.0)
+
+
+def _binance_boundary_retry_interval_sec() -> float:
+    return _env_float("PM15MIN_LIVE_FOUNDATION_BINANCE_RETRY_INTERVAL_SEC", default=0.2)
+
+
+def _binance_boundary_retry_window_sec() -> float:
+    return _env_float("PM15MIN_LIVE_FOUNDATION_BINANCE_RETRY_WINDOW_SEC", default=1.5)
+
+
+def _iter_binance_boundary_targets(
+    *,
+    now: datetime,
+    cycle_minutes: int,
+    boundary_offsets: tuple[int, ...],
+    boundary_delay_sec: float,
+) -> list[dict[str, float]]:
+    if int(cycle_minutes) <= 0 or not boundary_offsets:
+        return []
+    cycle_seconds = int(cycle_minutes) * 60
+    now_ts = float(now.timestamp())
+    cycle_start_ts = int(now_ts // cycle_seconds) * cycle_seconds
+    targets: list[dict[str, float]] = []
+    for cycle_shift in (-1, 0, 1):
+        base_ts = float(cycle_start_ts + cycle_shift * cycle_seconds)
+        for offset in boundary_offsets:
+            closed_bar_open_ts = base_ts + float(offset - 1) * 60.0
+            due_ts = closed_bar_open_ts + 60.0 + max(0.0, float(boundary_delay_sec))
+            targets.append(
+                {
+                    "offset": float(offset),
+                    "expected_open_ts": closed_bar_open_ts,
+                    "due_ts": due_ts,
+                }
+            )
+    targets.sort(key=lambda row: float(row["due_ts"]))
+    return targets
+
+
+def _active_binance_boundary_target(
+    *,
+    now: datetime,
+    cycle_minutes: int,
+    boundary_offsets: tuple[int, ...],
+    boundary_delay_sec: float,
+    retry_window_sec: float,
+) -> dict[str, float] | None:
+    now_ts = float(now.timestamp())
+    active = [
+        row
+        for row in _iter_binance_boundary_targets(
+            now=now,
+            cycle_minutes=cycle_minutes,
+            boundary_offsets=boundary_offsets,
+            boundary_delay_sec=boundary_delay_sec,
+        )
+        if float(row["due_ts"]) <= now_ts < float(row["due_ts"]) + max(0.0, float(retry_window_sec))
+    ]
+    if not active:
+        return None
+    return max(active, key=lambda row: float(row["due_ts"]))
+
+
 def _next_binance_boundary_due_ts(
     *,
     now: datetime,
@@ -270,21 +335,38 @@ def _next_binance_boundary_due_ts(
     boundary_offsets: tuple[int, ...],
     boundary_delay_sec: float,
 ) -> float | None:
-    if int(cycle_minutes) <= 0 or not boundary_offsets:
-        return None
-    cycle_seconds = int(cycle_minutes) * 60
     now_ts = float(now.timestamp())
-    cycle_start_ts = int(now_ts // cycle_seconds) * cycle_seconds
     candidates: list[float] = []
-    for cycle_shift in (0, 1):
-        base_ts = float(cycle_start_ts + cycle_shift * cycle_seconds)
-        for offset in boundary_offsets:
-            candidate = base_ts + float(offset) * 60.0 + max(0.0, float(boundary_delay_sec))
-            if candidate > now_ts:
-                candidates.append(candidate)
+    for row in _iter_binance_boundary_targets(
+        now=now,
+        cycle_minutes=cycle_minutes,
+        boundary_offsets=boundary_offsets,
+        boundary_delay_sec=boundary_delay_sec,
+    ):
+        candidate = float(row["due_ts"])
+        if candidate > now_ts:
+            candidates.append(candidate)
     if not candidates:
         return None
     return min(candidates)
+
+
+def _binance_summary_has_expected_closed_bar(*, summary: dict[str, object] | None, target: dict[str, float]) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    raw_latest_open_time = summary.get("latest_open_time")
+    if raw_latest_open_time in (None, ""):
+        return False
+    try:
+        latest_open_time = pd.Timestamp(raw_latest_open_time)
+    except Exception:
+        return False
+    if latest_open_time.tzinfo is None:
+        latest_open_time = latest_open_time.tz_localize("UTC")
+    else:
+        latest_open_time = latest_open_time.tz_convert("UTC")
+    expected_open_ts = float(target.get("expected_open_ts") or 0.0)
+    return float(latest_open_time.timestamp()) >= expected_open_ts
 
 
 def _next_foundation_task_due_at(
@@ -293,25 +375,46 @@ def _next_foundation_task_due_at(
     task_name: str,
     now: datetime,
     interval_sec: float,
+    last_summary: dict[str, object] | None = None,
 ) -> float:
     if str(task_name) != "binance":
         return float(now.timestamp()) + max(0.0, float(interval_sec))
     cycle_minutes = int(cfg.layout.cycle_seconds // 60)
+    boundary_offsets = _binance_boundary_offsets(cycle_minutes=cycle_minutes)
+    boundary_delay_sec = _binance_boundary_initial_delay_sec()
+    retry_window_sec = _binance_boundary_retry_window_sec()
+    retry_interval_sec = _binance_boundary_retry_interval_sec()
+    active_target = _active_binance_boundary_target(
+        now=now,
+        cycle_minutes=cycle_minutes,
+        boundary_offsets=boundary_offsets,
+        boundary_delay_sec=boundary_delay_sec,
+        retry_window_sec=retry_window_sec,
+    )
     boundary_due_ts = _next_binance_boundary_due_ts(
         now=now,
         cycle_minutes=cycle_minutes,
-        boundary_offsets=_binance_boundary_offsets(cycle_minutes=cycle_minutes),
-        boundary_delay_sec=_env_float("PM15MIN_LIVE_FOUNDATION_BINANCE_BOUNDARY_DELAY_SEC", default=0.75),
+        boundary_offsets=boundary_offsets,
+        boundary_delay_sec=boundary_delay_sec,
     )
     fallback_refresh_sec = _env_float(
         "PM15MIN_LIVE_FOUNDATION_BINANCE_FALLBACK_REFRESH_SEC",
         default=max(0.0, float(interval_sec)),
     )
+    now_ts = float(now.timestamp())
     fallback_due_ts = float(now.timestamp()) + max(0.0, float(fallback_refresh_sec))
+    if (
+        active_target is not None
+        and last_summary is not None
+        and not _binance_summary_has_expected_closed_bar(summary=last_summary, target=active_target)
+    ):
+        retry_deadline_ts = float(active_target["due_ts"]) + max(0.0, float(retry_window_sec))
+        if retry_interval_sec > 0.0 and now_ts < retry_deadline_ts:
+            return min(fallback_due_ts, now_ts + max(0.0, float(retry_interval_sec)), retry_deadline_ts)
     if boundary_due_ts is None:
         return fallback_due_ts
     if fallback_refresh_sec <= 0.0:
-        return boundary_due_ts
+        return fallback_due_ts
     return min(boundary_due_ts, fallback_due_ts)
 
 
@@ -676,6 +779,7 @@ def run_live_data_foundation(
                     task_name=task_name,
                     now=now,
                     interval_sec=interval_sec,
+                    last_summary=summary,
                 )
 
         _append_log(cfg, iteration_payload)
@@ -992,6 +1096,7 @@ def run_live_data_foundation_shared(
                         task_name=task_name,
                         now=now,
                         interval_sec=interval_sec,
+                        last_summary=summary,
                     )
 
         state_ts = _utc_now_iso(now_provider)

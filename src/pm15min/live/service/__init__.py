@@ -24,6 +24,8 @@ from .operation import (
 from ..signal.service import (
     check_live_latest as _check_live_latest_impl,
     decide_live_latest as _decide_live_latest_impl,
+    prewarm_live_signal_preview as _prewarm_live_signal_preview_impl,
+    prewarm_live_signal_inputs as _prewarm_live_signal_inputs_impl,
     prewarm_live_signal_cache as _prewarm_live_signal_cache_impl,
     quote_live_latest as _quote_live_latest_impl,
     score_live_latest as _score_live_latest_impl,
@@ -107,12 +109,14 @@ def score_live_latest(
     target: str = "direction",
     feature_set: str | None = None,
     persist: bool = True,
+    allow_preview_open_bar: bool = False,
 ) -> dict[str, object]:
     return _score_live_latest_impl(
         cfg,
         target=target,
         feature_set=feature_set,
         persist=persist,
+        allow_preview_open_bar=allow_preview_open_bar,
         **_score_live_latest_wiring(),
     )
 
@@ -158,6 +162,7 @@ def prewarm_live_signal_cache(
     feature_set: str | None = None,
     persist: bool = False,
     session_state: dict[str, object] | None = None,
+    marker_source: str = "prewarm",
 ) -> dict[str, object]:
     return _prewarm_live_signal_cache_impl(
         cfg,
@@ -165,6 +170,41 @@ def prewarm_live_signal_cache(
         feature_set=feature_set,
         persist=persist,
         session_state=session_state,
+        marker_source=marker_source,
+        score_live_latest_fn=score_live_latest,
+    )
+
+
+def prewarm_live_signal_inputs(
+    cfg: LiveConfig,
+    *,
+    target: str = "direction",
+    feature_set: str | None = None,
+) -> dict[str, object]:
+    return _prewarm_live_signal_inputs_impl(
+        cfg,
+        target=target,
+        feature_set=feature_set,
+        resolve_live_profile_spec_fn=resolve_live_profile_spec,
+        get_active_bundle_selection_fn=get_active_bundle_selection,
+        resolve_model_bundle_dir_fn=resolve_model_bundle_dir,
+        read_model_bundle_manifest_fn=read_model_bundle_manifest,
+        supports_feature_set_fn=_supports_feature_set,
+        build_live_feature_frame_fn=_build_live_feature_frame,
+        iso_or_none_fn=_iso_or_none,
+    )
+
+
+def prewarm_live_signal_preview(
+    cfg: LiveConfig,
+    *,
+    target: str = "direction",
+    feature_set: str | None = None,
+) -> dict[str, object]:
+    return _prewarm_live_signal_preview_impl(
+        cfg,
+        target=target,
+        feature_set=feature_set,
         score_live_latest_fn=score_live_latest,
     )
 

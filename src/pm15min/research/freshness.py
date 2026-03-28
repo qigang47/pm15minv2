@@ -6,8 +6,8 @@ from pathlib import Path
 import sys
 
 from pm15min.data.config import DataConfig
-from pm15min.data.pipelines.oracle_prices import build_oracle_prices_15m
-from pm15min.data.pipelines.truth import build_truth_15m
+from pm15min.data.pipelines.oracle_prices import build_oracle_prices_table
+from pm15min.data.pipelines.truth import build_truth_table
 from pm15min.research.config import ResearchConfig
 from pm15min.research.features.builders import build_feature_frame as build_feature_frame_df
 from pm15min.research.labels.frames import build_label_frame as build_label_frame_df
@@ -78,7 +78,7 @@ def _ensure_oracle_prices_table_aligned(
         data_cfg.layout.market_catalog_table_path,
         data_cfg.layout.direct_oracle_source_path,
         *sorted(data_cfg.layout.streams_source_root.glob("year=*/month=*/data.parquet")),
-        Path(build_oracle_prices_15m.__code__.co_filename).resolve(),
+        Path(build_oracle_prices_table.__code__.co_filename).resolve(),
     ]
     return _ensure_artifact_aligned(
         dataset="oracle_prices_table",
@@ -86,7 +86,7 @@ def _ensure_oracle_prices_table_aligned(
         lock_name=f"oracle_prices_{data_cfg.asset.slug}_{data_cfg.cycle}_{data_cfg.surface}",
         target_path=data_cfg.layout.oracle_prices_table_path,
         dependencies=dependencies,
-        build_fn=lambda: build_oracle_prices_15m(data_cfg),
+        build_fn=lambda: build_oracle_prices_table(data_cfg),
     )
 
 
@@ -99,7 +99,7 @@ def _ensure_truth_table_aligned(
         data_cfg.layout.market_catalog_table_path,
         data_cfg.layout.oracle_prices_table_path,
         data_cfg.layout.settlement_truth_source_path,
-        Path(build_truth_15m.__code__.co_filename).resolve(),
+        Path(build_truth_table.__code__.co_filename).resolve(),
     ]
     return _ensure_artifact_aligned(
         dataset="truth_table",
@@ -107,7 +107,7 @@ def _ensure_truth_table_aligned(
         lock_name=f"truth_{data_cfg.asset.slug}_{data_cfg.cycle}_{data_cfg.surface}",
         target_path=data_cfg.layout.truth_table_path,
         dependencies=dependencies,
-        build_fn=lambda: build_truth_15m(data_cfg),
+        build_fn=lambda: build_truth_table(data_cfg),
     )
 
 

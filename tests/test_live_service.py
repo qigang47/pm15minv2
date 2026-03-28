@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 
 import pandas as pd
@@ -12,14 +14,21 @@ from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.live.service import (
     check_live_latest,
     prewarm_live_signal_cache,
+    prewarm_live_signal_preview,
     check_live_trading_gateway,
     score_live_latest,
     show_live_latest_runner,
     show_live_ready,
 )
-from pm15min.live.signal.service import decide_live_latest as decide_live_latest_impl
+from pm15min.live.signal.service import (
+    decide_live_latest as decide_live_latest_impl,
+    prewarm_live_signal_cache as prewarm_live_signal_cache_impl,
+    prewarm_live_signal_inputs as prewarm_live_signal_inputs_impl,
+    prewarm_live_signal_preview as prewarm_live_signal_preview_impl,
+)
 from pm15min.live.signal import scoring_bundle as scoring_bundle_module
 from pm15min.live.signal import utils as signal_utils_module
+from pm15min.live.service import facade_helpers as service_facade_helpers_module
 from pm15min.live.signal.scoring_bundle import resolve_bundle_resolution
 from pm15min.live.signal.utils import build_live_feature_frame
 
@@ -154,6 +163,332 @@ def test_prewarm_live_signal_cache_populates_session_cache(tmp_path: Path, monke
     assert first["cache_hit"] is False
     assert first["offsets"] == [7]
     assert second["cache_hit"] is True
+
+
+def test_prewarm_live_signal_cache_writes_marker_only_on_refresh(tmp_path: Path, monkeypatch) -> None:
+    cfg = _prepare_nan_feature_score_case(tmp_path, monkeypatch)
+    session_state: dict[str, object] = {}
+    marker_path = (
+        cfg.layout.rewrite.root
+        / "var"
+        / "live"
+        / "logs"
+        / "markers"
+        / "signal_refresh_cycle=15m_asset=sol_profile=deep_otm_target=direction.jsonl"
+    )
+
+    first = prewarm_live_signal_cache(cfg, persist=False, session_state=session_state)
+    second = prewarm_live_signal_cache(cfg, persist=False, session_state=session_state)
+
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is True
+    lines = marker_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["source"] == "prewarm"
+    assert payload["cache_hit"] is False
+    assert payload["market"] == "sol"
+    assert payload["feature_rows"] == 1
+    assert payload["offset_rows"][0]["offset"] == 7
+
+
+def test_prewarm_live_signal_cache_supports_custom_marker_source(tmp_path: Path, monkeypatch) -> None:
+    cfg = _prepare_nan_feature_score_case(tmp_path, monkeypatch)
+    session_state: dict[str, object] = {}
+    marker_path = (
+        cfg.layout.rewrite.root
+        / "var"
+        / "live"
+        / "logs"
+        / "markers"
+        / "signal_refresh_cycle=15m_asset=sol_profile=deep_otm_target=direction.jsonl"
+    )
+
+    payload = prewarm_live_signal_cache(
+        cfg,
+        persist=False,
+        session_state=session_state,
+        marker_source="prewarm_prepare",
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["marker_source"] == "prewarm_prepare"
+    row = json.loads(marker_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert row["source"] == "prewarm_prepare"
+
+
+def test_prewarm_finalize_bypasses_unexpired_signal_cache(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    session_state = {
+        "live_signal_cache": {
+            "sol|deep_otm|15|direction|": {
+                "valid_until_ts": "2099-01-01T00:00:00+00:00",
+                "payload": {
+                    "snapshot_ts": "2000-01-01T00:00:00Z",
+                    "latest_feature_decision_ts": "2000-01-01T00:00:00+00:00",
+                    "offset_signals": [
+                        {
+                            "offset": 7,
+                            "status": "offset_not_yet_open",
+                            "window_start_ts": "2099-01-01T00:07:00+00:00",
+                            "window_end_ts": "2099-01-01T00:08:00+00:00",
+                            "cycle_end_ts": "2099-01-01T00:15:00+00:00",
+                        }
+                    ],
+                },
+            }
+        }
+    }
+    marker_path = (
+        cfg.layout.rewrite.root
+        / "var"
+        / "live"
+        / "logs"
+        / "markers"
+        / "signal_refresh_cycle=15m_asset=sol_profile=deep_otm_target=direction.jsonl"
+    )
+    calls = {"score": 0}
+
+    def _score(*args, **kwargs):
+        calls["score"] += 1
+        return {
+            "snapshot_ts": "2026-03-28T06:08:00Z",
+            "latest_feature_decision_ts": "2026-03-28T06:07:00+00:00",
+            "builder_feature_set": "bs_q_replace_direction",
+            "feature_rows": 12,
+            "offset_signals": [
+                {
+                    "offset": 7,
+                    "status": None,
+                    "decision_ts": "2026-03-28T06:07:00+00:00",
+                    "window_start_ts": "2099-03-28T06:07:00+00:00",
+                    "window_end_ts": "2099-03-28T06:08:00+00:00",
+                    "cycle_end_ts": "2099-03-28T06:15:00+00:00",
+                }
+            ],
+        }
+
+    payload = prewarm_live_signal_cache_impl(
+        cfg,
+        persist=False,
+        session_state=session_state,
+        marker_source="prewarm_finalize",
+        score_live_latest_fn=_score,
+    )
+
+    assert calls["score"] == 1
+    assert payload["cache_hit"] is False
+    assert payload["latest_feature_decision_ts"] == "2026-03-28T06:07:00+00:00"
+    cached = session_state["live_signal_cache"]["sol|deep_otm|15|direction|"]["payload"]
+    assert cached["latest_feature_decision_ts"] == "2026-03-28T06:07:00+00:00"
+    marker = json.loads(marker_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert marker["source"] == "prewarm_finalize"
+    assert marker["cache_hit"] is False
+
+
+def test_prewarm_live_signal_inputs_writes_prepare_marker(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    marker_path = (
+        cfg.layout.rewrite.root
+        / "var"
+        / "live"
+        / "logs"
+        / "markers"
+        / "signal_refresh_cycle=15m_asset=sol_profile=deep_otm_target=direction.jsonl"
+    )
+    bundle_dir = root / "bundles" / "bundle=prepare_guard"
+    (bundle_dir / "offsets" / "offset=7").mkdir(parents=True, exist_ok=True)
+    (bundle_dir / "offsets" / "offset=9").mkdir(parents=True, exist_ok=True)
+
+    payload = prewarm_live_signal_inputs_impl(
+        cfg,
+        target="direction",
+        feature_set="bs_q_replace_direction",
+        resolve_live_profile_spec_fn=lambda profile: SimpleNamespace(default_feature_set="bs_q_replace_direction"),
+        get_active_bundle_selection_fn=lambda *args, **kwargs: {
+            "selection": {"bundle_label": "prepare_guard"},
+            "selection_path": str(root / "selection.json"),
+        },
+        resolve_model_bundle_dir_fn=lambda *args, **kwargs: bundle_dir,
+        read_model_bundle_manifest_fn=lambda *args, **kwargs: SimpleNamespace(
+            spec={"feature_set": "bs_q_replace_direction", "bundle_label": "prepare_guard"}
+        ),
+        supports_feature_set_fn=lambda *args, **kwargs: True,
+        build_live_feature_frame_fn=lambda *args, **kwargs: pd.DataFrame(
+            [
+                {
+                    "decision_ts": "2026-03-28T06:07:00+00:00",
+                    "offset": 7,
+                },
+                {
+                    "decision_ts": "2026-03-28T06:09:00+00:00",
+                    "offset": 9,
+                },
+            ]
+        ),
+        iso_or_none_fn=lambda value: None
+        if value is None
+        else pd.to_datetime(value, utc=True, errors="coerce").isoformat(),
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["marker_source"] == "prewarm_prepare"
+    assert payload["offsets"] == [7, 9]
+    lines = marker_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    marker = json.loads(lines[0])
+    assert marker["source"] == "prewarm_prepare"
+    assert marker["cache_key"].endswith("|prepare")
+    assert marker["feature_rows"] == 2
+    assert marker["offset_rows"] == [
+        {
+            "offset": 7,
+            "status": "prepared",
+            "decision_ts": None,
+            "window_start_ts": None,
+            "window_end_ts": None,
+            "cycle_end_ts": None,
+        },
+        {
+            "offset": 9,
+            "status": "prepared",
+            "decision_ts": None,
+            "window_start_ts": None,
+            "window_end_ts": None,
+            "cycle_end_ts": None,
+        },
+    ]
+
+
+def test_prewarm_live_signal_preview_uses_preview_open_bar_and_writes_preview_marker(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    marker_path = (
+        cfg.layout.rewrite.root
+        / "var"
+        / "live"
+        / "logs"
+        / "markers"
+        / "signal_refresh_cycle=15m_asset=sol_profile=deep_otm_target=direction.jsonl"
+    )
+    calls: dict[str, object] = {}
+
+    def _score(cfg_arg, *, target, feature_set, persist, allow_preview_open_bar):
+        calls["cfg"] = cfg_arg
+        calls["target"] = target
+        calls["feature_set"] = feature_set
+        calls["persist"] = persist
+        calls["allow_preview_open_bar"] = allow_preview_open_bar
+        return {
+            "snapshot_ts": "2026-03-28T06:07:59Z",
+            "latest_feature_decision_ts": "2026-03-28T06:07:00+00:00",
+            "builder_feature_set": "bs_q_replace_direction",
+            "feature_rows": 12,
+            "offset_signals": [
+                {
+                    "offset": 7,
+                    "status": "ok",
+                    "decision_ts": "2026-03-28T06:07:00+00:00",
+                    "window_start_ts": "2026-03-28T06:07:00+00:00",
+                    "window_end_ts": "2026-03-28T06:08:00+00:00",
+                    "cycle_end_ts": "2026-03-28T06:15:00+00:00",
+                }
+            ],
+        }
+
+    payload = prewarm_live_signal_preview_impl(
+        cfg,
+        target="direction",
+        feature_set="bs_q_replace_direction",
+        score_live_latest_fn=_score,
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["preview_only"] is True
+    assert payload["feature_rows"] == 12
+    assert payload["latest_feature_decision_ts"] == "2026-03-28T06:07:00+00:00"
+    assert payload["offsets"] == [7]
+    assert calls["cfg"] == cfg
+    assert calls["target"] == "direction"
+    assert calls["feature_set"] == "bs_q_replace_direction"
+    assert calls["persist"] is False
+    assert calls["allow_preview_open_bar"] is True
+
+    lines = marker_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    marker = json.loads(lines[0])
+    assert marker["source"] == "prewarm_preview"
+    assert marker["cache_key"].endswith("|preview")
+    assert marker["feature_rows"] == 12
+    assert marker["offset_rows"][0]["offset"] == 7
+
+
+def test_service_prewarm_live_signal_preview_passes_through_public_wrapper(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+
+    monkeypatch.setattr(
+        "pm15min.live.service._prewarm_live_signal_preview_impl",
+        lambda cfg_arg, *, target, feature_set, score_live_latest_fn: {
+            "status": "ok",
+            "cfg_market": cfg_arg.asset.slug,
+            "target": target,
+            "feature_set": feature_set,
+            "score_callable": callable(score_live_latest_fn),
+        },
+    )
+
+    payload = prewarm_live_signal_preview(
+        cfg,
+        target="direction",
+        feature_set="bs_q_replace_direction",
+    )
+
+    assert payload == {
+        "status": "ok",
+        "cfg_market": "sol",
+        "target": "direction",
+        "feature_set": "bs_q_replace_direction",
+        "score_callable": True,
+    }
+
+
+def test_service_facade_build_live_feature_frame_supports_preview_flag(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    calls: dict[str, object] = {}
+
+    def _build(cfg_arg, *, feature_set, retain_offsets, allow_preview_open_bar):
+        calls["cfg"] = cfg_arg
+        calls["feature_set"] = feature_set
+        calls["retain_offsets"] = retain_offsets
+        calls["allow_preview_open_bar"] = allow_preview_open_bar
+        return pd.DataFrame([{"offset": 7}])
+
+    monkeypatch.setattr(
+        "pm15min.live.service.facade_helpers._build_live_feature_frame_impl",
+        _build,
+    )
+
+    payload = service_facade_helpers_module.build_live_feature_frame(
+        cfg,
+        feature_set="bs_q_replace_direction",
+        retain_offsets=(7, 8, 9),
+        allow_preview_open_bar=True,
+    )
+
+    assert list(payload["offset"]) == [7]
+    assert calls["cfg"] == cfg
+    assert calls["feature_set"] == "bs_q_replace_direction"
+    assert calls["retain_offsets"] == (7, 8, 9)
+    assert calls["allow_preview_open_bar"] is True
 
 
 def test_score_live_latest_ignores_expired_offset_rows(tmp_path: Path, monkeypatch) -> None:
@@ -403,7 +738,7 @@ def test_build_live_feature_frame_reuses_cached_frame_within_ttl(tmp_path: Path,
 
     assert not first.empty
     assert not second.empty
-    assert calls["refresh"] == 1
+    assert calls["refresh"] == 2
     assert calls["builder"] == 1
     assert first is not second
 
@@ -533,6 +868,83 @@ def test_build_live_feature_frame_limits_builder_input_to_bounded_kline_tail(tmp
     assert captured["sizes"] == (300, 300)
 
 
+def test_build_live_feature_frame_reuses_live_feature_state_for_identical_source_signature(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", "0")
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_BUILD_TAIL_BARS", "300")
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE.clear()
+    signal_utils_module._LIVE_FEATURE_STATE_CACHE.clear()
+
+    monkeypatch.setattr("pm15min.live.signal.utils.ensure_live_trade_inputs_fresh", lambda *args, **kwargs: {"status": "fresh"})
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_oracle_prices_table",
+        lambda *args, **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_live_runtime_oracle_prices",
+        lambda **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+
+    rows = pd.DataFrame(
+        [
+            {
+                "open_time": pd.Timestamp("2026-03-20T00:00:00Z") + pd.Timedelta(minutes=minute),
+                "close_time": pd.Timestamp("2026-03-20T00:00:59Z") + pd.Timedelta(minutes=minute),
+                "open": 100.0 + minute,
+                "high": 101.0 + minute,
+                "low": 99.0 + minute,
+                "close": 100.5 + minute,
+                "volume": 10.0 + minute,
+                "quote_asset_volume": 20.0 + minute,
+                "taker_buy_quote_volume": 8.0 + minute,
+                "number_of_trades": 5 + minute,
+            }
+            for minute in range(500)
+        ]
+    )
+    builder_calls = {"count": 0}
+
+    def _load_binance(data_cfg, symbol=None):
+        return rows.copy()
+
+    def _build_feature_frame(*args, **kwargs):
+        builder_calls["count"] += 1
+        return pd.DataFrame(
+            [
+                {
+                    "decision_ts": pd.Timestamp("2026-03-20T08:20:00Z"),
+                    "cycle_start_ts": pd.Timestamp("2026-03-20T08:15:00Z"),
+                    "cycle_end_ts": pd.Timestamp("2026-03-20T08:30:00Z"),
+                    "offset": 5,
+                    "ret_30m": 0.0,
+                }
+            ]
+        )
+
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    btc_cfg = DataConfig.build(market="btc", cycle="15m", surface="live", root=root)
+    data_cfg.layout.binance_klines_path().parent.mkdir(parents=True, exist_ok=True)
+    data_cfg.layout.binance_klines_path().write_text("x", encoding="utf-8")
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").parent.mkdir(parents=True, exist_ok=True)
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr("pm15min.live.signal.utils.load_binance_klines_1m", _load_binance)
+    monkeypatch.setattr("pm15min.live.signal.utils.build_feature_frame_df", _build_feature_frame)
+
+    first = build_live_feature_frame(cfg, feature_set="v6_user_core")
+    second = build_live_feature_frame(cfg, feature_set="v6_user_core")
+
+    assert not first.empty
+    assert not second.empty
+    assert builder_calls["count"] == 1
+
+
 def test_build_live_feature_frame_reuses_cached_kline_tail_when_source_unchanged(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
@@ -610,6 +1022,671 @@ def test_build_live_feature_frame_reuses_cached_kline_tail_when_source_unchanged
     assert not first.empty
     assert not second.empty
     assert calls == {"primary": 1, "btc": 1}
+
+
+def test_build_live_feature_frame_uses_incremental_tail_after_source_advances(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", "0")
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_BUILD_TAIL_BARS", "384")
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_INCREMENTAL_BUILD_TAIL_BARS", "320")
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE.clear()
+    signal_utils_module._LIVE_FEATURE_STATE_CACHE.clear()
+
+    monkeypatch.setattr("pm15min.live.signal.utils.ensure_live_trade_inputs_fresh", lambda *args, **kwargs: {"status": "fresh"})
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_oracle_prices_table",
+        lambda *args, **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_live_runtime_oracle_prices",
+        lambda **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+
+    base_rows = pd.DataFrame(
+        [
+            {
+                "open_time": pd.Timestamp("2026-03-20T00:00:00Z") + pd.Timedelta(minutes=minute),
+                "close_time": pd.Timestamp("2026-03-20T00:00:59Z") + pd.Timedelta(minutes=minute),
+                "open": 100.0 + minute,
+                "high": 101.0 + minute,
+                "low": 99.0 + minute,
+                "close": 100.5 + minute,
+                "volume": 10.0 + minute,
+                "quote_asset_volume": 20.0 + minute,
+                "taker_buy_quote_volume": 8.0 + minute,
+                "number_of_trades": 5 + minute,
+            }
+            for minute in range(500)
+        ]
+    )
+    appended_rows = pd.concat(
+        [
+            base_rows,
+            pd.DataFrame(
+                [
+                    {
+                        "open_time": pd.Timestamp("2026-03-20T08:20:00Z"),
+                        "close_time": pd.Timestamp("2026-03-20T08:20:59Z"),
+                        "open": 600.0,
+                        "high": 601.0,
+                        "low": 599.0,
+                        "close": 600.5,
+                        "volume": 510.0,
+                        "quote_asset_volume": 520.0,
+                        "taker_buy_quote_volume": 508.0,
+                        "number_of_trades": 505,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    current_rows = {"value": base_rows}
+    captured_sizes: list[tuple[int, int]] = []
+
+    def _load_binance(data_cfg, symbol=None):
+        return current_rows["value"].copy()
+
+    def _build_feature_frame(raw_klines, *, btc_klines=None, **kwargs):
+        captured_sizes.append((len(raw_klines), 0 if btc_klines is None else len(btc_klines)))
+        return pd.DataFrame(
+            [
+                {
+                    "decision_ts": pd.Timestamp("2026-03-20T08:20:00Z"),
+                    "cycle_start_ts": pd.Timestamp("2026-03-20T08:15:00Z"),
+                    "cycle_end_ts": pd.Timestamp("2026-03-20T08:30:00Z"),
+                    "offset": 5,
+                    "ret_30m": 0.0,
+                }
+            ]
+        )
+
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    btc_cfg = DataConfig.build(market="btc", cycle="15m", surface="live", root=root)
+    data_cfg.layout.binance_klines_path().parent.mkdir(parents=True, exist_ok=True)
+    data_cfg.layout.binance_klines_path().write_text("x", encoding="utf-8")
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").parent.mkdir(parents=True, exist_ok=True)
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr("pm15min.live.signal.utils.load_binance_klines_1m", _load_binance)
+    monkeypatch.setattr("pm15min.live.signal.utils.build_feature_frame_df", _build_feature_frame)
+
+    first = build_live_feature_frame(cfg, feature_set="v6_user_core")
+    current_rows["value"] = appended_rows
+    data_cfg.layout.binance_klines_path().write_text("xx", encoding="utf-8")
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").write_text("xx", encoding="utf-8")
+    second = build_live_feature_frame(cfg, feature_set="v6_user_core")
+
+    assert not first.empty
+    assert not second.empty
+    assert captured_sizes[0] == (384, 384)
+    assert captured_sizes[1] == (320, 320)
+
+
+def test_load_live_binance_klines_tail_appends_from_latest_marker_without_reload(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE.clear()
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    target_path = data_cfg.layout.binance_klines_path()
+
+    def _rows(start_minute: int, count: int) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "open_time": pd.Timestamp("2026-03-20T00:00:00Z") + pd.Timedelta(minutes=start_minute + minute),
+                    "close_time": pd.Timestamp("2026-03-20T00:00:59Z") + pd.Timedelta(minutes=start_minute + minute),
+                    "open": 100.0 + start_minute + minute,
+                    "high": 101.0 + start_minute + minute,
+                    "low": 99.0 + start_minute + minute,
+                    "close": 100.5 + start_minute + minute,
+                    "volume": 10.0 + start_minute + minute,
+                    "quote_asset_volume": 20.0 + start_minute + minute,
+                    "taker_buy_quote_volume": 8.0 + start_minute + minute,
+                    "number_of_trades": 5 + start_minute + minute,
+                }
+                for minute in range(count)
+            ]
+        )
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text("v1", encoding="utf-8")
+    base_rows = _rows(0, 384)
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE[(str(target_path), "SOLUSDT")] = (
+        signal_utils_module._path_signature(target_path),
+        base_rows.copy(),
+    )
+
+    appended_rows = _rows(384, 12)
+    marker_path = signal_utils_module._live_binance_latest_tail_path(data_cfg=data_cfg, symbol=None)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "tail_rows": [
+                    {
+                        "open_time": row["open_time"].isoformat(),
+                        "close_time": row["close_time"].isoformat(),
+                        "open": row["open"],
+                        "high": row["high"],
+                        "low": row["low"],
+                        "close": row["close"],
+                        "volume": row["volume"],
+                        "quote_asset_volume": row["quote_asset_volume"],
+                        "taker_buy_quote_volume": row["taker_buy_quote_volume"],
+                        "number_of_trades": row["number_of_trades"],
+                    }
+                    for row in appended_rows.to_dict("records")
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    target_path.write_text("v2", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_binance_klines_1m",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("full parquet load should not be used")),
+    )
+
+    out = signal_utils_module._load_live_binance_klines_tail(
+        data_cfg=data_cfg,
+        tail_bars=384,
+    )
+
+    assert len(out) == 384
+    assert out["open_time"].max() == appended_rows["open_time"].max()
+    assert out["open_time"].min() == base_rows.iloc[12]["open_time"]
+
+
+def test_load_live_binance_klines_tail_cached_signature_still_merges_preview_tail(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE.clear()
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    target_path = data_cfg.layout.binance_klines_path()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text("v1", encoding="utf-8")
+
+    base_rows = pd.DataFrame(
+        [
+            {
+                "open_time": pd.Timestamp("2026-03-20T00:00:00Z") + pd.Timedelta(minutes=minute),
+                "close_time": pd.Timestamp("2026-03-20T00:00:59Z") + pd.Timedelta(minutes=minute),
+                "open": 100.0 + minute,
+                "high": 101.0 + minute,
+                "low": 99.0 + minute,
+                "close": 100.5 + minute,
+                "volume": 10.0 + minute,
+                "quote_asset_volume": 20.0 + minute,
+                "taker_buy_quote_volume": 8.0 + minute,
+                "number_of_trades": 5 + minute,
+            }
+            for minute in range(384)
+        ]
+    )
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE[(str(target_path), "SOLUSDT")] = (
+        signal_utils_module._path_signature(target_path),
+        base_rows.copy(),
+    )
+    preview_rows = pd.DataFrame(
+        [
+            {
+                "open_time": pd.Timestamp("2026-03-20T06:24:00Z"),
+                "close_time": pd.Timestamp("2026-03-20T06:24:59Z"),
+                "open": 600.0,
+                "high": 601.0,
+                "low": 599.0,
+                "close": 600.5,
+                "volume": 610.0,
+                "quote_asset_volume": 620.0,
+                "taker_buy_quote_volume": 608.0,
+                "number_of_trades": 605,
+            }
+        ]
+    )
+
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils._load_live_binance_preview_tail",
+        lambda **kwargs: preview_rows.copy(),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_binance_klines_1m",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("full parquet load should not be used")),
+    )
+
+    out = signal_utils_module._load_live_binance_klines_tail(
+        data_cfg=data_cfg,
+        tail_bars=384,
+        allow_preview_open_bar=True,
+        now_utc=pd.Timestamp("2026-03-20T06:24:30Z"),
+    )
+
+    assert out["open_time"].max() == pd.Timestamp("2026-03-20T06:24:00Z")
+    assert len(out) == 384
+
+
+def test_load_live_binance_klines_tail_cached_signature_still_merges_latest_closed_marker(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE.clear()
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    target_path = data_cfg.layout.binance_klines_path()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text("v1", encoding="utf-8")
+
+    base_rows = pd.DataFrame(
+        [
+            {
+                "open_time": pd.Timestamp("2026-03-20T00:00:00Z") + pd.Timedelta(minutes=minute),
+                "close_time": pd.Timestamp("2026-03-20T00:00:59Z") + pd.Timedelta(minutes=minute),
+                "open": 100.0 + minute,
+                "high": 101.0 + minute,
+                "low": 99.0 + minute,
+                "close": 100.5 + minute,
+                "volume": 10.0 + minute,
+                "quote_asset_volume": 20.0 + minute,
+                "taker_buy_quote_volume": 8.0 + minute,
+                "number_of_trades": 5 + minute,
+            }
+            for minute in range(384)
+        ]
+    )
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE[(str(target_path), "SOLUSDT")] = (
+        signal_utils_module._path_signature(target_path),
+        base_rows.copy(),
+    )
+    appended_rows = pd.DataFrame(
+        [
+            {
+                "open_time": pd.Timestamp("2026-03-20T06:24:00Z"),
+                "close_time": pd.Timestamp("2026-03-20T06:24:59Z"),
+                "open": 600.0,
+                "high": 601.0,
+                "low": 599.0,
+                "close": 600.5,
+                "volume": 610.0,
+                "quote_asset_volume": 620.0,
+                "taker_buy_quote_volume": 608.0,
+                "number_of_trades": 605,
+            }
+        ]
+    )
+    marker_path = signal_utils_module._live_binance_latest_tail_path(data_cfg=data_cfg, symbol=None)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "tail_rows": [
+                    {
+                        "open_time": row["open_time"].isoformat(),
+                        "close_time": row["close_time"].isoformat(),
+                        "open": row["open"],
+                        "high": row["high"],
+                        "low": row["low"],
+                        "close": row["close"],
+                        "volume": row["volume"],
+                        "quote_asset_volume": row["quote_asset_volume"],
+                        "taker_buy_quote_volume": row["taker_buy_quote_volume"],
+                        "number_of_trades": row["number_of_trades"],
+                    }
+                    for row in appended_rows.to_dict("records")
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_binance_klines_1m",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("full parquet load should not be used")),
+    )
+
+    out = signal_utils_module._load_live_binance_klines_tail(
+        data_cfg=data_cfg,
+        tail_bars=384,
+        allow_preview_open_bar=False,
+    )
+
+    assert out["open_time"].max() == pd.Timestamp("2026-03-20T06:24:00Z")
+    assert len(out) == 384
+
+
+def test_build_live_feature_frame_stateful_marker_append_matches_full_rebuild_for_active_offsets(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm_baseline", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", "0")
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_BUILD_TAIL_BARS", "384")
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_TAIL_CYCLES", "2")
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE.clear()
+    signal_utils_module._LIVE_FEATURE_STATE_CACHE.clear()
+
+    def _rows(start_minute: int, count: int, *, base_price: float) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "open_time": pd.Timestamp("2026-03-20T00:00:00Z") + pd.Timedelta(minutes=start_minute + minute),
+                    "close_time": pd.Timestamp("2026-03-20T00:00:59Z") + pd.Timedelta(minutes=start_minute + minute),
+                    "open": base_price + start_minute + minute * 0.5,
+                    "high": base_price + start_minute + minute * 0.5 + 0.8,
+                    "low": base_price + start_minute + minute * 0.5 - 0.7,
+                    "close": base_price + start_minute + minute * 0.5 + 0.2,
+                    "volume": 100.0 + start_minute + minute,
+                    "quote_asset_volume": 200.0 + start_minute + minute * 2.0,
+                    "taker_buy_quote_volume": 90.0 + start_minute + minute,
+                    "number_of_trades": 50 + start_minute + minute,
+                }
+                for minute in range(count)
+            ]
+        )
+
+    base_rows = _rows(0, 384, base_price=100.0)
+    appended_rows = _rows(384, 12, base_price=100.0)
+    full_rows = pd.concat([base_rows, appended_rows], ignore_index=True)
+    btc_base_rows = _rows(0, 384, base_price=200.0)
+    btc_appended_rows = _rows(384, 12, base_price=200.0)
+    btc_full_rows = pd.concat([btc_base_rows, btc_appended_rows], ignore_index=True)
+    oracle_prices = pd.DataFrame(
+        [
+            {
+                "asset": "sol",
+                "cycle_start_ts": int((pd.Timestamp("2026-03-20T00:00:00Z") + pd.Timedelta(minutes=15 * idx)).timestamp()),
+                "cycle_end_ts": int((pd.Timestamp("2026-03-20T00:15:00Z") + pd.Timedelta(minutes=15 * idx)).timestamp()),
+                "price_to_beat": 150.0 + idx,
+                "final_price": None,
+            }
+            for idx in range(40)
+        ]
+    )
+
+    monkeypatch.setattr("pm15min.live.signal.utils.ensure_live_trade_inputs_fresh", lambda *args, **kwargs: {"status": "fresh"})
+    monkeypatch.setattr("pm15min.live.signal.utils.load_oracle_prices_table", lambda *args, **kwargs: oracle_prices.copy())
+    monkeypatch.setattr("pm15min.live.signal.utils.build_live_runtime_oracle_prices", lambda **kwargs: oracle_prices.copy())
+
+    load_calls = {"sol": 0, "btc": 0}
+
+    def _load_binance(data_cfg, symbol=None):
+        if symbol == "BTCUSDT":
+            load_calls["btc"] += 1
+            return btc_base_rows.copy()
+        load_calls["sol"] += 1
+        return base_rows.copy()
+
+    monkeypatch.setattr("pm15min.live.signal.utils.load_binance_klines_1m", _load_binance)
+
+    first = build_live_feature_frame(cfg, feature_set="bs_q_replace_direction", retain_offsets=(7, 8, 9))
+    assert not first.empty
+    assert load_calls == {"sol": 1, "btc": 1}
+
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    btc_cfg = DataConfig.build(market="btc", cycle="15m", surface="live", root=root)
+    data_cfg.layout.binance_klines_path().parent.mkdir(parents=True, exist_ok=True)
+    data_cfg.layout.binance_klines_path().write_text("v1", encoding="utf-8")
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").parent.mkdir(parents=True, exist_ok=True)
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").write_text("v1", encoding="utf-8")
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE[(str(data_cfg.layout.binance_klines_path()), "SOLUSDT")] = (
+        signal_utils_module._path_signature(data_cfg.layout.binance_klines_path()),
+        base_rows.copy(),
+    )
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE[(str(btc_cfg.layout.binance_klines_path(symbol="BTCUSDT")), "BTCUSDT")] = (
+        signal_utils_module._path_signature(btc_cfg.layout.binance_klines_path(symbol="BTCUSDT")),
+        btc_base_rows.copy(),
+    )
+
+    for marker_cfg, rows, symbol in (
+        (data_cfg, appended_rows, "SOLUSDT"),
+        (btc_cfg, btc_appended_rows, "BTCUSDT"),
+    ):
+        marker_path = signal_utils_module._live_binance_latest_tail_path(data_cfg=marker_cfg, symbol=symbol)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "tail_rows": [
+                        {
+                            "open_time": row["open_time"].isoformat(),
+                            "close_time": row["close_time"].isoformat(),
+                            "open": row["open"],
+                            "high": row["high"],
+                            "low": row["low"],
+                            "close": row["close"],
+                            "volume": row["volume"],
+                            "quote_asset_volume": row["quote_asset_volume"],
+                            "taker_buy_quote_volume": row["taker_buy_quote_volume"],
+                            "number_of_trades": row["number_of_trades"],
+                        }
+                        for row in rows.to_dict("records")
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    data_cfg.layout.binance_klines_path().write_text("v2", encoding="utf-8")
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").write_text("v2", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_binance_klines_1m",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("stateful marker append should avoid full parquet load")),
+    )
+
+    actual = build_live_feature_frame(cfg, feature_set="bs_q_replace_direction", retain_offsets=(7, 8, 9))
+
+    full_tail_bars = signal_utils_module._live_feature_build_tail_bars(cycle_minutes=15, tail_cycles=2)
+    expected = signal_utils_module.build_feature_frame_df(
+        full_rows.tail(full_tail_bars).reset_index(drop=True),
+        feature_set="bs_q_replace_direction",
+        oracle_prices=oracle_prices.copy(),
+        btc_klines=btc_full_rows.tail(full_tail_bars).reset_index(drop=True),
+        cycle="15m",
+    )
+    expected = signal_utils_module._trim_live_feature_frame(
+        expected,
+        cycle_minutes=15,
+        retain_offsets=(7, 8, 9),
+        tail_cycles=2,
+    )
+    expected_latest_cycle = pd.to_datetime(expected["cycle_start_ts"], utc=True, errors="coerce").max()
+    expected_latest = expected.loc[pd.to_datetime(expected["cycle_start_ts"], utc=True, errors="coerce").eq(expected_latest_cycle)].reset_index(drop=True)
+    actual_latest = actual.loc[pd.to_datetime(actual["cycle_start_ts"], utc=True, errors="coerce").eq(expected_latest_cycle)].reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(actual_latest, expected_latest, check_exact=False, atol=1e-9, rtol=1e-9)
+
+
+def test_build_live_feature_frame_invalidates_state_cache_when_mid_tail_value_changes(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", "0")
+    signal_utils_module._LIVE_FEATURE_STATE_CACHE.clear()
+
+    monkeypatch.setattr("pm15min.live.signal.utils.ensure_live_trade_inputs_fresh", lambda *args, **kwargs: {"status": "fresh"})
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_oracle_prices_table",
+        lambda *args, **kwargs: pd.DataFrame([{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_live_runtime_oracle_prices",
+        lambda **kwargs: pd.DataFrame([{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]),
+    )
+
+    base_rows = pd.DataFrame(
+        [
+            {
+                "open_time": pd.Timestamp("2026-03-20T00:00:00Z") + pd.Timedelta(minutes=minute),
+                "close_time": pd.Timestamp("2026-03-20T00:00:59Z") + pd.Timedelta(minutes=minute),
+                "open": 100.0 + minute,
+                "high": 101.0 + minute,
+                "low": 99.0 + minute,
+                "close": 100.5 + minute,
+                "volume": 10.0 + minute,
+                "quote_asset_volume": 20.0 + minute,
+                "taker_buy_quote_volume": 8.0 + minute,
+                "number_of_trades": 5 + minute,
+            }
+            for minute in range(16)
+        ]
+    )
+    corrected_rows = base_rows.copy()
+    corrected_rows.loc[5, "close"] = 999.0
+    current_rows = {"value": base_rows}
+    builder_calls = {"count": 0}
+
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_binance_klines_1m",
+        lambda *args, **kwargs: current_rows["value"].copy(),
+    )
+
+    def _build_feature_frame(*args, **kwargs):
+        builder_calls["count"] += 1
+        return pd.DataFrame(
+            [
+                {
+                    "decision_ts": pd.Timestamp("2026-03-20T00:15:00Z"),
+                    "cycle_start_ts": pd.Timestamp("2026-03-20T00:00:00Z"),
+                    "cycle_end_ts": pd.Timestamp("2026-03-20T00:15:00Z"),
+                    "offset": 1,
+                    "ret_30m": float(builder_calls["count"]),
+                }
+            ]
+        )
+
+    monkeypatch.setattr("pm15min.live.signal.utils.build_feature_frame_df", _build_feature_frame)
+
+    first = build_live_feature_frame(cfg, feature_set="v6_user_core")
+    current_rows["value"] = corrected_rows
+    second = build_live_feature_frame(cfg, feature_set="v6_user_core")
+
+    assert builder_calls["count"] == 2
+    assert float(first.iloc[0]["ret_30m"]) == 1.0
+    assert float(second.iloc[0]["ret_30m"]) == 2.0
+
+
+def test_ensure_live_closed_bar_inputs_ready_waits_for_latest_tail_markers(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setenv("PM15MIN_LIVE_ENFORCE_EXPECTED_CLOSED_BAR", "1")
+    monkeypatch.setenv("PM15MIN_LIVE_EXPECTED_CLOSED_BAR_WAIT_SEC", "0.5")
+    monkeypatch.setenv("PM15MIN_LIVE_EXPECTED_CLOSED_BAR_POLL_SEC", "0.01")
+
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    btc_cfg = DataConfig.build(market="btc", cycle="15m", surface="live", root=root)
+
+    def _write_marker(path: Path, latest_open_time: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "latest_open_time": latest_open_time,
+                    "tail_rows": [
+                        {
+                            "open_time": latest_open_time,
+                            "close_time": (pd.Timestamp(latest_open_time) + pd.Timedelta(seconds=59)).isoformat(),
+                            "close": 1.0,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    sol_marker = signal_utils_module._live_binance_latest_tail_path(data_cfg=data_cfg, symbol="SOLUSDT")
+    btc_marker = signal_utils_module._live_binance_latest_tail_path(data_cfg=btc_cfg, symbol="BTCUSDT")
+    _write_marker(sol_marker, "2026-03-20T00:05:00+00:00")
+    _write_marker(btc_marker, "2026-03-20T00:05:00+00:00")
+
+    def _late_update() -> None:
+        time.sleep(0.05)
+        _write_marker(sol_marker, "2026-03-20T00:06:00+00:00")
+        _write_marker(btc_marker, "2026-03-20T00:06:00+00:00")
+
+    worker = threading.Thread(target=_late_update, daemon=True)
+    worker.start()
+
+    signal_utils_module._ensure_live_closed_bar_inputs_ready(
+        data_cfg=data_cfg,
+        btc_cfg=btc_cfg,
+        now_utc=pd.Timestamp("2026-03-20T00:07:00.100000+00:00"),
+        cycle_minutes=15,
+        retain_offsets=(7, 8, 9),
+    )
+
+
+def test_ensure_live_closed_bar_inputs_ready_raises_when_latest_tail_marker_stale(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setenv("PM15MIN_LIVE_ENFORCE_EXPECTED_CLOSED_BAR", "1")
+    monkeypatch.setenv("PM15MIN_LIVE_EXPECTED_CLOSED_BAR_WAIT_SEC", "0.05")
+    monkeypatch.setenv("PM15MIN_LIVE_EXPECTED_CLOSED_BAR_POLL_SEC", "0.01")
+
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    marker_path = signal_utils_module._live_binance_latest_tail_path(data_cfg=data_cfg, symbol="SOLUSDT")
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "latest_open_time": "2026-03-20T00:05:00+00:00",
+                "tail_rows": [
+                    {
+                        "open_time": "2026-03-20T00:05:00+00:00",
+                        "close_time": "2026-03-20T00:05:59+00:00",
+                        "close": 1.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        signal_utils_module._ensure_live_closed_bar_inputs_ready(
+            data_cfg=data_cfg,
+            btc_cfg=None,
+            now_utc=pd.Timestamp("2026-03-20T00:07:00.100000+00:00"),
+            cycle_minutes=15,
+            retain_offsets=(7, 8, 9),
+        )
+    except signal_utils_module.LiveClosedBarNotReadyError as exc:
+        assert "expected_open_time=2026-03-20T00:06:00+00:00" in str(exc)
+        assert "SOLUSDT=2026-03-20T00:05:00+00:00" in str(exc)
+    else:
+        raise AssertionError("expected LiveClosedBarNotReadyError")
+
+
+def test_ensure_live_closed_bar_inputs_ready_skips_non_boundary_minutes(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setenv("PM15MIN_LIVE_ENFORCE_EXPECTED_CLOSED_BAR", "1")
+
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    marker_path = signal_utils_module._live_binance_latest_tail_path(data_cfg=data_cfg, symbol="SOLUSDT")
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "latest_open_time": "2026-03-20T00:01:00+00:00",
+                "tail_rows": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    signal_utils_module._ensure_live_closed_bar_inputs_ready(
+        data_cfg=data_cfg,
+        btc_cfg=None,
+        now_utc=pd.Timestamp("2026-03-20T00:03:00.100000+00:00"),
+        cycle_minutes=15,
+        retain_offsets=(7, 8, 9),
+    )
 
 
 def test_load_live_account_context_reuses_cached_snapshot_when_files_unchanged(tmp_path: Path, monkeypatch) -> None:

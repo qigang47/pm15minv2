@@ -9,6 +9,8 @@ import pytest
 
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
+from pm15min.data.pipelines.oracle_prices import build_oracle_prices_15m
+from pm15min.data.pipelines.truth import build_truth_15m
 from pm15min.research.config import ResearchConfig
 from pm15min.research.bundles.builder import build_model_bundle
 from pm15min.research.backtests.engine import run_research_backtest
@@ -65,6 +67,34 @@ def _sample_oracle_prices(asset: str, *, cycle_start_ts: int, n_cycles: int, pri
     return pd.DataFrame(rows)
 
 
+def _sample_oracle_prices_for_cycle(
+    asset: str,
+    *,
+    cycle_start_ts: int,
+    cycle_seconds: int,
+    n_cycles: int,
+    price_base: float,
+) -> pd.DataFrame:
+    rows = []
+    for offset in range(n_cycles):
+        start_ts = cycle_start_ts + offset * cycle_seconds
+        rows.append(
+            {
+                "asset": asset,
+                "cycle_start_ts": start_ts,
+                "cycle_end_ts": start_ts + cycle_seconds,
+                "price_to_beat": price_base + offset * 2.0,
+                "final_price": price_base + offset * 2.0 + 1.0,
+                "source_price_to_beat": "direct_api",
+                "source_final_price": "streams_rpc",
+                "has_price_to_beat": True,
+                "has_final_price": True,
+                "has_both": True,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def test_build_feature_frame_dataset(tmp_path: Path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
@@ -91,7 +121,7 @@ def test_build_feature_frame_dataset(tmp_path: Path) -> None:
         feature_set="deep_otm_v1",
         root=root,
     )
-    summary = build_feature_frame_dataset(cfg)
+    summary = build_feature_frame_dataset(cfg, skip_freshness=True)
 
     out = pd.read_parquet(cfg.layout.feature_frame_path(cfg.feature_set, source_surface=cfg.source_surface))
     assert summary["rows_written"] == len(out)
@@ -200,7 +230,7 @@ def test_build_label_frame_dataset_truth(tmp_path: Path) -> None:
         label_set="truth",
         root=root,
     )
-    summary = build_label_frame_dataset(cfg)
+    summary = build_label_frame_dataset(cfg, skip_freshness=True)
     out = pd.read_parquet(cfg.layout.label_frame_path(cfg.label_set))
     manifest = read_manifest(cfg.layout.label_frame_manifest_path(cfg.label_set))
 
@@ -262,15 +292,103 @@ def test_build_label_frame_dataset_truth_prefers_resolved_oracle_candidate(tmp_p
         label_set="truth",
         root=root,
     )
-    summary = build_label_frame_dataset(cfg)
+    summary = build_label_frame_dataset(cfg, skip_freshness=True)
     out = pd.read_parquet(cfg.layout.label_frame_path(cfg.label_set))
 
     assert summary["rows_written"] == 1
     assert len(out) == 1
-    assert out.iloc[0]["winner_side"] == "DOWN"
+    assert out.iloc[0]["winner_side"] == "UP"
     assert bool(out.iloc[0]["resolved"]) is True
     assert bool(out.iloc[0]["full_truth"]) is True
-    assert out.iloc[0]["settlement_source"] == "oracle_prices"
+    assert out.iloc[0]["settlement_source"] == "streams_rpc"
+
+
+def test_build_oracle_truth_and_label_frame_support_cycle_5m(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="xrp", cycle="5m", surface="backtest", root=root)
+
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "xrp",
+                    "cycle": "5m",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_323_500,
+                    "token_up": "tok-up-1",
+                    "token_down": "tok-down-1",
+                    "slug": "xrp-updown-5m-1772323200",
+                    "question": "XRP up?",
+                    "resolution_source": "data.chain.link/streams/xrp-usd",
+                    "event_id": "event-1",
+                    "event_slug": "event-1",
+                    "event_title": "XRP up?",
+                    "series_slug": "xrp-up-or-down-5m",
+                    "closed_ts": 1_772_323_500,
+                    "source_snapshot_ts": "2026-03-01T00-05-00Z",
+                },
+                {
+                    "market_id": "market-2",
+                    "condition_id": "cond-2",
+                    "asset": "xrp",
+                    "cycle": "5m",
+                    "cycle_start_ts": 1_772_323_500,
+                    "cycle_end_ts": 1_772_323_800,
+                    "token_up": "tok-up-2",
+                    "token_down": "tok-down-2",
+                    "slug": "xrp-updown-5m-1772323500",
+                    "question": "XRP up again?",
+                    "resolution_source": "data.chain.link/streams/xrp-usd",
+                    "event_id": "event-2",
+                    "event_slug": "event-2",
+                    "event_title": "XRP up again?",
+                    "series_slug": "xrp-up-or-down-5m",
+                    "closed_ts": 1_772_323_800,
+                    "source_snapshot_ts": "2026-03-01T00-10-00Z",
+                },
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        _sample_oracle_prices_for_cycle(
+            "xrp",
+            cycle_start_ts=1_772_323_200,
+            cycle_seconds=300,
+            n_cycles=2,
+            price_base=2.0,
+        ),
+        data_cfg.layout.direct_oracle_source_path,
+    )
+
+    oracle_summary = build_oracle_prices_15m(data_cfg)
+    truth_summary = build_truth_15m(data_cfg)
+
+    cfg = ResearchConfig.build(
+        market="xrp",
+        cycle="5m",
+        profile="deep_otm",
+        source_surface="backtest",
+        label_set="truth",
+        root=root,
+    )
+    label_summary = build_label_frame_dataset(cfg, skip_freshness=True)
+    out = pd.read_parquet(cfg.layout.label_frame_path(cfg.label_set))
+    manifest = read_manifest(cfg.layout.label_frame_manifest_path(cfg.label_set))
+
+    assert oracle_summary["dataset"] == "oracle_prices_5m"
+    assert truth_summary["dataset"] == "truth_5m"
+    assert label_summary["rows_written"] == 2
+    assert len(out) == 2
+    assert out["market_id"].tolist() == ["market-1", "market-2"]
+    assert out["winner_side"].tolist() == ["UP", "UP"]
+    assert float(out.iloc[0]["price_to_beat"]) == 2.0
+    assert float(out.iloc[0]["final_price"]) == 3.0
+    input_kinds = [str(item.get("kind")) for item in manifest.inputs]
+    assert "truth_5m" in input_kinds
+    assert "oracle_prices_5m" in input_kinds
 
 
 def test_build_training_set_dataset_direction_and_reversal(tmp_path: Path) -> None:

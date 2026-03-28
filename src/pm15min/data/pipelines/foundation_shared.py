@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--oracle-lookback-days", type=int, default=2)
     parser.add_argument("--oracle-lookahead-hours", type=int, default=24)
     parser.add_argument("--no-direct-oracle", action="store_true")
+    parser.add_argument("--no-streams", action="store_true")
     parser.add_argument("--no-orderbooks", action="store_true")
     return parser
 
@@ -80,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         oracle_lookback_days=int(args.oracle_lookback_days),
         oracle_lookahead_hours=int(args.oracle_lookahead_hours),
         include_direct_oracle=not bool(args.no_direct_oracle),
+        include_streams=not bool(args.no_streams),
         include_orderbooks=not bool(args.no_orderbooks),
     )
     print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))

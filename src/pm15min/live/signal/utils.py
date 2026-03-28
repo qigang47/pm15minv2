@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ from pm15min.data.config import DataConfig
 from pm15min.data.pipelines.binance_klines import sync_binance_klines_1m
 from pm15min.data.pipelines.market_catalog import sync_market_catalog
 from pm15min.data.queries.loaders import load_binance_klines_1m, load_oracle_prices_table
+from pm15min.data.sources.binance_spot import BinanceSpotKlinesClient, BinanceSpotKlinesRequest
 from pm15min.live.oracle import build_live_runtime_oracle_prices
 from ..account import summarize_account_state_payload, summarize_open_orders_snapshot, summarize_positions_snapshot
 from ..account import load_latest_open_orders_snapshot, load_latest_positions_snapshot
@@ -31,8 +34,25 @@ DEFAULT_LIVE_MARKET_CATALOG_LOOKAHEAD_HOURS = 24
 DEFAULT_LIVE_BINANCE_LOOKBACK_MINUTES = 2880
 DEFAULT_LIVE_BINANCE_BATCH_LIMIT = 1000
 
-_LIVE_FEATURE_FRAME_CACHE: dict[tuple[str, str, int, str, tuple[int, ...], int], tuple[float, pd.DataFrame]] = {}
+@dataclass
+class LiveFeatureState:
+    source_signature: tuple[object, ...]
+    features: pd.DataFrame
+    build_tail_bars: int
+    build_mode: str
+
+
+class LiveClosedBarNotReadyError(RuntimeError):
+    """Raised when live feature refresh would otherwise compute on stale 1m inputs."""
+
+
+_LIVE_FEATURE_FRAME_CACHE: dict[
+    tuple[str, str, int, str, tuple[int, ...], int],
+    tuple[float, tuple[object, ...], pd.DataFrame],
+] = {}
 _LIVE_FEATURE_FRAME_CACHE_LOCK = threading.Lock()
+_LIVE_FEATURE_STATE_CACHE: dict[tuple[str, str, int, str, tuple[int, ...], int], LiveFeatureState] = {}
+_LIVE_FEATURE_STATE_CACHE_LOCK = threading.Lock()
 _LIVE_ACCOUNT_CONTEXT_CACHE: dict[tuple[str, str], tuple[float, tuple[int | None, int | None], dict[str, object]]] = {}
 _LIVE_ACCOUNT_CONTEXT_CACHE_LOCK = threading.Lock()
 _LIVE_KLINES_TAIL_CACHE: dict[tuple[str, str], tuple[tuple[int | None, int | None], pd.DataFrame]] = {}
@@ -52,6 +72,7 @@ def build_live_feature_frame(
     *,
     feature_set: str,
     retain_offsets: tuple[int, ...] | None = None,
+    allow_preview_open_bar: bool = False,
 ) -> pd.DataFrame:
     cache_ttl_seconds = _env_float("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", default=0.0)
     resolved_retain_offsets = tuple(retain_offsets or _env_int_list("PM15MIN_LIVE_FEATURE_RETAIN_OFFSETS"))
@@ -64,10 +85,6 @@ def build_live_feature_frame(
         tuple(resolved_retain_offsets),
         int(tail_cycles),
     )
-    if cache_ttl_seconds > 0.0:
-        cached = _load_cached_live_feature_frame(cache_key=cache_key)
-        if cached is not None:
-            return cached
     data_cfg = DataConfig.build(
         market=cfg.asset.slug,
         cycle=f"{int(cfg.cycle_minutes)}m",
@@ -75,10 +92,29 @@ def build_live_feature_frame(
         root=cfg.layout.rewrite.root,
     )
     ensure_live_trade_inputs_fresh(cfg)
+    btc_cfg = None
+    if cfg.asset.slug != "btc":
+        btc_cfg = DataConfig.build(
+            market="btc",
+            cycle=f"{int(cfg.cycle_minutes)}m",
+            surface="live",
+            root=cfg.layout.rewrite.root,
+        )
+    now_utc = pd.Timestamp.now(tz="UTC")
+    if not allow_preview_open_bar:
+        _ensure_live_closed_bar_inputs_ready(
+            data_cfg=data_cfg,
+            btc_cfg=btc_cfg,
+            now_utc=now_utc,
+            cycle_minutes=int(cfg.cycle_minutes),
+            retain_offsets=resolved_retain_offsets,
+        )
     raw_tail_bars = _live_feature_build_tail_bars(cycle_minutes=int(cfg.cycle_minutes), tail_cycles=tail_cycles)
     raw_klines = _load_live_binance_klines_tail(
         data_cfg=data_cfg,
         tail_bars=raw_tail_bars,
+        allow_preview_open_bar=allow_preview_open_bar,
+        now_utc=now_utc,
     )
     oracle_prices = build_live_runtime_oracle_prices(
         data_cfg=data_cfg,
@@ -87,23 +123,59 @@ def build_live_feature_frame(
         oracle_prices_table=load_oracle_prices_table(data_cfg),
     )
     btc_klines = None
-    if cfg.asset.slug != "btc":
-        btc_cfg = DataConfig.build(
-            market="btc",
-            cycle=f"{int(cfg.cycle_minutes)}m",
-            surface="live",
-            root=cfg.layout.rewrite.root,
-        )
+    if btc_cfg is not None:
         btc_klines = _load_live_binance_klines_tail(
             data_cfg=btc_cfg,
             symbol="BTCUSDT",
             tail_bars=raw_tail_bars,
+            allow_preview_open_bar=allow_preview_open_bar,
+            now_utc=now_utc,
         )
+    source_signature = _live_feature_source_signature(
+        raw_klines=raw_klines,
+        btc_klines=btc_klines,
+        oracle_prices=oracle_prices,
+    )
+    state_cached = _load_live_feature_state(
+        cache_key=cache_key,
+        source_signature=source_signature,
+    )
+    if state_cached is not None:
+        return state_cached
+    if cache_ttl_seconds > 0.0:
+        cached = _load_cached_live_feature_frame(
+            cache_key=cache_key,
+            source_signature=source_signature,
+        )
+        if cached is not None:
+            _store_live_feature_state(
+                cache_key=cache_key,
+                source_signature=source_signature,
+                features=cached,
+                build_tail_bars=int(raw_tail_bars),
+                build_mode="ttl_cache_hit",
+            )
+            return cached
+    build_tail_bars = int(raw_tail_bars)
+    build_mode = "full_tail"
+    prior_state = _load_any_live_feature_state(cache_key=cache_key)
+    if prior_state is not None and _can_incrementally_refresh_feature_state(
+        prior_state=prior_state,
+        source_signature=source_signature,
+    ):
+        build_tail_bars = _live_feature_incremental_build_tail_bars(
+            cycle_minutes=int(cfg.cycle_minutes),
+            tail_cycles=tail_cycles,
+            full_tail_bars=int(raw_tail_bars),
+        )
+        build_mode = "incremental_tail"
+    builder_raw_klines = _slice_feature_builder_tail(raw_klines, tail_bars=build_tail_bars)
+    builder_btc_klines = _slice_feature_builder_tail(btc_klines, tail_bars=build_tail_bars)
     features = build_feature_frame_df(
-        raw_klines,
+        builder_raw_klines,
         feature_set=feature_set,
         oracle_prices=oracle_prices,
-        btc_klines=btc_klines,
+        btc_klines=builder_btc_klines,
         cycle=f"{int(cfg.cycle_minutes)}m",
     )
     features = _trim_live_feature_frame(
@@ -112,23 +184,35 @@ def build_live_feature_frame(
         retain_offsets=resolved_retain_offsets,
         tail_cycles=tail_cycles,
     )
+    _store_live_feature_state(
+        cache_key=cache_key,
+        source_signature=source_signature,
+        features=features,
+        build_tail_bars=build_tail_bars,
+        build_mode=build_mode,
+    )
     if cache_ttl_seconds > 0.0:
         _store_cached_live_feature_frame(
             cache_key=cache_key,
             cache_ttl_seconds=cache_ttl_seconds,
+            source_signature=source_signature,
             features=features,
         )
     return features
 
 
-def _load_cached_live_feature_frame(*, cache_key: tuple[str, str, int, str, tuple[int, ...], int]) -> pd.DataFrame | None:
+def _load_cached_live_feature_frame(
+    *,
+    cache_key: tuple[str, str, int, str, tuple[int, ...], int],
+    source_signature: tuple[object, ...],
+) -> pd.DataFrame | None:
     now_monotonic = time.monotonic()
     with _LIVE_FEATURE_FRAME_CACHE_LOCK:
         cached = _LIVE_FEATURE_FRAME_CACHE.get(cache_key)
         if cached is None:
             return None
-        expires_at, frame = cached
-        if now_monotonic >= float(expires_at):
+        expires_at, cached_source_signature, frame = cached
+        if now_monotonic >= float(expires_at) or cached_source_signature != source_signature:
             _LIVE_FEATURE_FRAME_CACHE.pop(cache_key, None)
             return None
         return frame.copy(deep=False)
@@ -138,12 +222,113 @@ def _store_cached_live_feature_frame(
     *,
     cache_key: tuple[str, str, int, str, tuple[int, ...], int],
     cache_ttl_seconds: float,
+    source_signature: tuple[object, ...],
     features: pd.DataFrame,
 ) -> None:
     with _LIVE_FEATURE_FRAME_CACHE_LOCK:
         _LIVE_FEATURE_FRAME_CACHE[cache_key] = (
             time.monotonic() + max(0.0, float(cache_ttl_seconds)),
+            tuple(source_signature),
             features.copy(deep=False),
+        )
+
+
+def _live_feature_source_signature(
+    *,
+    raw_klines: pd.DataFrame,
+    btc_klines: pd.DataFrame | None,
+    oracle_prices: pd.DataFrame,
+) -> tuple[object, ...]:
+    return (
+        _logical_frame_signature(raw_klines, key_columns=("open_time",), value_columns=("close",)),
+        _logical_frame_signature(btc_klines, key_columns=("open_time",), value_columns=("close",))
+        if isinstance(btc_klines, pd.DataFrame)
+        else None,
+        _logical_frame_signature(
+            oracle_prices,
+            key_columns=("cycle_start_ts", "cycle_end_ts"),
+            value_columns=("price_to_beat", "final_price"),
+        ),
+    )
+
+
+def _logical_frame_signature(
+    frame: pd.DataFrame | None,
+    *,
+    key_columns: tuple[str, ...],
+    value_columns: tuple[str, ...],
+) -> tuple[object, ...]:
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return (0, None)
+    selected_columns = [column for column in [*key_columns, *value_columns] if column in frame.columns]
+    if not selected_columns:
+        return (int(len(frame)), tuple())
+    subset = frame.loc[:, selected_columns].copy()
+    row_hashes = pd.util.hash_pandas_object(subset, index=False)
+    digest = hashlib.blake2b(
+        row_hashes.to_numpy(dtype="uint64", copy=False).tobytes(),
+        digest_size=16,
+    ).hexdigest()
+    return (int(len(frame)), tuple(selected_columns), digest)
+
+
+def _normalize_signature_value(value: object) -> object:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.tz_convert("UTC").isoformat() if value.tzinfo is not None else value.isoformat()
+    if isinstance(value, datetime):
+        timestamp = pd.Timestamp(value)
+        return timestamp.tz_convert("UTC").isoformat() if timestamp.tzinfo is not None else timestamp.isoformat()
+    if isinstance(value, (int, str, bool)):
+        return value
+    if isinstance(value, float):
+        return round(float(value), 10)
+    return str(value)
+
+
+def _load_live_feature_state(
+    *,
+    cache_key: tuple[str, str, int, str, tuple[int, ...], int],
+    source_signature: tuple[object, ...],
+) -> pd.DataFrame | None:
+    with _LIVE_FEATURE_STATE_CACHE_LOCK:
+        state = _LIVE_FEATURE_STATE_CACHE.get(cache_key)
+        if state is None or state.source_signature != source_signature:
+            return None
+        return state.features.copy(deep=False)
+
+
+def _load_any_live_feature_state(
+    *,
+    cache_key: tuple[str, str, int, str, tuple[int, ...], int],
+) -> LiveFeatureState | None:
+    with _LIVE_FEATURE_STATE_CACHE_LOCK:
+        state = _LIVE_FEATURE_STATE_CACHE.get(cache_key)
+        if state is None:
+            return None
+        return LiveFeatureState(
+            source_signature=tuple(state.source_signature),
+            features=state.features.copy(deep=False),
+            build_tail_bars=int(state.build_tail_bars),
+            build_mode=str(state.build_mode),
+        )
+
+
+def _store_live_feature_state(
+    *,
+    cache_key: tuple[str, str, int, str, tuple[int, ...], int],
+    source_signature: tuple[object, ...],
+    features: pd.DataFrame,
+    build_tail_bars: int,
+    build_mode: str,
+) -> None:
+    with _LIVE_FEATURE_STATE_CACHE_LOCK:
+        _LIVE_FEATURE_STATE_CACHE[cache_key] = LiveFeatureState(
+            source_signature=tuple(source_signature),
+            features=features.copy(deep=False),
+            build_tail_bars=int(build_tail_bars),
+            build_mode=str(build_mode),
         )
 
 
@@ -193,30 +378,372 @@ def _live_feature_build_tail_bars(*, cycle_minutes: int, tail_cycles: int) -> in
     return max(int(requested), int(minimum))
 
 
+def _live_feature_incremental_build_tail_bars(
+    *,
+    cycle_minutes: int,
+    tail_cycles: int,
+    full_tail_bars: int,
+) -> int:
+    requested = _env_int("PM15MIN_LIVE_FEATURE_INCREMENTAL_BUILD_TAIL_BARS", default=320)
+    minimum = max(260, int(cycle_minutes) * max(4, int(tail_cycles) + 2))
+    return max(int(min(full_tail_bars, requested)), int(minimum))
+
+
+def _slice_feature_builder_tail(frame: pd.DataFrame | None, *, tail_bars: int) -> pd.DataFrame | None:
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return frame
+    limit = max(1, int(tail_bars))
+    if len(frame) <= limit:
+        return frame
+    return frame.tail(limit).reset_index(drop=True)
+
+
+def _can_incrementally_refresh_feature_state(
+    *,
+    prior_state: LiveFeatureState,
+    source_signature: tuple[object, ...],
+) -> bool:
+    return tuple(prior_state.source_signature) != tuple(source_signature)
+
+
 def _load_live_binance_klines_tail(
     *,
     data_cfg: DataConfig,
     symbol: str | None = None,
     tail_bars: int,
+    allow_preview_open_bar: bool = False,
+    now_utc: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     path = data_cfg.layout.binance_klines_path(symbol=symbol)
     cache_key = (str(path), str(symbol or data_cfg.asset.binance_symbol))
     signature = _path_signature(path)
+    cached_frame: pd.DataFrame | None = None
     if signature[0] is not None:
         with _LIVE_KLINES_TAIL_CACHE_LOCK:
             cached = _LIVE_KLINES_TAIL_CACHE.get(cache_key)
             if cached is not None and cached[0] == signature:
-                return cached[1].copy(deep=False)
-    raw = load_binance_klines_1m(data_cfg, symbol=symbol)
-    if isinstance(raw, pd.DataFrame) and not raw.empty and int(tail_bars) > 0 and len(raw) > int(tail_bars):
-        raw = raw.tail(int(tail_bars)).reset_index(drop=True)
+                cached_frame = cached[1].copy(deep=False)
+            if cached is not None:
+                cached_frame = cached[1].copy(deep=False)
+    marker_frame = _load_live_binance_latest_tail_marker(
+        data_cfg=data_cfg,
+        symbol=symbol,
+    )
+    base_frame: pd.DataFrame | None = None
+    if isinstance(cached_frame, pd.DataFrame) and not cached_frame.empty and isinstance(marker_frame, pd.DataFrame):
+        merged = _merge_cached_kline_tail_with_marker(
+            cached_frame=cached_frame,
+            marker_frame=marker_frame,
+            tail_bars=tail_bars,
+        )
+        if merged is not None:
+            if signature[0] is not None:
+                with _LIVE_KLINES_TAIL_CACHE_LOCK:
+                    _LIVE_KLINES_TAIL_CACHE[cache_key] = (
+                        signature,
+                        merged.copy(deep=False),
+                    )
+            base_frame = merged
+    if base_frame is None and isinstance(cached_frame, pd.DataFrame) and not cached_frame.empty:
+        base_frame = cached_frame
+    if base_frame is None:
+        raw = load_binance_klines_1m(data_cfg, symbol=symbol)
+        if isinstance(raw, pd.DataFrame) and not raw.empty and int(tail_bars) > 0 and len(raw) > int(tail_bars):
+            raw = raw.tail(int(tail_bars)).reset_index(drop=True)
+        base_frame = raw
     if signature[0] is not None:
         with _LIVE_KLINES_TAIL_CACHE_LOCK:
             _LIVE_KLINES_TAIL_CACHE[cache_key] = (
                 signature,
-                raw.copy(deep=False),
+                base_frame.copy(deep=False),
             )
-    return raw
+    if not allow_preview_open_bar:
+        return base_frame
+    preview_frame = _load_live_binance_preview_tail(
+        data_cfg=data_cfg,
+        symbol=symbol,
+        now_utc=now_utc,
+    )
+    merged_preview = _merge_cached_kline_tail_with_marker(
+        cached_frame=base_frame,
+        marker_frame=preview_frame,
+        tail_bars=tail_bars,
+    )
+    return merged_preview if merged_preview is not None else base_frame
+
+
+def _load_live_binance_latest_tail_marker(
+    *,
+    data_cfg: DataConfig,
+    symbol: str | None,
+) -> pd.DataFrame | None:
+    path = _live_binance_latest_tail_path(data_cfg=data_cfg, symbol=symbol)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    rows = payload.get("tail_rows")
+    if not isinstance(rows, list) or not rows:
+        return None
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return None
+    if "open_time" in frame.columns:
+        frame["open_time"] = pd.to_datetime(frame["open_time"], utc=True, errors="coerce")
+    if "close_time" in frame.columns:
+        frame["close_time"] = pd.to_datetime(frame["close_time"], utc=True, errors="coerce")
+    for column in (
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_asset_volume",
+        "taker_buy_quote_volume",
+        "number_of_trades",
+    ):
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["open_time", "close"]).sort_values("open_time").drop_duplicates(subset=["open_time"], keep="last")
+    if frame.empty:
+        return None
+    return frame.reset_index(drop=True)
+
+
+def _load_live_binance_preview_tail(
+    *,
+    data_cfg: DataConfig,
+    symbol: str | None,
+    now_utc: pd.Timestamp | None,
+) -> pd.DataFrame | None:
+    resolved_now = pd.to_datetime(now_utc, utc=True, errors="coerce")
+    if resolved_now is None or pd.isna(resolved_now):
+        resolved_now = pd.Timestamp.now(tz="UTC")
+    resolved_symbol = str(symbol or data_cfg.asset.binance_symbol).strip().upper()
+    minute_floor = resolved_now.floor("min")
+    start_time = minute_floor - pd.Timedelta(minutes=2)
+    client = BinanceSpotKlinesClient(timeout_sec=max(2.0, data_cfg.orderbook_timeout_sec * 4.0))
+    frame = client.fetch_klines(
+        BinanceSpotKlinesRequest(
+            symbol=resolved_symbol,
+            interval="1m",
+            start_time_ms=int(start_time.timestamp() * 1000),
+            end_time_ms=int(resolved_now.timestamp() * 1000),
+            limit=5,
+        )
+    )
+    preview = _normalize_preview_kline_frame(frame=frame, now_utc=resolved_now)
+    if preview.empty:
+        return None
+    return preview.tail(2).reset_index(drop=True)
+
+
+def _normalize_preview_kline_frame(*, frame: pd.DataFrame, now_utc: pd.Timestamp) -> pd.DataFrame:
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame()
+    out = frame.copy()
+    out["open_time"] = pd.to_datetime(pd.to_numeric(out.get("open_time"), errors="coerce"), unit="ms", utc=True)
+    out["close_time"] = pd.to_datetime(pd.to_numeric(out.get("close_time"), errors="coerce"), unit="ms", utc=True)
+    for column in (
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_asset_volume",
+        "taker_buy_quote_volume",
+        "number_of_trades",
+    ):
+        if column in out.columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce")
+    out = out.dropna(subset=["open_time", "close"]).copy()
+    out = out.loc[out["open_time"] <= now_utc.floor("min")].copy()
+    if out.empty:
+        return pd.DataFrame()
+    out = out.sort_values("open_time").drop_duplicates(subset=["open_time"], keep="last").reset_index(drop=True)
+    return out
+
+
+def _read_live_binance_latest_open_time(
+    *,
+    path: Path,
+) -> pd.Timestamp | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    latest_open_time = pd.to_datetime(payload.get("latest_open_time"), utc=True, errors="coerce")
+    if latest_open_time is not None and not pd.isna(latest_open_time):
+        return latest_open_time
+    rows = payload.get("tail_rows")
+    if not isinstance(rows, list) or not rows:
+        return None
+    frame = pd.DataFrame(rows)
+    if frame.empty or "open_time" not in frame.columns:
+        return None
+    open_time = pd.to_datetime(frame["open_time"], utc=True, errors="coerce").dropna()
+    if open_time.empty:
+        return None
+    return open_time.max()
+
+
+def _expected_latest_closed_bar_open_time(*, now_utc: pd.Timestamp) -> pd.Timestamp:
+    normalized = pd.to_datetime(now_utc, utc=True, errors="coerce")
+    if normalized is None or pd.isna(normalized):
+        normalized = pd.Timestamp.now(tz="UTC")
+    return normalized.floor("min") - pd.Timedelta(minutes=1)
+
+
+def _expected_boundary_closed_bar_open_time(
+    *,
+    now_utc: pd.Timestamp,
+    cycle_minutes: int,
+    retain_offsets: tuple[int, ...],
+) -> pd.Timestamp | None:
+    if int(cycle_minutes) <= 0:
+        return None
+    offsets = tuple(sorted({int(offset) for offset in retain_offsets if 0 <= int(offset) < int(cycle_minutes)}))
+    if not offsets:
+        return None
+    normalized = pd.to_datetime(now_utc, utc=True, errors="coerce")
+    if normalized is None or pd.isna(normalized):
+        normalized = pd.Timestamp.now(tz="UTC")
+    minute_floor = normalized.floor("min")
+    cycle_start = minute_floor.floor(f"{int(cycle_minutes)}min")
+    minute_offset = int((minute_floor - cycle_start).total_seconds() // 60)
+    boundary_minutes = {int(offset) for offset in offsets}
+    if minute_offset not in boundary_minutes:
+        return None
+    return minute_floor - pd.Timedelta(minutes=1)
+
+
+def _ensure_live_closed_bar_inputs_ready(
+    *,
+    data_cfg: DataConfig,
+    btc_cfg: DataConfig | None,
+    now_utc: pd.Timestamp,
+    cycle_minutes: int,
+    retain_offsets: tuple[int, ...],
+) -> None:
+    if not _env_bool("PM15MIN_LIVE_ENFORCE_EXPECTED_CLOSED_BAR", default=False):
+        return
+    expected_open_time = _expected_boundary_closed_bar_open_time(
+        now_utc=now_utc,
+        cycle_minutes=int(cycle_minutes),
+        retain_offsets=retain_offsets,
+    )
+    if expected_open_time is None:
+        return
+    wait_sec = max(0.0, _env_float("PM15MIN_LIVE_EXPECTED_CLOSED_BAR_WAIT_SEC", default=1.5))
+    poll_sec = max(0.01, _env_float("PM15MIN_LIVE_EXPECTED_CLOSED_BAR_POLL_SEC", default=0.05))
+    checks: list[tuple[str, Path]] = [
+        (
+            str(data_cfg.asset.binance_symbol).strip().upper(),
+            _live_binance_latest_tail_path(data_cfg=data_cfg, symbol=data_cfg.asset.binance_symbol),
+        ),
+    ]
+    if btc_cfg is not None:
+        checks.append(
+            (
+                "BTCUSDT",
+                _live_binance_latest_tail_path(data_cfg=btc_cfg, symbol="BTCUSDT"),
+            )
+        )
+    deadline = time.monotonic() + wait_sec
+    latest_by_symbol: dict[str, pd.Timestamp | None] = {}
+    while True:
+        stale_symbols: list[str] = []
+        for symbol, path in checks:
+            latest_open_time = _read_live_binance_latest_open_time(path=path)
+            latest_by_symbol[symbol] = latest_open_time
+            if latest_open_time is None or latest_open_time < expected_open_time:
+                stale_symbols.append(symbol)
+        if not stale_symbols:
+            return
+        if time.monotonic() >= deadline:
+            observed = ", ".join(
+                f"{symbol}={None if latest_by_symbol.get(symbol) is None else latest_by_symbol[symbol].isoformat()}"
+                for symbol, _ in checks
+            )
+            raise LiveClosedBarNotReadyError(
+                "live_closed_bar_not_ready "
+                f"expected_open_time={expected_open_time.isoformat()} "
+                f"stale_symbols={','.join(stale_symbols)} "
+                f"observed={observed}"
+            )
+        time.sleep(poll_sec)
+
+
+def _live_binance_latest_tail_path(*, data_cfg: DataConfig, symbol: str | None) -> Path:
+    resolved_symbol = str(symbol or data_cfg.asset.binance_symbol).strip().upper()
+    return (
+        data_cfg.layout.surface_var_root
+        / "state"
+        / "binance_klines_1m"
+        / f"symbol={resolved_symbol}"
+        / "latest_tail.json"
+    )
+
+
+def _merge_cached_kline_tail_with_marker(
+    *,
+    cached_frame: pd.DataFrame,
+    marker_frame: pd.DataFrame,
+    tail_bars: int,
+) -> pd.DataFrame | None:
+    cached = _normalize_kline_tail_frame(cached_frame)
+    marker = _normalize_kline_tail_frame(marker_frame)
+    if cached.empty or marker.empty:
+        return None
+    cached_last_open = pd.to_datetime(cached["open_time"], utc=True, errors="coerce").max()
+    marker_last_open = pd.to_datetime(marker["open_time"], utc=True, errors="coerce").max()
+    if pd.isna(cached_last_open) or pd.isna(marker_last_open):
+        return None
+    if marker_last_open <= cached_last_open:
+        return None
+    expected_next_open = cached_last_open + pd.Timedelta(minutes=1)
+    marker_after_cached = marker.loc[pd.to_datetime(marker["open_time"], utc=True, errors="coerce") >= expected_next_open].copy()
+    if marker_after_cached.empty:
+        return None
+    earliest_open = pd.to_datetime(marker_after_cached["open_time"], utc=True, errors="coerce").min()
+    if earliest_open > expected_next_open:
+        return None
+    if not _kline_open_times_are_contiguous(marker_after_cached["open_time"]):
+        return None
+    combined = (
+        pd.concat([cached, marker_after_cached], ignore_index=True, sort=False)
+        .sort_values("open_time")
+        .drop_duplicates(subset=["open_time"], keep="last")
+        .reset_index(drop=True)
+    )
+    if int(tail_bars) > 0 and len(combined) > int(tail_bars):
+        combined = combined.tail(int(tail_bars)).reset_index(drop=True)
+    return combined
+
+
+def _normalize_kline_tail_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame()
+    out = frame.copy()
+    out["open_time"] = pd.to_datetime(out.get("open_time"), utc=True, errors="coerce")
+    if "close_time" in out.columns:
+        out["close_time"] = pd.to_datetime(out.get("close_time"), utc=True, errors="coerce")
+    out = out.dropna(subset=["open_time"]).sort_values("open_time").drop_duplicates(subset=["open_time"], keep="last")
+    return out.reset_index(drop=True)
+
+
+def _kline_open_times_are_contiguous(series: pd.Series) -> bool:
+    open_times = pd.to_datetime(series, utc=True, errors="coerce").dropna().sort_values()
+    if open_times.empty:
+        return False
+    diffs = open_times.diff().dropna()
+    if diffs.empty:
+        return True
+    return bool((diffs == pd.Timedelta(minutes=1)).all())
 
 
 def ensure_live_trade_inputs_fresh(cfg) -> dict[str, object]:
@@ -534,6 +1061,13 @@ def _path_signature(path: Path) -> tuple[int | None, int | None]:
         return (None, None)
     except Exception:
         return (None, None)
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _compact_live_open_orders_snapshot(payload: dict[str, object] | None) -> dict[str, object] | None:

@@ -3,16 +3,23 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pm15min.live.runner as runner_module
 from pm15min.core.config import LiveConfig
 from pm15min.live.layout import LiveStateLayout
 from pm15min.live.runner import run_live_runner
+from pm15min.live.runner import iteration as runner_iteration_module
 from pm15min.live.runner.runtime import _load_persisted_session_state, _resolve_iteration_limit
+from pm15min.live.signal.utils import LiveClosedBarNotReadyError
 
 
 def _patch_v2_roots(monkeypatch, root: Path) -> None:
     monkeypatch.setattr("pm15min.core.layout.rewrite_root", lambda: root)
     monkeypatch.setattr("pm15min.data.layout.rewrite_root", lambda: root)
     monkeypatch.setattr("pm15min.research.layout.rewrite_root", lambda: root)
+
+
+def test_runner_exports_distinct_prepare_and_preview_prewarm_callables() -> None:
+    assert runner_module.prewarm_live_signal_inputs is not runner_module.prewarm_live_signal_preview
 
 
 def test_run_live_runner_writes_summary_and_log(tmp_path: Path, monkeypatch) -> None:
@@ -1009,6 +1016,10 @@ def test_run_live_runner_prewarms_signal_once_per_minute(tmp_path: Path, monkeyp
         lambda *args, **kwargs: prewarm_calls.append(None) or {"status": "ok", "cache_hit": False, "elapsed_ms": 12.0, "snapshot_ts": "2026-03-20T00-01-00Z", "offsets": [7, 8, 9]},
     )
     monkeypatch.setattr(
+        "pm15min.live.runner.prewarm_live_signal_inputs",
+        lambda *args, **kwargs: {"status": "ok", "elapsed_ms": 9.0, "feature_rows": 9, "latest_feature_decision_ts": "2026-03-20T00:00:00Z", "offsets": [7, 8, 9]},
+    )
+    monkeypatch.setattr(
         "pm15min.live.runner.decide_live_latest",
         lambda *args, **kwargs: {
             "snapshot_ts": "2026-03-20T00-00-00Z",
@@ -1059,4 +1070,338 @@ def test_run_live_runner_prewarms_signal_once_per_minute(tmp_path: Path, monkeyp
 
     assert len(prewarm_calls) == 1
     assert summary["last_iteration"]["timings_ms"]["signal_prewarm_triggered"] is False
-    assert summary["last_iteration"]["signal_prewarm_payload"]["reason"] == "signal_prewarm_already_attempted_for_bucket"
+    assert summary["last_iteration"]["signal_prewarm_payload"]["reason"] == "signal_prewarm_finalize_already_attempted_for_bucket"
+
+
+def test_maybe_prewarm_signal_cache_retries_after_closed_bar_deferral(monkeypatch) -> None:
+    session_state: dict[str, object] = {}
+    fake_now = {"value": 60.05}
+    calls = {"count": 0}
+
+    monkeypatch.setenv("PM15MIN_RUNNER_ENABLE_SIGNAL_PREWARM", "1")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MIN_DELAY_SEC", "0")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MAX_DELAY_SEC", "3")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_FINALIZE_CLOSED_BAR_WAIT_SEC", "0")
+    monkeypatch.setattr("pm15min.live.runner.iteration.time.time", lambda: float(fake_now["value"]))
+
+    def _prewarm(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise LiveClosedBarNotReadyError("live_closed_bar_not_ready expected_open_time=2026-03-20T00:07:00+00:00")
+        return {
+            "status": "ok",
+            "cache_hit": False,
+            "elapsed_ms": 12.0,
+            "snapshot_ts": "2026-03-20T00:01:00Z",
+            "offsets": [7, 8, 9],
+        }
+
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    first = runner_iteration_module._maybe_prewarm_signal_cache(
+        cfg,
+        target="direction",
+        feature_set=None,
+        session_state=session_state,
+        prewarm_live_signal_inputs_fn=lambda *args, **kwargs: {"status": "ok"},
+        prewarm_live_signal_cache_fn=_prewarm,
+    )
+    assert first["status"] == "deferred"
+    assert first["triggered"] is False
+    assert first["reason"] == "signal_prewarm_waiting_for_closed_bar"
+
+    fake_now["value"] = 60.25
+    second = runner_iteration_module._maybe_prewarm_signal_cache(
+        cfg,
+        target="direction",
+        feature_set=None,
+        session_state=session_state,
+        prewarm_live_signal_inputs_fn=lambda *args, **kwargs: {"status": "ok"},
+        prewarm_live_signal_cache_fn=_prewarm,
+    )
+    assert second["status"] == "ok"
+    assert second["triggered"] is True
+    assert calls["count"] == 2
+
+
+def test_maybe_prewarm_signal_cache_finalize_waits_for_closed_bar_within_same_iteration(monkeypatch) -> None:
+    session_state: dict[str, object] = {}
+    fake_now = {"value": 60.05}
+    calls = {"count": 0}
+
+    monkeypatch.setenv("PM15MIN_RUNNER_ENABLE_SIGNAL_PREWARM", "1")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MIN_DELAY_SEC", "0")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MAX_DELAY_SEC", "3")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_FINALIZE_CLOSED_BAR_WAIT_SEC", "0.30")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_FINALIZE_RETRY_INTERVAL_SEC", "0.10")
+    monkeypatch.setattr("pm15min.live.runner.iteration.time.time", lambda: float(fake_now["value"]))
+    monkeypatch.setattr(
+        "pm15min.live.runner.iteration.time.sleep",
+        lambda seconds: fake_now.__setitem__("value", float(fake_now["value"]) + float(seconds)),
+    )
+
+    def _prewarm(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise LiveClosedBarNotReadyError("live_closed_bar_not_ready expected_open_time=2026-03-20T00:07:00+00:00")
+        return {
+            "status": "ok",
+            "cache_hit": False,
+            "elapsed_ms": 12.0,
+            "snapshot_ts": "2026-03-20T00:01:00Z",
+            "offsets": [7, 8, 9],
+        }
+
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    payload = runner_iteration_module._maybe_prewarm_signal_cache(
+        cfg,
+        target="direction",
+        feature_set=None,
+        session_state=session_state,
+        prewarm_live_signal_inputs_fn=lambda *args, **kwargs: {"status": "ok"},
+        prewarm_live_signal_cache_fn=_prewarm,
+    )
+    assert payload["status"] == "ok"
+    assert payload["triggered"] is True
+    assert payload["stage"] == "finalize"
+    assert calls["count"] == 3
+
+
+def test_maybe_prewarm_signal_cache_prepare_can_bridge_into_finalize(monkeypatch) -> None:
+    session_state: dict[str, object] = {}
+    fake_now = {"value": 119.60}
+    calls: list[str] = []
+
+    monkeypatch.setenv("PM15MIN_RUNNER_ENABLE_SIGNAL_PREWARM", "1")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MIN_DELAY_SEC", "0")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MAX_DELAY_SEC", "3")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_MIN_DELAY_SEC", "57")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_MAX_DELAY_SEC", "59.9")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_FINALIZE_BRIDGE_SEC", "1.0")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_FINALIZE_CLOSED_BAR_WAIT_SEC", "0")
+    monkeypatch.setattr("pm15min.live.runner.iteration.time.time", lambda: float(fake_now["value"]))
+    monkeypatch.setattr(
+        "pm15min.live.runner.iteration.time.sleep",
+        lambda seconds: fake_now.__setitem__("value", float(fake_now["value"]) + float(seconds)),
+    )
+
+    def _prewarm_prepare(*args, **kwargs):
+        calls.append("prepare")
+        return {
+            "status": "ok",
+            "elapsed_ms": 9.0,
+            "feature_rows": 9,
+            "latest_feature_decision_ts": "2026-03-20T00:00:00Z",
+            "offsets": [7, 8, 9],
+        }
+
+    def _prewarm_finalize(*args, **kwargs):
+        calls.append(str(kwargs.get("marker_source") or "prewarm_finalize"))
+        return {
+            "status": "ok",
+            "cache_hit": False,
+            "elapsed_ms": 12.0,
+            "snapshot_ts": "2026-03-20T00:01:00Z",
+            "offsets": [7, 8, 9],
+            "marker_source": str(kwargs.get("marker_source") or "prewarm_finalize"),
+        }
+
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    payload = runner_iteration_module._maybe_prewarm_signal_cache(
+        cfg,
+        target="direction",
+        feature_set=None,
+        session_state=session_state,
+        prewarm_live_signal_inputs_fn=_prewarm_prepare,
+        prewarm_live_signal_cache_fn=_prewarm_finalize,
+    )
+    assert payload["status"] == "ok"
+    assert payload["stage"] == "finalize"
+    assert calls == ["prepare", "prewarm_finalize"]
+
+
+def test_maybe_prewarm_signal_cache_bridges_using_post_prepare_time(monkeypatch) -> None:
+    session_state: dict[str, object] = {}
+    fake_now = {"value": 118.40}
+    calls: list[str] = []
+
+    monkeypatch.setenv("PM15MIN_RUNNER_ENABLE_SIGNAL_PREWARM", "1")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MIN_DELAY_SEC", "0")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MAX_DELAY_SEC", "3")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_MIN_DELAY_SEC", "57")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_MAX_DELAY_SEC", "59.9")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_FINALIZE_BRIDGE_SEC", "1.0")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_FINALIZE_CLOSED_BAR_WAIT_SEC", "0")
+    monkeypatch.setattr("pm15min.live.runner.iteration.time.time", lambda: float(fake_now["value"]))
+    monkeypatch.setattr(
+        "pm15min.live.runner.iteration.time.sleep",
+        lambda seconds: fake_now.__setitem__("value", float(fake_now["value"]) + float(seconds)),
+    )
+
+    def _prewarm_prepare(*args, **kwargs):
+        calls.append("prepare")
+        fake_now["value"] += 0.90
+        return {
+            "status": "ok",
+            "elapsed_ms": 900.0,
+            "feature_rows": 9,
+            "latest_feature_decision_ts": "2026-03-20T00:00:00Z",
+            "offsets": [7, 8, 9],
+        }
+
+    def _prewarm_finalize(*args, **kwargs):
+        calls.append(str(kwargs.get("marker_source") or "prewarm_finalize"))
+        return {
+            "status": "ok",
+            "cache_hit": False,
+            "elapsed_ms": 12.0,
+            "snapshot_ts": "2026-03-20T00:01:00Z",
+            "offsets": [7, 8, 9],
+            "marker_source": str(kwargs.get("marker_source") or "prewarm_finalize"),
+        }
+
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    payload = runner_iteration_module._maybe_prewarm_signal_cache(
+        cfg,
+        target="direction",
+        feature_set=None,
+        session_state=session_state,
+        prewarm_live_signal_inputs_fn=_prewarm_prepare,
+        prewarm_live_signal_cache_fn=_prewarm_finalize,
+    )
+    assert payload["status"] == "ok"
+    assert payload["stage"] == "finalize"
+    assert calls == ["prepare", "prewarm_finalize"]
+
+
+def test_maybe_prewarm_signal_cache_wider_bridge_catches_earlier_prepare(monkeypatch) -> None:
+    session_state: dict[str, object] = {}
+    fake_now = {"value": 117.20}
+    calls: list[str] = []
+
+    monkeypatch.setenv("PM15MIN_RUNNER_ENABLE_SIGNAL_PREWARM", "1")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MIN_DELAY_SEC", "0")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MAX_DELAY_SEC", "3")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_MIN_DELAY_SEC", "57")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_MAX_DELAY_SEC", "59.9")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_FINALIZE_BRIDGE_SEC", "4.0")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_FINALIZE_CLOSED_BAR_WAIT_SEC", "0")
+    monkeypatch.setattr("pm15min.live.runner.iteration.time.time", lambda: float(fake_now["value"]))
+    monkeypatch.setattr(
+        "pm15min.live.runner.iteration.time.sleep",
+        lambda seconds: fake_now.__setitem__("value", float(fake_now["value"]) + float(seconds)),
+    )
+
+    def _prewarm_prepare(*args, **kwargs):
+        calls.append("prepare")
+        return {
+            "status": "ok",
+            "elapsed_ms": 12.0,
+            "feature_rows": 9,
+            "latest_feature_decision_ts": "2026-03-20T00:00:00Z",
+            "offsets": [7, 8, 9],
+        }
+
+    def _prewarm_finalize(*args, **kwargs):
+        calls.append(str(kwargs.get("marker_source") or "prewarm_finalize"))
+        return {
+            "status": "ok",
+            "cache_hit": False,
+            "elapsed_ms": 12.0,
+            "snapshot_ts": "2026-03-20T00:01:00Z",
+            "offsets": [7, 8, 9],
+            "marker_source": str(kwargs.get("marker_source") or "prewarm_finalize"),
+        }
+
+    cfg = LiveConfig.build(market="xrp", profile="deep_otm", cycle_minutes=15)
+    payload = runner_iteration_module._maybe_prewarm_signal_cache(
+        cfg,
+        target="direction",
+        feature_set=None,
+        session_state=session_state,
+        prewarm_live_signal_inputs_fn=_prewarm_prepare,
+        prewarm_live_signal_cache_fn=_prewarm_finalize,
+    )
+    assert payload["status"] == "ok"
+    assert payload["stage"] == "finalize"
+    assert calls == ["prepare", "prewarm_finalize"]
+    assert fake_now["value"] >= 120.0
+
+
+def test_signal_prewarm_prepare_trigger_sec_staggers_markets() -> None:
+    assert runner_iteration_module._signal_prewarm_prepare_trigger_sec(market="sol", default=57.0, upper_bound=59.9) == 56.6
+    assert runner_iteration_module._signal_prewarm_prepare_trigger_sec(market="xrp", default=57.0, upper_bound=59.9) == 57.2
+    assert runner_iteration_module._signal_prewarm_prepare_trigger_sec(market="eth", default=57.0, upper_bound=59.9) == 57.8
+    assert runner_iteration_module._signal_prewarm_prepare_trigger_sec(market="btc", default=57.0, upper_bound=59.9) == 58.4
+
+
+def test_maybe_prewarm_signal_cache_prepare_and_finalize_use_separate_bucket_guards(monkeypatch) -> None:
+    session_state: dict[str, object] = {}
+    fake_now = {"value": 60.10}
+    calls: list[str] = []
+
+    monkeypatch.setenv("PM15MIN_RUNNER_ENABLE_SIGNAL_PREWARM", "1")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MIN_DELAY_SEC", "0")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MAX_DELAY_SEC", "3")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_MIN_DELAY_SEC", "57")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_MAX_DELAY_SEC", "59.9")
+    monkeypatch.setattr("pm15min.live.runner.iteration.time.time", lambda: float(fake_now["value"]))
+
+    def _prewarm_prepare(*args, **kwargs):
+        calls.append("prewarm_prepare_inputs")
+        return {
+            "status": "ok",
+            "elapsed_ms": 9.0,
+            "feature_rows": 9,
+            "latest_feature_decision_ts": "2026-03-20T00:00:00Z",
+            "offsets": [7, 8, 9],
+        }
+
+    def _prewarm_finalize(*args, **kwargs):
+        calls.append(str(kwargs.get("marker_source") or "prewarm_finalize"))
+        return {
+            "status": "ok",
+            "cache_hit": False,
+            "elapsed_ms": 12.0,
+            "snapshot_ts": "2026-03-20T00:01:00Z",
+            "offsets": [7, 8, 9],
+            "marker_source": str(kwargs.get("marker_source") or "prewarm_finalize"),
+        }
+
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    first = runner_iteration_module._maybe_prewarm_signal_cache(
+        cfg,
+        target="direction",
+        feature_set=None,
+        session_state=session_state,
+        prewarm_live_signal_inputs_fn=_prewarm_prepare,
+        prewarm_live_signal_cache_fn=_prewarm_finalize,
+    )
+    assert first["status"] == "ok"
+    assert first["stage"] == "finalize"
+    assert first["triggered"] is True
+
+    fake_now["value"] = 117.90
+    second = runner_iteration_module._maybe_prewarm_signal_cache(
+        cfg,
+        target="direction",
+        feature_set=None,
+        session_state=session_state,
+        prewarm_live_signal_inputs_fn=_prewarm_prepare,
+        prewarm_live_signal_cache_fn=_prewarm_finalize,
+    )
+    assert second["status"] == "ok"
+    assert second["stage"] == "prepare"
+    assert second["triggered"] is True
+
+    fake_now["value"] = 118.10
+    third = runner_iteration_module._maybe_prewarm_signal_cache(
+        cfg,
+        target="direction",
+        feature_set=None,
+        session_state=session_state,
+        prewarm_live_signal_inputs_fn=_prewarm_prepare,
+        prewarm_live_signal_cache_fn=_prewarm_finalize,
+    )
+    assert third["status"] == "skipped"
+    assert third["reason"] == "signal_prewarm_prepare_already_attempted_for_bucket"
+    assert calls == ["prewarm_finalize", "prewarm_prepare_inputs"]

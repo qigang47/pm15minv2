@@ -63,7 +63,7 @@ def build_feature_frame_dataset(cfg: ResearchConfig, *, skip_freshness: bool = F
         },
         inputs=[
             {"path": str(data_cfg.layout.binance_klines_path()), "kind": "binance_klines_1m"},
-            {"path": str(data_cfg.layout.oracle_prices_table_path), "kind": "oracle_prices_15m"},
+            {"path": str(data_cfg.layout.oracle_prices_table_path), "kind": f"oracle_prices_{cfg.cycle}"},
         ]
         + (
             [{"path": str(DataConfig.build(market="btc", cycle=cfg.cycle, surface=cfg.source_surface, root=cfg.layout.storage.rewrite_root).layout.binance_klines_path()), "kind": "btc_klines_1m"}]

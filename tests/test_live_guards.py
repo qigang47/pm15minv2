@@ -54,6 +54,18 @@ def test_decision_rejects_when_ret_30m_guard_fails() -> None:
     assert out["rejected_offsets"][0]["guard_reasons"] == ["ret30m_down_ceiling"]
 
 
+def test_deep_otm_baseline_ret30_thresholds_match_relaxed_btc_eth_policy() -> None:
+    spec = resolve_live_profile_spec("deep_otm_baseline")
+
+    assert spec.ret_30m_up_floor_for("btc") == -0.04
+    assert spec.ret_30m_up_floor_for("eth") == -0.04
+    assert spec.ret_30m_up_floor_for("xrp") == -0.04
+    assert spec.ret_30m_down_ceiling_for("btc") == 0.009
+    assert spec.ret_30m_down_ceiling_for("eth") == 0.009
+    assert spec.ret_30m_down_ceiling_for("xrp") == 0.009
+    assert spec.ret_30m_down_ceiling_for("sol") == 0.002
+
+
 def test_decision_rejects_when_tail_space_guard_fails() -> None:
     row = _base_signal_row()
     row["recommended_side"] = "UP"

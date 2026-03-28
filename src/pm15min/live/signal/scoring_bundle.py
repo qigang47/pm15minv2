@@ -143,11 +143,13 @@ def prepare_live_features_and_states(
     active_offsets: tuple[int, ...] = (),
     persist: bool,
     build_live_feature_frame_fn,
+    allow_preview_open_bar: bool = False,
 ) -> LiveFeatureContext:
     base_features = build_live_feature_frame_fn(
         cfg,
         feature_set=builder_feature_set,
         retain_offsets=active_offsets,
+        allow_preview_open_bar=allow_preview_open_bar,
     )
     if base_features.empty:
         raise ValueError(f"Live feature frame is empty for market={cfg.asset.slug}")

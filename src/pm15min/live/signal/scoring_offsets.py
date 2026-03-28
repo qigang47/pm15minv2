@@ -334,7 +334,9 @@ def _resolve_latest_live_row(
             current_cycle_scored = scored.loc[current_cycle_mask].copy()
 
             expected_open_ts = active_cycle_start + pd.to_timedelta(int(ctx.offset), unit="m")
-            if latest_feature_decision_ts is None or latest_feature_decision_ts < expected_open_ts:
+            # Live offset windows open on minute N using the factor row from minute N-1.
+            required_feature_ts = expected_open_ts - pd.to_timedelta(DEFAULT_OFFSET_WINDOW_SECONDS, unit="s")
+            if latest_feature_decision_ts is None or latest_feature_decision_ts < required_feature_ts:
                 return None, base_coverage, "offset_not_yet_open"
             if current_cycle_scored.empty:
                 return None, base_coverage, "missing_score_row"

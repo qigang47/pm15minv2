@@ -222,12 +222,14 @@ class GammaEventsClient:
         start_ts: int,
         end_ts: int,
         limit: int,
-        max_pages: int,
+        max_pages: int | None,
         sleep_sec: float,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         limit = max(1, int(limit))
-        for page in range(max(1, int(max_pages))):
+        page = 0
+        page_cap = None if max_pages is None else max(1, int(max_pages))
+        while page_cap is None or page < page_cap:
             params = {
                 "closed": "true",
                 "end_date_min": _iso(start_ts),
@@ -243,6 +245,7 @@ class GammaEventsClient:
             rows.extend(item for item in payload if isinstance(item, dict))
             if len(payload) < limit:
                 break
+            page += 1
             if sleep_sec > 0:
                 time.sleep(float(sleep_sec))
         return rows
@@ -253,12 +256,14 @@ class GammaEventsClient:
         start_ts: int,
         end_ts: int,
         limit: int,
-        max_pages: int,
+        max_pages: int | None,
         sleep_sec: float,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         limit = max(1, int(limit))
-        for page in range(max(1, int(max_pages))):
+        page = 0
+        page_cap = None if max_pages is None else max(1, int(max_pages))
+        while page_cap is None or page < page_cap:
             params = {
                 "active": "true",
                 "closed": "false",
@@ -275,6 +280,7 @@ class GammaEventsClient:
             rows.extend(item for item in payload if isinstance(item, dict))
             if len(payload) < limit:
                 break
+            page += 1
             if sleep_sec > 0:
                 time.sleep(float(sleep_sec))
         return rows

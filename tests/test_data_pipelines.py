@@ -361,6 +361,65 @@ def test_record_orderbooks_once_live_raises_when_refreshed_catalog_still_has_no_
     assert refresh_calls == ["btc"]
 
 
+def test_record_orderbooks_once_backtest_refreshes_closed_event_catalog(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = DataConfig.build(market="btc", cycle="15m", surface="backtest", root=tmp_path / "v2", market_depth=1)
+    captured_ts_ms = 1_772_374_800_000
+    refresh_calls: list[dict[str, object]] = []
+    refreshed_market_table = pd.DataFrame(
+        [
+            {
+                "market_id": "fresh-market-1",
+                "condition_id": "cond-fresh-1",
+                "asset": "btc",
+                "cycle": "15m",
+                "cycle_start_ts": 1_772_374_500,
+                "cycle_end_ts": 1_772_375_400,
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "slug": "btc-up-or-down-15m-1772374500",
+                "question": "BTC fresh up or down",
+                "resolution_source": "https://data.chain.link/streams/btc-usd",
+                "event_id": "event-fresh-1",
+                "event_slug": "event-fresh",
+                "event_title": "fresh",
+                "series_slug": "btc-up-or-down-15m",
+                "closed_ts": None,
+                "source_snapshot_ts": "2026-03-19T09-00-00Z",
+            }
+        ]
+    )
+
+    def _fake_sync_market_catalog(local_cfg, *, start_ts: int, end_ts: int, client=None, now=None, selection_mode=None):
+        refresh_calls.append(
+            {
+                "market": local_cfg.asset.slug,
+                "cycle": local_cfg.cycle,
+                "selection_mode": selection_mode,
+                "start_ts": int(start_ts),
+                "end_ts": int(end_ts),
+            }
+        )
+        write_parquet_atomic(refreshed_market_table, local_cfg.layout.market_catalog_table_path)
+        return {"status": "ok", "source_mode": "gamma_closed_events"}
+
+    monkeypatch.setattr("pm15min.data.pipelines.orderbook_recording.sync_market_catalog", _fake_sync_market_catalog)
+
+    summary = record_orderbooks_once(
+        cfg,
+        client=_FakeClobClient(),
+        captured_ts_ms=captured_ts_ms,
+    )
+
+    assert len(refresh_calls) == 1
+    assert refresh_calls[0]["selection_mode"] is None
+    assert summary["selected_markets"] == 1
+    assert summary["selected_market_ids"] == ["fresh-market-1"]
+    assert summary["snapshot_rows"] == 2
+
+
 def test_update_recent_orderbook_index_recovers_corrupt_existing_file(tmp_path: Path) -> None:
     path = tmp_path / "recent.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -524,6 +583,24 @@ def test_sync_market_catalog_live_uses_active_markets(tmp_path: Path) -> None:
     assert len(canonical) == 1
     assert canonical.iloc[0]["market_id"] == "market-live-1"
     assert canonical.iloc[0]["token_up"] == "token-up"
+
+
+def test_sync_market_catalog_backtest_can_force_active_markets(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=tmp_path / "v2")
+    summary = sync_market_catalog(
+        cfg,
+        start_ts=1_772_374_800,
+        end_ts=1_772_461_200,
+        client=_FakeGammaClient(),
+        now=datetime(2026, 3, 19, 9, 0, tzinfo=timezone.utc),
+        selection_mode="active_markets",
+    )
+
+    canonical = pd.read_parquet(Path(summary["canonical_path"]))
+    assert summary["source_mode"] == "gamma_active_markets"
+    assert summary["rows_fetched"] == 1
+    assert len(canonical) == 1
+    assert canonical.iloc[0]["market_id"] == "market-live-1"
 
 
 def test_sync_binance_klines_1m_appends_new_rows(tmp_path: Path) -> None:

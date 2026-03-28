@@ -235,6 +235,12 @@ DEEP_OTM_BASELINE_LIVE_PROFILE_SPEC = LiveProfileSpec(
                 "sol": -0.04,
                 "xrp": -0.04,
             },
+            "ret_30m_down_ceiling_by_asset": {
+                "btc": 0.009,
+                "eth": 0.009,
+                "sol": 0.002,
+                "xrp": 0.009,
+            },
         }
     )
 )

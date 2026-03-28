@@ -60,6 +60,7 @@ def score_live_latest(
     target: str = "direction",
     feature_set: str | None = None,
     persist: bool = True,
+    allow_preview_open_bar: bool = False,
     resolve_live_profile_spec_fn,
     get_active_bundle_selection_fn,
     resolve_model_bundle_dir_fn,
@@ -93,6 +94,7 @@ def score_live_latest(
         active_offsets=_bundle_offsets(bundle.bundle_dir),
         persist=persist,
         build_live_feature_frame_fn=build_live_feature_frame_fn,
+        allow_preview_open_bar=allow_preview_open_bar,
     )
     offset_signals = _score_offset_signals(
         cfg,

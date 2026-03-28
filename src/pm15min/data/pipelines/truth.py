@@ -57,10 +57,7 @@ def _resolve_oracle_truth_source(row: pd.Series) -> str:
     return "oracle_prices"
 
 
-def build_truth_15m(cfg: DataConfig) -> dict[str, object]:
-    if cfg.cycle != "15m":
-        raise ValueError("truth_15m currently requires cycle=15m.")
-
+def build_truth_table(cfg: DataConfig) -> dict[str, object]:
     markets = load_market_catalog(cfg)
     if markets.empty:
         raise FileNotFoundError(
@@ -160,8 +157,12 @@ def build_truth_15m(cfg: DataConfig) -> dict[str, object]:
 
     write_parquet_atomic(out, cfg.layout.truth_table_path)
     return {
-        "dataset": "truth_15m",
+        "dataset": f"truth_{cfg.cycle}",
         "market": cfg.asset.slug,
         "rows_written": int(len(out)),
         "target_path": str(cfg.layout.truth_table_path),
     }
+
+
+def build_truth_15m(cfg: DataConfig) -> dict[str, object]:
+    return build_truth_table(cfg)

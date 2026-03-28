@@ -19,7 +19,7 @@ Env overrides:
   V2_ORDERBOOK_FLEET_MARKET_START_OFFSET default: 0
   V2_ORDERBOOK_FLEET_ITERATIONS       default: 0
   V2_ORDERBOOK_FLEET_SLEEP_SEC        default: same as poll interval
-  V2_ORDERBOOK_FLEET_LOG_PATH         default: var/live/logs/entrypoints/orderbook_fleet_<cycle>_<surface>.out
+  V2_ORDERBOOK_FLEET_LOG_PATH         default: var/<surface>/logs/entrypoints/orderbook_fleet_<cycle>_<surface>.out
   PM15MIN_ORDERBOOK_FLEET_SCHEDULER_MODE default: process_per_market
   MALLOC_ARENA_MAX                    default: 2
 EOF
@@ -139,7 +139,7 @@ MARKET_DEPTH="${V2_ORDERBOOK_FLEET_MARKET_DEPTH:-1}"
 MARKET_START_OFFSET="${V2_ORDERBOOK_FLEET_MARKET_START_OFFSET:-0}"
 ITERATIONS="${V2_ORDERBOOK_FLEET_ITERATIONS:-0}"
 SLEEP_SEC="${V2_ORDERBOOK_FLEET_SLEEP_SEC:-$POLL_SEC}"
-LOG_PATH="${V2_ORDERBOOK_FLEET_LOG_PATH:-$PROJECT_DIR/var/live/logs/entrypoints/orderbook_fleet_${CYCLE}_${SURFACE}.out}"
+LOG_PATH="${V2_ORDERBOOK_FLEET_LOG_PATH:-$PROJECT_DIR/var/${SURFACE}/logs/entrypoints/orderbook_fleet_${CYCLE}_${SURFACE}.out}"
 ALLOCATOR_ARENAS="${MALLOC_ARENA_MAX:-2}"
 SCHEDULER_MODE="${PM15MIN_ORDERBOOK_FLEET_SCHEDULER_MODE:-process_per_market}"
 
@@ -191,4 +191,4 @@ nohup env MALLOC_ARENA_MAX="$ALLOCATOR_ARENAS" "${cmd[@]}" >> "$LOG_PATH" 2>&1 &
 
 echo "started v2 orderbook fleet: pid=$!"
 echo "  wrapper log: $LOG_PATH"
-echo "  canonical recorder state/log: var/live/state/orderbooks/... and var/live/logs/data/recorders/..."
+echo "  canonical recorder state/log: var/${SURFACE}/state/orderbooks/... and var/${SURFACE}/logs/data/recorders/..."

@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 from pm15min.data.config import DataConfig
+from ..signal.utils import LiveClosedBarNotReadyError
 from ..session_state import (
     build_market_offset_side_trade_count_key,
     build_market_offset_trade_count_key,
@@ -29,6 +30,7 @@ def build_runner_iteration(
     run_live_data_foundation_fn,
     build_liquidity_state_snapshot_fn,
     decide_live_latest_fn,
+    prewarm_live_signal_inputs_fn,
     prewarm_live_signal_cache_fn,
     build_execution_snapshot_fn,
     persist_execution_snapshot_fn,
@@ -104,6 +106,7 @@ def build_runner_iteration(
         target=target,
         feature_set=feature_set,
         session_state=session_state,
+        prewarm_live_signal_inputs_fn=prewarm_live_signal_inputs_fn,
         prewarm_live_signal_cache_fn=prewarm_live_signal_cache_fn,
     )
     phase_timings_ms["signal_prewarm_triggered"] = bool(signal_prewarm_payload.get("triggered"))
@@ -602,52 +605,256 @@ def _maybe_prewarm_signal_cache(
     target: str,
     feature_set: str | None,
     session_state: dict[str, Any] | None,
+    prewarm_live_signal_inputs_fn,
     prewarm_live_signal_cache_fn,
 ) -> dict[str, object]:
     if not _env_bool("PM15MIN_RUNNER_ENABLE_SIGNAL_PREWARM", default=True):
         return {"status": "skipped", "reason": "signal_prewarm_disabled", "triggered": False}
     now_epoch = time.time()
     boundary_offset_sec = now_epoch % 60.0
-    min_delay_sec = max(0.0, _env_float("PM15MIN_RUNNER_SIGNAL_PREWARM_MIN_DELAY_SEC", default=0.75))
-    max_delay_sec = max(min_delay_sec, _env_float("PM15MIN_RUNNER_SIGNAL_PREWARM_MAX_DELAY_SEC", default=3.0))
     boundary_offset_ms = round(boundary_offset_sec * 1000.0, 3)
-    if boundary_offset_sec < min_delay_sec or boundary_offset_sec > max_delay_sec:
-        return {
-            "status": "skipped",
-            "reason": "outside_signal_prewarm_window",
-            "triggered": False,
-            "boundary_offset_ms": boundary_offset_ms,
-        }
-    bucket_epoch = int(now_epoch // 60)
     state = _session_signal_prewarm_state(session_state)
-    if int_or_none(state.get("last_bucket_epoch")) == bucket_epoch:
+    finalize_min_delay_sec = max(0.0, _env_float("PM15MIN_RUNNER_SIGNAL_PREWARM_MIN_DELAY_SEC", default=0.0))
+    finalize_max_delay_sec = max(finalize_min_delay_sec, _env_float("PM15MIN_RUNNER_SIGNAL_PREWARM_MAX_DELAY_SEC", default=3.0))
+    finalize_closed_bar_wait_sec = max(
+        0.0,
+        _env_float("PM15MIN_RUNNER_SIGNAL_PREWARM_FINALIZE_CLOSED_BAR_WAIT_SEC", default=1.5),
+    )
+    finalize_retry_interval_sec = max(
+        0.0,
+        _env_float("PM15MIN_RUNNER_SIGNAL_PREWARM_FINALIZE_RETRY_INTERVAL_SEC", default=0.05),
+    )
+    prepare_min_delay_sec = max(0.0, _env_float("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_MIN_DELAY_SEC", default=57.0))
+    prepare_max_delay_sec = max(prepare_min_delay_sec, _env_float("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_MAX_DELAY_SEC", default=59.9))
+    prepare_trigger_sec = _signal_prewarm_prepare_trigger_sec(
+        market=str(cfg.asset.slug),
+        default=prepare_min_delay_sec,
+        upper_bound=prepare_max_delay_sec,
+    )
+    prepare_finalize_bridge_sec = max(
+        0.0,
+        _env_float("PM15MIN_RUNNER_SIGNAL_PREWARM_PREPARE_FINALIZE_BRIDGE_SEC", default=4.0),
+    )
+    bucket_epoch = int(now_epoch // 60)
+    finalize_closed_bar_budget_sec = min(
+        max(0.0, float(finalize_max_delay_sec - boundary_offset_sec)),
+        finalize_closed_bar_wait_sec,
+    )
+
+    if prepare_trigger_sec <= boundary_offset_sec <= prepare_max_delay_sec:
+        prepare_payload = _run_signal_prewarm_stage(
+            cfg,
+            target=target,
+            feature_set=feature_set,
+            session_state=session_state,
+            prewarm_stage_fn=prewarm_live_signal_inputs_fn,
+            state=state,
+            bucket_epoch=bucket_epoch,
+            boundary_offset_ms=boundary_offset_ms,
+            stage="prepare",
+            state_bucket_key="last_prepare_bucket_epoch",
+        )
+        if (
+            str(prepare_payload.get("status") or "").strip().lower() == "ok"
+            and str(prepare_payload.get("stage") or "") == "prepare"
+        ):
+            now_epoch = time.time()
+            boundary_offset_sec = now_epoch % 60.0
+            boundary_offset_ms = round(boundary_offset_sec * 1000.0, 3)
+            next_bucket_epoch = int(now_epoch // 60)
+            crossed_boundary = int(next_bucket_epoch) > int(bucket_epoch)
+            if (not crossed_boundary) and max(0.0, 60.0 - boundary_offset_sec) <= prepare_finalize_bridge_sec:
+                seconds_to_boundary = max(0.0, 60.0 - boundary_offset_sec)
+                if seconds_to_boundary > 0.0:
+                    time.sleep(seconds_to_boundary)
+                now_epoch = time.time()
+                boundary_offset_sec = now_epoch % 60.0
+                boundary_offset_ms = round(boundary_offset_sec * 1000.0, 3)
+                next_bucket_epoch = int(now_epoch // 60)
+                crossed_boundary = int(next_bucket_epoch) > int(bucket_epoch)
+            bucket_epoch = next_bucket_epoch
+            finalize_closed_bar_budget_sec = min(
+                max(0.0, float(finalize_max_delay_sec - boundary_offset_sec)),
+                finalize_closed_bar_wait_sec,
+            )
+            if crossed_boundary and finalize_min_delay_sec <= boundary_offset_sec <= finalize_max_delay_sec:
+                return _run_signal_prewarm_stage(
+                    cfg,
+                    target=target,
+                    feature_set=feature_set,
+                    session_state=session_state,
+                    prewarm_stage_fn=prewarm_live_signal_cache_fn,
+                    state=state,
+                    bucket_epoch=bucket_epoch,
+                    boundary_offset_ms=boundary_offset_ms,
+                    stage="finalize",
+                    state_bucket_key="last_finalize_bucket_epoch",
+                    closed_bar_wait_sec=finalize_closed_bar_budget_sec,
+                    retry_interval_sec=finalize_retry_interval_sec if finalize_closed_bar_budget_sec > 0.0 else 0.0,
+                )
+        return prepare_payload
+    if finalize_min_delay_sec <= boundary_offset_sec <= finalize_max_delay_sec:
+        return _run_signal_prewarm_stage(
+            cfg,
+            target=target,
+            feature_set=feature_set,
+            session_state=session_state,
+            prewarm_stage_fn=prewarm_live_signal_cache_fn,
+            state=state,
+            bucket_epoch=bucket_epoch,
+            boundary_offset_ms=boundary_offset_ms,
+            stage="finalize",
+            state_bucket_key="last_finalize_bucket_epoch",
+            closed_bar_wait_sec=finalize_closed_bar_budget_sec,
+            retry_interval_sec=finalize_retry_interval_sec if finalize_closed_bar_budget_sec > 0.0 else 0.0,
+        )
+    return {
+        "status": "skipped",
+        "reason": "outside_signal_prewarm_window",
+        "triggered": False,
+        "boundary_offset_ms": boundary_offset_ms,
+    }
+
+
+def _signal_prewarm_prepare_trigger_sec(
+    *,
+    market: str,
+    default: float,
+    upper_bound: float,
+) -> float:
+    token = str(market or "").strip().lower()
+    stagger_defaults = {
+        "sol": 56.6,
+        "xrp": 57.2,
+        "eth": 57.8,
+        "btc": 58.4,
+    }
+    trigger_sec = float(stagger_defaults.get(token, default))
+    trigger_sec = max(0.0, trigger_sec)
+    trigger_sec = min(float(upper_bound), trigger_sec)
+    return trigger_sec
+
+
+def _run_signal_prewarm_stage(
+    cfg,
+    *,
+    target: str,
+    feature_set: str | None,
+    session_state: dict[str, Any] | None,
+    prewarm_stage_fn,
+    state: dict[str, object],
+    bucket_epoch: int,
+    boundary_offset_ms: float,
+    stage: str,
+    state_bucket_key: str,
+    closed_bar_wait_sec: float = 0.0,
+    retry_interval_sec: float = 0.0,
+) -> dict[str, object]:
+    if int_or_none(state.get(state_bucket_key)) == int(bucket_epoch):
         return {
             "status": "skipped",
-            "reason": "signal_prewarm_already_attempted_for_bucket",
+            "reason": f"signal_prewarm_{stage}_already_attempted_for_bucket",
             "triggered": False,
             "boundary_offset_ms": boundary_offset_ms,
+            "stage": stage,
         }
     started = time.perf_counter()
-    payload = prewarm_live_signal_cache_fn(
-        cfg,
-        target=target,
-        feature_set=feature_set,
-        persist=False,
-        session_state=session_state,
-    )
+    closed_bar_deadline = time.monotonic() + max(0.0, float(closed_bar_wait_sec))
+    while True:
+        try:
+            if stage == "prepare":
+                payload = prewarm_stage_fn(
+                    cfg,
+                    target=target,
+                    feature_set=feature_set,
+                )
+            else:
+                payload = prewarm_stage_fn(
+                    cfg,
+                    target=target,
+                    feature_set=feature_set,
+                    persist=False,
+                    session_state=session_state,
+                    marker_source="prewarm_finalize",
+                )
+        except LiveClosedBarNotReadyError as exc:
+            if stage == "finalize":
+                deferred = _maybe_retry_signal_prewarm_finalize(
+                    reason_payload={
+                        "status": "deferred",
+                        "reason": "signal_prewarm_waiting_for_closed_bar",
+                        "triggered": False,
+                        "boundary_offset_ms": boundary_offset_ms,
+                        "elapsed_ms": _elapsed_ms(started),
+                        "stage": stage,
+                        "error": str(exc),
+                    },
+                    closed_bar_deadline=closed_bar_deadline,
+                    retry_interval_sec=retry_interval_sec,
+                )
+                if deferred is None:
+                    continue
+                return deferred
+            return {
+                "status": "deferred",
+                "reason": "signal_prewarm_waiting_for_closed_bar",
+                "triggered": False,
+                "boundary_offset_ms": boundary_offset_ms,
+                "elapsed_ms": _elapsed_ms(started),
+                "stage": stage,
+                "error": str(exc),
+            }
+        if str(payload.get("status") or "").strip().lower() == "deferred":
+            deferred_payload = {
+                **payload,
+                "triggered": False,
+                "boundary_offset_ms": boundary_offset_ms,
+                "elapsed_ms": _elapsed_ms(started),
+                "stage": stage,
+            }
+            if stage == "finalize":
+                deferred = _maybe_retry_signal_prewarm_finalize(
+                    reason_payload=deferred_payload,
+                    closed_bar_deadline=closed_bar_deadline,
+                    retry_interval_sec=retry_interval_sec,
+                )
+                if deferred is None:
+                    continue
+                return deferred
+            return deferred_payload
+        break
     elapsed_ms = _elapsed_ms(started)
-    state["last_bucket_epoch"] = bucket_epoch
-    state["last_boundary_offset_ms"] = boundary_offset_ms
-    state["last_elapsed_ms"] = elapsed_ms
-    state["last_snapshot_ts"] = payload.get("snapshot_ts")
-    state["last_cache_hit"] = bool(payload.get("cache_hit"))
+    state[state_bucket_key] = int(bucket_epoch)
+    state[f"last_{stage}_boundary_offset_ms"] = boundary_offset_ms
+    state[f"last_{stage}_elapsed_ms"] = elapsed_ms
+    state[f"last_{stage}_snapshot_ts"] = payload.get("snapshot_ts")
+    state[f"last_{stage}_cache_hit"] = bool(payload.get("cache_hit"))
     return {
         **payload,
         "status": "ok",
         "triggered": True,
         "elapsed_ms": elapsed_ms,
         "boundary_offset_ms": boundary_offset_ms,
+        "stage": stage,
     }
+
+
+def _maybe_retry_signal_prewarm_finalize(
+    *,
+    reason_payload: dict[str, object],
+    closed_bar_deadline: float,
+    retry_interval_sec: float,
+) -> dict[str, object] | None:
+    if max(0.0, float(retry_interval_sec)) <= 0.0:
+        return reason_payload
+    remaining = max(0.0, float(closed_bar_deadline) - time.monotonic())
+    if remaining <= 0.0:
+        return reason_payload
+    sleep_sec = min(max(0.0, float(retry_interval_sec)), remaining)
+    if sleep_sec <= 0.0:
+        return reason_payload
+    time.sleep(sleep_sec)
+    return None
 
 
 def _build_account_state_skip_payload(
@@ -714,7 +921,10 @@ def _env_float(name: str, *, default: float) -> float:
     raw = os.getenv(name)
     if raw is None:
         return float(default)
-    return _float_or_none(raw) or float(default)
+    value = _float_or_none(raw)
+    if value is None:
+        return float(default)
+    return float(value)
 
 
 def _float_or_none(value: object) -> float | None:

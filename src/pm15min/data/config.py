@@ -18,7 +18,7 @@ class DataConfig:
     market_depth: int = 1
     market_start_offset: int = 0
     gamma_limit: int = 500
-    max_pages: int = 200
+    max_pages: int | None = None
     sleep_sec: float = 0.03
 
     @classmethod
@@ -34,7 +34,7 @@ class DataConfig:
         market_depth: int = 1,
         market_start_offset: int = 0,
         gamma_limit: int = 500,
-        max_pages: int = 200,
+        max_pages: int | None = None,
         sleep_sec: float = 0.03,
         root=None,
     ) -> "DataConfig":
@@ -43,6 +43,9 @@ class DataConfig:
         storage.ensure_base_dirs()
         cycle_slug = normalize_cycle(cycle)
         surface_slug = normalize_surface(surface)
+        normalized_max_pages = None if max_pages is None else int(max_pages)
+        if normalized_max_pages is not None and normalized_max_pages <= 0:
+            normalized_max_pages = None
         return cls(
             asset=asset,
             cycle=cycle_slug,
@@ -54,7 +57,7 @@ class DataConfig:
             market_depth=max(1, int(market_depth)),
             market_start_offset=max(0, int(market_start_offset)),
             gamma_limit=max(1, int(gamma_limit)),
-            max_pages=max(1, int(max_pages)),
+            max_pages=normalized_max_pages,
             sleep_sec=max(0.0, float(sleep_sec)),
         )
 

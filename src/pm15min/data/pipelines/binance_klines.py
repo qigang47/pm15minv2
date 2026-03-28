@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
 
 import pandas as pd
 
 from ..config import DataConfig
+from ..io.json_files import write_json_atomic
 from ..io.parquet import read_parquet_if_exists, upsert_parquet
 from ..sources.binance_spot import (
     BINANCE_KLINE_COLUMNS,
@@ -23,6 +26,19 @@ NUMERIC_COLUMNS = [
     "taker_buy_base_volume",
     "taker_buy_quote_volume",
     "ignore",
+]
+
+_LATEST_TAIL_COLUMNS = [
+    "open_time",
+    "close_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "quote_asset_volume",
+    "taker_buy_quote_volume",
+    "number_of_trades",
 ]
 
 
@@ -51,6 +67,78 @@ def _max_open_time(df: pd.DataFrame) -> pd.Timestamp | None:
     if ts.empty:
         return None
     return ts.max()
+
+
+def _latest_tail_path(cfg: DataConfig, *, symbol: str) -> Path:
+    return (
+        cfg.layout.surface_var_root
+        / "state"
+        / "binance_klines_1m"
+        / f"symbol={str(symbol).strip().upper()}"
+        / "latest_tail.json"
+    )
+
+
+def _env_int(name: str, *, default: int) -> int:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def _serialize_latest_tail_rows(frame: pd.DataFrame, *, max_rows: int) -> list[dict[str, object]]:
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return []
+    rows = frame.tail(max(1, int(max_rows))).copy()
+    payload_rows: list[dict[str, object]] = []
+    for row in rows.to_dict("records"):
+        payload: dict[str, object] = {}
+        for column in _LATEST_TAIL_COLUMNS:
+            value = row.get(column)
+            if isinstance(value, pd.Timestamp):
+                if value.tzinfo is None:
+                    value = value.tz_localize("UTC")
+                else:
+                    value = value.tz_convert("UTC")
+                payload[column] = value.isoformat()
+            elif value is None or pd.isna(value):
+                payload[column] = None
+            elif column == "number_of_trades":
+                payload[column] = int(value)
+            else:
+                payload[column] = float(value) if isinstance(value, (int, float)) else value
+        payload_rows.append(payload)
+    return payload_rows
+
+
+def _write_latest_tail_marker(
+    cfg: DataConfig,
+    *,
+    symbol: str,
+    canonical: pd.DataFrame,
+    now_utc: datetime,
+) -> Path:
+    latest_open_time = _max_open_time(canonical)
+    tail_rows = _serialize_latest_tail_rows(
+        canonical,
+        max_rows=_env_int("PM15MIN_LIVE_BINANCE_TAIL_MARKER_ROWS", default=32),
+    )
+    return write_json_atomic(
+        {
+            "dataset": "binance_klines_1m_latest_tail",
+            "market": cfg.asset.slug,
+            "surface": cfg.surface,
+            "symbol": str(symbol).strip().upper(),
+            "snapshot_ts": pd.Timestamp(now_utc).isoformat(),
+            "latest_open_time": None if latest_open_time is None else latest_open_time.isoformat(),
+            "row_count": int(len(canonical)),
+            "tail_rows": tail_rows,
+        },
+        _latest_tail_path(cfg, symbol=str(symbol).strip().upper()),
+    )
 
 
 def sync_binance_klines_1m(
@@ -122,6 +210,12 @@ def sync_binance_klines_1m(
         key_columns=["open_time"],
         sort_columns=["open_time", "close_time"],
     )
+    latest_tail_path = _write_latest_tail_marker(
+        cfg,
+        symbol=resolved_symbol,
+        canonical=canonical,
+        now_utc=now_utc,
+    )
     latest_open_time = _max_open_time(canonical)
     return {
         "dataset": "binance_klines_1m",
@@ -134,4 +228,5 @@ def sync_binance_klines_1m(
         "end_time_ms": int(effective_end_ms),
         "latest_open_time": None if latest_open_time is None else latest_open_time.isoformat(),
         "target_path": str(target_path),
+        "latest_tail_path": str(latest_tail_path),
     }

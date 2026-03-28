@@ -7,6 +7,7 @@ from .handlers import DataCliDeps, parse_utc_datetime, run_data_command as _run_
 from .parser import attach_data_subcommands as _attach_data_subcommands_impl
 from ..config import DataConfig
 from ..layout import DataLayout
+from ..service.orderbook_coverage import build_orderbook_coverage_report
 from ..service import show_data_summary
 from ..pipelines.binance_klines import sync_binance_klines_1m
 from ..pipelines.backtest_refresh import run_backtest_data_refresh
@@ -39,6 +40,7 @@ def _build_cli_deps() -> DataCliDeps:
         DataConfig=DataConfig,
         DataLayout=DataLayout,
         show_data_summary=show_data_summary,
+        build_orderbook_coverage_report=build_orderbook_coverage_report,
         sync_market_catalog=sync_market_catalog,
         sync_streams_from_rpc=sync_streams_from_rpc,
         sync_datafeeds_from_rpc=sync_datafeeds_from_rpc,

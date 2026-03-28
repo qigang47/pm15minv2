@@ -51,8 +51,8 @@ def build_label_frame_dataset(cfg: ResearchConfig, *, skip_freshness: bool = Fal
             "columns": list(LABEL_FRAME_COLUMNS),
         },
         inputs=[
-            {"path": str(data_cfg.layout.truth_table_path), "kind": "truth_15m"},
-            {"path": str(data_cfg.layout.oracle_prices_table_path), "kind": "oracle_prices_15m"},
+            {"path": str(data_cfg.layout.truth_table_path), "kind": f"truth_{cfg.cycle}"},
+            {"path": str(data_cfg.layout.oracle_prices_table_path), "kind": f"oracle_prices_{cfg.cycle}"},
         ],
         outputs=[
             {"path": str(data_path), "kind": "label_frame_parquet"},

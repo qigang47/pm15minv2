@@ -24,6 +24,14 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
     add_market_cycle_surface_args(show_summary)
     show_summary.add_argument("--write-state", action="store_true")
 
+    show_orderbook_coverage = data_sub.add_parser(
+        "show-orderbook-coverage",
+        help="Report raw orderbook depth partition coverage and inferred writer provenance.",
+    )
+    add_market_cycle_surface_args(show_orderbook_coverage)
+    show_orderbook_coverage.add_argument("--date-from", default=None, help="Inclusive UTC date, YYYY-MM-DD.")
+    show_orderbook_coverage.add_argument("--date-to", default=None, help="Inclusive UTC date, YYYY-MM-DD.")
+
     sync = data_sub.add_parser("sync", help="Sync raw source datasets into canonical source storage.")
     sync_sub = sync.add_subparsers(dest="data_sync_command")
 
@@ -33,7 +41,7 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
     market_catalog.add_argument("--end-date", default=None, help="UTC end date or ISO8601 timestamp.")
     market_catalog.add_argument("--lookback-days", type=int, default=35)
     market_catalog.add_argument("--limit", type=int, default=500)
-    market_catalog.add_argument("--max-pages", type=int, default=200)
+    market_catalog.add_argument("--max-pages", type=int, default=None, help="Optional page cap; default fetches until Gamma is exhausted.")
     market_catalog.add_argument("--sleep-sec", type=float, default=0.03)
 
     streams_rpc = sync_sub.add_parser(
@@ -210,6 +218,7 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
     foundation.add_argument("--oracle-lookback-days", type=int, default=2)
     foundation.add_argument("--oracle-lookahead-hours", type=int, default=24)
     foundation.add_argument("--no-direct-oracle", action="store_true")
+    foundation.add_argument("--no-streams", action="store_true")
     foundation.add_argument("--no-orderbooks", action="store_true")
 
     backtest_refresh = run_sub.add_parser("backtest-refresh", help="One-click refresh the canonical backtest data surface.")

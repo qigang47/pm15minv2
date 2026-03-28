@@ -21,10 +21,7 @@ ORACLE_PRICE_COLUMNS = [
 ]
 
 
-def build_oracle_prices_15m(cfg: DataConfig) -> dict[str, object]:
-    if cfg.cycle != "15m":
-        raise ValueError("oracle_prices_15m currently requires cycle=15m.")
-
+def build_oracle_prices_table(cfg: DataConfig) -> dict[str, object]:
     markets = load_market_catalog(cfg)
     if markets.empty:
         raise FileNotFoundError(
@@ -60,6 +57,12 @@ def build_oracle_prices_15m(cfg: DataConfig) -> dict[str, object]:
         direct["cycle_end_ts"] = pd.to_numeric(direct["cycle_end_ts"], errors="coerce")
         direct["price_to_beat"] = pd.to_numeric(direct["price_to_beat"], errors="coerce")
         direct["final_price"] = pd.to_numeric(direct["final_price"], errors="coerce")
+        if "source_priority" not in direct.columns:
+            direct["source_priority"] = 0
+        if "fetched_at" not in direct.columns:
+            direct["fetched_at"] = ""
+        if "source" not in direct.columns:
+            direct["source"] = ""
         direct = direct.dropna(subset=["cycle_start_ts", "cycle_end_ts"], how="any").copy()
         direct = direct.sort_values(["cycle_start_ts", "source_priority", "fetched_at"]).drop_duplicates(
             subset=["asset", "cycle_start_ts"], keep="last"
@@ -149,9 +152,13 @@ def build_oracle_prices_15m(cfg: DataConfig) -> dict[str, object]:
 
     write_parquet_atomic(out, cfg.layout.oracle_prices_table_path)
     return {
-        "dataset": "oracle_prices_15m",
+        "dataset": f"oracle_prices_{cfg.cycle}",
         "market": cfg.asset.slug,
         "surface": cfg.surface,
         "rows_written": int(len(out)),
         "target_path": str(cfg.layout.oracle_prices_table_path),
     }
+
+
+def build_oracle_prices_15m(cfg: DataConfig) -> dict[str, object]:
+    return build_oracle_prices_table(cfg)

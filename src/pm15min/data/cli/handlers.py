@@ -13,6 +13,7 @@ class DataCliDeps:
     DataConfig: type
     DataLayout: type
     show_data_summary: Callable[..., dict[str, Any]]
+    build_orderbook_coverage_report: Callable[..., dict[str, Any]]
     sync_market_catalog: Callable[..., dict[str, Any]]
     sync_streams_from_rpc: Callable[..., dict[str, Any]]
     sync_datafeeds_from_rpc: Callable[..., dict[str, Any]]
@@ -71,6 +72,15 @@ def _handle_show_layout(args: argparse.Namespace, deps: DataCliDeps) -> dict[str
 def _handle_show_summary(args: argparse.Namespace, deps: DataCliDeps) -> dict[str, Any]:
     cfg = _build_data_cfg(args, deps)
     return deps.show_data_summary(cfg, persist=bool(args.write_state))
+
+
+def _handle_show_orderbook_coverage(args: argparse.Namespace, deps: DataCliDeps) -> dict[str, Any]:
+    cfg = _build_data_cfg(args, deps)
+    return deps.build_orderbook_coverage_report(
+        cfg,
+        date_from=args.date_from,
+        date_to=args.date_to,
+    )
 
 
 def _sync_window(args: argparse.Namespace) -> tuple[int, int]:
@@ -262,6 +272,7 @@ def _handle_run_live_foundation(args: argparse.Namespace, deps: DataCliDeps) -> 
         oracle_lookback_days=int(args.oracle_lookback_days),
         oracle_lookahead_hours=int(args.oracle_lookahead_hours),
         include_direct_oracle=not bool(args.no_direct_oracle),
+        include_streams=not bool(args.no_streams),
         include_orderbooks=not bool(args.no_orderbooks),
     )
 
@@ -278,6 +289,7 @@ _ROOT_HANDLERS: dict[str, Callable[[argparse.Namespace, DataCliDeps], dict[str, 
     "show-config": _handle_show_config,
     "show-layout": _handle_show_layout,
     "show-summary": _handle_show_summary,
+    "show-orderbook-coverage": _handle_show_orderbook_coverage,
 }
 
 _SYNC_HANDLERS: dict[str, Callable[[argparse.Namespace, DataCliDeps], dict[str, Any]]] = {

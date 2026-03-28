@@ -261,6 +261,10 @@ def _index_row_from_snapshot(record: OrderbookSnapshotRecord) -> OrderbookIndexR
     )
 
 
+def _market_catalog_requires_active_rows(*, surface: str) -> bool:
+    return str(surface).strip().lower() in {"live", "backtest"}
+
+
 def _load_market_table(
     cfg: DataConfig,
     *,
@@ -272,7 +276,8 @@ def _load_market_table(
     now = datetime.fromtimestamp(captured_ts_ms / 1000.0, tz=timezone.utc)
     now_ts = int(captured_ts_ms // 1000)
     df = read_parquet_if_exists(target_path)
-    if cfg.surface == "live" and _live_market_catalog_refresh_reason(
+    requires_active_rows = _market_catalog_requires_active_rows(surface=cfg.surface)
+    if requires_active_rows and _live_market_catalog_refresh_reason(
         target_path=target_path,
         frame=df,
         now_ts=now_ts,
@@ -294,9 +299,9 @@ def _load_market_table(
     missing = [column for column in MARKET_TABLE_REQUIRED if column not in df.columns]
     if missing:
         raise KeyError(f"Market catalog missing required columns: {missing}")
-    if cfg.surface == "live" and not _has_active_or_future_rows(df, now_ts=now_ts):
+    if requires_active_rows and not _has_active_or_future_rows(df, now_ts=now_ts):
         raise RuntimeError(
-            f"live market catalog has no active or future markets: {target_path}"
+            f"{cfg.surface} market catalog has no active or future markets: {target_path}"
         )
     return df.copy()
 
