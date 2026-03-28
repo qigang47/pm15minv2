@@ -284,10 +284,21 @@ def build_runner_iteration(
     risk_alerts = build_runner_risk_alerts_fn(risk_summary=risk_summary, runner_health=runner_health)
     risk_alert_summary = summarize_runner_risk_alerts_fn(alerts=risk_alerts)
     phase_timings_ms["decision_signal_stage_ms"] = _float_or_none((decision_payload.get("timings_ms") or {}).get("signal_stage_ms"))
+    phase_timings_ms["decision_signal_bundle_resolution_stage_ms"] = _float_or_none((decision_payload.get("timings_ms") or {}).get("signal_bundle_resolution_stage_ms"))
+    phase_timings_ms["decision_signal_feature_prepare_stage_ms"] = _float_or_none((decision_payload.get("timings_ms") or {}).get("signal_feature_prepare_stage_ms"))
+    phase_timings_ms["decision_signal_feature_frame_stage_ms"] = _float_or_none((decision_payload.get("timings_ms") or {}).get("signal_feature_frame_stage_ms"))
+    phase_timings_ms["decision_signal_liquidity_state_stage_ms"] = _float_or_none((decision_payload.get("timings_ms") or {}).get("signal_liquidity_state_stage_ms"))
+    phase_timings_ms["decision_signal_regime_state_stage_ms"] = _float_or_none((decision_payload.get("timings_ms") or {}).get("signal_regime_state_stage_ms"))
+    phase_timings_ms["decision_signal_offset_scoring_stage_ms"] = _float_or_none((decision_payload.get("timings_ms") or {}).get("signal_offset_scoring_stage_ms"))
     phase_timings_ms["decision_quote_stage_ms"] = _float_or_none((decision_payload.get("timings_ms") or {}).get("quote_stage_ms"))
     phase_timings_ms["decision_account_context_stage_ms"] = _float_or_none((decision_payload.get("timings_ms") or {}).get("account_context_stage_ms"))
     phase_timings_ms["decision_build_stage_ms"] = _float_or_none((decision_payload.get("timings_ms") or {}).get("decision_build_stage_ms"))
     phase_timings_ms["decision_signal_cache_hit"] = bool((decision_payload.get("timings_ms") or {}).get("signal_cache_hit"))
+    for key, value in dict(decision_payload.get("timings_ms") or {}).items():
+        prefixed_key = f"decision_{key}"
+        if prefixed_key in phase_timings_ms:
+            continue
+        phase_timings_ms[prefixed_key] = value
     phase_timings_ms["execution_depth_stage_ms"] = _float_or_none((execution_payload.get("timings_ms") or {}).get("depth_stage_ms"))
     phase_timings_ms["execution_depth_plan_reused"] = bool((execution_payload.get("timings_ms") or {}).get("depth_plan_reused"))
     return {

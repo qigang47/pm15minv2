@@ -534,6 +534,67 @@ def test_sync_direct_oracle_uses_five_variant_for_5m(tmp_path: Path) -> None:
     assert calls[0]["cycle_seconds"] == 300
 
 
+def test_sync_direct_oracle_falls_back_to_single_when_batch_fetch_fails(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="eth", cycle="5m", surface="backtest", root=tmp_path / "v2")
+    cycle_start_ts = 1700000000
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "eth",
+                    "cycle": "5m",
+                    "cycle_start_ts": cycle_start_ts,
+                    "cycle_end_ts": cycle_start_ts + 300,
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "slug": "eth-up-or-down-5m-1700000000",
+                    "question": "Eth Up or Down",
+                    "resolution_source": "https://data.chain.link/streams/eth-usd",
+                    "event_id": "event-1",
+                    "event_slug": "slug-1",
+                    "event_title": "title-1",
+                    "series_slug": "eth-up-or-down-5m",
+                    "closed_ts": None,
+                    "source_snapshot_ts": "2026-03-19T09-00-00Z",
+                }
+            ]
+        ),
+        cfg.layout.market_catalog_table_path,
+    )
+
+    class _FakeClient:
+        def fetch_past_results_batch(self, **kwargs):
+            raise RuntimeError('/api/past-results failed status=400: {"status":"error","error":"unsupported"}')
+
+        def fetch_crypto_price(self, **kwargs):
+            return {
+                "openPrice": 100.0,
+                "closePrice": 101.0,
+                "completed": True,
+                "incomplete": False,
+                "cached": False,
+                "timestamp": 1700000300000,
+                "source": "event_page_dehydrated_state",
+            }
+
+    summary = sync_polymarket_oracle_prices_direct(
+        cfg,
+        start_ts=cycle_start_ts,
+        end_ts=cycle_start_ts,
+        max_requests=1,
+        client=_FakeClient(),
+    )
+    direct = pd.read_parquet(cfg.layout.direct_oracle_source_path)
+
+    assert summary["rows_imported"] == 1
+    assert "past-results failed status=400" in str(summary["batch_fetch_error"])
+    assert len(direct) == 1
+    assert bool(direct.iloc[0]["has_both"]) is True
+    assert direct.iloc[0]["source"] == "event_page_dehydrated_state"
+
+
 def test_sync_direct_oracle_overwrites_existing_incomplete_row_with_complete_candidate(tmp_path: Path) -> None:
     cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=tmp_path / "v2")
     cycle_start_ts = 1700000000

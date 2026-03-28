@@ -223,3 +223,27 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
 
     backtest_refresh = run_sub.add_parser("backtest-refresh", help="One-click refresh the canonical backtest data surface.")
     backtest_refresh.add_argument("--markets", default="btc,eth,sol,xrp", help="Comma-separated markets, default btc,eth,sol,xrp.")
+
+    backfill_direct_oracle = run_sub.add_parser(
+        "backfill-direct-oracle",
+        help="Backfill direct Polymarket oracle rows and rebuild oracle/truth/label outputs.",
+    )
+    add_market_cycle_surface_args(backfill_direct_oracle, surface_default="backtest")
+    backfill_direct_oracle.add_argument("--workers", type=int, default=1)
+    backfill_direct_oracle.add_argument("--flush-every", type=int, default=200)
+    backfill_direct_oracle.add_argument("--timeout-sec", type=float, default=30.0)
+    backfill_direct_oracle.add_argument("--max-retries", type=int, default=6)
+    backfill_direct_oracle.add_argument("--sleep-sec", type=float, default=0.0)
+
+    backfill_gamma = run_sub.add_parser(
+        "backfill-cycle-labels-gamma",
+        help="Backfill market catalog and truth/label frames from Gamma outcome prices.",
+    )
+    backfill_gamma.add_argument("--markets", default="btc,eth,sol,xrp", help="Comma-separated markets or all.")
+    backfill_gamma.add_argument("--cycle", default="15m", choices=["5m", "15m"])
+    backfill_gamma.add_argument("--surface", default="backtest", choices=["backtest", "live"])
+    backfill_gamma.add_argument("--start-date", default=None, help="UTC start date or ISO8601 timestamp.")
+    backfill_gamma.add_argument("--end-date", default=None, help="UTC end date or ISO8601 timestamp.")
+    backfill_gamma.add_argument("--window-days", type=int, default=7)
+    backfill_gamma.add_argument("--workers", type=int, default=4)
+    backfill_gamma.add_argument("--skip-market-catalog-refresh", action="store_true")

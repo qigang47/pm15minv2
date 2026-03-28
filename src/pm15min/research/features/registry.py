@@ -87,6 +87,11 @@ _FEATURES = (
     FeatureDefinition("rel_strength_15m", "cross_asset", "Asset minus BTC 15-minute return"),
 )
 
+_FEATURE_GROUP_BY_NAME = {
+    str(feature.name): str(feature.group)
+    for feature in _FEATURES
+}
+
 _FEATURE_SET_COLUMNS = {
     "v6_user_core": (
         "ret_1m",
@@ -266,6 +271,10 @@ _FEATURE_SET_DROP_COLUMNS = {
         "has_oracle_strike",
     ),
 }
+
+
+def feature_group(name: str) -> str | None:
+    return _FEATURE_GROUP_BY_NAME.get(str(name))
 
 
 def feature_registry() -> dict[str, FeatureDefinition]:

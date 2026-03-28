@@ -6,7 +6,12 @@ import pandas as pd
 
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
-from pm15min.data.pipelines.direct_sync import sync_datafeeds_from_rpc, sync_settlement_truth_from_rpc, sync_streams_from_rpc
+from pm15min.data.pipelines.direct_sync import (
+    sync_datafeeds_from_rpc,
+    sync_settlement_truth_from_gamma,
+    sync_settlement_truth_from_rpc,
+    sync_streams_from_rpc,
+)
 
 
 class _FakeRpc:
@@ -18,6 +23,18 @@ class _FakeRpc:
 
     def find_first_block_at_or_after_ts(self, target_ts: int, lo_block: int, hi_block: int) -> int:
         return max(1, min(1000, int(target_ts % 1000) + 1))
+
+
+class _FakeGammaClient:
+    def fetch_markets_by_ids(self, market_ids: list[str], *, sleep_sec: float = 0.0):
+        return [
+            {
+                "id": "market-1",
+                "outcomes": '["Up", "Down"]',
+                "outcomePrices": '["0", "1"]',
+                "umaResolutionStatus": "resolved",
+            }
+        ]
 
 
 class _FakeChainlinkSource:
@@ -186,4 +203,41 @@ def test_sync_settlement_truth_from_rpc_writes_source_table(tmp_path: Path, monk
     assert summary["rows_imported"] == 1
     df = pd.read_parquet(cfg.layout.settlement_truth_source_path)
     assert df.iloc[0]["winner_side"] == "UP"
+    assert bool(df.iloc[0]["full_truth"]) is True
+
+
+def test_sync_settlement_truth_from_gamma_writes_source_table(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
+
+    market_table = pd.DataFrame(
+        [
+            {
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "asset": "eth",
+                "cycle": "5m",
+                "cycle_start_ts": 1766031900,
+                "cycle_end_ts": 1766032200,
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "slug": "eth-updown-5m-1766031900",
+                "question": "Ethereum Up or Down",
+                "resolution_source": "https://data.chain.link/streams/eth-usd",
+                "event_id": "event-1",
+                "event_slug": "slug-1",
+                "event_title": "title-1",
+                "series_slug": "eth-up-or-down-5m",
+                "closed_ts": 1766032520,
+                "source_snapshot_ts": "2026-03-28T10:00:00Z",
+            }
+        ]
+    )
+    write_parquet_atomic(market_table, cfg.layout.market_catalog_table_path)
+
+    summary = sync_settlement_truth_from_gamma(cfg, client=_FakeGammaClient())
+
+    assert summary["rows_imported"] == 1
+    assert summary["rows_resolved"] == 1
+    df = pd.read_parquet(cfg.layout.settlement_truth_source_path)
+    assert df.iloc[0]["winner_side"] == "DOWN"
     assert bool(df.iloc[0]["full_truth"]) is True

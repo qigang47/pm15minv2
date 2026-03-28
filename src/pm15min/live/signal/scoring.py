@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 from .scoring_bundle import BundleResolution, LiveFeatureContext
 from .scoring_bundle import (
@@ -20,6 +21,7 @@ def _build_signal_payload(
     bundle: BundleResolution,
     feature_ctx: LiveFeatureContext,
     offset_signals: list[dict[str, object]],
+    timings_ms: dict[str, float],
     utc_snapshot_label_fn,
     iso_or_none_fn,
 ) -> dict[str, object]:
@@ -51,6 +53,7 @@ def _build_signal_payload(
         "regime_snapshot_path": _optional_payload_field(feature_ctx.regime_payload, "regime_snapshot_path"),
         "regime_state": feature_ctx.regime_state,
         "offset_signals": offset_signals,
+        "timings_ms": timings_ms,
     }
 
 
@@ -78,6 +81,8 @@ def score_live_latest(
     persist_live_signal_snapshot_fn,
     utc_snapshot_label_fn,
 ) -> dict[str, object]:
+    score_started = time.perf_counter()
+    bundle_started = time.perf_counter()
     bundle = _resolve_bundle_resolution(
         cfg,
         target=target,
@@ -88,6 +93,8 @@ def score_live_latest(
         read_model_bundle_manifest_fn=read_model_bundle_manifest_fn,
         supports_feature_set_fn=supports_feature_set_fn,
     )
+    bundle_elapsed_ms = round(max(0.0, (time.perf_counter() - float(bundle_started)) * 1000.0), 3)
+    feature_ctx_started = time.perf_counter()
     feature_ctx = _prepare_live_features_and_states(
         cfg,
         builder_feature_set=bundle.builder_feature_set,
@@ -96,7 +103,9 @@ def score_live_latest(
         build_live_feature_frame_fn=build_live_feature_frame_fn,
         allow_preview_open_bar=allow_preview_open_bar,
     )
-    offset_signals = _score_offset_signals(
+    feature_ctx_total_ms = round(max(0.0, (time.perf_counter() - float(feature_ctx_started)) * 1000.0), 3)
+    offset_scoring_started = time.perf_counter()
+    offset_signals, offset_scoring_timings = _score_offset_signals(
         cfg,
         selected_target=bundle.selected_target,
         profile_spec=bundle.profile_spec,
@@ -111,11 +120,27 @@ def score_live_latest(
         extract_feature_snapshot_fn=extract_feature_snapshot_fn,
         iso_or_none_fn=iso_or_none_fn,
     )
+    offset_scoring_elapsed_ms = round(max(0.0, (time.perf_counter() - float(offset_scoring_started)) * 1000.0), 3)
+    total_elapsed_ms = round(max(0.0, (time.perf_counter() - float(score_started)) * 1000.0), 3)
     payload = _build_signal_payload(
         cfg,
         bundle=bundle,
         feature_ctx=feature_ctx,
         offset_signals=offset_signals,
+        timings_ms={
+            "bundle_resolution_stage_ms": bundle_elapsed_ms,
+            "feature_prepare_stage_ms": feature_ctx_total_ms,
+            **{
+                str(key): value
+                for key, value in feature_ctx.timings_ms.items()
+            },
+            "offset_scoring_stage_ms": offset_scoring_elapsed_ms,
+            **{
+                str(key): value
+                for key, value in offset_scoring_timings.items()
+            },
+            "signal_total_stage_ms": total_elapsed_ms,
+        },
         utc_snapshot_label_fn=utc_snapshot_label_fn,
         iso_or_none_fn=iso_or_none_fn,
     )

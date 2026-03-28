@@ -10,7 +10,8 @@ from ..layout import DataLayout
 from ..service.orderbook_coverage import build_orderbook_coverage_report
 from ..service import show_data_summary
 from ..pipelines.binance_klines import sync_binance_klines_1m
-from ..pipelines.backtest_refresh import run_backtest_data_refresh
+from ..pipelines.backtest_refresh import backfill_cycle_labels_from_gamma, run_backtest_data_refresh
+from ..pipelines.direct_oracle_prices import backfill_direct_oracle_prices
 from ..pipelines.direct_sync import sync_datafeeds_from_rpc, sync_settlement_truth_from_rpc, sync_streams_from_rpc
 from ..pipelines.export_tables import export_oracle_prices_15m, export_truth_15m
 from ..pipelines.foundation_runtime import run_live_data_foundation
@@ -60,6 +61,8 @@ def _build_cli_deps() -> DataCliDeps:
         run_orderbook_recorder_fleet=run_orderbook_recorder_fleet,
         run_live_data_foundation=run_live_data_foundation,
         run_backtest_data_refresh=run_backtest_data_refresh,
+        backfill_direct_oracle_prices=backfill_direct_oracle_prices,
+        backfill_cycle_labels_from_gamma=backfill_cycle_labels_from_gamma,
     )
 
 

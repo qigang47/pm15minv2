@@ -9,8 +9,12 @@ def append_cross_asset_features(
     frame: pd.DataFrame,
     *,
     btc_klines: pd.DataFrame | None,
+    requested_columns: set[str] | None = None,
 ) -> pd.DataFrame:
     out = frame.copy()
+    requested = None if requested_columns is None else {str(column) for column in requested_columns}
+    if requested is not None and not requested.intersection({"btc_ret_5m", "btc_vol_30m", "rel_strength_15m"}):
+        return out
     if btc_klines is None or btc_klines.empty:
         return out
 

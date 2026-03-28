@@ -153,11 +153,22 @@ def decide_live_latest(
     decision_elapsed_ms = _elapsed_ms(decision_started)
     payload["timings_ms"] = {
         "signal_stage_ms": signal_elapsed_ms,
+        "signal_bundle_resolution_stage_ms": _float_or_none((signal.get("timings_ms") or {}).get("bundle_resolution_stage_ms")),
+        "signal_feature_prepare_stage_ms": _float_or_none((signal.get("timings_ms") or {}).get("feature_prepare_stage_ms")),
+        "signal_feature_frame_stage_ms": _float_or_none((signal.get("timings_ms") or {}).get("feature_frame_stage_ms")),
+        "signal_liquidity_state_stage_ms": _float_or_none((signal.get("timings_ms") or {}).get("liquidity_state_stage_ms")),
+        "signal_regime_state_stage_ms": _float_or_none((signal.get("timings_ms") or {}).get("regime_state_stage_ms")),
+        "signal_offset_scoring_stage_ms": _float_or_none((signal.get("timings_ms") or {}).get("offset_scoring_stage_ms")),
         "quote_stage_ms": quote_elapsed_ms,
         "account_context_stage_ms": account_elapsed_ms,
         "decision_build_stage_ms": decision_elapsed_ms,
         "signal_cache_hit": bool(signal_cache_hit),
     }
+    for key, value in dict(signal.get("timings_ms") or {}).items():
+        prefixed_key = f"signal_{key}"
+        if prefixed_key in payload["timings_ms"]:
+            continue
+        payload["timings_ms"][prefixed_key] = value
     if persist:
         paths = persist_decision_snapshot_fn(rewrite_root=cfg.layout.rewrite.root, payload=payload)
         payload["latest_decision_path"] = str(paths["latest"])
@@ -440,6 +451,20 @@ def _resolve_signal_cache_valid_until(
     for row in list(payload.get("offset_signals") or []):
         if not isinstance(row, dict):
             continue
+        status = str(row.get("status") or "").strip().lower()
+        decision_ts = pd.to_datetime(row.get("decision_ts"), utc=True, errors="coerce")
+        window_start_ts = pd.to_datetime(row.get("window_start_ts"), utc=True, errors="coerce")
+        window_end_ts = pd.to_datetime(row.get("window_end_ts"), utc=True, errors="coerce")
+        active_unresolved_window = (
+            status in {"offset_not_yet_open", "missing_score_row"}
+            and (decision_ts is None or pd.isna(decision_ts))
+            and window_start_ts is not None
+            and not pd.isna(window_start_ts)
+            and window_start_ts <= now_utc
+            and (window_end_ts is None or pd.isna(window_end_ts) or now_utc < window_end_ts)
+        )
+        if active_unresolved_window:
+            return None
         for key in ("window_start_ts", "window_end_ts", "cycle_end_ts"):
             ts = pd.to_datetime(row.get(key), utc=True, errors="coerce")
             if ts is None or pd.isna(ts):
@@ -538,6 +563,15 @@ def _int_or_none(value: object) -> int | None:
         if value in (None, ""):
             return None
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
     except (TypeError, ValueError):
         return None
 

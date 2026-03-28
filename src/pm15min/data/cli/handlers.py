@@ -33,6 +33,8 @@ class DataCliDeps:
     run_orderbook_recorder_fleet: Callable[..., dict[str, Any]]
     run_live_data_foundation: Callable[..., dict[str, Any]]
     run_backtest_data_refresh: Callable[..., dict[str, Any]]
+    backfill_direct_oracle_prices: Callable[..., dict[str, Any]]
+    backfill_cycle_labels_from_gamma: Callable[..., dict[str, Any]]
 
 
 def _print_payload(payload: dict[str, Any]) -> int:
@@ -285,6 +287,36 @@ def _handle_run_backtest_refresh(args: argparse.Namespace, deps: DataCliDeps) ->
     )
 
 
+def _handle_run_backfill_direct_oracle(args: argparse.Namespace, deps: DataCliDeps) -> dict[str, Any]:
+    cfg = _build_data_cfg(args, deps)
+    return deps.backfill_direct_oracle_prices(
+        cfg,
+        workers=int(args.workers),
+        flush_every=int(args.flush_every),
+        timeout_sec=float(args.timeout_sec),
+        max_retries=int(args.max_retries),
+        sleep_sec=float(args.sleep_sec),
+    )
+
+
+def _handle_run_backfill_cycle_labels_gamma(args: argparse.Namespace, deps: DataCliDeps) -> dict[str, Any]:
+    markets = [item.strip().lower() for item in str(args.markets or "").split(",") if item.strip()]
+    if any(item == "all" for item in markets):
+        markets = ["btc", "eth", "sol", "xrp"]
+    start_ts = int(parse_utc_datetime(args.start_date).timestamp()) if args.start_date else None
+    end_ts = int(parse_utc_datetime(args.end_date).timestamp()) if args.end_date else None
+    return deps.backfill_cycle_labels_from_gamma(
+        markets=markets or ["btc", "eth", "sol", "xrp"],
+        cycle=args.cycle,
+        surface=args.surface,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        window_days=int(args.window_days),
+        workers=int(args.workers),
+        refresh_market_catalog=not bool(args.skip_market_catalog_refresh),
+    )
+
+
 _ROOT_HANDLERS: dict[str, Callable[[argparse.Namespace, DataCliDeps], dict[str, Any]]] = {
     "show-config": _handle_show_config,
     "show-layout": _handle_show_layout,
@@ -324,6 +356,8 @@ _RUN_HANDLERS: dict[str, Callable[[argparse.Namespace, DataCliDeps], dict[str, A
     "orderbook-fleet": _handle_run_orderbook_fleet,
     "live-foundation": _handle_run_live_foundation,
     "backtest-refresh": _handle_run_backtest_refresh,
+    "backfill-direct-oracle": _handle_run_backfill_direct_oracle,
+    "backfill-cycle-labels-gamma": _handle_run_backfill_cycle_labels_gamma,
 }
 
 

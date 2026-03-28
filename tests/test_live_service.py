@@ -26,6 +26,7 @@ from pm15min.live.signal.service import (
     prewarm_live_signal_inputs as prewarm_live_signal_inputs_impl,
     prewarm_live_signal_preview as prewarm_live_signal_preview_impl,
 )
+from pm15min.live.signal import service as signal_service_module
 from pm15min.live.signal import scoring_bundle as scoring_bundle_module
 from pm15min.live.signal import utils as signal_utils_module
 from pm15min.live.service import facade_helpers as service_facade_helpers_module
@@ -53,8 +54,11 @@ def _prepare_nan_feature_score_case(tmp_path: Path, monkeypatch) -> LiveConfig:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
-    decision_ts = pd.Timestamp.now(tz="UTC").floor("min")
-    cycle_start_ts = decision_ts.floor("15min")
+    now_utc = pd.Timestamp.now(tz="UTC")
+    cycle_start_ts = now_utc.floor("15min")
+    if now_utc < cycle_start_ts + pd.Timedelta(minutes=7):
+        cycle_start_ts = cycle_start_ts - pd.Timedelta(minutes=15)
+    decision_ts = cycle_start_ts + pd.Timedelta(minutes=7)
     cycle_end_ts = cycle_start_ts + pd.Timedelta(minutes=15)
     bundle_dir = root / "bundles" / "bundle=nan_guard"
     (bundle_dir / "offsets" / "offset=7").mkdir(parents=True, exist_ok=True)
@@ -116,6 +120,10 @@ def _prepare_nan_feature_score_case(tmp_path: Path, monkeypatch) -> LiveConfig:
                 }
             ]
         ),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.scoring_offsets.pd.Timestamp.now",
+        lambda *args, **kwargs: decision_ts + pd.Timedelta(seconds=10),
     )
     return cfg
 
@@ -495,9 +503,12 @@ def test_score_live_latest_ignores_expired_offset_rows(tmp_path: Path, monkeypat
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
-    current_decision_ts = pd.Timestamp.now(tz="UTC").floor("min")
+    current_now_utc = pd.Timestamp.now(tz="UTC")
+    current_cycle_start_ts = current_now_utc.floor("15min")
+    if current_now_utc < current_cycle_start_ts + pd.Timedelta(minutes=7):
+        current_cycle_start_ts = current_cycle_start_ts - pd.Timedelta(minutes=15)
+    current_decision_ts = current_cycle_start_ts + pd.Timedelta(minutes=7)
     expired_decision_ts = current_decision_ts - pd.Timedelta(minutes=20)
-    current_cycle_start_ts = current_decision_ts.floor("15min")
     expired_cycle_start_ts = expired_decision_ts.floor("15min")
     bundle_dir = root / "bundles" / "bundle=fresh_guard"
     (bundle_dir / "offsets" / "offset=7").mkdir(parents=True, exist_ok=True)
@@ -581,6 +592,10 @@ def test_score_live_latest_ignores_expired_offset_rows(tmp_path: Path, monkeypat
                 },
             ]
         ),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.scoring_offsets.pd.Timestamp.now",
+        lambda *args, **kwargs: current_decision_ts + pd.Timedelta(seconds=10),
     )
 
     payload = score_live_latest(cfg, persist=False)
@@ -1841,6 +1856,26 @@ def test_decide_live_latest_reuses_cached_signal_until_next_transition(tmp_path:
     assert first["decision"]["status"] == "reject"
     assert second["decision"]["status"] == "reject"
     assert calls["score"] == 1
+
+
+def test_resolve_signal_cache_valid_until_skips_active_unresolved_window() -> None:
+    now_utc = pd.Timestamp("2026-03-27T14:07:10Z")
+    payload = {
+        "offset_signals": [
+            {
+                "offset": 7,
+                "status": "offset_not_yet_open",
+                "decision_ts": None,
+                "window_start_ts": "2026-03-27T14:07:00+00:00",
+                "window_end_ts": "2026-03-27T14:08:00+00:00",
+                "cycle_end_ts": "2026-03-27T14:15:00+00:00",
+            }
+        ]
+    }
+
+    valid_until_ts = signal_service_module._resolve_signal_cache_valid_until(payload=payload, now_utc=now_utc)
+
+    assert valid_until_ts is None
 
 
 def test_decide_live_latest_refreshes_when_cached_signal_is_expired(tmp_path: Path, monkeypatch) -> None:

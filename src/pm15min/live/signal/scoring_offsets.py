@@ -3,11 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import time
 
 import pandas as pd
 
 
 DEFAULT_OFFSET_WINDOW_SECONDS = 60.0
+
+
+@dataclass(frozen=True)
+class FeatureFrameContext:
+    features: pd.DataFrame
+    rows_by_offset: dict[int, pd.DataFrame]
+    active_cycle_start: pd.Timestamp | None
+    active_cycle_end: pd.Timestamp | None
+    latest_feature_decision_ts: pd.Timestamp | None
 
 
 @dataclass(frozen=True)
@@ -19,6 +29,7 @@ class OffsetScoreContext:
     not_allowed_blacklist: list[str]
     features: Any
     scored: Any
+    feature_frame_ctx: FeatureFrameContext | None = None
 
 
 def resolve_offset_dirs(bundle_dir: Path) -> list[Path]:
@@ -64,32 +75,29 @@ def build_offset_coverage(
 
 def prepare_offset_score_context(
     *,
-    bundle_dir: Path,
     offset: int,
-    base_features,
-    profile_blacklist: list[str],
-    read_bundle_config_fn,
-    resolve_live_blacklist_fn,
-    apply_live_blacklist_fn,
+    bundle_cfg: dict[str, object],
+    feature_columns: list[str],
+    effective_blacklist: list[str],
+    not_allowed_blacklist: list[str],
+    feature_frame_ctx: FeatureFrameContext,
+    bundle_dir: Path,
     score_bundle_offset_fn,
 ) -> OffsetScoreContext:
-    bundle_cfg = read_bundle_config_fn(bundle_dir, offset=offset)
-    feature_columns = list(bundle_cfg.get("feature_columns") or [])
-    effective_blacklist, not_allowed_blacklist = resolve_live_blacklist_fn(
-        profile_blacklist=profile_blacklist,
-        bundle_allowed_blacklist=list(bundle_cfg.get("allowed_blacklist_columns") or []),
-    )
-    features = base_features.copy()
-    apply_live_blacklist_fn(features, blacklist_columns=effective_blacklist)
-    scored = score_bundle_offset_fn(bundle_dir, features, offset=offset)
+    scored = score_bundle_offset_fn(bundle_dir, feature_frame_ctx.features, offset=offset)
+    if isinstance(scored, pd.DataFrame) and not scored.empty and "decision_ts" in scored.columns:
+        scored = scored.copy()
+        scored["decision_ts"] = pd.to_datetime(scored.get("decision_ts"), utc=True, errors="coerce")
+        scored = scored.dropna(subset=["decision_ts"]).sort_values("decision_ts").reset_index(drop=True)
     return OffsetScoreContext(
         offset=offset,
         bundle_cfg=bundle_cfg,
         feature_columns=feature_columns,
         effective_blacklist=effective_blacklist,
         not_allowed_blacklist=not_allowed_blacklist,
-        features=features,
+        features=feature_frame_ctx.features,
         scored=scored,
+        feature_frame_ctx=feature_frame_ctx,
     )
 
 
@@ -164,7 +172,11 @@ def build_scored_signal(
         score_reason=str(row.get("score_reason") or ""),
         nan_feature_columns=nan_feature_columns,
     )
-    feature_snapshot = extract_feature_snapshot_fn(ctx.features, offset=ctx.offset, decision_ts=row.get("decision_ts"))
+    feature_snapshot = _resolve_feature_snapshot(
+        ctx=ctx,
+        decision_ts=row.get("decision_ts"),
+        extract_feature_snapshot_fn=extract_feature_snapshot_fn,
+    )
     return {
         "offset": ctx.offset,
         "decision_ts": decision_ts,
@@ -242,6 +254,12 @@ def _feature_cycle_context(
     ctx: OffsetScoreContext,
     now_utc: pd.Timestamp,
 ) -> tuple[pd.Timestamp | None, pd.Timestamp | None, pd.Timestamp | None]:
+    if ctx.feature_frame_ctx is not None:
+        return (
+            ctx.feature_frame_ctx.active_cycle_start,
+            ctx.feature_frame_ctx.active_cycle_end,
+            ctx.feature_frame_ctx.latest_feature_decision_ts,
+        )
     features = ctx.features
     if not isinstance(features, pd.DataFrame) or features.empty:
         return None, None, None
@@ -312,11 +330,9 @@ def _resolve_latest_live_row(
         nan_feature_columns=[],
         feature_coverage_fn=feature_coverage_fn,
     )
-    scored = ctx.scored.copy()
+    scored = ctx.scored
     if scored.empty or "decision_ts" not in scored.columns:
         return None, base_coverage, "missing_score_row"
-    scored["decision_ts"] = pd.to_datetime(scored.get("decision_ts"), utc=True, errors="coerce")
-    scored = scored.dropna(subset=["decision_ts"]).sort_values("decision_ts")
     if scored.empty:
         return None, base_coverage, "missing_score_row"
 
@@ -346,11 +362,10 @@ def _resolve_latest_live_row(
     if scored.empty:
         return None, base_coverage, "offset_not_yet_open"
     row = scored.iloc[-1]
-    nan_feature_columns = latest_nan_feature_columns_fn(
-        features=ctx.features,
-        offset=ctx.offset,
+    nan_feature_columns = _resolve_nan_feature_columns(
+        ctx=ctx,
         decision_ts=row.get("decision_ts"),
-        required_columns=ctx.feature_columns,
+        latest_nan_feature_columns_fn=latest_nan_feature_columns_fn,
     )
     coverage = build_offset_coverage(
         ctx=ctx,
@@ -390,8 +405,6 @@ def build_offset_signal(
         iso_or_none_fn=iso_or_none_fn,
     )
     if row is None:
-        if inactive_reason == "missing_score_row":
-            return build_missing_score_signal(offset=ctx.offset, coverage=coverage)
         active_cycle_start, active_cycle_end, _ = _feature_cycle_context(
             ctx=ctx,
             now_utc=now_utc,
@@ -445,7 +458,7 @@ def score_offset_signals(
     extract_feature_snapshot_fn,
     iso_or_none_fn,
     now_utc: pd.Timestamp | None = None,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], dict[str, object]]:
     profile_blacklist = list(profile_spec.blacklist_for(cfg.asset.slug))
     now_utc = pd.Timestamp(now_utc) if now_utc is not None else pd.Timestamp.now(tz="UTC")
     if now_utc.tzinfo is None:
@@ -453,18 +466,34 @@ def score_offset_signals(
     else:
         now_utc = now_utc.tz_convert("UTC")
     offset_signals: list[dict[str, object]] = []
-    for offset_dir in resolve_offset_dirs(bundle_dir):
-        offset = int(offset_dir.name.split("=", 1)[1])
+    offset_timings_ms: dict[str, dict[str, float]] = {}
+    scoring_started = time.perf_counter()
+    offset_specs = _resolve_offset_specs(
+        bundle_dir=bundle_dir,
+        profile_blacklist=profile_blacklist,
+        read_bundle_config_fn=read_bundle_config_fn,
+        resolve_live_blacklist_fn=resolve_live_blacklist_fn,
+    )
+    shared_feature_frames = _build_shared_feature_frames(
+        base_features=base_features,
+        now_utc=now_utc,
+        offset_specs=offset_specs,
+        apply_live_blacklist_fn=apply_live_blacklist_fn,
+    )
+    for spec in offset_specs:
+        context_started = time.perf_counter()
         ctx = prepare_offset_score_context(
+            offset=spec.offset,
+            bundle_cfg=spec.bundle_cfg,
+            feature_columns=spec.feature_columns,
+            effective_blacklist=spec.effective_blacklist,
+            not_allowed_blacklist=spec.not_allowed_blacklist,
+            feature_frame_ctx=shared_feature_frames[tuple(spec.effective_blacklist)],
             bundle_dir=bundle_dir,
-            offset=offset,
-            base_features=base_features,
-            profile_blacklist=profile_blacklist,
-            read_bundle_config_fn=read_bundle_config_fn,
-            resolve_live_blacklist_fn=resolve_live_blacklist_fn,
-            apply_live_blacklist_fn=apply_live_blacklist_fn,
             score_bundle_offset_fn=score_bundle_offset_fn,
         )
+        context_elapsed_ms = _elapsed_ms(context_started)
+        build_started = time.perf_counter()
         offset_signals.append(
             build_offset_signal(
                 selected_target=selected_target,
@@ -476,4 +505,227 @@ def score_offset_signals(
                 now_utc=now_utc,
             )
         )
-    return offset_signals
+        build_elapsed_ms = _elapsed_ms(build_started)
+        offset_timings_ms[str(spec.offset)] = {
+            "prepare_context_stage_ms": context_elapsed_ms,
+            "build_signal_stage_ms": build_elapsed_ms,
+            "total_stage_ms": round(context_elapsed_ms + build_elapsed_ms, 3),
+        }
+    return offset_signals, {
+        "offset_scoring_total_stage_ms": _elapsed_ms(scoring_started),
+        "offset_scoring_offsets_ms": offset_timings_ms,
+    }
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round(max(0.0, (time.perf_counter() - float(started_at)) * 1000.0), 3)
+
+
+@dataclass(frozen=True)
+class _OffsetSpec:
+    offset: int
+    bundle_cfg: dict[str, object]
+    feature_columns: list[str]
+    effective_blacklist: list[str]
+    not_allowed_blacklist: list[str]
+
+
+def _resolve_offset_specs(
+    *,
+    bundle_dir: Path,
+    profile_blacklist: list[str],
+    read_bundle_config_fn,
+    resolve_live_blacklist_fn,
+) -> list[_OffsetSpec]:
+    specs: list[_OffsetSpec] = []
+    for offset_dir in resolve_offset_dirs(bundle_dir):
+        offset = int(offset_dir.name.split("=", 1)[1])
+        bundle_cfg = read_bundle_config_fn(bundle_dir, offset=offset)
+        effective_blacklist, not_allowed_blacklist = resolve_live_blacklist_fn(
+            profile_blacklist=profile_blacklist,
+            bundle_allowed_blacklist=list(bundle_cfg.get("allowed_blacklist_columns") or []),
+        )
+        specs.append(
+            _OffsetSpec(
+                offset=offset,
+                bundle_cfg=dict(bundle_cfg),
+                feature_columns=list(bundle_cfg.get("feature_columns") or []),
+                effective_blacklist=effective_blacklist,
+                not_allowed_blacklist=not_allowed_blacklist,
+            )
+        )
+    return specs
+
+
+def _build_shared_feature_frames(
+    *,
+    base_features,
+    now_utc: pd.Timestamp,
+    offset_specs: list[_OffsetSpec],
+    apply_live_blacklist_fn,
+) -> dict[tuple[str, ...], FeatureFrameContext]:
+    shared: dict[tuple[str, ...], FeatureFrameContext] = {}
+    for spec in offset_specs:
+        blacklist_key = tuple(spec.effective_blacklist)
+        if blacklist_key in shared:
+            continue
+        features = base_features.copy()
+        apply_live_blacklist_fn(features, blacklist_columns=list(blacklist_key))
+        shared[blacklist_key] = _build_feature_frame_context(features=features, now_utc=now_utc)
+    return shared
+
+
+def _build_feature_frame_context(*, features: pd.DataFrame, now_utc: pd.Timestamp) -> FeatureFrameContext:
+    if not isinstance(features, pd.DataFrame) or features.empty:
+        return FeatureFrameContext(
+            features=features,
+            rows_by_offset={},
+            active_cycle_start=None,
+            active_cycle_end=None,
+            latest_feature_decision_ts=None,
+        )
+    rows = features.copy()
+    rows["__offset_num"] = pd.to_numeric(rows.get("offset"), errors="coerce")
+    rows["__decision_ts"] = pd.to_datetime(rows.get("decision_ts"), utc=True, errors="coerce")
+    rows["__cycle_start_ts"] = pd.to_datetime(rows.get("cycle_start_ts"), utc=True, errors="coerce")
+    rows["__cycle_end_ts"] = pd.to_datetime(rows.get("cycle_end_ts"), utc=True, errors="coerce")
+    rows = rows.sort_values("__decision_ts", na_position="last").reset_index(drop=True)
+    rows_by_offset: dict[int, pd.DataFrame] = {}
+    valid_offsets = rows.loc[rows["__offset_num"].notna()].copy()
+    if not valid_offsets.empty:
+        for offset, offset_rows in valid_offsets.groupby("__offset_num", sort=False):
+            try:
+                rows_by_offset[int(offset)] = offset_rows.reset_index(drop=True)
+            except Exception:
+                continue
+    latest_feature_decision_ts = _max_valid_timestamp(rows.get("__decision_ts"))
+    active_cycle_start, active_cycle_end = _resolve_active_cycle_bounds(rows=rows, now_utc=now_utc)
+    return FeatureFrameContext(
+        features=features,
+        rows_by_offset=rows_by_offset,
+        active_cycle_start=active_cycle_start,
+        active_cycle_end=active_cycle_end,
+        latest_feature_decision_ts=latest_feature_decision_ts,
+    )
+
+
+def _resolve_active_cycle_bounds(
+    *,
+    rows: pd.DataFrame,
+    now_utc: pd.Timestamp,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    cycle_start = rows.get("__cycle_start_ts")
+    cycle_end = rows.get("__cycle_end_ts")
+    if not isinstance(cycle_start, pd.Series) or not isinstance(cycle_end, pd.Series):
+        return None, None
+    active = cycle_start.notna() & cycle_end.notna() & cycle_start.le(now_utc) & cycle_end.gt(now_utc)
+    if bool(active.any()):
+        active_cycle_start = cycle_start.loc[active].max()
+        active_cycle_end = cycle_end.loc[active & cycle_start.eq(active_cycle_start)].max()
+        return active_cycle_start, active_cycle_end
+    inferred_cycle = _infer_current_cycle_bounds(
+        now_utc=now_utc,
+        cycle_start=cycle_start,
+        cycle_end=cycle_end,
+    )
+    if inferred_cycle is None:
+        return None, None
+    return inferred_cycle
+
+
+def _max_valid_timestamp(series: object) -> pd.Timestamp | None:
+    if not isinstance(series, pd.Series):
+        return None
+    valid = series.dropna()
+    if valid.empty:
+        return None
+    latest = valid.max()
+    return None if pd.isna(latest) else latest
+
+
+def _resolve_feature_rows(
+    *,
+    ctx: OffsetScoreContext,
+    decision_ts,
+) -> pd.DataFrame:
+    if ctx.feature_frame_ctx is None:
+        return pd.DataFrame()
+    rows = ctx.feature_frame_ctx.rows_by_offset.get(int(ctx.offset))
+    if not isinstance(rows, pd.DataFrame) or rows.empty:
+        return pd.DataFrame()
+    if decision_ts is None:
+        return rows
+    target_ts = pd.to_datetime(decision_ts, utc=True, errors="coerce")
+    if target_ts is None or pd.isna(target_ts):
+        return rows
+    decision_series = rows.get("__decision_ts")
+    if not isinstance(decision_series, pd.Series):
+        return rows
+    matched = rows.loc[decision_series.eq(target_ts)].copy()
+    if matched.empty:
+        return pd.DataFrame()
+    return matched
+
+
+def _resolve_nan_feature_columns(
+    *,
+    ctx: OffsetScoreContext,
+    decision_ts,
+    latest_nan_feature_columns_fn,
+) -> list[str]:
+    rows = _resolve_feature_rows(ctx=ctx, decision_ts=decision_ts)
+    if rows.empty:
+        return latest_nan_feature_columns_fn(
+            features=ctx.features,
+            offset=ctx.offset,
+            decision_ts=decision_ts,
+            required_columns=ctx.feature_columns,
+        )
+    row = rows.tail(1)
+    nan_columns: list[str] = []
+    for column in ctx.feature_columns:
+        if column not in row.columns:
+            continue
+        series = pd.to_numeric(row[column], errors="coerce").replace([float("inf"), float("-inf")], pd.NA)
+        if bool(series.isna().any()):
+            nan_columns.append(str(column))
+    return sorted(set(nan_columns))
+
+
+def _resolve_feature_snapshot(
+    *,
+    ctx: OffsetScoreContext,
+    decision_ts,
+    extract_feature_snapshot_fn,
+) -> dict[str, object]:
+    rows = _resolve_feature_rows(ctx=ctx, decision_ts=decision_ts)
+    if rows.empty:
+        return extract_feature_snapshot_fn(ctx.features, offset=ctx.offset, decision_ts=decision_ts)
+    row = rows.tail(1).iloc[0]
+    snapshot: dict[str, object] = {}
+    excluded_columns = {
+        "decision_ts",
+        "cycle_start_ts",
+        "cycle_end_ts",
+        "offset",
+        "__offset_num",
+        "__decision_ts",
+        "__cycle_start_ts",
+        "__cycle_end_ts",
+    }
+    for column in rows.columns:
+        if column in excluded_columns:
+            continue
+        value = row.get(column)
+        if pd.isna(value):
+            snapshot[column] = None
+            continue
+        if isinstance(value, bool):
+            snapshot[column] = bool(value)
+            continue
+        numeric_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.isna(numeric_value):
+            continue
+        float_value = float(numeric_value)
+        snapshot[column] = int(float_value) if float_value.is_integer() else float_value
+    return snapshot

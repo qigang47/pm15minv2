@@ -74,7 +74,7 @@ def test_run_live_data_foundation_writes_state_and_logs(tmp_path: Path, monkeypa
         return {"status": "ok", "dataset": "orderbook_depth"}
 
     start = datetime(2026, 3, 20, 0, 0, tzinfo=timezone.utc)
-    ticks = iter(start + timedelta(seconds=idx) for idx in range(8))
+    ticks = iter(start + timedelta(seconds=idx) for idx in range(10))
 
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_market_catalog", fake_market_catalog)
     monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_binance_klines_1m", fake_binance)
@@ -112,8 +112,8 @@ def test_run_live_data_foundation_writes_state_and_logs(tmp_path: Path, monkeypa
     assert state["status"] == "ok"
     assert state["completed_iterations"] == 2
     assert summary["run_started_at"] == "2026-03-20T00:00:00Z"
-    assert summary["last_completed_at"] == "2026-03-20T00:00:06Z"
-    assert summary["finished_at"] == "2026-03-20T00:00:06Z"
+    assert summary["last_completed_at"] == "2026-03-20T00:00:08Z"
+    assert summary["finished_at"] == "2026-03-20T00:00:08Z"
     assert state["run_started_at"] == summary["run_started_at"]
     assert state["last_completed_at"] == summary["last_completed_at"]
     assert state["finished_at"] == summary["finished_at"]
@@ -122,6 +122,72 @@ def test_run_live_data_foundation_writes_state_and_logs(tmp_path: Path, monkeypa
     lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert any('"event": "foundation_iteration"' in line for line in lines)
     assert any('"event": "foundation_finished"' in line for line in lines)
+
+
+def test_build_foundation_task_specs_refreshes_only_binance_now(tmp_path: Path, monkeypatch) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
+    iteration_now = datetime(2026, 3, 20, 0, 6, 59, 900000, tzinfo=timezone.utc)
+    binance_now = datetime(2026, 3, 20, 0, 7, 0, 400000, tzinfo=timezone.utc)
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        foundation_runtime_module,
+        "_run_market_catalog_step",
+        lambda *args, **kwargs: seen.__setitem__("market_catalog", kwargs["now"]) or {"dataset": "market_catalog"},
+    )
+    monkeypatch.setattr(
+        foundation_runtime_module,
+        "_run_binance_step",
+        lambda *args, **kwargs: seen.__setitem__("binance", kwargs["now"]) or {"dataset": "binance_klines_1m"},
+    )
+    monkeypatch.setattr(
+        foundation_runtime_module,
+        "_run_streams_step",
+        lambda *args, **kwargs: seen.__setitem__("streams", kwargs["now"]) or {"dataset": "chainlink_streams_rpc"},
+    )
+    monkeypatch.setattr(
+        foundation_runtime_module,
+        "_run_oracle_step",
+        lambda *args, **kwargs: seen.__setitem__("oracle", kwargs["now"]) or {"dataset": "oracle_prices_15m"},
+    )
+    monkeypatch.setattr(
+        foundation_runtime_module,
+        "_run_orderbook_step",
+        lambda *args, **kwargs: seen.__setitem__("orderbooks", True) or {"status": "ok", "dataset": "orderbook_depth"},
+    )
+
+    task_specs = foundation_runtime_module._build_foundation_task_specs(
+        cfg,
+        now=iteration_now,
+        now_provider=lambda: binance_now,
+        gamma_client=None,
+        binance_client=None,
+        oracle_client=None,
+        orderbook_client=None,
+        market_catalog_refresh_sec=300.0,
+        binance_refresh_sec=60.0,
+        oracle_refresh_sec=60.0,
+        streams_refresh_sec=300.0,
+        orderbook_refresh_sec=0.35,
+        market_catalog_lookback_hours=24,
+        market_catalog_lookahead_hours=24,
+        binance_lookback_minutes=2880,
+        binance_batch_limit=1000,
+        oracle_lookback_days=2,
+        oracle_lookahead_hours=24,
+        include_direct_oracle=True,
+        include_streams=True,
+        include_orderbooks=True,
+    )
+
+    for _task_name, _interval_sec, task_fn in task_specs:
+        task_fn()
+
+    assert seen["market_catalog"] == iteration_now
+    assert seen["binance"] == binance_now
+    assert seen["streams"] == iteration_now
+    assert seen["oracle"] == iteration_now
+    assert seen["orderbooks"] is True
 
 
 def test_run_live_data_foundation_allows_oracle_fail_open_with_existing_table(tmp_path: Path, monkeypatch) -> None:

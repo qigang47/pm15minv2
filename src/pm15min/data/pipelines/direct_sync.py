@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pandas as pd
 from ..config import DataConfig
 from ..io.parquet import upsert_parquet
 from ..queries.loaders import load_market_catalog, load_streams_source
+from ..sources.polymarket_gamma import GammaEventsClient, resolve_winner_side_from_market
 from ..sources.chainlink_rpc import ChainlinkRpcSource
 from ..sources.polygon_rpc import PolygonRpcClient
 
@@ -297,5 +299,121 @@ def sync_settlement_truth_from_rpc(
         "canonical_rows": int(len(canonical)),
         "from_block": from_block,
         "to_block": to_block,
+        "target_path": str(cfg.layout.settlement_truth_source_path),
+    }
+
+
+def sync_settlement_truth_from_gamma(
+    cfg: DataConfig,
+    *,
+    client: GammaEventsClient | None = None,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    fetched_markets: list[dict[str, object]] | None = None,
+    workers: int = 8,
+) -> dict[str, object]:
+    markets = load_market_catalog(cfg)
+    if markets.empty:
+        raise FileNotFoundError(
+            f"Missing canonical market catalog: {cfg.layout.market_catalog_table_path}. "
+            "Run `pm15min data sync market-catalog` first."
+        )
+
+    client = client or GammaEventsClient()
+    min_end_ts = int(markets["cycle_end_ts"].min()) if start_ts is None else int(start_ts)
+    max_end_ts = int(markets["cycle_end_ts"].max()) if end_ts is None else int(end_ts)
+    base = markets.copy()
+    base["cycle_end_ts"] = pd.to_numeric(base["cycle_end_ts"], errors="coerce")
+    base = base.dropna(subset=["cycle_end_ts"]).copy()
+    base["cycle_end_ts"] = base["cycle_end_ts"].astype("int64")
+    base = base[(base["cycle_end_ts"] >= min_end_ts) & (base["cycle_end_ts"] <= max_end_ts)].copy()
+    if base.empty:
+        return {
+            "dataset": "settlement_truth_gamma",
+            "market": cfg.asset.slug,
+            "rows_imported": 0,
+            "rows_resolved": 0,
+            "markets_fetched": 0,
+            "matched_markets": 0,
+            "canonical_rows": 0,
+            "target_path": str(cfg.layout.settlement_truth_source_path),
+        }
+
+    if fetched_markets is None:
+        fetched: list[dict[str, object]] = []
+        market_ids = [str(market_id).strip() for market_id in base["market_id"].astype(str).tolist() if str(market_id).strip()]
+        batch_size = 20
+        batches = [market_ids[offset : offset + batch_size] for offset in range(0, len(market_ids), batch_size)]
+        if max(1, int(workers)) <= 1:
+            for batch in batches:
+                fetched.extend(client.fetch_markets_by_ids(batch, sleep_sec=cfg.sleep_sec))
+        else:
+            with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
+                future_map = {
+                    executor.submit(client.fetch_markets_by_ids, batch, sleep_sec=cfg.sleep_sec): batch for batch in batches
+                }
+                for future in as_completed(future_map):
+                    fetched.extend(future.result())
+    else:
+        fetched = [item for item in fetched_markets if isinstance(item, dict)]
+    by_market_id = {
+        str(item.get("id") or "").strip(): item
+        for item in fetched
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+
+    base["market_id"] = base["market_id"].astype(str)
+    base["winner_side"] = base["market_id"].map(lambda market_id: resolve_winner_side_from_market(by_market_id.get(market_id, {})))
+    base["label_updown"] = base["winner_side"]
+    base["onchain_resolved"] = base["market_id"].map(
+        lambda market_id: str((by_market_id.get(market_id, {}) or {}).get("umaResolutionStatus") or "").strip().lower()
+        == "resolved"
+    )
+    base["full_truth"] = base["winner_side"].ne("")
+    base["onchain_resolved"] = base["onchain_resolved"] | base["full_truth"]
+    base["stream_match_exact"] = False
+    base["stream_price"] = pd.Series([pd.NA] * len(base), index=base.index, dtype="Float64")
+    base["stream_extra_ts"] = pd.Series([pd.NA] * len(base), index=base.index, dtype="Int64")
+    base["cycle"] = cfg.cycle
+    base["source_file"] = "zzz_gamma:markets_outcome_prices"
+    base["ingested_at"] = _utc_now_label()
+
+    out = base[
+        [
+            "market_id",
+            "condition_id",
+            "asset",
+            "cycle",
+            "cycle_start_ts",
+            "cycle_end_ts",
+            "slug",
+            "question",
+            "resolution_source",
+            "winner_side",
+            "label_updown",
+            "onchain_resolved",
+            "stream_match_exact",
+            "full_truth",
+            "stream_price",
+            "stream_extra_ts",
+            "source_file",
+            "ingested_at",
+        ]
+    ].copy()
+
+    canonical = upsert_parquet(
+        path=cfg.layout.settlement_truth_source_path,
+        incoming=out,
+        key_columns=["market_id", "cycle_end_ts"],
+        sort_columns=["cycle_end_ts", "full_truth", "source_file", "market_id"],
+    )
+    return {
+        "dataset": "settlement_truth_gamma",
+        "market": cfg.asset.slug,
+        "rows_imported": int(len(out)),
+        "rows_resolved": int(out["winner_side"].ne("").sum()),
+        "markets_fetched": int(len(fetched)),
+        "matched_markets": int(base["market_id"].isin(by_market_id).sum()),
+        "canonical_rows": int(len(canonical)),
         "target_path": str(cfg.layout.settlement_truth_source_path),
     }

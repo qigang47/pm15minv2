@@ -367,8 +367,7 @@ def score_bundle_offset(
 
     model_context = load_offset_model_context(offset_dir) if include_model_context else None
 
-    rows = features.copy()
-    rows = rows[pd.to_numeric(rows.get("offset"), errors="coerce") == int(offset)].copy()
+    rows = features[pd.to_numeric(features.get("offset"), errors="coerce") == int(offset)].copy()
     if rows.empty:
         return pd.DataFrame(
             columns=[

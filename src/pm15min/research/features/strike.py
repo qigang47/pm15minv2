@@ -22,11 +22,32 @@ def append_strike_features(
     *,
     oracle_prices: pd.DataFrame,
     cycle: str = "15m",
+    requested_columns: set[str] | None = None,
 ) -> pd.DataFrame:
     out = frame.copy()
+    requested = None if requested_columns is None else {str(column) for column in requested_columns}
+
+    def needs(*columns: str) -> bool:
+        if requested is None:
+            return True
+        return any(str(column) in requested for column in columns)
+
+    if not needs(
+        "ret_from_strike",
+        "basis_bp",
+        "has_oracle_strike",
+        "has_cl_strike",
+        "move_z_strike",
+        "q_bs_up_strike",
+        "q_bs_up_strike_centered",
+    ):
+        return out
+
     freq = _pandas_cycle_freq(cycle)
-    out["has_oracle_strike"] = 0
-    out["basis_bp"] = 0.0
+    if needs("has_oracle_strike", "has_cl_strike"):
+        out["has_oracle_strike"] = 0
+    if needs("basis_bp"):
+        out["basis_bp"] = 0.0
 
     ret_cycle = pd.to_numeric(out["ret_from_cycle_open"], errors="coerce")
     strike = pd.Series(np.nan, index=out.index, dtype=float)
@@ -51,26 +72,34 @@ def append_strike_features(
     valid = strike.notna() & np.isfinite(strike) & (strike > 0) & basis_ratio.notna() & np.isfinite(basis_ratio)
     basis_ratio = basis_ratio.where(valid)
 
-    out["has_oracle_strike"] = valid.fillna(False).astype(int)
-    out["has_cl_strike"] = out["has_oracle_strike"].astype(int)
-    out["basis_bp"] = (basis_ratio.fillna(0.0) * 1e4).astype(float)
-    out["ret_from_strike"] = ((1.0 + ret_cycle) * (1.0 + basis_ratio.fillna(0.0)) - 1.0).astype(float)
-    out["move_z_strike"] = out["ret_from_strike"] / pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
+    if needs("has_oracle_strike", "has_cl_strike"):
+        out["has_oracle_strike"] = valid.fillna(False).astype(int)
+        if needs("has_cl_strike"):
+            out["has_cl_strike"] = out["has_oracle_strike"].astype(int)
+    if needs("basis_bp"):
+        out["basis_bp"] = (basis_ratio.fillna(0.0) * 1e4).astype(float)
+    if needs("ret_from_strike", "move_z_strike", "q_bs_up_strike", "q_bs_up_strike_centered"):
+        out["ret_from_strike"] = ((1.0 + ret_cycle) * (1.0 + basis_ratio.fillna(0.0)) - 1.0).astype(float)
+    if needs("move_z_strike"):
+        out["move_z_strike"] = out["ret_from_strike"] / pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
 
-    decision_ts = pd.to_datetime(out["decision_ts"], utc=True, errors="coerce")
-    cycle_end = decision_ts.dt.floor(freq) + pd.Timedelta(freq)
-    minutes_left = ((cycle_end - decision_ts).dt.total_seconds() / 60.0).clip(lower=0.0)
-    log_moneyness = pd.Series(np.nan, index=out.index, dtype=float)
-    valid_ret = pd.to_numeric(out["ret_from_strike"], errors="coerce") > -1.0
-    if bool(valid_ret.any()):
-        log_moneyness.loc[valid_ret] = np.log1p(pd.to_numeric(out.loc[valid_ret, "ret_from_strike"], errors="coerce"))
-    rv_30 = pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
-    v_bs = rv_30 * np.sqrt(minutes_left)
-    d_bs = pd.Series(np.nan, index=out.index, dtype=float)
-    mask = log_moneyness.notna() & np.isfinite(log_moneyness) & v_bs.notna() & np.isfinite(v_bs) & (v_bs > 1e-12)
-    if bool(mask.any()):
-        d_bs.loc[mask] = ((log_moneyness.loc[mask] - 0.5 * np.square(v_bs.loc[mask])) / v_bs.loc[mask]).astype(float)
-    q_bs = _normal_cdf(d_bs).clip(lower=0.0, upper=1.0)
-    out["q_bs_up_strike"] = q_bs.fillna(0.5).astype(float)
-    out["q_bs_up_strike_centered"] = (q_bs.fillna(0.5) - 0.5).astype(float)
+    if needs("q_bs_up_strike", "q_bs_up_strike_centered"):
+        decision_ts = pd.to_datetime(out["decision_ts"], utc=True, errors="coerce")
+        cycle_end = decision_ts.dt.floor(freq) + pd.Timedelta(freq)
+        minutes_left = ((cycle_end - decision_ts).dt.total_seconds() / 60.0).clip(lower=0.0)
+        log_moneyness = pd.Series(np.nan, index=out.index, dtype=float)
+        valid_ret = pd.to_numeric(out["ret_from_strike"], errors="coerce") > -1.0
+        if bool(valid_ret.any()):
+            log_moneyness.loc[valid_ret] = np.log1p(pd.to_numeric(out.loc[valid_ret, "ret_from_strike"], errors="coerce"))
+        rv_30 = pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
+        v_bs = rv_30 * np.sqrt(minutes_left)
+        d_bs = pd.Series(np.nan, index=out.index, dtype=float)
+        mask = log_moneyness.notna() & np.isfinite(log_moneyness) & v_bs.notna() & np.isfinite(v_bs) & (v_bs > 1e-12)
+        if bool(mask.any()):
+            d_bs.loc[mask] = ((log_moneyness.loc[mask] - 0.5 * np.square(v_bs.loc[mask])) / v_bs.loc[mask]).astype(float)
+        q_bs = _normal_cdf(d_bs).clip(lower=0.0, upper=1.0)
+        if needs("q_bs_up_strike"):
+            out["q_bs_up_strike"] = q_bs.fillna(0.5).astype(float)
+        if needs("q_bs_up_strike_centered"):
+            out["q_bs_up_strike_centered"] = (q_bs.fillna(0.5) - 0.5).astype(float)
     return out

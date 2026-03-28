@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import threading
+import time
 
 import pandas as pd
 
@@ -9,6 +12,10 @@ from ..config import DataConfig
 from ..io.parquet import read_parquet_if_exists, write_parquet_atomic
 from ..queries.loaders import load_market_catalog
 from ..sources.polymarket_oracle_api import PolymarketOracleApiClient
+from .oracle_prices import build_oracle_prices_table
+from .truth import build_truth_table
+from ...research.config import ResearchConfig
+from ...research.labels.datasets import build_label_frame_dataset
 
 
 DIRECT_ORACLE_COLUMNS = [
@@ -172,19 +179,26 @@ def sync_polymarket_oracle_prices_direct(
     cycle_starts = sorted(set(mk["cycle_start_ts"].astype(int).tolist()))
     symbol = cfg.asset.slug.upper()
     fetched: dict[int, dict[str, object]] = {}
+    batch_fetch_error = ""
 
     # Batch fetch via past-results for recent windows.
     current_ts = max(cycle_starts) + cfg.layout.cycle_seconds
     requests_done = 0
     while requests_done < int(max_requests):
         requests_done += 1
-        batch = client.fetch_past_results_batch(
-            symbol=symbol,
-            current_event_start_time=datetime.fromtimestamp(current_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            cycle_seconds=cfg.layout.cycle_seconds,
-            count=int(count),
-            sleep_sec=float(sleep_sec),
-        )
+        try:
+            batch = client.fetch_past_results_batch(
+                symbol=symbol,
+                current_event_start_time=datetime.fromtimestamp(current_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                cycle_seconds=cfg.layout.cycle_seconds,
+                count=int(count),
+                sleep_sec=float(sleep_sec),
+            )
+        except RuntimeError as exc:
+            batch_fetch_error = str(exc)
+            if fallback_single:
+                break
+            raise
         if not batch:
             break
 
@@ -249,8 +263,8 @@ def sync_polymarket_oracle_prices_direct(
                     "cached": obj.get("cached"),
                     "api_timestamp_ms": obj.get("timestamp"),
                     "http_status": 200,
-                    "source": "polymarket_api_crypto_price",
-                    "source_priority": 3,
+                    "source": str(obj.get("source") or "polymarket_api_crypto_price"),
+                    "source_priority": 3 if str(obj.get("source") or "polymarket_api_crypto_price") == "polymarket_api_crypto_price" else 2,
                     "fetched_at": _utc_now_label(),
                 },
             )
@@ -294,6 +308,7 @@ def sync_polymarket_oracle_prices_direct(
         "rows_imported": int(len(out)),
         "canonical_rows": int(len(canonical)),
         "target_path": str(cfg.layout.direct_oracle_source_path),
+        "batch_fetch_error": batch_fetch_error or None,
     }
 
 
@@ -361,4 +376,191 @@ def sync_polymarket_oracle_price_window(
         "rows_imported": rows_imported,
         "canonical_rows": canonical_rows,
         "target_path": str(cfg.layout.direct_oracle_source_path),
+    }
+
+
+def backfill_direct_oracle_prices(
+    cfg: DataConfig,
+    *,
+    workers: int = 1,
+    flush_every: int = 200,
+    timeout_sec: float = 30.0,
+    max_retries: int = 6,
+    sleep_sec: float = 0.0,
+    skip_freshness: bool = True,
+) -> dict[str, object]:
+    market_table = pd.read_parquet(cfg.layout.market_catalog_table_path, columns=["cycle_start_ts"])
+    cycle_starts = sorted(set(pd.to_numeric(market_table["cycle_start_ts"], errors="coerce").dropna().astype(int).tolist()))
+
+    existing = read_parquet_if_exists(cfg.layout.direct_oracle_source_path)
+    completed: set[int] = set()
+    if existing is not None and not existing.empty:
+        existing = existing.copy()
+        existing["cycle_start_ts"] = pd.to_numeric(existing["cycle_start_ts"], errors="coerce").astype("Int64")
+        mask = existing["has_both"].fillna(False).astype(bool) & existing["cycle_start_ts"].notna()
+        completed = set(existing.loc[mask, "cycle_start_ts"].astype(int).tolist())
+
+    pending = [ts for ts in cycle_starts if ts not in completed]
+    if not pending:
+        oracle = build_oracle_prices_table(cfg)
+        truth = build_truth_table(cfg)
+        label = build_label_frame_dataset(
+            ResearchConfig.build(
+                market=cfg.asset.slug,
+                cycle=cfg.cycle,
+                source_surface=cfg.surface,
+                label_set="truth",
+                root=cfg.layout.storage.rewrite_root,
+            ),
+            skip_freshness=skip_freshness,
+        )
+        return {
+            "dataset": "direct_oracle_backfill",
+            "market": cfg.asset.slug,
+            "cycle": cfg.cycle,
+            "cycle_starts": int(len(cycle_starts)),
+            "completed": int(len(completed)),
+            "pending": 0,
+            "oracle": oracle,
+            "truth": truth,
+            "label": label,
+        }
+
+    thread_local = threading.local()
+
+    def _client() -> PolymarketOracleApiClient:
+        client = getattr(thread_local, "client", None)
+        if client is None:
+            client = PolymarketOracleApiClient(timeout_sec=float(timeout_sec))
+            thread_local.client = client
+        return client
+
+    def _fetch_one(cycle_start_ts: int) -> tuple[int, dict[str, object]]:
+        last_err = ""
+        for attempt in range(1, max(1, int(max_retries)) + 1):
+            try:
+                payload = _client().fetch_crypto_price(
+                    symbol=cfg.asset.slug.upper(),
+                    cycle_start_ts=int(cycle_start_ts),
+                    cycle_seconds=cfg.layout.cycle_seconds,
+                    sleep_sec=float(sleep_sec),
+                    max_retries=1,
+                )
+                return int(cycle_start_ts), payload
+            except RuntimeError as exc:
+                last_err = str(exc)
+                if "Too Many Requests" in last_err:
+                    time.sleep(min(60.0, 2.0 * attempt))
+                    continue
+                if "Timestamp too old" in last_err:
+                    return int(cycle_start_ts), {}
+                time.sleep(min(10.0, 0.5 * attempt))
+        raise RuntimeError(f"fetch_failed:{cfg.asset.slug}:{cycle_start_ts}:{last_err}")
+
+    def _flush_rows(rows: list[dict[str, object]]) -> int:
+        if not rows:
+            return 0
+        frame = pd.DataFrame(rows, columns=DIRECT_ORACLE_COLUMNS)
+        frame["price_to_beat"] = pd.to_numeric(frame["price_to_beat"], errors="coerce")
+        frame["final_price"] = pd.to_numeric(frame["final_price"], errors="coerce")
+        frame["has_price_to_beat"] = frame["price_to_beat"].notna()
+        frame["has_final_price"] = frame["final_price"].notna()
+        frame["has_both"] = frame["has_price_to_beat"] & frame["has_final_price"]
+        canonical = _write_direct_oracle_canonical(target_path=cfg.layout.direct_oracle_source_path, incoming=frame)
+        rows.clear()
+        return int(len(canonical))
+
+    buffer: list[dict[str, object]] = []
+    fetched = 0
+    last_canonical_rows = len(existing) if existing is not None else 0
+    flush_every = max(1, int(flush_every))
+    workers = max(1, int(workers))
+
+    def _append_payload(cycle_start_ts: int, payload: dict[str, object]) -> None:
+        nonlocal fetched
+        if not payload:
+            return
+        source = str(payload.get("source") or "polymarket_api_crypto_price")
+        buffer.append(
+            {
+                "asset": cfg.asset.slug,
+                "cycle": cfg.cycle,
+                "cycle_start_ts": int(cycle_start_ts),
+                "cycle_end_ts": int(cycle_start_ts + cfg.layout.cycle_seconds),
+                "price_to_beat": payload.get("openPrice"),
+                "final_price": payload.get("closePrice"),
+                "has_price_to_beat": False,
+                "has_final_price": False,
+                "has_both": False,
+                "completed": payload.get("completed"),
+                "incomplete": payload.get("incomplete"),
+                "cached": payload.get("cached"),
+                "api_timestamp_ms": payload.get("timestamp"),
+                "http_status": 200,
+                "source": source,
+                "source_priority": 3 if source == "polymarket_api_crypto_price" else 2,
+                "fetched_at": _utc_now_label(),
+            }
+        )
+        fetched += 1
+
+    if workers <= 1:
+        for cycle_start_ts in pending:
+            while True:
+                try:
+                    _, payload = _fetch_one(int(cycle_start_ts))
+                    break
+                except RuntimeError as exc:
+                    if "Too Many Requests" in str(exc):
+                        time.sleep(60.0)
+                        continue
+                    payload = {}
+                    break
+            _append_payload(int(cycle_start_ts), payload)
+            if len(buffer) >= flush_every:
+                last_canonical_rows = _flush_rows(buffer)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(_fetch_one, ts): ts for ts in pending}
+            for future in as_completed(future_map):
+                cycle_start_ts = int(future_map[future])
+                try:
+                    _, payload = future.result()
+                except RuntimeError:
+                    payload = {}
+                _append_payload(cycle_start_ts, payload)
+                if len(buffer) >= flush_every:
+                    last_canonical_rows = _flush_rows(buffer)
+
+    last_canonical_rows = _flush_rows(buffer)
+    oracle = build_oracle_prices_table(cfg)
+    truth = build_truth_table(cfg)
+    label = build_label_frame_dataset(
+        ResearchConfig.build(
+            market=cfg.asset.slug,
+            cycle=cfg.cycle,
+            source_surface=cfg.surface,
+            label_set="truth",
+            root=cfg.layout.storage.rewrite_root,
+        ),
+        skip_freshness=skip_freshness,
+    )
+    truth_table = pd.read_parquet(cfg.layout.truth_table_path, columns=["cycle_start_ts", "resolved"])
+    ts = pd.to_datetime(pd.to_numeric(truth_table["cycle_start_ts"], errors="coerce"), unit="s", utc=True, errors="coerce").dropna()
+    return {
+        "dataset": "direct_oracle_backfill",
+        "market": cfg.asset.slug,
+        "cycle": cfg.cycle,
+        "cycle_starts": int(len(cycle_starts)),
+        "completed": int(len(completed)),
+        "pending": int(len(pending)),
+        "fetched": int(fetched),
+        "canonical_rows": int(last_canonical_rows),
+        "oracle": oracle,
+        "truth": truth,
+        "label": label,
+        "truth_rows": int(len(truth_table)),
+        "resolved": int(truth_table["resolved"].fillna(False).sum()),
+        "first": str(ts.min()) if not ts.empty else None,
+        "last": str(ts.max()) if not ts.empty else None,
     }

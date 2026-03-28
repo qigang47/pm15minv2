@@ -73,7 +73,9 @@ def build_live_feature_frame(
     feature_set: str,
     retain_offsets: tuple[int, ...] | None = None,
     allow_preview_open_bar: bool = False,
+    required_feature_columns: set[str] | None = None,
 ) -> pd.DataFrame:
+    total_started = time.perf_counter()
     cache_ttl_seconds = _env_float("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", default=0.0)
     resolved_retain_offsets = tuple(retain_offsets or _env_int_list("PM15MIN_LIVE_FEATURE_RETAIN_OFFSETS"))
     tail_cycles = _env_int("PM15MIN_LIVE_FEATURE_TAIL_CYCLES", default=2)
@@ -91,7 +93,10 @@ def build_live_feature_frame(
         surface="live",
         root=cfg.layout.rewrite.root,
     )
+    timings_ms: dict[str, float | bool] = {}
+    refresh_started = time.perf_counter()
     ensure_live_trade_inputs_fresh(cfg)
+    timings_ms["trade_inputs_refresh_stage_ms"] = _elapsed_ms(refresh_started)
     btc_cfg = None
     if cfg.asset.slug != "btc":
         btc_cfg = DataConfig.build(
@@ -102,6 +107,7 @@ def build_live_feature_frame(
         )
     now_utc = pd.Timestamp.now(tz="UTC")
     if not allow_preview_open_bar:
+        closed_bar_wait_started = time.perf_counter()
         _ensure_live_closed_bar_inputs_ready(
             data_cfg=data_cfg,
             btc_cfg=btc_cfg,
@@ -109,21 +115,27 @@ def build_live_feature_frame(
             cycle_minutes=int(cfg.cycle_minutes),
             retain_offsets=resolved_retain_offsets,
         )
+        timings_ms["closed_bar_wait_stage_ms"] = _elapsed_ms(closed_bar_wait_started)
     raw_tail_bars = _live_feature_build_tail_bars(cycle_minutes=int(cfg.cycle_minutes), tail_cycles=tail_cycles)
+    primary_kline_started = time.perf_counter()
     raw_klines = _load_live_binance_klines_tail(
         data_cfg=data_cfg,
         tail_bars=raw_tail_bars,
         allow_preview_open_bar=allow_preview_open_bar,
         now_utc=now_utc,
     )
+    timings_ms["primary_kline_load_stage_ms"] = _elapsed_ms(primary_kline_started)
+    oracle_started = time.perf_counter()
     oracle_prices = build_live_runtime_oracle_prices(
         data_cfg=data_cfg,
         market_slug=cfg.asset.slug,
         raw_klines=raw_klines,
         oracle_prices_table=load_oracle_prices_table(data_cfg),
     )
+    timings_ms["oracle_stage_ms"] = _elapsed_ms(oracle_started)
     btc_klines = None
     if btc_cfg is not None:
+        btc_kline_started = time.perf_counter()
         btc_klines = _load_live_binance_klines_tail(
             data_cfg=btc_cfg,
             symbol="BTCUSDT",
@@ -131,6 +143,7 @@ def build_live_feature_frame(
             allow_preview_open_bar=allow_preview_open_bar,
             now_utc=now_utc,
         )
+        timings_ms["btc_kline_load_stage_ms"] = _elapsed_ms(btc_kline_started)
     source_signature = _live_feature_source_signature(
         raw_klines=raw_klines,
         btc_klines=btc_klines,
@@ -141,6 +154,14 @@ def build_live_feature_frame(
         source_signature=source_signature,
     )
     if state_cached is not None:
+        _attach_live_feature_timings(
+            state_cached,
+            timings_ms={
+                **timings_ms,
+                "feature_frame_cache_hit": True,
+                "feature_frame_total_stage_ms": _elapsed_ms(total_started),
+            },
+        )
         return state_cached
     if cache_ttl_seconds > 0.0:
         cached = _load_cached_live_feature_frame(
@@ -154,6 +175,14 @@ def build_live_feature_frame(
                 features=cached,
                 build_tail_bars=int(raw_tail_bars),
                 build_mode="ttl_cache_hit",
+            )
+            _attach_live_feature_timings(
+                cached,
+                timings_ms={
+                    **timings_ms,
+                    "feature_frame_cache_hit": True,
+                    "feature_frame_total_stage_ms": _elapsed_ms(total_started),
+                },
             )
             return cached
     build_tail_bars = int(raw_tail_bars)
@@ -171,18 +200,36 @@ def build_live_feature_frame(
         build_mode = "incremental_tail"
     builder_raw_klines = _slice_feature_builder_tail(raw_klines, tail_bars=build_tail_bars)
     builder_btc_klines = _slice_feature_builder_tail(btc_klines, tail_bars=build_tail_bars)
+    builder_started = time.perf_counter()
     features = build_feature_frame_df(
         builder_raw_klines,
         feature_set=feature_set,
         oracle_prices=oracle_prices,
         btc_klines=builder_btc_klines,
         cycle=f"{int(cfg.cycle_minutes)}m",
+        requested_columns=required_feature_columns,
     )
+    timings_ms["builder_call_stage_ms"] = _elapsed_ms(builder_started)
+    trim_started = time.perf_counter()
     features = _trim_live_feature_frame(
         features,
         cycle_minutes=int(cfg.cycle_minutes),
         retain_offsets=resolved_retain_offsets,
         tail_cycles=tail_cycles,
+    )
+    timings_ms["trim_stage_ms"] = _elapsed_ms(trim_started)
+    builder_timings = {
+        f"builder_{key}": value
+        for key, value in dict(getattr(features, "attrs", {}).get("timings_ms") or {}).items()
+    }
+    _attach_live_feature_timings(
+        features,
+        timings_ms={
+            **timings_ms,
+            **builder_timings,
+            "feature_frame_cache_hit": False,
+            "feature_frame_total_stage_ms": _elapsed_ms(total_started),
+        },
     )
     _store_live_feature_state(
         cache_key=cache_key,
@@ -199,6 +246,16 @@ def build_live_feature_frame(
             features=features,
         )
     return features
+
+
+def _attach_live_feature_timings(features: pd.DataFrame, *, timings_ms: dict[str, object]) -> None:
+    attrs = dict(getattr(features, "attrs", {}) or {})
+    attrs["timings_ms"] = {
+        str(key): value
+        for key, value in timings_ms.items()
+        if value is not None
+    }
+    features.attrs = attrs
 
 
 def _load_cached_live_feature_frame(
@@ -418,21 +475,23 @@ def _load_live_binance_klines_tail(
     cache_key = (str(path), str(symbol or data_cfg.asset.binance_symbol))
     signature = _path_signature(path)
     cached_frame: pd.DataFrame | None = None
+    stale_cached_frame: pd.DataFrame | None = None
     if signature[0] is not None:
         with _LIVE_KLINES_TAIL_CACHE_LOCK:
             cached = _LIVE_KLINES_TAIL_CACHE.get(cache_key)
-            if cached is not None and cached[0] == signature:
-                cached_frame = cached[1].copy(deep=False)
             if cached is not None:
-                cached_frame = cached[1].copy(deep=False)
+                stale_cached_frame = cached[1].copy(deep=False)
+                if cached[0] == signature:
+                    cached_frame = stale_cached_frame
     marker_frame = _load_live_binance_latest_tail_marker(
         data_cfg=data_cfg,
         symbol=symbol,
     )
     base_frame: pd.DataFrame | None = None
-    if isinstance(cached_frame, pd.DataFrame) and not cached_frame.empty and isinstance(marker_frame, pd.DataFrame):
+    merge_source = stale_cached_frame if isinstance(stale_cached_frame, pd.DataFrame) and not stale_cached_frame.empty else cached_frame
+    if isinstance(merge_source, pd.DataFrame) and not merge_source.empty and isinstance(marker_frame, pd.DataFrame):
         merged = _merge_cached_kline_tail_with_marker(
-            cached_frame=cached_frame,
+            cached_frame=merge_source,
             marker_frame=marker_frame,
             tail_bars=tail_bars,
         )
@@ -1240,3 +1299,7 @@ def iso_or_none(value) -> str | None:
     if pd.isna(ts):
         return None
     return ts.isoformat()
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round(max(0.0, (time.perf_counter() - float(started_at)) * 1000.0), 3)

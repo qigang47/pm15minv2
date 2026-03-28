@@ -495,6 +495,7 @@ def _build_foundation_task_specs(
     cfg: DataConfig,
     *,
     now: datetime,
+    now_provider: Callable[[], datetime] | None,
     gamma_client: GammaEventsClient | None,
     binance_client: BinanceSpotKlinesClient | None,
     oracle_client: PolymarketOracleApiClient | None,
@@ -532,7 +533,9 @@ def _build_foundation_task_specs(
             float(binance_refresh_sec),
             lambda: _run_binance_step(
                 cfg,
-                now=now,
+                # Use execution-time now so a just-closed boundary bar is not
+                # filtered out when earlier tasks delay the Binance sync.
+                now=_utc_now(now_provider),
                 client=binance_client,
                 lookback_minutes=binance_lookback_minutes,
                 batch_limit=binance_batch_limit,
@@ -665,6 +668,7 @@ def run_live_data_foundation(
         task_specs = _build_foundation_task_specs(
             cfg,
             now=now,
+            now_provider=now_provider,
             gamma_client=gamma_client,
             binance_client=binance_client,
             oracle_client=oracle_client,
@@ -963,6 +967,7 @@ def run_live_data_foundation_shared(
                 for task_name, interval_sec, task_fn in _build_foundation_task_specs(
                     cfg,
                     now=now,
+                    now_provider=now_provider,
                     gamma_client=gamma_client,
                     binance_client=binance_client,
                     oracle_client=oracle_client,

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from pm15min.data.sources.polymarket_gamma import GammaEventsClient, build_market_catalog_records
+from pm15min.data.sources.polymarket_gamma import (
+    GammaEventsClient,
+    build_market_catalog_records,
+    build_market_catalog_records_from_markets,
+    resolve_winner_side_from_market,
+)
 
 
 class _FakeResponse:
@@ -109,3 +114,88 @@ def test_fetch_closed_events_respects_explicit_page_cap() -> None:
 
     assert [row["id"] for row in rows] == ["event-1", "event-2", "event-3", "event-4"]
     assert [call["params"]["offset"] for call in session.calls] == [0, 2]
+
+
+def test_fetch_closed_markets_without_page_cap_runs_until_short_page() -> None:
+    session = _FakeSession(
+        [
+            [{"id": "market-1"}, {"id": "market-2"}],
+            [{"id": "market-3"}],
+        ]
+    )
+    client = GammaEventsClient(session=session)
+
+    rows = client.fetch_closed_markets(
+        start_ts=1_700_000_000,
+        end_ts=1_700_086_400,
+        limit=2,
+        max_pages=None,
+        sleep_sec=0.0,
+    )
+
+    assert [row["id"] for row in rows] == ["market-1", "market-2", "market-3"]
+    assert [call["params"]["offset"] for call in session.calls] == [0, 2]
+
+
+def test_resolve_winner_side_from_market_uses_outcome_prices() -> None:
+    market = {
+        "outcomes": '["Up", "Down"]',
+        "outcomePrices": '["0", "1"]',
+    }
+
+    assert resolve_winner_side_from_market(market) == "DOWN"
+
+
+def test_fetch_markets_by_ids_sends_repeated_id_params() -> None:
+    session = _FakeSession(
+        [
+            [{"id": "market-1"}, {"id": "market-2"}],
+        ]
+    )
+    client = GammaEventsClient(session=session)
+
+    rows = client.fetch_markets_by_ids(["market-1", "market-2"], sleep_sec=0.0)
+
+    assert [row["id"] for row in rows] == ["market-1", "market-2"]
+    assert session.calls[0]["params"]["id"] == ["market-1", "market-2"]
+
+
+def test_build_market_catalog_records_from_closed_markets() -> None:
+    markets = [
+        {
+            "id": "market-1",
+            "conditionId": "cond-1",
+            "slug": "btc-updown-15m-1700000000",
+            "question": "Bitcoin Up or Down",
+            "endDate": "2023-11-14T22:28:20Z",
+            "closedTime": "2023-11-14T22:29:00Z",
+            "resolutionSource": "https://data.chain.link/streams/btc-usd",
+            "outcomes": '["Up", "Down"]',
+            "clobTokenIds": '["token-up", "token-down"]',
+            "active": False,
+            "closed": True,
+            "events": [
+                {
+                    "id": "event-1",
+                    "slug": "btc-updown-15m-1700000000",
+                    "title": "Bitcoin Up or Down 15m",
+                    "series": [{"slug": "btc-up-or-down-15m", "recurrence": "15m"}],
+                    "resolutionSource": "https://data.chain.link/streams/btc-usd",
+                    "closed": True,
+                }
+            ],
+        }
+    ]
+
+    records = build_market_catalog_records_from_markets(
+        markets=markets,
+        asset="btc",
+        cycle="15m",
+        snapshot_ts="2026-03-28T16-20-00Z",
+        include_closed=True,
+    )
+
+    assert len(records) == 1
+    row = records[0].to_row()
+    assert row["market_id"] == "market-1"
+    assert row["cycle_start_ts"] == 1700000000

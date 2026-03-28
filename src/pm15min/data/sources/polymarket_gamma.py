@@ -110,6 +110,42 @@ def _map_token_ids(outcomes: object, clob_token_ids: object) -> tuple[str, str]:
     return toks[0], toks[1]
 
 
+def _normalize_outcome_side(value: object) -> str:
+    token = str(value or "").strip().lower()
+    if token in {"up", "yes"}:
+        return "UP"
+    if token in {"down", "no"}:
+        return "DOWN"
+    return str(value or "").strip().upper()
+
+
+def resolve_winner_side_from_market(market: dict[str, Any]) -> str:
+    winner = _normalize_outcome_side(market.get("winner") or market.get("winningOutcome"))
+    if winner in {"UP", "DOWN"}:
+        return winner
+
+    outcomes = [str(item or "").strip() for item in _coerce_list(market.get("outcomes"))]
+    prices_raw = _coerce_list(market.get("outcomePrices"))
+    if len(outcomes) != len(prices_raw) or not outcomes:
+        return ""
+
+    prices: list[float] = []
+    for item in prices_raw:
+        try:
+            prices.append(float(item))
+        except Exception:
+            return ""
+    if not prices:
+        return ""
+    best_price = max(prices)
+    if best_price <= 0:
+        return ""
+    if sum(abs(price - best_price) <= 1e-12 for price in prices) != 1:
+        return ""
+    winner_idx = max(range(len(prices)), key=prices.__getitem__)
+    return _normalize_outcome_side(outcomes[winner_idx])
+
+
 def _is_cycle_stream_event(event: dict[str, Any], cycle: str) -> bool:
     resolution_source = str(event.get("resolutionSource") or "").lower()
     if "data.chain.link/streams/" not in resolution_source:
@@ -250,6 +286,68 @@ class GammaEventsClient:
                 time.sleep(float(sleep_sec))
         return rows
 
+    def fetch_closed_markets(
+        self,
+        *,
+        start_ts: int,
+        end_ts: int,
+        limit: int,
+        max_pages: int | None,
+        sleep_sec: float,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        limit = max(1, int(limit))
+        page = 0
+        page_cap = None if max_pages is None else max(1, int(max_pages))
+        while page_cap is None or page < page_cap:
+            params = {
+                "closed": "true",
+                "end_date_min": _iso(start_ts),
+                "end_date_max": _iso(end_ts),
+                "limit": limit,
+                "offset": page * limit,
+            }
+            resp = self.session.get(self.markets_url, params=params, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, list) or not payload:
+                break
+            rows.extend(item for item in payload if isinstance(item, dict))
+            if len(payload) < limit:
+                break
+            page += 1
+            if sleep_sec > 0:
+                time.sleep(float(sleep_sec))
+        return rows
+
+    def fetch_markets_by_ids(
+        self,
+        market_ids: list[str],
+        *,
+        sleep_sec: float = 0.0,
+        max_retries: int = 6,
+    ) -> list[dict[str, Any]]:
+        ids = [str(market_id).strip() for market_id in market_ids if str(market_id).strip()]
+        if not ids:
+            return []
+        last_err = ""
+        for attempt in range(max(1, int(max_retries))):
+            resp = self.session.get(self.markets_url, params={"id": ids}, timeout=30)
+            status_code = int(getattr(resp, "status_code", 200))
+            if status_code == 200:
+                payload = resp.json()
+                if sleep_sec > 0:
+                    time.sleep(float(sleep_sec))
+                if not isinstance(payload, list):
+                    return []
+                return [item for item in payload if isinstance(item, dict)]
+            last_err = f"status={status_code}: {(getattr(resp, 'text', '') or '')[:200]}"
+            if status_code in {429, 500, 502, 503, 504}:
+                time.sleep(min(20.0, 0.5 * (attempt + 1)))
+                continue
+            resp.raise_for_status()
+        raise RuntimeError(f"/markets by ids failed after retries: {last_err}")
+
     def fetch_active_markets(
         self,
         *,
@@ -329,6 +427,7 @@ def build_market_catalog_records_from_markets(
     asset: str,
     cycle: str,
     snapshot_ts: str,
+    include_closed: bool = False,
 ) -> list[MarketCatalogRecord]:
     cycle = normalize_cycle(cycle)
     asset = asset.strip().lower()
@@ -337,9 +436,9 @@ def build_market_catalog_records_from_markets(
     for market in markets:
         if not isinstance(market, dict):
             continue
-        if bool(market.get("closed", False)):
+        if not include_closed and bool(market.get("closed", False)):
             continue
-        if not bool(market.get("active", False)):
+        if not include_closed and not bool(market.get("active", False)):
             continue
         event = _first_event(market.get("events"))
         if not (_is_cycle_stream_event(market, cycle) or _is_cycle_stream_event(event, cycle)):

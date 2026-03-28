@@ -1025,6 +1025,12 @@ def test_run_live_runner_prewarms_signal_once_per_minute(tmp_path: Path, monkeyp
             "snapshot_ts": "2026-03-20T00-00-00Z",
             "timings_ms": {
                 "signal_stage_ms": 0.5,
+                "signal_bundle_resolution_stage_ms": 0.11,
+                "signal_feature_prepare_stage_ms": 0.22,
+                "signal_feature_frame_stage_ms": 0.33,
+                "signal_liquidity_state_stage_ms": 0.44,
+                "signal_regime_state_stage_ms": 0.55,
+                "signal_offset_scoring_stage_ms": 0.66,
                 "quote_stage_ms": 1.0,
                 "account_context_stage_ms": 0.1,
                 "decision_build_stage_ms": 0.2,
@@ -1070,6 +1076,12 @@ def test_run_live_runner_prewarms_signal_once_per_minute(tmp_path: Path, monkeyp
 
     assert len(prewarm_calls) == 1
     assert summary["last_iteration"]["timings_ms"]["signal_prewarm_triggered"] is False
+    assert summary["last_iteration"]["timings_ms"]["decision_signal_bundle_resolution_stage_ms"] == 0.11
+    assert summary["last_iteration"]["timings_ms"]["decision_signal_feature_prepare_stage_ms"] == 0.22
+    assert summary["last_iteration"]["timings_ms"]["decision_signal_feature_frame_stage_ms"] == 0.33
+    assert summary["last_iteration"]["timings_ms"]["decision_signal_liquidity_state_stage_ms"] == 0.44
+    assert summary["last_iteration"]["timings_ms"]["decision_signal_regime_state_stage_ms"] == 0.55
+    assert summary["last_iteration"]["timings_ms"]["decision_signal_offset_scoring_stage_ms"] == 0.66
     assert summary["last_iteration"]["signal_prewarm_payload"]["reason"] == "signal_prewarm_finalize_already_attempted_for_bucket"
 
 

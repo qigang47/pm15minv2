@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -40,6 +40,42 @@ def _frame_from_records(records) -> pd.DataFrame:
         return pd.DataFrame(columns=MARKET_CATALOG_COLUMNS)
     df = pd.DataFrame([record.to_row() for record in records], columns=MARKET_CATALOG_COLUMNS)
     return df.sort_values(["cycle_start_ts", "market_id"]).reset_index(drop=True)
+
+
+def _write_market_catalog_snapshot(
+    *,
+    cfg: DataConfig,
+    snapshot_df: pd.DataFrame,
+    snapshot_ts: str,
+    source_mode: str,
+    start_ts: int,
+    end_ts: int,
+    fetched_rows: int,
+) -> dict[str, object]:
+    snapshot_path = cfg.layout.market_catalog_snapshot_path(snapshot_ts)
+    write_parquet_atomic(snapshot_df, snapshot_path)
+
+    canonical_df = upsert_parquet(
+        path=cfg.layout.market_catalog_table_path,
+        incoming=snapshot_df,
+        key_columns=["market_id"],
+        sort_columns=["cycle_start_ts", "source_snapshot_ts", "market_id"],
+    )
+
+    return {
+        "dataset": "market_catalog",
+        "market": cfg.asset.slug,
+        "cycle": cfg.cycle,
+        "surface": cfg.surface,
+        "source_mode": source_mode,
+        "start_ts": int(start_ts),
+        "end_ts": int(end_ts),
+        "rows_fetched": int(fetched_rows),
+        "snapshot_rows": int(len(snapshot_df)),
+        "canonical_rows": int(len(canonical_df)),
+        "snapshot_path": str(snapshot_path),
+        "canonical_path": str(cfg.layout.market_catalog_table_path),
+    }
 
 
 def sync_market_catalog(
@@ -93,27 +129,80 @@ def sync_market_catalog(
         fetched_rows = len(events)
     snapshot_df = _frame_from_records(records)
 
-    snapshot_path = cfg.layout.market_catalog_snapshot_path(snapshot_ts)
-    write_parquet_atomic(snapshot_df, snapshot_path)
-
-    canonical_df = upsert_parquet(
-        path=cfg.layout.market_catalog_table_path,
-        incoming=snapshot_df,
-        key_columns=["market_id"],
-        sort_columns=["cycle_start_ts", "source_snapshot_ts", "market_id"],
+    return _write_market_catalog_snapshot(
+        cfg=cfg,
+        snapshot_df=snapshot_df,
+        snapshot_ts=snapshot_ts,
+        source_mode=source_mode,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        fetched_rows=fetched_rows,
     )
 
+
+def backfill_market_catalog_from_closed_markets(
+    cfg: DataConfig,
+    *,
+    start_ts: int,
+    end_ts: int,
+    window_days: int = 7,
+    client: GammaEventsClient | None = None,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    client = client or GammaEventsClient()
+    window_days = max(1, int(window_days))
+    cursor = int(start_ts)
+    step = window_days * 86400
+    window_results: list[dict[str, object]] = []
+    total_rows_fetched = 0
+    total_snapshot_rows = 0
+    last_canonical_rows = 0
+    base_now = now or datetime.now(timezone.utc)
+
+    while cursor <= int(end_ts):
+        window_end = min(int(end_ts), cursor + step - 1)
+        snapshot_ts = f"{utc_snapshot_label(base_now)}_{int(cursor)}_{int(window_end)}"
+        markets = client.fetch_closed_markets(
+            start_ts=cursor,
+            end_ts=window_end,
+            limit=cfg.gamma_limit,
+            max_pages=cfg.max_pages,
+            sleep_sec=cfg.sleep_sec,
+        )
+        records = build_market_catalog_records_from_markets(
+            markets=markets,
+            asset=cfg.asset.slug,
+            cycle=cfg.cycle,
+            snapshot_ts=snapshot_ts,
+            include_closed=True,
+        )
+        snapshot_df = _frame_from_records(records)
+        summary = _write_market_catalog_snapshot(
+            cfg=cfg,
+            snapshot_df=snapshot_df,
+            snapshot_ts=snapshot_ts,
+            source_mode="gamma_closed_markets",
+            start_ts=cursor,
+            end_ts=window_end,
+            fetched_rows=len(markets),
+        )
+        window_results.append(summary)
+        total_rows_fetched += int(summary["rows_fetched"])
+        total_snapshot_rows += int(summary["snapshot_rows"])
+        last_canonical_rows = int(summary["canonical_rows"])
+        cursor = window_end + 1
+
     return {
-        "dataset": "market_catalog",
+        "dataset": "market_catalog_backfill",
         "market": cfg.asset.slug,
         "cycle": cfg.cycle,
         "surface": cfg.surface,
-        "source_mode": source_mode,
         "start_ts": int(start_ts),
         "end_ts": int(end_ts),
-        "rows_fetched": int(fetched_rows),
-        "snapshot_rows": int(len(snapshot_df)),
-        "canonical_rows": int(len(canonical_df)),
-        "snapshot_path": str(snapshot_path),
-        "canonical_path": str(cfg.layout.market_catalog_table_path),
+        "window_days": int(window_days),
+        "windows_processed": int(len(window_results)),
+        "rows_fetched": int(total_rows_fetched),
+        "snapshot_rows": int(total_snapshot_rows),
+        "canonical_rows": int(last_canonical_rows),
+        "window_results": window_results,
     }
