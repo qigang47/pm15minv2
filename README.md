@@ -1403,57 +1403,39 @@
 在仓库根目录执行：
 
 ```bash
-PYTHONPATH=v2/src python -m pm15min --help
-PYTHONPATH=v2/src python -m pm15min layout --market sol --json
-PYTHONPATH=v2/src python -m pm15min data show-layout --market sol --cycle 15m --surface live
-PYTHONPATH=v2/src python -m pm15min data run live-foundation --market sol --surface live
-PYTHONPATH=v2/src python -m pm15min research list-runs --market sol --target direction
-PYTHONPATH=v2/src python -m pm15min console show-home
-PYTHONPATH=v2/src python -m pm15min console show-runtime-state
-PYTHONPATH=v2/src python -m pm15min console show-actions
-PYTHONPATH=v2/src python -m pm15min console build-action --action-id data_refresh_summary --request-json '{"market":"sol"}'
-PYTHONPATH=v2/src python -m pm15min console list-tasks --status-group active
-PYTHONPATH=v2/src python -m pm15min console show-data-overview --market sol --cycle 15m --surface backtest
-PYTHONPATH=v2/src python -m pm15min console serve --host 127.0.0.1 --port 8765
-PYTHONPATH=v2/src python -m pm15min live show-config --market sol --profile deep_otm
-PYTHONPATH=v2/src python -m pm15min live runner-once --market sol --profile deep_otm --target direction
-PYTHONPATH=v2/src pytest -q v2/tests
+PYTHONPATH=src python -m pm15min --help
+PYTHONPATH=src python -m pm15min layout --market sol --json
+PYTHONPATH=src python -m pm15min data show-layout --market sol --cycle 15m --surface live
+PYTHONPATH=src python -m pm15min data run live-foundation --market sol --surface live
+PYTHONPATH=src python -m pm15min research list-runs --market sol --target direction
+PYTHONPATH=src python -m pm15min console show-home
+PYTHONPATH=src python -m pm15min console show-runtime-state
+PYTHONPATH=src python -m pm15min console show-actions
+PYTHONPATH=src python -m pm15min console build-action --action-id data_refresh_summary --request-json '{"market":"sol"}'
+PYTHONPATH=src python -m pm15min console list-tasks --status-group active
+PYTHONPATH=src python -m pm15min console show-data-overview --market sol --cycle 15m --surface backtest
+PYTHONPATH=src python -m pm15min console serve --host 127.0.0.1 --port 8765
+PYTHONPATH=src python -m pm15min live show-config --market sol --profile deep_otm
+PYTHONPATH=src python -m pm15min live runner-once --market sol --profile deep_otm --target direction
+PYTHONPATH=src pytest -q tests
 ```
 
 ## `docs/`
 
-`docs/` 不是“读不读都行”的补充材料；它记录了这套 rewrite 为什么长成现在这样、还有哪些风险没有收口、operator 实际怎么跑。很多设计取舍在代码里只剩结果，在这里才有上下文。
+`docs/` 现在只保留长期有效的规范和 runbook，不再混放阶段性 checklist、执行板、单次验证和 dated audit。索引见 `docs/README.md`。
 
-- `docs/CURRENT_REMAINING_CHECKLIST.md`
-  当前剩余待办和收尾清单。
 - `docs/DATA_TECHNICAL_PLAN.md`
-  Data 域正式技术方案。
-- `docs/EXECUTION_BOARD.md`
-  并行开发/执行看板，记录谁在做什么。
-- `docs/LIVE_OPERATOR_RUNBOOK.md`
-  实盘 operator 视角运行手册。
-- `docs/LIVE_OPERATOR_VALIDATION_20260322.md`
-  2026-03-22 的 live operator 验证记录。
-- `docs/LIVE_TECHNICAL_PLAN.md`
-  Live 域正式技术方案。
-- `docs/MODEL_BUNDLE_IMPORT_STATE.md`
-  model bundle 导入状态和遗留问题。
-- `docs/PHASE_A_TRADING_INFRA_TECHNICAL_PLAN.md`
-  trading infra phase A 设计方案。
-- `docs/POLY_EVAL_AND_SCRIPTS_MIGRATION_TECHNICAL_PLAN.md`
-  poly eval 与历史脚本迁移方案。
+  Data 域长期 layout 和边界。
 - `docs/RESEARCH_TECHNICAL_PLAN.md`
-  Research 域正式技术方案。
-- `docs/REWRITE_STATUS_AND_ROADMAP.md`
-  rewrite 当前完成度与路线图。
-- `docs/V2_FULL_CODE_PARITY_AUDIT_20260323.md`
-  2026-03-23 的全代码 parity 审计记录。
-- `docs/V2_REFACTOR_REVIEW_20260320.md`
-  2026-03-20 的重构审查与风险记录。
-- `docs/V2_SHOULD_DO_EXECUTION_20260322.md`
-  2026-03-22 关于执行链路“should do”语义的专项记录。
-- `docs/V2_TRAINING_BACKTEST_VISUALIZATION_PLAN.md`
-  训练 / bundle / backtest 可视化规划。
+  Research 域长期对象模型和主链。
+- `docs/LIVE_TECHNICAL_PLAN.md`
+  Live 域长期 runtime contract。
+- `docs/LIVE_OPERATOR_RUNBOOK.md`
+  operator 值班手册。
+- `docs/MODEL_BUNDLE_IMPORT_STATE.md`
+  当前 active bundle 入口说明。
+- `docs/POLY_EVAL_AND_SCRIPTS_MIGRATION_TECHNICAL_PLAN.md`
+  package 与脚本边界的迁移原则。
 
 ## 最后一句
 

@@ -1,117 +1,114 @@
-# Model Bundle Import State
+# Model Bundle State
 
-这份文档只描述目前已经落到 `v2/research/model_bundles` 的真实 bundle，不讨论旧仓库里其它候选 run。
+这份文档只记录当前仓库里长期有用的 bundle 入口规则，以及截至 2026-03-29 观测到的 active selection。
 
-## 1. 当前 canonical direction bundle
+规则优先级：
 
-### 1.1 Current live
+1. `research/active_bundles/.../selection.json`
+2. `research/model_bundles/...`
 
-- `SOL`
-  - `usage=live_current`
-  - source run:
-    - `data/markets/sol/artifacts_runs/train_v6_sol_stage2_pool_drop_volume_z_3_end0309_dist_20260317_161410`
-  - canonical bundle:
-    - `v2/research/model_bundles/cycle=15m/asset=sol/profile=deep_otm/target=direction/bundle=legacy-train_v6_sol_stage2_pool_drop_volume_z_3_end0309_dist_20260317_161410`
-  - active registry:
-    - `v2/research/active_bundles/cycle=15m/asset=sol/profile=deep_otm/target=direction/selection.json`
+也就是说：
 
-- `XRP`
-  - `usage=live_current`
-  - source run:
-    - `data/markets/xrp/artifacts_runs/alpha_search_stage6_qcentered_capacity_cross_repair_end0309_dist/train_v6_xrp_stage6_q_capacity_cross_drop_vol_price_corr_15_vwap_gap_20_end0309_dist_20260318_162707`
-  - canonical bundle:
-    - `v2/research/model_bundles/cycle=15m/asset=xrp/profile=deep_otm/target=direction/bundle=legacy-train_v6_xrp_stage6_q_capacity_cross_drop_vol_price_corr_15_vwap_gap_20_end0309_dist_20260318_162707`
-  - active registry:
-    - `v2/research/active_bundles/cycle=15m/asset=xrp/profile=deep_otm/target=direction/selection.json`
+- `model_bundles/` 可以有很多候选 bundle
+- `active_bundles/selection.json` 才是 live 和 operator 默认要看的当前入口
 
-### 1.2 Baseline reference
+## 1. 当前 active selections（2026-03-29）
 
-- `SOL`
-  - `usage=baseline_reference`
-  - source run:
-    - `data/markets/sol/artifacts_runs/by_group/B_bs_replace_direction/bs_replace/bs_q_replace/base/train_v6_bs_q_replace_sol_20260313_163701`
-  - canonical bundle:
-    - `v2/research/model_bundles/cycle=15m/asset=sol/profile=deep_otm_baseline/target=direction/bundle=legacy-train_v6_bs_q_replace_sol_20260313_163701`
-  - active registry:
-    - `v2/research/active_bundles/cycle=15m/asset=sol/profile=deep_otm_baseline/target=direction/selection.json`
+### 1.1 live 当前 profile
 
-- `XRP`
-  - `usage=baseline_reference`
-  - source run:
-    - `data/markets/xrp/artifacts_runs/by_group/B_bs_replace_direction/bs_replace/bs_q_replace/base/train_v6_bs_q_replace_xrp_20260313_163602`
-  - canonical bundle:
-    - `v2/research/model_bundles/cycle=15m/asset=xrp/profile=deep_otm_baseline/target=direction/bundle=legacy-train_v6_bs_q_replace_xrp_20260313_163602`
-  - active registry:
-    - `v2/research/active_bundles/cycle=15m/asset=xrp/profile=deep_otm_baseline/target=direction/selection.json`
+- `sol`
+  - `profile=deep_otm`
+  - `target=direction`
+  - active bundle:
+    - `legacy-train_v6_sol_stage2_pool_drop_volume_z_3_end0309_dist_20260317_161410`
+  - selection:
+    - `research/active_bundles/cycle=15m/asset=sol/profile=deep_otm/target=direction/selection.json`
 
-## 2. Offset layout
+- `xrp`
+  - `profile=deep_otm`
+  - `target=direction`
+  - active bundle:
+    - `legacy-train_v6_xrp_stage6_q_capacity_cross_drop_vol_price_corr_15_vwap_gap_20_end0309_dist_20260318_162707`
+  - selection:
+    - `research/active_bundles/cycle=15m/asset=xrp/profile=deep_otm/target=direction/selection.json`
 
-每个 bundle 都只保留 `offset=7/8/9`，并统一整理成：
+### 1.2 baseline 参考 profile
+
+- `btc`
+  - `profile=deep_otm_baseline`
+  - `target=direction`
+  - active bundle:
+    - `unified_truth0328_btc_baseline_20260328`
+
+- `eth`
+  - `profile=deep_otm_baseline`
+  - `target=direction`
+  - active bundle:
+    - `unified_truth0328_eth_baseline_20260328`
+
+- `sol`
+  - `profile=deep_otm_baseline`
+  - `target=direction`
+  - active bundle:
+    - `unified_truth0328_sol_baseline_20260328`
+
+- `xrp`
+  - `profile=deep_otm_baseline`
+  - `target=direction`
+  - active bundle:
+    - `unified_truth0328_xrp_baseline_20260328`
+
+对应 selection 文件都在：
 
 ```text
-.../bundle=<bundle_label>/
+research/active_bundles/cycle=15m/asset=<asset>/profile=<profile>/target=direction/selection.json
+```
+
+## 2. bundle 目录结构
+
+当前 bundle 目录长期约定为：
+
+```text
+research/model_bundles/cycle=<cycle>/asset=<asset>/profile=<profile>/target=<target>/bundle=<bundle_label>/
   manifest.json
   offsets/
-    offset=7/
+    offset=<n>/
       bundle_config.json
       feature_cols.joblib
       feature_schema.json
       models/
-        lgbm_sigmoid.joblib
-        logreg_sigmoid.joblib
-        catboost.joblib          # if present in legacy source
-        xgb.joblib               # if present in legacy source
       calibration/
-        blend_weights.json
-        cat_temperature.json     # if present in legacy source
-        reliability_bins*.json
       diagnostics/
-        metrics.json             # if present in legacy source
-        final_model_probe.json   # if present in legacy source
 ```
 
-## 3. Reversal policy
+## 3. 操作规则
 
-- `reversal` 不再作为当前 canonical live bundle 保留在 `v2/research/model_bundles`
-- 之前误导入的 legacy reversal bundle 已移到：
-  - `v2/var/quarantine/model_bundles_reversal_legacy/`
+- 默认读取 bundle 时，先读 `selection.json`。
+- 只有在显式指定 bundle label 或做 inventory 时，才直接看 `model_bundles/`。
+- 不要把 training run 目录直接当 live bundle。
 
-## 4. Why this split exists
-
-- `profile=deep_otm`
-  - 表示当前实盘真正使用的 direction bundle
-
-- `profile=deep_otm_baseline`
-  - 表示当前最重要的 baseline reference
-  - 避免和 `profile=deep_otm` 混在一起，导致默认解析 bundle 时误选 baseline
-
-## 5. Resolution rule
-
-- 默认解析 bundle 时，先读：
-  - `v2/research/active_bundles/.../selection.json`
-- 只有在 active registry 缺失时，才回退到 `model_bundles` 目录下的默认搜索逻辑
-
-## 6. Operations
+## 4. 常用命令
 
 查看当前 active bundle：
 
 ```bash
-PYTHONPATH=v2/src python -m pm15min research show-active-bundle --market sol --profile deep_otm --target direction
+PYTHONPATH=src python -m pm15min research show-active-bundle --market sol --profile deep_otm --target direction
 ```
 
 切换 active bundle：
 
 ```bash
-PYTHONPATH=v2/src python -m pm15min research activate-bundle --market sol --profile deep_otm --target direction --bundle-label legacy-train_v6_sol_stage2_pool_drop_volume_z_3_end0309_dist_20260317_161410
+PYTHONPATH=src python -m pm15min research activate-bundle --market sol --profile deep_otm --target direction --bundle-label <bundle_label>
 ```
 
 按当前 active bundle 做 live 打分：
 
 ```bash
-PYTHONPATH=v2/src python -m pm15min live score-latest --market xrp --profile deep_otm
+PYTHONPATH=src python -m pm15min live score-latest --market sol --profile deep_otm
 ```
 
-原则：
+## 5. 维护规则
 
-- `model_bundles/` 可以很多
-- `active_bundles/selection.json` 每个 `asset + profile + target` 只保留一个当前入口
+- 这个文档只保留当前 active 入口和目录规则。
+- 更细的训练来源、历史迁移过程、一次性导入记录不再留在这里。
+- 当 `selection.json` 发生切换时，同步更新本文件即可。

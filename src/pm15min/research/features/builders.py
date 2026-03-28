@@ -44,29 +44,34 @@ def build_feature_frame(
     frame = base.copy()
     if None in required_groups or "price" in required_groups or "calendar" in required_groups:
         price_started = time.perf_counter()
-        frame = append_price_features(frame, requested_columns=required_columns)
+        frame = append_price_features(frame)
         timings_ms["price_stage_ms"] = _elapsed_ms(price_started)
     if "volume" in required_groups:
         volume_started = time.perf_counter()
-        frame = append_volume_features(frame, requested_columns=required_columns)
+        frame = append_volume_features(frame)
         timings_ms["volume_stage_ms"] = _elapsed_ms(volume_started)
     metadata_started = time.perf_counter()
     frame = append_decision_cycle_metadata(frame, cycle=cycle)
     timings_ms["decision_cycle_metadata_stage_ms"] = _elapsed_ms(metadata_started)
     if "cycle" in required_groups:
         cycle_started = time.perf_counter()
-        frame = append_cycle_features(frame, cycle=cycle, requested_columns=required_columns)
+        frame = append_cycle_features(frame, cycle=cycle)
         timings_ms["cycle_stage_ms"] = _elapsed_ms(cycle_started)
     if "strike" in required_groups:
         strike_started = time.perf_counter()
-        frame = append_strike_features(frame, oracle_prices=oracle_prices, cycle=cycle, requested_columns=required_columns)
+        frame = append_strike_features(frame, oracle_prices=oracle_prices, cycle=cycle)
         timings_ms["strike_stage_ms"] = _elapsed_ms(strike_started)
     if "cross_asset" in required_groups:
         cross_asset_started = time.perf_counter()
-        frame = append_cross_asset_features(frame, btc_klines=btc_klines, requested_columns=required_columns)
+        frame = append_cross_asset_features(frame, btc_klines=btc_klines)
         timings_ms["cross_asset_stage_ms"] = _elapsed_ms(cross_asset_started)
 
-    columns = list(_META_COLUMNS) + sorted(required_columns)
+    meta_columns = set(_META_COLUMNS)
+    columns = list(_META_COLUMNS) + [
+        column
+        for column in frame.columns
+        if column not in meta_columns and (feature_group(column) in required_groups or column in required_columns)
+    ]
     normalize_started = time.perf_counter()
     out = normalize_feature_frame(frame, columns=columns)
     out = out.sort_values("decision_ts").reset_index(drop=True)

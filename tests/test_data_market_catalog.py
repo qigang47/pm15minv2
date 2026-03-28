@@ -4,6 +4,7 @@ from pm15min.data.sources.polymarket_gamma import (
     GammaEventsClient,
     build_market_catalog_records,
     build_market_catalog_records_from_markets,
+    gamma_market_is_resolved,
     resolve_winner_side_from_market,
 )
 
@@ -144,6 +145,21 @@ def test_resolve_winner_side_from_market_uses_outcome_prices() -> None:
     }
 
     assert resolve_winner_side_from_market(market) == "DOWN"
+
+
+def test_gamma_market_is_resolved_requires_resolution_signal() -> None:
+    unresolved_market = {
+        "outcomes": '["Up", "Down"]',
+        "outcomePrices": '["0.6", "0.4"]',
+    }
+    resolved_market = {
+        "outcomes": '["Up", "Down"]',
+        "outcomePrices": '["0", "1"]',
+        "umaResolutionStatus": "resolved",
+    }
+
+    assert gamma_market_is_resolved(unresolved_market) is False
+    assert gamma_market_is_resolved(resolved_market) is True
 
 
 def test_fetch_markets_by_ids_sends_repeated_id_params() -> None:

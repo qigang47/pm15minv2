@@ -241,3 +241,51 @@ def test_sync_settlement_truth_from_gamma_writes_source_table(tmp_path: Path) ->
     df = pd.read_parquet(cfg.layout.settlement_truth_source_path)
     assert df.iloc[0]["winner_side"] == "DOWN"
     assert bool(df.iloc[0]["full_truth"]) is True
+
+
+def test_sync_settlement_truth_from_gamma_does_not_promote_unresolved_market_prices_to_truth(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
+
+    market_table = pd.DataFrame(
+        [
+            {
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "asset": "eth",
+                "cycle": "5m",
+                "cycle_start_ts": 1766031900,
+                "cycle_end_ts": 1766032200,
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "slug": "eth-updown-5m-1766031900",
+                "question": "Ethereum Up or Down",
+                "resolution_source": "https://data.chain.link/streams/eth-usd",
+                "event_id": "event-1",
+                "event_slug": "slug-1",
+                "event_title": "title-1",
+                "series_slug": "eth-up-or-down-5m",
+                "closed_ts": 1766032520,
+                "source_snapshot_ts": "2026-03-28T10:00:00Z",
+            }
+        ]
+    )
+    write_parquet_atomic(market_table, cfg.layout.market_catalog_table_path)
+
+    class _UnresolvedGammaClient:
+        def fetch_markets_by_ids(self, market_ids: list[str], *, sleep_sec: float = 0.0):
+            return [
+                {
+                    "id": "market-1",
+                    "outcomes": '["Up", "Down"]',
+                    "outcomePrices": '["0.6", "0.4"]',
+                }
+            ]
+
+    summary = sync_settlement_truth_from_gamma(cfg, client=_UnresolvedGammaClient())
+
+    assert summary["rows_imported"] == 1
+    assert summary["rows_resolved"] == 0
+    df = pd.read_parquet(cfg.layout.settlement_truth_source_path)
+    assert df.iloc[0]["winner_side"] == ""
+    assert bool(df.iloc[0]["onchain_resolved"]) is False
+    assert bool(df.iloc[0]["full_truth"]) is False

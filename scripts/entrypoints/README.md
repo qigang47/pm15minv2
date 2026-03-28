@@ -1,13 +1,27 @@
-`v2/scripts/entrypoints/` 是 `v2` standalone 运行面的 canonical shell 入口。
+`scripts/entrypoints/` 是当前仓库的 canonical shell 入口。
 
-- 这些脚本默认以 `v2/` 目录为项目根：
-  - 代码：`src/`
-  - 数据：`data/`
-  - 研究产物：`research/`
-  - 运行日志：`var/`
-- `.env` 读取顺序：
-  1. `PM15MIN_ENV_FILE`
-  2. `<v2-root>/.env`
-  3. `<v2-root>/../.env`
+这些脚本默认以当前仓库根目录作为 rewrite root：
 
-当前 monorepo 顶层 `scripts/entrypoints/start_v2_*` 只是兼容 wrapper，真正实现已经在这里。
+- 代码：`src/`
+- 数据：`data/`
+- 研究产物：`research/`
+- 运行日志：`var/`
+
+`_python_env.sh` 会同时兼容两种场景：
+
+- 当前仓库直接作为 rewrite root 运行
+- 当前仓库被放在更大 workspace 的 `v2/` 子目录下运行
+
+`.env` 读取顺序：
+
+1. `PM15MIN_ENV_FILE`
+2. `<rewrite-root>/.env`
+3. `<rewrite-root>/../.env`
+
+这些脚本只负责：
+
+- 激活 Python 运行环境
+- 设置 `PYTHONPATH`
+- 做薄包装的进程与日志管理
+
+真正状态仍以 `var/` 下的 canonical state / logs 为准。

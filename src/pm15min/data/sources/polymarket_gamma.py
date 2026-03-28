@@ -119,6 +119,14 @@ def _normalize_outcome_side(value: object) -> str:
     return str(value or "").strip().upper()
 
 
+def gamma_market_is_resolved(market: dict[str, Any]) -> bool:
+    status = str(market.get("umaResolutionStatus") or "").strip().lower()
+    if status == "resolved":
+        return True
+    winner = _normalize_outcome_side(market.get("winner") or market.get("winningOutcome"))
+    return winner in {"UP", "DOWN"}
+
+
 def resolve_winner_side_from_market(market: dict[str, Any]) -> str:
     winner = _normalize_outcome_side(market.get("winner") or market.get("winningOutcome"))
     if winner in {"UP", "DOWN"}:

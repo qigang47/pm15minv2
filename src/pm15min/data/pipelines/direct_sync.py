@@ -9,7 +9,7 @@ import pandas as pd
 from ..config import DataConfig
 from ..io.parquet import upsert_parquet
 from ..queries.loaders import load_market_catalog, load_streams_source
-from ..sources.polymarket_gamma import GammaEventsClient, resolve_winner_side_from_market
+from ..sources.polymarket_gamma import GammaEventsClient, gamma_market_is_resolved, resolve_winner_side_from_market
 from ..sources.chainlink_rpc import ChainlinkRpcSource
 from ..sources.polygon_rpc import PolygonRpcClient
 
@@ -363,14 +363,19 @@ def sync_settlement_truth_from_gamma(
     }
 
     base["market_id"] = base["market_id"].astype(str)
-    base["winner_side"] = base["market_id"].map(lambda market_id: resolve_winner_side_from_market(by_market_id.get(market_id, {})))
-    base["label_updown"] = base["winner_side"]
-    base["onchain_resolved"] = base["market_id"].map(
-        lambda market_id: str((by_market_id.get(market_id, {}) or {}).get("umaResolutionStatus") or "").strip().lower()
-        == "resolved"
+    resolved_by_market_id = {
+        market_id: gamma_market_is_resolved(market)
+        for market_id, market in by_market_id.items()
+    }
+    gamma_resolved = base["market_id"].map(lambda market_id: resolved_by_market_id.get(market_id, False))
+    base["onchain_resolved"] = gamma_resolved
+    base["winner_side"] = base["market_id"].map(
+        lambda market_id: resolve_winner_side_from_market(by_market_id.get(market_id, {}))
+        if resolved_by_market_id.get(market_id, False)
+        else ""
     )
-    base["full_truth"] = base["winner_side"].ne("")
-    base["onchain_resolved"] = base["onchain_resolved"] | base["full_truth"]
+    base["label_updown"] = base["winner_side"]
+    base["full_truth"] = base["onchain_resolved"] & base["winner_side"].isin(["UP", "DOWN"])
     base["stream_match_exact"] = False
     base["stream_price"] = pd.Series([pd.NA] * len(base), index=base.index, dtype="Float64")
     base["stream_extra_ts"] = pd.Series([pd.NA] * len(base), index=base.index, dtype="Int64")
@@ -411,7 +416,7 @@ def sync_settlement_truth_from_gamma(
         "dataset": "settlement_truth_gamma",
         "market": cfg.asset.slug,
         "rows_imported": int(len(out)),
-        "rows_resolved": int(out["winner_side"].ne("").sum()),
+        "rows_resolved": int(out["full_truth"].fillna(False).sum()),
         "markets_fetched": int(len(fetched)),
         "matched_markets": int(base["market_id"].isin(by_market_id).sum()),
         "canonical_rows": int(len(canonical)),
