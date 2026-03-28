@@ -10,7 +10,7 @@ import pytest
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import read_parquet_if_exists
 from pm15min.data.io.parquet import write_parquet_atomic
-from pm15min.data.pipelines.foundation_runtime import run_live_data_foundation
+from pm15min.data.pipelines.foundation_runtime import run_live_data_foundation, run_live_data_foundation_shared
 import pm15min.data.pipelines.foundation_runtime as foundation_runtime_module
 
 
@@ -304,3 +304,89 @@ def test_run_live_data_foundation_loop_zero_iterations_runs_until_stopped(
 
     assert calls["market_catalog"] >= 2
     assert calls["binance"] >= 2
+
+
+def test_run_live_data_foundation_shared_prioritizes_due_factor_tasks_across_markets(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sol_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
+    xrp_cfg = DataConfig.build(market="xrp", cycle="15m", surface="live", root=tmp_path / "v2")
+    calls: list[tuple[str, str]] = []
+
+    def fake_market_catalog(*args, **kwargs):
+        target_cfg = kwargs.get("cfg") or args[0]
+        calls.append(("market_catalog", target_cfg.asset.slug))
+        return {"dataset": "market_catalog"}
+
+    def fake_binance(*args, **kwargs):
+        target_cfg = args[0]
+        calls.append(("binance", target_cfg.asset.slug))
+        return {"dataset": "binance_klines_1m", "market": target_cfg.asset.slug}
+
+    def fake_direct_oracle(*args, **kwargs):
+        target_cfg = args[0]
+        calls.append(("oracle", target_cfg.asset.slug))
+        return {
+            "dataset": "polymarket_direct_oracle_price_window",
+            "rows_imported": 1,
+            "canonical_rows": 1,
+            "target_path": str(target_cfg.layout.direct_oracle_source_path),
+        }
+
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_market_catalog", fake_market_catalog)
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_binance_klines_1m", fake_binance)
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_polymarket_oracle_price_window", fake_direct_oracle)
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_streams_from_rpc", lambda *args, **kwargs: {"dataset": "chainlink_streams_rpc"})
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.build_oracle_prices_15m", lambda *args, **kwargs: {"dataset": "oracle_prices_15m"})
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.run_orderbook_recorder", lambda *args, **kwargs: {"status": "ok", "dataset": "orderbook_depth"})
+
+    summary = run_live_data_foundation_shared(
+        [sol_cfg, xrp_cfg],
+        iterations=1,
+        loop=False,
+        include_streams=False,
+        include_orderbooks=False,
+        now_provider=lambda: datetime(2026, 3, 20, 0, 7, tzinfo=timezone.utc),
+    )
+
+    assert summary["status"] == "ok"
+    assert summary["markets"] == ["sol", "xrp"]
+    assert calls[:6] == [
+        ("binance", "sol"),
+        ("binance", "xrp"),
+        ("oracle", "sol"),
+        ("oracle", "xrp"),
+        ("market_catalog", "sol"),
+        ("market_catalog", "xrp"),
+    ]
+    sol_state = json.loads(sol_cfg.layout.foundation_state_path.read_text(encoding="utf-8"))
+    xrp_state = json.loads(xrp_cfg.layout.foundation_state_path.read_text(encoding="utf-8"))
+    assert sol_state["mode"] == "shared"
+    assert xrp_state["mode"] == "shared"
+    assert sol_state["shared_markets"] == ["sol", "xrp"]
+
+
+def test_next_foundation_task_due_at_prefers_boundary_then_fallback(tmp_path: Path, monkeypatch) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
+    monkeypatch.setenv("PM15MIN_LIVE_FOUNDATION_BINANCE_BOUNDARY_OFFSETS", "7,8,9")
+    monkeypatch.setenv("PM15MIN_LIVE_FOUNDATION_BINANCE_BOUNDARY_DELAY_SEC", "0.75")
+    monkeypatch.setenv("PM15MIN_LIVE_FOUNDATION_BINANCE_FALLBACK_REFRESH_SEC", "300")
+
+    near_boundary = datetime(2026, 3, 20, 0, 7, 1, tzinfo=timezone.utc)
+    due_near = foundation_runtime_module._next_foundation_task_due_at(
+        cfg=cfg,
+        task_name="binance",
+        now=near_boundary,
+        interval_sec=60.0,
+    )
+    assert pd.Timestamp(due_near, unit="s", tz="UTC") == pd.Timestamp("2026-03-20T00:08:00.750000Z")
+
+    after_window = datetime(2026, 3, 20, 0, 10, 0, tzinfo=timezone.utc)
+    due_fallback = foundation_runtime_module._next_foundation_task_due_at(
+        cfg=cfg,
+        task_name="binance",
+        now=after_window,
+        interval_sec=60.0,
+    )
+    assert pd.Timestamp(due_fallback, unit="s", tz="UTC") == pd.Timestamp("2026-03-20T00:15:00Z")

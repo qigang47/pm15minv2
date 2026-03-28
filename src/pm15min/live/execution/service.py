@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from typing import Any
 
 from pm15min.data.config import DataConfig
@@ -22,7 +24,6 @@ def build_execution_snapshot(
     resolve_side_probability_fn,
     float_or_none_fn,
     build_depth_execution_plan_fn,
-    repriced_order_guard_fn,
 ) -> dict[str, Any]:
     market = str(decision_payload["market"])
     profile = str(decision_payload["profile"])
@@ -58,7 +59,6 @@ def build_execution_snapshot(
             "order_type_selection",
             "l1_fill_proxy",
             "full_orderbook_depth",
-            "orderbook_limit_reprice",
             "retry_policy",
             "cancel_policy",
             "redeem_policy",
@@ -69,7 +69,9 @@ def build_execution_snapshot(
             "redeem_side_effect",
         ],
     }
-    policy_state = load_policy_state_fn(rewrite_root=cfg.layout.rewrite.root, market=market)
+    policy_state = None
+    if _execution_policy_state_required():
+        policy_state = load_policy_state_fn(rewrite_root=cfg.layout.rewrite.root, market=market)
     policy_context = build_policy_context_fn()
     if not selected_row:
         payload["execution"] = build_execution_record_fn(
@@ -167,13 +169,13 @@ def build_execution_snapshot(
     reused_depth_plan = False
     depth_plan = None
     depth_reason = None
-    repriced_metrics = None
+    repriced_metrics = quote_metrics.get("repriced_metrics") if isinstance(quote_metrics, dict) else None
+    depth_started = time.perf_counter()
     if _can_reuse_precomputed_depth_plan(
         quote_metrics=quote_metrics,
         side=side,
         requested_notional=requested_notional,
         price_cap=p_cap,
-        prefer_live_depth=prefer_live_depth,
         float_or_none_fn=float_or_none_fn,
     ):
         depth_plan = dict(quote_metrics.get("depth_plan") or {})
@@ -197,17 +199,10 @@ def build_execution_snapshot(
             orderbook_provider=orderbook_provider,
             prefer_live_provider=prefer_live_depth,
         )
+    depth_elapsed_ms = round(max(0.0, (time.perf_counter() - float(depth_started)) * 1000.0), 3)
 
     if depth_reason:
         execution_reasons.append(depth_reason)
-    if depth_plan is not None and str(depth_plan.get("status") or "") == "ok":
-        # Cached repriced metrics carry numbers but not the current rejection reasons.
-        repriced_metrics, repriced_reasons = repriced_order_guard_fn(
-            spec=spec,
-            selected_row=selected_row,
-            repriced_entry_price=float(depth_plan["max_price"]),
-        )
-        execution_reasons.extend(repriced_reasons)
 
     execution_status = "plan" if not execution_reasons else "blocked"
     order_type = str(spec.default_order_type)
@@ -263,6 +258,11 @@ def build_execution_snapshot(
             "repriced_metrics": repriced_metrics,
         },
     )
+    payload["timings_ms"] = {
+        "depth_stage_ms": depth_elapsed_ms,
+        "depth_plan_reused": bool(reused_depth_plan),
+        "policy_state_loaded": bool(policy_state is not None),
+    }
     return payload
 
 
@@ -272,11 +272,8 @@ def _can_reuse_precomputed_depth_plan(
     side: str,
     requested_notional: float,
     price_cap: float | None,
-    prefer_live_depth: bool,
     float_or_none_fn,
 ) -> bool:
-    if prefer_live_depth:
-        return False
     if not isinstance(quote_metrics, dict):
         return False
     if not bool(quote_metrics.get("depth_enforced")):
@@ -296,6 +293,20 @@ def _can_reuse_precomputed_depth_plan(
     if not _same_optional_float(precomputed_price_cap, price_cap):
         return False
     return True
+
+
+def _execution_policy_state_required() -> bool:
+    return _env_bool("PM15MIN_RUNNER_ENABLE_CANCEL_POLICY", default=True) or _env_bool(
+        "PM15MIN_RUNNER_ENABLE_REDEEM_POLICY",
+        default=True,
+    )
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 def _same_optional_float(left: float | None, right: float | None, *, tol: float = 1e-9) -> bool:

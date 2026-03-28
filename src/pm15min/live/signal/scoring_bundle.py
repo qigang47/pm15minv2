@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
+import threading
+import time
 from typing import Any
 
 from ..liquidity import load_latest_liquidity_state_snapshot, summarize_liquidity_state
@@ -29,6 +32,10 @@ class LiveFeatureContext:
     liquidity_state: dict[str, object]
     regime_payload: dict[str, object] | None
     regime_state: dict[str, object]
+
+
+_BUNDLE_RESOLUTION_CACHE: dict[tuple[str, str, int, str, str | None], tuple[float, BundleResolution]] = {}
+_BUNDLE_RESOLUTION_CACHE_LOCK = threading.Lock()
 
 
 def normalize_feature_set(value: object) -> str:
@@ -60,6 +67,18 @@ def resolve_bundle_resolution(
     read_model_bundle_manifest_fn,
     supports_feature_set_fn,
 ) -> BundleResolution:
+    cache_ttl_seconds = _env_float("PM15MIN_LIVE_BUNDLE_CACHE_SEC", default=0.0)
+    cache_key = (
+        str(cfg.layout.rewrite.root),
+        str(cfg.asset.slug),
+        int(cfg.cycle_minutes),
+        str(target or "direction").strip().lower(),
+        None if feature_set is None else str(feature_set),
+    )
+    if cache_ttl_seconds > 0.0:
+        cached = _load_cached_bundle_resolution(cache_key=cache_key)
+        if cached is not None:
+            return cached
     selected_target = str(target or "direction").strip().lower()
     profile_spec = resolve_live_profile_spec_fn(cfg.profile)
     research_cfg = ResearchConfig.build(
@@ -97,7 +116,7 @@ def resolve_bundle_resolution(
         supports_feature_set_fn=supports_feature_set_fn,
     )
 
-    return BundleResolution(
+    resolved = BundleResolution(
         selected_target=selected_target,
         profile_spec=profile_spec,
         research_cfg=research_cfg,
@@ -108,16 +127,28 @@ def resolve_bundle_resolution(
         manifest_feature_set=manifest_feature_set,
         builder_feature_set=builder_feature_set,
     )
+    if cache_ttl_seconds > 0.0:
+        _store_cached_bundle_resolution(
+            cache_key=cache_key,
+            cache_ttl_seconds=cache_ttl_seconds,
+            resolution=resolved,
+        )
+    return resolved
 
 
 def prepare_live_features_and_states(
     cfg,
     *,
     builder_feature_set: str,
+    active_offsets: tuple[int, ...] = (),
     persist: bool,
     build_live_feature_frame_fn,
 ) -> LiveFeatureContext:
-    base_features = build_live_feature_frame_fn(cfg, feature_set=builder_feature_set)
+    base_features = build_live_feature_frame_fn(
+        cfg,
+        feature_set=builder_feature_set,
+        retain_offsets=active_offsets,
+    )
     if base_features.empty:
         raise ValueError(f"Live feature frame is empty for market={cfg.asset.slug}")
 
@@ -143,3 +174,42 @@ def prepare_live_features_and_states(
         regime_payload=regime_payload,
         regime_state=regime_state,
     )
+
+
+def _load_cached_bundle_resolution(
+    *,
+    cache_key: tuple[str, str, int, str, str | None],
+) -> BundleResolution | None:
+    now_monotonic = time.monotonic()
+    with _BUNDLE_RESOLUTION_CACHE_LOCK:
+        cached = _BUNDLE_RESOLUTION_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        expires_at, resolution = cached
+        if now_monotonic >= float(expires_at):
+            _BUNDLE_RESOLUTION_CACHE.pop(cache_key, None)
+            return None
+        return resolution
+
+
+def _store_cached_bundle_resolution(
+    *,
+    cache_key: tuple[str, str, int, str, str | None],
+    cache_ttl_seconds: float,
+    resolution: BundleResolution,
+) -> None:
+    with _BUNDLE_RESOLUTION_CACHE_LOCK:
+        _BUNDLE_RESOLUTION_CACHE[cache_key] = (
+            time.monotonic() + max(0.0, float(cache_ttl_seconds)),
+            resolution,
+        )
+
+
+def _env_float(name: str, *, default: float) -> float:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)

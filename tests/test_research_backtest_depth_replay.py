@@ -477,3 +477,156 @@ def test_build_raw_depth_replay_frame_uses_token_window_fallback_with_catalog_me
     assert summary.decision_key_snapshot_rows == 0
     assert summary.token_window_snapshot_rows == 1
     assert summary.replay_rows_with_snapshots == 1
+
+
+def test_build_raw_depth_replay_frame_backfills_blank_market_id_from_cycle_catalog(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "m-3",
+                    "condition_id": "c-3",
+                    "token_up": "tok-up-3",
+                    "token_down": "tok-down-3",
+                    "question": "SOL higher?",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_324_100,
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    append_ndjson_zst(
+        data_cfg.layout.orderbook_depth_path("2026-03-01"),
+        [
+            {
+                "logged_at": "2026-03-01T00:05:20.000000+00:00",
+                "market_id": "m-3",
+                "token_id": "tok-up-3",
+                "side": "up",
+                "asks": [[0.30, 10.0]],
+                "bids": [[0.29, 5.0]],
+            },
+            {
+                "logged_at": "2026-03-01T00:05:20.000000+00:00",
+                "market_id": "m-3",
+                "token_id": "tok-down-3",
+                "side": "down",
+                "asks": [[0.70, 8.0]],
+                "bids": [[0.69, 3.0]],
+            },
+        ],
+    )
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "",
+                "condition_id": "",
+                "token_up": "",
+                "token_down": "",
+            }
+        ]
+    )
+
+    out, summary = build_raw_depth_replay_frame(
+        replay=replay,
+        data_cfg=data_cfg,
+        snapshot_tolerance_ms=60_000,
+    )
+
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert row["market_id"] == "m-3"
+    assert row["condition_id"] == "c-3"
+    assert row["token_up"] == "tok-up-3"
+    assert row["token_down"] == "tok-down-3"
+    assert row["question"] == "SOL higher?"
+    assert row["depth_snapshot_status"] == "ok"
+    assert row["depth_match_strategy"] == "token_window"
+    assert summary.replay_rows_with_snapshots == 1
+
+
+def test_build_raw_depth_replay_frame_prefers_market_id_catalog_match_before_cycle_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "m-good",
+                    "condition_id": "c-good",
+                    "token_up": "tok-up-good",
+                    "token_down": "tok-down-good",
+                    "question": "SOL good?",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_324_100,
+                },
+                {
+                    "market_id": "m-bad",
+                    "condition_id": "c-bad",
+                    "token_up": "tok-up-bad",
+                    "token_down": "tok-down-bad",
+                    "question": "SOL bad?",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_324_100,
+                },
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    append_ndjson_zst(
+        data_cfg.layout.orderbook_depth_path("2026-03-01"),
+        [
+            {
+                "logged_at": "2026-03-01T00:05:20.000000+00:00",
+                "market_id": "m-good",
+                "token_id": "tok-up-good",
+                "side": "up",
+                "asks": [[0.30, 10.0]],
+                "bids": [[0.29, 5.0]],
+            },
+            {
+                "logged_at": "2026-03-01T00:05:20.000000+00:00",
+                "market_id": "m-good",
+                "token_id": "tok-down-good",
+                "side": "down",
+                "asks": [[0.70, 8.0]],
+                "bids": [[0.69, 3.0]],
+            },
+        ],
+    )
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-good",
+                "condition_id": "",
+                "token_up": "",
+                "token_down": "",
+            }
+        ]
+    )
+
+    out, summary = build_raw_depth_replay_frame(
+        replay=replay,
+        data_cfg=data_cfg,
+        snapshot_tolerance_ms=60_000,
+    )
+
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert row["market_id"] == "m-good"
+    assert row["token_up"] == "tok-up-good"
+    assert row["token_down"] == "tok-down-good"
+    assert row["question"] == "SOL good?"
+    assert row["depth_snapshot_status"] == "ok"
+    assert summary.replay_rows_with_snapshots == 1

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from pm15min.data.pipelines.orderbook_fleet import parse_orderbook_fleet_markets, run_orderbook_recorder_fleet
 
 
@@ -67,3 +69,57 @@ def test_run_orderbook_recorder_fleet_runs_markets_independently() -> None:
     assert payload["status"] == "ok"
     assert payload["completed_rounds"] == 2
     assert payload["scheduler_mode"] == "parallel_per_market"
+
+
+def test_run_orderbook_recorder_fleet_can_launch_process_per_market(monkeypatch) -> None:
+    commands: list[list[str]] = []
+    pids = iter([1001, 1002])
+
+    class _FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+    def _fake_popen(cmd, **kwargs):
+        del kwargs
+        commands.append(list(cmd))
+        return _FakeProcess(next(pids))
+
+    monkeypatch.setattr("pm15min.data.pipelines.orderbook_fleet.subprocess.Popen", _fake_popen)
+
+    payload = run_orderbook_recorder_fleet(
+        markets="sol,xrp",
+        cycle="15m",
+        loop=True,
+        iterations=0,
+        sleep_sec=0.35,
+        scheduler_mode="process_per_market",
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["scheduler_mode"] == "process_per_market"
+    assert payload["pids"] == {"sol": 1001, "xrp": 1002}
+    assert payload["results"] == {}
+    assert len(commands) == 2
+    assert any("market='sol'" in " ".join(command) for command in commands)
+    assert any("market='xrp'" in " ".join(command) for command in commands)
+
+
+def test_run_orderbook_recorder_fleet_process_mode_requires_default_recorder() -> None:
+    with pytest.raises(ValueError, match="default run_orderbook_recorder"):
+        run_orderbook_recorder_fleet(
+            markets="sol",
+            loop=True,
+            iterations=0,
+            scheduler_mode="process_per_market",
+            run_orderbook_recorder_fn=lambda cfg, **kwargs: {"status": "ok"},
+        )
+
+
+def test_run_orderbook_recorder_fleet_process_mode_requires_infinite_loop() -> None:
+    with pytest.raises(ValueError, match="loop=True and iterations=0"):
+        run_orderbook_recorder_fleet(
+            markets="sol",
+            loop=False,
+            iterations=1,
+            scheduler_mode="process_per_market",
+        )

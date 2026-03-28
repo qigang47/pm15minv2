@@ -111,7 +111,7 @@ DEEP_OTM_LIVE_PROFILE_SPEC = LiveProfileSpec(
         _DEFAULT_PROFILE_VALUES
         | {
             "profile": "deep_otm",
-            "active_markets": ("sol", "xrp"),
+            "active_markets": ("btc", "eth", "sol", "xrp"),
             "offsets": (7, 8, 9),
             "entry_price_min": 0.01,
             "entry_price_max": 0.30,
@@ -135,10 +135,14 @@ DEEP_OTM_LIVE_PROFILE_SPEC = LiveProfileSpec(
             "repeat_same_decision_stake_multiple": 3.0,
             "repeat_same_decision_lock_side": False,
             "ret_30m_up_floor_by_asset": {
+                "btc": 0.0,
+                "eth": 0.0,
                 "sol": 0.0,
                 "xrp": 0.0,
             },
             "ret_30m_down_ceiling_by_asset": {
+                "btc": 0.002,
+                "eth": 0.002,
                 "sol": 0.002,
                 "xrp": 0.009,
             },
@@ -226,6 +230,8 @@ DEEP_OTM_BASELINE_LIVE_PROFILE_SPEC = LiveProfileSpec(
         | {
             "profile": "deep_otm_baseline",
             "ret_30m_up_floor_by_asset": {
+                "btc": -0.04,
+                "eth": -0.04,
                 "sol": -0.04,
                 "xrp": -0.04,
             },

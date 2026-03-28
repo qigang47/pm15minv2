@@ -51,6 +51,21 @@ class FakeCalibratedModel:
         self.calibrated_classifiers_ = [FakeCalibratedMember(estimator)]
 
 
+class LogisticRegression:
+    def predict_proba(self, X):
+        if not hasattr(self, "multi_class"):
+            raise AttributeError("'LogisticRegression' object has no attribute 'multi_class'")
+        return np.asarray([[0.4, 0.6] for _ in range(len(X))], dtype=float)
+
+
+class FakeCompatPipeline:
+    def __init__(self) -> None:
+        self.named_steps = {"clf": LogisticRegression()}
+
+    def predict_proba(self, X):
+        return self.named_steps["clf"].predict_proba(X)
+
+
 def test_score_bundle_offset_uses_conservative_reliability_probabilities(tmp_path) -> None:
     bundle_dir = tmp_path / "bundle=test"
     offset_dir = bundle_dir / "offsets" / "offset=7"
@@ -378,3 +393,47 @@ def test_score_bundle_offset_refreshes_cached_models_when_model_file_changes(tmp
     second = score_bundle_offset(bundle_dir, features, offset=7)
     assert float(second.iloc[0]["p_lr"]) == pytest.approx(0.1)
     assert float(second.iloc[0]["p_signal"]) == pytest.approx(0.5)
+
+
+def test_score_bundle_offset_applies_compat_shim_for_missing_logreg_multi_class(tmp_path) -> None:
+    bundle_dir = tmp_path / "bundle=test"
+    offset_dir = bundle_dir / "offsets" / "offset=7"
+    model_dir = offset_dir / "models"
+    calibration_dir = offset_dir / "calibration"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    calibration_dir.mkdir(parents=True, exist_ok=True)
+
+    (offset_dir / "bundle_config.json").write_text(
+        json.dumps(
+            {
+                "feature_columns": ["ret_1m"],
+                "signal_target": "direction",
+                "allowed_blacklist_columns": [],
+                "missing_feature_fill_value": 0.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    joblib.dump(FixedProbabilityModel(0.90), model_dir / "lgbm_sigmoid.joblib")
+    joblib.dump(FakeCompatPipeline(), model_dir / "logreg_sigmoid.joblib")
+    (calibration_dir / "blend_weights.json").write_text(
+        json.dumps({"w_lgb": 0.5, "w_lr": 0.5}),
+        encoding="utf-8",
+    )
+
+    features = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-20T00:08:00+00:00",
+                "cycle_start_ts": "2026-03-20T00:00:00+00:00",
+                "cycle_end_ts": "2026-03-20T00:15:00+00:00",
+                "offset": 7,
+                "ret_1m": 0.01,
+            }
+        ]
+    )
+
+    out = score_bundle_offset(bundle_dir, features, offset=7)
+
+    assert len(out) == 1
+    assert float(out.iloc[0]["p_lr"]) == pytest.approx(0.6)

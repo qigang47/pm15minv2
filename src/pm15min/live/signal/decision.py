@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +106,8 @@ def build_decision_snapshot(
         "active_bundle": signal_payload.get("active_bundle"),
         "signal_snapshot_ts": signal_payload.get("snapshot_ts"),
         "signal_snapshot_path": signal_payload.get("snapshot_path"),
+        "latest_feature_decision_ts": signal_payload.get("latest_feature_decision_ts"),
+        "feature_rows": signal_payload.get("feature_rows"),
         "quote_snapshot_ts": quote_payload.get("snapshot_ts") if quote_payload else None,
         "quote_snapshot_path": quote_payload.get("quote_snapshot_path") if quote_payload else None,
         "latest_quote_path": quote_payload.get("latest_quote_path") if quote_payload else None,
@@ -130,7 +133,6 @@ def build_decision_snapshot(
             "max_open_markets_guard",
         ],
         "pending_guard_layers": [
-            "orderbook_execution_guard",
             "repeat_same_decision_guard",
         ],
         "liquidity_state_snapshot_ts": signal_payload.get("liquidity_state_snapshot_ts"),
@@ -275,6 +277,8 @@ def _build_decision_quote_metrics(
     denom = max((1.0 + float(roi_threshold) + float(fee_rate)) * (1.0 + slip), 1e-9)
     p_cap = max(1e-6, min(float(p_side) / denom, 1.0))
     metrics["price_cap"] = p_cap
+    if not _decision_depth_enforced():
+        return metrics
 
     has_persisted_depth = False
     if rewrite_root is not None:
@@ -324,6 +328,13 @@ def _build_decision_quote_metrics(
     metrics["roi_net_vs_quote"] = repriced_metrics.get("repriced_roi_net")
     metrics["roi_threshold_required"] = repriced_metrics.get("repriced_roi_threshold_required")
     return metrics
+
+
+def _decision_depth_enforced() -> bool:
+    raw = os.getenv("PM15MIN_LIVE_DECISION_DEPTH_ENFORCED")
+    if raw in (None, ""):
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def persist_decision_snapshot(*, rewrite_root: Path, payload: dict[str, Any]) -> dict[str, Path]:

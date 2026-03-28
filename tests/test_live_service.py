@@ -11,11 +11,16 @@ from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.live.service import (
     check_live_latest,
+    prewarm_live_signal_cache,
     check_live_trading_gateway,
     score_live_latest,
     show_live_latest_runner,
     show_live_ready,
 )
+from pm15min.live.signal.service import decide_live_latest as decide_live_latest_impl
+from pm15min.live.signal import scoring_bundle as scoring_bundle_module
+from pm15min.live.signal import utils as signal_utils_module
+from pm15min.live.signal.scoring_bundle import resolve_bundle_resolution
 from pm15min.live.signal.utils import build_live_feature_frame
 
 
@@ -136,6 +141,19 @@ def test_check_live_latest_fails_when_nan_features_present(tmp_path: Path, monke
     offset_check = next(item for item in payload["checks"] if item["name"] == "offset_signals_valid")
     assert offset_check["ok"] is False
     assert offset_check["detail"][0]["nan_feature_count"] == 1
+
+
+def test_prewarm_live_signal_cache_populates_session_cache(tmp_path: Path, monkeypatch) -> None:
+    cfg = _prepare_nan_feature_score_case(tmp_path, monkeypatch)
+    session_state: dict[str, object] = {}
+
+    first = prewarm_live_signal_cache(cfg, persist=False, session_state=session_state)
+    second = prewarm_live_signal_cache(cfg, persist=False, session_state=session_state)
+
+    assert first["status"] == "ok"
+    assert first["cache_hit"] is False
+    assert first["offsets"] == [7]
+    assert second["cache_hit"] is True
 
 
 def test_score_live_latest_ignores_expired_offset_rows(tmp_path: Path, monkeypatch) -> None:
@@ -331,6 +349,477 @@ def test_build_live_feature_frame_skips_trade_input_refresh_when_files_are_fresh
     out = build_live_feature_frame(cfg, feature_set="v6_user_core")
 
     assert not out.empty
+
+
+def test_build_live_feature_frame_reuses_cached_frame_within_ttl(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", "60")
+    signal_utils_module._LIVE_FEATURE_FRAME_CACHE.clear()
+    calls = {"refresh": 0, "builder": 0}
+
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.ensure_live_trade_inputs_fresh",
+        lambda *args, **kwargs: calls.__setitem__("refresh", calls["refresh"] + 1) or {"status": "fresh"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_binance_klines_1m",
+        lambda *args, **kwargs: pd.DataFrame(
+            [{"open_time": pd.Timestamp("2026-03-20T00:00:00Z"), "close_time": pd.Timestamp("2026-03-20T00:00:59Z"), "close": 100.0}]
+        ),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_oracle_prices_table",
+        lambda *args, **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_live_runtime_oracle_prices",
+        lambda **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+
+    def _build_feature_frame(*args, **kwargs):
+        calls["builder"] += 1
+        return pd.DataFrame(
+            [
+                {
+                    "decision_ts": pd.Timestamp("2026-03-20T00:01:00Z"),
+                    "cycle_start_ts": pd.Timestamp("2026-03-20T00:00:00Z"),
+                    "cycle_end_ts": pd.Timestamp("2026-03-20T00:15:00Z"),
+                    "offset": 1,
+                    "ret_30m": 0.0,
+                }
+            ]
+        )
+
+    monkeypatch.setattr("pm15min.live.signal.utils.build_feature_frame_df", _build_feature_frame)
+
+    first = build_live_feature_frame(cfg, feature_set="v6_user_core")
+    second = build_live_feature_frame(cfg, feature_set="v6_user_core")
+
+    assert not first.empty
+    assert not second.empty
+    assert calls["refresh"] == 1
+    assert calls["builder"] == 1
+    assert first is not second
+
+
+def test_build_live_feature_frame_trims_to_recent_cycles_and_active_offsets(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", "0")
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_TAIL_CYCLES", "2")
+
+    monkeypatch.setattr("pm15min.live.signal.utils.ensure_live_trade_inputs_fresh", lambda *args, **kwargs: {"status": "fresh"})
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_binance_klines_1m",
+        lambda *args, **kwargs: pd.DataFrame(
+            [{"open_time": pd.Timestamp("2026-03-20T00:00:00Z"), "close_time": pd.Timestamp("2026-03-20T00:00:59Z"), "close": 100.0}]
+        ),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_oracle_prices_table",
+        lambda *args, **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_live_runtime_oracle_prices",
+        lambda **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+
+    def _build_feature_frame(*args, **kwargs):
+        rows = []
+        start = pd.Timestamp("2026-03-20T00:00:00Z")
+        for minute in range(45):
+            decision_ts = start + pd.Timedelta(minutes=minute)
+            cycle_start = decision_ts.floor("15min")
+            rows.append(
+                {
+                    "decision_ts": decision_ts,
+                    "cycle_start_ts": cycle_start,
+                    "cycle_end_ts": cycle_start + pd.Timedelta(minutes=15),
+                    "offset": minute % 15,
+                    "ret_30m": float(minute),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    monkeypatch.setattr("pm15min.live.signal.utils.build_feature_frame_df", _build_feature_frame)
+
+    out = build_live_feature_frame(cfg, feature_set="v6_user_core", retain_offsets=(7, 8, 9))
+
+    assert len(out) == 18
+    assert sorted(out.loc[out["cycle_start_ts"] == pd.Timestamp("2026-03-20T00:30:00Z"), "offset"].tolist()) == list(range(15))
+    assert sorted(out.loc[out["cycle_start_ts"] == pd.Timestamp("2026-03-20T00:15:00Z"), "offset"].tolist()) == [7, 8, 9]
+
+
+def test_build_live_feature_frame_limits_builder_input_to_bounded_kline_tail(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", "0")
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_BUILD_TAIL_BARS", "300")
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE.clear()
+
+    monkeypatch.setattr("pm15min.live.signal.utils.ensure_live_trade_inputs_fresh", lambda *args, **kwargs: {"status": "fresh"})
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_oracle_prices_table",
+        lambda *args, **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_live_runtime_oracle_prices",
+        lambda **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+
+    base_rows = [
+        {
+            "open_time": pd.Timestamp("2026-03-20T00:00:00Z") + pd.Timedelta(minutes=minute),
+            "close_time": pd.Timestamp("2026-03-20T00:00:59Z") + pd.Timedelta(minutes=minute),
+            "open": 100.0 + minute,
+            "high": 101.0 + minute,
+            "low": 99.0 + minute,
+            "close": 100.5 + minute,
+            "volume": 10.0 + minute,
+            "quote_asset_volume": 20.0 + minute,
+            "taker_buy_quote_volume": 8.0 + minute,
+            "number_of_trades": 5 + minute,
+        }
+        for minute in range(1000)
+    ]
+    captured: dict[str, tuple[int, int]] = {}
+
+    def _load_binance(data_cfg, symbol=None):
+        return pd.DataFrame(base_rows)
+
+    def _build_feature_frame(raw_klines, *, btc_klines=None, **kwargs):
+        captured["sizes"] = (len(raw_klines), 0 if btc_klines is None else len(btc_klines))
+        return pd.DataFrame(
+            [
+                {
+                    "decision_ts": pd.Timestamp("2026-03-20T16:40:00Z"),
+                    "cycle_start_ts": pd.Timestamp("2026-03-20T16:30:00Z"),
+                    "cycle_end_ts": pd.Timestamp("2026-03-20T16:45:00Z"),
+                    "offset": 10,
+                    "ret_30m": 0.0,
+                }
+            ]
+        )
+
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    btc_cfg = DataConfig.build(market="btc", cycle="15m", surface="live", root=root)
+    data_cfg.layout.binance_klines_path().parent.mkdir(parents=True, exist_ok=True)
+    data_cfg.layout.binance_klines_path().write_text("x", encoding="utf-8")
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").parent.mkdir(parents=True, exist_ok=True)
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr("pm15min.live.signal.utils.load_binance_klines_1m", _load_binance)
+    monkeypatch.setattr("pm15min.live.signal.utils.build_feature_frame_df", _build_feature_frame)
+
+    out = build_live_feature_frame(cfg, feature_set="v6_user_core")
+
+    assert not out.empty
+    assert captured["sizes"] == (300, 300)
+
+
+def test_build_live_feature_frame_reuses_cached_kline_tail_when_source_unchanged(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", "0")
+    monkeypatch.setenv("PM15MIN_LIVE_FEATURE_BUILD_TAIL_BARS", "300")
+    signal_utils_module._LIVE_KLINES_TAIL_CACHE.clear()
+
+    monkeypatch.setattr("pm15min.live.signal.utils.ensure_live_trade_inputs_fresh", lambda *args, **kwargs: {"status": "fresh"})
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.load_oracle_prices_table",
+        lambda *args, **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_live_runtime_oracle_prices",
+        lambda **kwargs: pd.DataFrame(
+            [{"asset": "sol", "cycle_start_ts": 0, "cycle_end_ts": 900, "price_to_beat": 100.0, "final_price": None}]
+        ),
+    )
+
+    rows = pd.DataFrame(
+        [
+            {
+                "open_time": pd.Timestamp("2026-03-20T00:00:00Z") + pd.Timedelta(minutes=minute),
+                "close_time": pd.Timestamp("2026-03-20T00:00:59Z") + pd.Timedelta(minutes=minute),
+                "open": 100.0 + minute,
+                "high": 101.0 + minute,
+                "low": 99.0 + minute,
+                "close": 100.5 + minute,
+                "volume": 10.0 + minute,
+                "quote_asset_volume": 20.0 + minute,
+                "taker_buy_quote_volume": 8.0 + minute,
+                "number_of_trades": 5 + minute,
+            }
+            for minute in range(500)
+        ]
+    )
+    calls = {"primary": 0, "btc": 0}
+
+    def _load_binance(data_cfg, symbol=None):
+        if symbol == "BTCUSDT":
+            calls["btc"] += 1
+        else:
+            calls["primary"] += 1
+        return rows.copy()
+
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    btc_cfg = DataConfig.build(market="btc", cycle="15m", surface="live", root=root)
+    data_cfg.layout.binance_klines_path().parent.mkdir(parents=True, exist_ok=True)
+    data_cfg.layout.binance_klines_path().write_text("x", encoding="utf-8")
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").parent.mkdir(parents=True, exist_ok=True)
+    btc_cfg.layout.binance_klines_path(symbol="BTCUSDT").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr("pm15min.live.signal.utils.load_binance_klines_1m", _load_binance)
+    monkeypatch.setattr(
+        "pm15min.live.signal.utils.build_feature_frame_df",
+        lambda *args, **kwargs: pd.DataFrame(
+            [
+                {
+                    "decision_ts": pd.Timestamp("2026-03-20T08:20:00Z"),
+                    "cycle_start_ts": pd.Timestamp("2026-03-20T08:15:00Z"),
+                    "cycle_end_ts": pd.Timestamp("2026-03-20T08:30:00Z"),
+                    "offset": 5,
+                    "ret_30m": 0.0,
+                }
+            ]
+        ),
+    )
+
+    first = build_live_feature_frame(cfg, feature_set="v6_user_core")
+    second = build_live_feature_frame(cfg, feature_set="v6_user_core")
+
+    assert not first.empty
+    assert not second.empty
+    assert calls == {"primary": 1, "btc": 1}
+
+
+def test_load_live_account_context_reuses_cached_snapshot_when_files_unchanged(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_ACCOUNT_CONTEXT_CACHE_SEC", "60")
+    signal_utils_module._LIVE_ACCOUNT_CONTEXT_CACHE.clear()
+    calls = {"open_orders": 0, "positions": 0}
+
+    def _open_orders(**kwargs):
+        calls["open_orders"] += 1
+        return {"status": "ok", "orders": []}
+
+    def _positions(**kwargs):
+        calls["positions"] += 1
+        return {"status": "ok", "positions": [], "cash_balance_usd": 123.0}
+
+    layout = signal_utils_module.LiveStateLayout.discover(root=root)
+    layout.latest_open_orders_path(market="sol").parent.mkdir(parents=True, exist_ok=True)
+    layout.latest_open_orders_path(market="sol").write_text("{}", encoding="utf-8")
+    layout.latest_positions_path(market="sol").parent.mkdir(parents=True, exist_ok=True)
+    layout.latest_positions_path(market="sol").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr("pm15min.live.signal.utils.load_latest_open_orders_snapshot", _open_orders)
+    monkeypatch.setattr("pm15min.live.signal.utils.load_latest_positions_snapshot", _positions)
+
+    first = signal_utils_module.load_live_account_context(cfg, utc_snapshot_label_fn=lambda: "2026-03-27T00-00-00Z")
+    second = signal_utils_module.load_live_account_context(cfg, utc_snapshot_label_fn=lambda: "2026-03-27T00-00-01Z")
+
+    assert first["summary"]["cash_balance_usd"] == 123.0
+    assert second["summary"]["cash_balance_usd"] == 123.0
+    assert first["open_orders"].get("orders") is None
+    assert first["positions"].get("positions") is None
+    assert calls["open_orders"] == 1
+    assert calls["positions"] == 1
+
+
+def test_resolve_bundle_resolution_reuses_cached_result_within_ttl(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    bundle_dir = root / "bundles" / "bundle=cached"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("PM15MIN_LIVE_BUNDLE_CACHE_SEC", "60")
+    scoring_bundle_module._BUNDLE_RESOLUTION_CACHE.clear()
+    calls = {"selection": 0, "manifest": 0}
+
+    def _get_active_bundle_selection(*args, **kwargs):
+        calls["selection"] += 1
+        return {
+            "selection": {"bundle_label": "cached"},
+            "selection_path": str(root / "selection.json"),
+        }
+
+    def _read_model_bundle_manifest(*args, **kwargs):
+        calls["manifest"] += 1
+        return SimpleNamespace(spec={"feature_set": "v6_user_core", "bundle_label": "cached"})
+
+    first = resolve_bundle_resolution(
+        cfg,
+        target="direction",
+        feature_set="v6_user_core",
+        resolve_live_profile_spec_fn=lambda profile: SimpleNamespace(default_feature_set="v6_user_core"),
+        get_active_bundle_selection_fn=_get_active_bundle_selection,
+        resolve_model_bundle_dir_fn=lambda *args, **kwargs: bundle_dir,
+        read_model_bundle_manifest_fn=_read_model_bundle_manifest,
+        supports_feature_set_fn=lambda feature_set: True,
+    )
+    second = resolve_bundle_resolution(
+        cfg,
+        target="direction",
+        feature_set="v6_user_core",
+        resolve_live_profile_spec_fn=lambda profile: SimpleNamespace(default_feature_set="v6_user_core"),
+        get_active_bundle_selection_fn=_get_active_bundle_selection,
+        resolve_model_bundle_dir_fn=lambda *args, **kwargs: bundle_dir,
+        read_model_bundle_manifest_fn=_read_model_bundle_manifest,
+        supports_feature_set_fn=lambda feature_set: True,
+    )
+
+    assert first.bundle_dir == bundle_dir
+    assert second.bundle_dir == bundle_dir
+    assert calls["selection"] == 1
+    assert calls["manifest"] == 1
+
+
+def test_decide_live_latest_reuses_cached_signal_until_next_transition(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_WINDOW_SIGNAL_CACHE", "1")
+    session_state: dict[str, object] = {}
+    calls = {"score": 0}
+
+    signal_payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "snapshot_ts": "2026-03-27T14-00-00Z",
+        "offset_signals": [
+            {
+                "offset": 7,
+                "decision_ts": "2026-03-27T14:07:00+00:00",
+                "window_start_ts": "2099-03-27T14:07:00+00:00",
+                "window_end_ts": "2099-03-27T14:08:00+00:00",
+                "cycle_end_ts": "2099-03-27T14:15:00+00:00",
+                "recommended_side": "UP",
+                "confidence": 0.8,
+                "edge": 0.3,
+                "score_valid": True,
+                "coverage": {"effective_missing_feature_count": 0, "not_allowed_blacklist_count": 0},
+            }
+        ],
+    }
+
+    def _score(*args, **kwargs):
+        calls["score"] += 1
+        return dict(signal_payload)
+
+    def _quote(**kwargs):
+        return {"snapshot_ts": "2026-03-27T14-00-01Z", "quote_rows": []}
+
+    def _decision(signal, quote, account_state, **kwargs):
+        return {
+            "snapshot_ts": "2026-03-27T14-00-02Z",
+            "decision": {"status": "reject", "selected_offset": None},
+            "signal_snapshot_ts": signal.get("snapshot_ts"),
+        }
+
+    first = decide_live_latest_impl(
+        cfg,
+        persist=False,
+        session_state=session_state,
+        score_live_latest_fn=_score,
+        build_quote_snapshot_fn=_quote,
+        load_live_account_context_fn=lambda *_args, **_kwargs: {},
+        build_decision_snapshot_fn=_decision,
+        persist_decision_snapshot_fn=lambda **kwargs: {},
+    )
+    second = decide_live_latest_impl(
+        cfg,
+        persist=False,
+        session_state=session_state,
+        score_live_latest_fn=_score,
+        build_quote_snapshot_fn=_quote,
+        load_live_account_context_fn=lambda *_args, **_kwargs: {},
+        build_decision_snapshot_fn=_decision,
+        persist_decision_snapshot_fn=lambda **kwargs: {},
+    )
+
+    assert first["decision"]["status"] == "reject"
+    assert second["decision"]["status"] == "reject"
+    assert calls["score"] == 1
+
+
+def test_decide_live_latest_refreshes_when_cached_signal_is_expired(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_WINDOW_SIGNAL_CACHE", "1")
+    session_state = {
+        "live_signal_cache": {
+            "sol|deep_otm|15|direction|": {
+                "valid_until_ts": "2000-01-01T00:00:00+00:00",
+                "payload": {"market": "sol"},
+            }
+        }
+    }
+    calls = {"score": 0}
+
+    def _score(*args, **kwargs):
+        calls["score"] += 1
+        return {
+            "market": "sol",
+            "profile": "deep_otm",
+            "cycle": "15m",
+            "target": "direction",
+            "snapshot_ts": "2026-03-27T14-00-00Z",
+            "offset_signals": [
+                {
+                    "offset": 7,
+                    "decision_ts": "2026-03-27T14:07:00+00:00",
+                    "window_start_ts": "2099-03-27T14:07:00+00:00",
+                    "window_end_ts": "2099-03-27T14:08:00+00:00",
+                    "cycle_end_ts": "2099-03-27T14:15:00+00:00",
+                    "recommended_side": "UP",
+                    "confidence": 0.8,
+                    "edge": 0.3,
+                    "score_valid": True,
+                    "coverage": {"effective_missing_feature_count": 0, "not_allowed_blacklist_count": 0},
+                }
+            ],
+        }
+
+    decide_live_latest_impl(
+        cfg,
+        persist=False,
+        session_state=session_state,
+        score_live_latest_fn=_score,
+        build_quote_snapshot_fn=lambda **kwargs: {"snapshot_ts": "2026-03-27T14-00-01Z", "quote_rows": []},
+        load_live_account_context_fn=lambda *_args, **_kwargs: {},
+        build_decision_snapshot_fn=lambda signal, quote, account_state, **kwargs: {
+            "snapshot_ts": "2026-03-27T14-00-02Z",
+            "decision": {"status": "reject", "selected_offset": None},
+        },
+        persist_decision_snapshot_fn=lambda **kwargs: {},
+    )
+
+    assert calls["score"] == 1
 
 
 def test_check_live_trading_gateway_reports_injected_gateway(tmp_path: Path, monkeypatch) -> None:

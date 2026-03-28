@@ -31,6 +31,38 @@ class _OffsetScoringRuntime:
     reliability_bins: tuple[dict[str, float | int], ...]
 
 
+def _apply_sklearn_compat_shims(model):
+    seen: set[int] = set()
+
+    def _walk(obj):
+        if obj is None:
+            return
+        ident = id(obj)
+        if ident in seen:
+            return
+        seen.add(ident)
+
+        if obj.__class__.__name__ == "LogisticRegression" and not hasattr(obj, "multi_class"):
+            try:
+                setattr(obj, "multi_class", "auto")
+            except Exception:
+                pass
+
+        for child in getattr(obj, "named_steps", {}).values():
+            _walk(child)
+        for item in list(getattr(obj, "steps", []) or []):
+            if isinstance(item, tuple) and len(item) >= 2:
+                _walk(item[1])
+        for item in list(getattr(obj, "calibrated_classifiers_", []) or []):
+            for name in ("estimator", "base_estimator", "classifier", "classifier_"):
+                _walk(getattr(item, name, None))
+        for name in ("estimator", "base_estimator", "classifier", "classifier_"):
+            _walk(getattr(obj, name, None))
+
+    _walk(model)
+    return model
+
+
 def _clip_probability(value: object) -> float:
     try:
         out = float(value)
@@ -202,10 +234,10 @@ def _compute_model_context_from_artifacts(offset_dir: Path, *, top_n: int) -> di
         logreg_path = offset_dir / "models" / "logreg_sigmoid.joblib"
         lgb_path = offset_dir / "models" / "lgbm_sigmoid.joblib"
         if logreg_path.exists():
-            resolved_logreg = _resolve_base_estimator(joblib.load(logreg_path))
+            resolved_logreg = _resolve_base_estimator(_apply_sklearn_compat_shims(joblib.load(logreg_path)))
             logreg_payload = build_logreg_coefficients(feature_names=feature_names, model=resolved_logreg)
         if lgb_path.exists():
-            resolved_lgb = _resolve_base_estimator(joblib.load(lgb_path))
+            resolved_lgb = _resolve_base_estimator(_apply_sklearn_compat_shims(joblib.load(lgb_path)))
             if hasattr(resolved_lgb, "booster_"):
                 lgb_payload = build_lgb_feature_importance(feature_names=feature_names, model=resolved_lgb)
     except Exception:
@@ -433,8 +465,8 @@ def _load_offset_scoring_runtime_cached(
     missing_feature_fill_value = float(bundle_cfg.get("missing_feature_fill_value", 0.0))
     signal_target = str(bundle_cfg.get("signal_target") or "direction").strip().lower()
 
-    model_lgb = joblib.load(offset_dir / "models" / "lgbm_sigmoid.joblib")
-    model_lr = joblib.load(offset_dir / "models" / "logreg_sigmoid.joblib")
+    model_lgb = _apply_sklearn_compat_shims(joblib.load(offset_dir / "models" / "lgbm_sigmoid.joblib"))
+    model_lr = _apply_sklearn_compat_shims(joblib.load(offset_dir / "models" / "logreg_sigmoid.joblib"))
     weights = json.loads((offset_dir / "calibration" / "blend_weights.json").read_text(encoding="utf-8"))
     w_lgb = float(weights.get("w_lgb", 0.5))
     w_lr = float(weights.get("w_lr", 0.5))

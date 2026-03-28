@@ -26,22 +26,35 @@ def load_market_catalog_with_fallback(data_cfg: DataConfig) -> pd.DataFrame:
 
 def resolve_orderbook_depth_path(data_cfg: DataConfig, date_str: str) -> Path:
     primary = data_cfg.layout.orderbook_depth_path(date_str)
-    if primary.exists() or data_cfg.surface == "live":
+    if data_cfg.surface == "live":
         return primary
-    return live_surface_cfg(data_cfg).layout.orderbook_depth_path(date_str)
+    if primary.exists() and not _depth_source_is_definitely_empty(primary):
+        return primary
+    live_path = live_surface_cfg(data_cfg).layout.orderbook_depth_path(date_str)
+    if live_path.exists() and not _depth_source_is_definitely_empty(live_path):
+        return live_path
+    return primary
 
 
 def resolve_orderbook_index_path(data_cfg: DataConfig, date_str: str) -> Path:
     primary = data_cfg.layout.orderbook_index_path(date_str)
-    if primary.exists() or data_cfg.surface == "live":
+    if data_cfg.surface == "live":
         return primary
-    return live_surface_cfg(data_cfg).layout.orderbook_index_path(date_str)
+    primary_depth = data_cfg.layout.orderbook_depth_path(date_str)
+    if primary.exists() and not _depth_source_is_definitely_empty(primary_depth):
+        return primary
+    live_cfg = live_surface_cfg(data_cfg)
+    live_index = live_cfg.layout.orderbook_index_path(date_str)
+    live_depth = live_cfg.layout.orderbook_depth_path(date_str)
+    if live_index.exists() and not _depth_source_is_definitely_empty(live_depth):
+        return live_index
+    return primary
 
 
 def ensure_orderbook_index_path(data_cfg: DataConfig, date_str: str) -> Path:
     primary_index_path = data_cfg.layout.orderbook_index_path(date_str)
     primary_depth_path = data_cfg.layout.orderbook_depth_path(date_str)
-    if primary_index_path.exists():
+    if primary_index_path.exists() and not _depth_source_is_definitely_empty(primary_depth_path):
         if _should_rebuild_index(index_path=primary_index_path, depth_path=primary_depth_path):
             _rebuild_orderbook_index(data_cfg, date_str=date_str)
         return primary_index_path
@@ -59,9 +72,22 @@ def preflight_orderbook_index_dates(
     data_cfg: DataConfig,
     *,
     date_strings: Sequence[str],
+    expected_market_ids_by_date: dict[str, set[str]] | None = None,
 ) -> dict[str, object]:
     requested_dates = sorted({str(value).strip() for value in date_strings if str(value).strip()})
-    details = [_inspect_orderbook_index_date(data_cfg, date_str=date_str) for date_str in requested_dates]
+    catalog_market_ids_by_date = _catalog_market_ids_by_date(data_cfg)
+    details = [
+        _inspect_orderbook_index_date(
+            data_cfg,
+            date_str=date_str,
+            expected_market_ids=(
+                expected_market_ids_by_date.get(date_str, set())
+                if expected_market_ids_by_date is not None and date_str in expected_market_ids_by_date
+                else catalog_market_ids_by_date.get(date_str, set())
+            ),
+        )
+        for date_str in requested_dates
+    ]
     status_counts: dict[str, int] = {}
     for detail in details:
         status = str(detail.get("status") or "")
@@ -73,6 +99,7 @@ def preflight_orderbook_index_dates(
     refreshed_dates = [str(detail["date"]) for detail in details if str(detail.get("status")) == "refreshed"]
     missing_depth_dates = [str(detail["date"]) for detail in details if str(detail.get("status")) == "missing_depth"]
     empty_depth_source_dates = [str(detail["date"]) for detail in details if str(detail.get("status")) == "empty_depth_source"]
+    partial_market_coverage_dates = [str(detail["date"]) for detail in details if str(detail.get("status")) == "partial_market_coverage"]
     index_missing_dates = [
         str(detail["date"])
         for detail in details
@@ -95,6 +122,8 @@ def preflight_orderbook_index_dates(
         "missing_depth_date_count": int(len(missing_depth_dates)),
         "empty_depth_source_dates": empty_depth_source_dates,
         "empty_depth_source_date_count": int(len(empty_depth_source_dates)),
+        "partial_market_coverage_dates": partial_market_coverage_dates,
+        "partial_market_coverage_date_count": int(len(partial_market_coverage_dates)),
         "index_missing_dates": index_missing_dates,
         "index_missing_date_count": int(len(index_missing_dates)),
         "used_live_surface_dates": used_live_surface_dates,
@@ -117,9 +146,15 @@ def live_surface_cfg(data_cfg: DataConfig) -> DataConfig:
 
 def _orderbook_source_cfg(data_cfg: DataConfig, date_str: str) -> DataConfig:
     primary_depth = data_cfg.layout.orderbook_depth_path(date_str)
-    if primary_depth.exists() or data_cfg.surface == "live":
+    if data_cfg.surface == "live":
         return data_cfg
-    return live_surface_cfg(data_cfg)
+    if primary_depth.exists() and not _depth_source_is_definitely_empty(primary_depth):
+        return data_cfg
+    live_cfg = live_surface_cfg(data_cfg)
+    live_depth = live_cfg.layout.orderbook_depth_path(date_str)
+    if live_depth.exists() and not _depth_source_is_definitely_empty(live_depth):
+        return live_cfg
+    return data_cfg
 
 
 def _should_rebuild_index(*, index_path: Path, depth_path: Path) -> bool:
@@ -135,7 +170,12 @@ def _should_rebuild_index(*, index_path: Path, depth_path: Path) -> bool:
     return _index_is_suspiciously_sparse(index_path=index_path, depth_path=depth_path)
 
 
-def _inspect_orderbook_index_date(data_cfg: DataConfig, *, date_str: str) -> dict[str, object]:
+def _inspect_orderbook_index_date(
+    data_cfg: DataConfig,
+    *,
+    date_str: str,
+    expected_market_ids: set[str] | None = None,
+) -> dict[str, object]:
     source_cfg = _orderbook_source_cfg(data_cfg, date_str)
     depth_path = source_cfg.layout.orderbook_depth_path(date_str)
     index_path = source_cfg.layout.orderbook_index_path(date_str)
@@ -151,6 +191,7 @@ def _inspect_orderbook_index_date(data_cfg: DataConfig, *, date_str: str) -> dic
         "depth_exists": bool(depth_exists),
         "index_exists_before": bool(index_exists_before),
         "depth_bytes": depth_bytes,
+        "expected_market_id_count": int(len(expected_market_ids or set())),
     }
     if not depth_exists:
         detail["status"] = "missing_depth"
@@ -158,10 +199,10 @@ def _inspect_orderbook_index_date(data_cfg: DataConfig, *, date_str: str) -> dic
         detail["index_row_count"] = _safe_index_row_count(index_path)
         return detail
 
-    if not index_exists_before and _depth_source_is_definitely_empty(depth_path):
+    if _depth_source_is_definitely_empty(depth_path):
         detail["status"] = "empty_depth_source"
-        detail["index_exists_after"] = False
-        detail["index_row_count"] = 0
+        detail["index_exists_after"] = bool(index_exists_before)
+        detail["index_row_count"] = _safe_index_row_count(index_path)
         return detail
 
     rebuild_needed = _should_rebuild_index(index_path=index_path, depth_path=depth_path)
@@ -186,7 +227,16 @@ def _inspect_orderbook_index_date(data_cfg: DataConfig, *, date_str: str) -> dic
     index_row_count = _safe_index_row_count(index_path)
     detail["index_exists_after"] = bool(index_exists_after)
     detail["index_row_count"] = int(index_row_count)
+    observed_market_ids = _safe_index_market_ids(index_path)
+    detail["index_market_id_count"] = int(len(observed_market_ids))
+    missing_market_ids = sorted((expected_market_ids or set()) - observed_market_ids)
+    detail["missing_market_id_count"] = int(len(missing_market_ids))
+    if missing_market_ids:
+        detail["missing_market_id_samples"] = missing_market_ids[:10]
     if index_row_count > 0:
+        if missing_market_ids:
+            detail["status"] = "partial_market_coverage"
+            return detail
         if rebuild_needed and rebuild_action == "refresh":
             detail["status"] = "refreshed"
         elif rebuild_needed:
@@ -230,6 +280,17 @@ def _safe_index_row_count(path: Path) -> int:
         return 0
 
 
+def _safe_index_market_ids(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    try:
+        frame = pd.read_parquet(path, columns=["market_id"])
+    except Exception:
+        return set()
+    values = frame.get("market_id", pd.Series(dtype="string")).astype("string").fillna("")
+    return {str(value) for value in values.tolist() if str(value)}
+
+
 def _safe_file_size(path: Path) -> int:
     if not path.exists():
         return 0
@@ -241,6 +302,25 @@ def _safe_file_size(path: Path) -> int:
 
 def _depth_source_is_definitely_empty(depth_path: Path) -> bool:
     return _safe_file_size(depth_path) <= int(TINY_DEPTH_BYTES_FOR_EMPTY_SOURCE)
+
+
+def _catalog_market_ids_by_date(data_cfg: DataConfig) -> dict[str, set[str]]:
+    table = load_market_catalog_with_fallback(data_cfg)
+    if table.empty or "cycle_start_ts" not in table.columns or "market_id" not in table.columns:
+        return {}
+    out = table.copy()
+    numeric = pd.to_numeric(out["cycle_start_ts"], errors="coerce")
+    out["cycle_start_ts"] = pd.to_datetime(numeric, unit="s", utc=True, errors="coerce")
+    out["market_id"] = out["market_id"].astype("string").fillna("")
+    out = out.loc[out["cycle_start_ts"].notna() & out["market_id"].ne("")].copy()
+    if out.empty:
+        return {}
+    dates = out["cycle_start_ts"].dt.strftime("%Y-%m-%d")
+    grouped = out.groupby(dates, dropna=False, sort=False)["market_id"]
+    return {
+        str(date_str): {str(value) for value in series.astype("string").tolist() if str(value)}
+        for date_str, series in grouped
+    }
 
 
 def _depth_source_has_raw_records(depth_path: Path) -> bool:

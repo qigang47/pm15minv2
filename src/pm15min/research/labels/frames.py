@@ -91,49 +91,69 @@ def _build_truth_label_frame(
     *,
     requested_label_set: str,
 ) -> pd.DataFrame:
-    if truth_table.empty:
-        return pd.DataFrame(columns=LABEL_FRAME_COLUMNS)
     truth = truth_table.copy()
-    truth["winner_side"] = truth["winner_side"].fillna(truth["label_updown"]).astype(str).str.upper()
-    truth["direction_up"] = truth["winner_side"].map({"UP": 1.0, "DOWN": 0.0})
-    truth["label_set"] = requested_label_set
-    truth["settlement_source"] = truth["truth_source"].fillna("")
-    truth["label_source"] = normalize_label_source_series(truth["settlement_source"], default="settlement_truth")
-    truth["resolved"] = truth["resolved"].fillna(False).astype(bool)
-    truth["full_truth"] = truth["full_truth"].fillna(False).astype(bool)
+    if not truth.empty:
+        truth["winner_side"] = truth["winner_side"].fillna(truth["label_updown"]).astype(str).str.upper()
+        truth["direction_up"] = truth["winner_side"].map({"UP": 1.0, "DOWN": 0.0})
+        truth["label_set"] = requested_label_set
+        truth["settlement_source"] = truth["truth_source"].fillna("")
+        truth["label_source"] = normalize_label_source_series(truth["settlement_source"], default="settlement_truth")
+        truth["resolved"] = truth["resolved"].fillna(False).astype(bool)
+        truth["full_truth"] = truth["full_truth"].fillna(False).astype(bool)
 
     if oracle_prices_table.empty:
+        if truth.empty:
+            return pd.DataFrame(columns=LABEL_FRAME_COLUMNS)
         truth["price_to_beat"] = pd.NA
         truth["final_price"] = pd.NA
+        combined = truth.reindex(columns=LABEL_FRAME_COLUMNS).copy()
+        combined["label_origin_priority"] = 1
     else:
-        oracle = oracle_prices_table[["asset", "cycle_start_ts", "cycle_end_ts", "price_to_beat", "final_price"]].copy()
-        truth = truth.merge(
-            oracle,
-            on=["asset", "cycle_start_ts", "cycle_end_ts"],
-            how="left",
+        oracle_prices = oracle_prices_table[["asset", "cycle_start_ts", "cycle_end_ts", "price_to_beat", "final_price"]].copy()
+        if not truth.empty:
+            truth = truth.merge(
+                oracle_prices,
+                on=["asset", "cycle_start_ts", "cycle_end_ts"],
+                how="left",
+            )
+            truth = truth.reindex(columns=LABEL_FRAME_COLUMNS)
+            truth["label_origin_priority"] = 1
+        oracle_fallback = _build_oracle_label_frame(
+            oracle_prices_table,
+            requested_label_set=requested_label_set,
         )
+        oracle_fallback["label_origin_priority"] = 0
+        combined = pd.concat([truth, oracle_fallback], ignore_index=True, sort=False)
 
-    truth = truth.reindex(columns=LABEL_FRAME_COLUMNS)
-    truth["source_priority"] = truth["label_source"].map(
-        {"settlement_truth": 2, "streams": 2, "chainlink_mixed": 2, "datafeeds": 2, "oracle_prices": 1}
+    combined["source_priority"] = combined["label_source"].map(
+        {"settlement_truth": 3, "streams": 2, "chainlink_mixed": 2, "datafeeds": 2, "oracle_prices": 1}
     ).fillna(0)
-    truth["resolved_priority"] = truth["resolved"].fillna(False).astype(int)
-    truth["full_truth_priority"] = truth["full_truth"].fillna(False).astype(int)
-    truth["winner_side_priority"] = truth["winner_side"].fillna("").astype(str).ne("").astype(int)
+    combined["resolved_priority"] = combined["resolved"].fillna(False).astype(int)
+    combined["full_truth_priority"] = combined["full_truth"].fillna(False).astype(int)
+    combined["winner_side_priority"] = combined["winner_side"].fillna("").astype(str).ne("").astype(int)
 
     return (
-        truth.sort_values(
+        combined.sort_values(
             [
                 "cycle_start_ts",
                 "full_truth_priority",
                 "resolved_priority",
                 "winner_side_priority",
                 "source_priority",
+                "label_origin_priority",
                 "market_id",
             ]
         )
         .drop_duplicates(subset=["asset", "cycle_start_ts"], keep="last")
-        .drop(columns=["source_priority", "resolved_priority", "full_truth_priority", "winner_side_priority"])
+        .drop(
+            columns=[
+                "source_priority",
+                "resolved_priority",
+                "full_truth_priority",
+                "winner_side_priority",
+                "label_origin_priority",
+            ]
+        )
         .reset_index(drop=True)
     )
 

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import time
+
+import pandas as pd
 
 from .decision import build_decision_snapshot, persist_decision_snapshot
 from ..quotes import build_quote_snapshot
@@ -112,14 +116,28 @@ def decide_live_latest(
     build_decision_snapshot_fn=build_decision_snapshot,
     persist_decision_snapshot_fn=persist_decision_snapshot,
 ) -> dict[str, object]:
-    signal = score_live_latest_fn(cfg, target=target, feature_set=feature_set, persist=persist)
+    signal_started = time.perf_counter()
+    signal, signal_cache_hit = _resolve_live_signal_payload(
+        cfg,
+        target=target,
+        feature_set=feature_set,
+        persist=persist,
+        session_state=session_state,
+        score_live_latest_fn=score_live_latest_fn,
+    )
+    signal_elapsed_ms = _elapsed_ms(signal_started)
+    quote_started = time.perf_counter()
     quote = build_quote_snapshot_fn(
         cfg=cfg,
         signal_payload=signal,
         persist=persist,
         orderbook_provider=orderbook_provider,
     )
+    quote_elapsed_ms = _elapsed_ms(quote_started)
+    account_started = time.perf_counter()
     account_state = load_live_account_context_fn(cfg)
+    account_elapsed_ms = _elapsed_ms(account_started)
+    decision_started = time.perf_counter()
     payload = build_decision_snapshot_fn(
         signal,
         quote,
@@ -128,11 +146,182 @@ def decide_live_latest(
         rewrite_root=cfg.layout.rewrite.root,
         orderbook_provider=orderbook_provider,
     )
+    decision_elapsed_ms = _elapsed_ms(decision_started)
+    payload["timings_ms"] = {
+        "signal_stage_ms": signal_elapsed_ms,
+        "quote_stage_ms": quote_elapsed_ms,
+        "account_context_stage_ms": account_elapsed_ms,
+        "decision_build_stage_ms": decision_elapsed_ms,
+        "signal_cache_hit": bool(signal_cache_hit),
+    }
     if persist:
         paths = persist_decision_snapshot_fn(rewrite_root=cfg.layout.rewrite.root, payload=payload)
         payload["latest_decision_path"] = str(paths["latest"])
         payload["decision_snapshot_path"] = str(paths["snapshot"])
     return payload
+
+
+def prewarm_live_signal_cache(
+    cfg,
+    *,
+    target: str = "direction",
+    feature_set: str | None = None,
+    persist: bool = False,
+    session_state: dict[str, object] | None = None,
+    score_live_latest_fn,
+) -> dict[str, object]:
+    started = time.perf_counter()
+    payload, cache_hit = _resolve_live_signal_payload(
+        cfg,
+        target=target,
+        feature_set=feature_set,
+        persist=persist,
+        session_state=session_state,
+        score_live_latest_fn=score_live_latest_fn,
+    )
+    now_utc = pd.Timestamp.now(tz="UTC")
+    valid_until_ts = _resolve_signal_cache_valid_until(payload=payload, now_utc=now_utc)
+    return {
+        "status": "ok",
+        "cache_hit": bool(cache_hit),
+        "elapsed_ms": _elapsed_ms(started),
+        "snapshot_ts": payload.get("snapshot_ts"),
+        "latest_feature_decision_ts": payload.get("latest_feature_decision_ts"),
+        "valid_until_ts": None if valid_until_ts is None or pd.isna(valid_until_ts) else valid_until_ts.isoformat(),
+        "offsets": [
+            int(row["offset"])
+            for row in list(payload.get("offset_signals") or [])
+            if isinstance(row, dict) and row.get("offset") is not None
+        ],
+    }
+
+
+def _resolve_live_signal_payload(
+    cfg,
+    *,
+    target: str,
+    feature_set: str | None,
+    persist: bool,
+    session_state: dict[str, object] | None,
+    score_live_latest_fn,
+) -> tuple[dict[str, object], bool]:
+    now_utc = pd.Timestamp.now(tz="UTC")
+    cache_enabled = _env_bool("PM15MIN_LIVE_WINDOW_SIGNAL_CACHE", default=True)
+    cache_key = _signal_cache_key(cfg=cfg, target=target, feature_set=feature_set)
+    if cache_enabled:
+        cached = _load_cached_signal_payload(
+            session_state=session_state,
+            cache_key=cache_key,
+            now_utc=now_utc,
+        )
+        if cached is not None:
+            return cached, True
+    payload = score_live_latest_fn(cfg, target=target, feature_set=feature_set, persist=persist)
+    if cache_enabled:
+        _store_cached_signal_payload(
+            session_state=session_state,
+            cache_key=cache_key,
+            payload=payload,
+            now_utc=now_utc,
+        )
+    return payload, False
+
+
+def _signal_cache_key(*, cfg, target: str, feature_set: str | None) -> str:
+    feature_token = "" if feature_set is None else str(feature_set).strip().lower()
+    return "|".join(
+        [
+            str(cfg.asset.slug),
+            str(cfg.profile),
+            str(int(cfg.cycle_minutes)),
+            str(target or "direction").strip().lower(),
+            feature_token,
+        ]
+    )
+
+
+def _session_signal_cache(session_state: dict[str, object] | None, *, create: bool = True) -> dict[str, object]:
+    if not isinstance(session_state, dict):
+        return {}
+    raw = session_state.get("live_signal_cache")
+    if isinstance(raw, dict):
+        return raw
+    if not create:
+        return {}
+    raw = {}
+    session_state["live_signal_cache"] = raw
+    return raw
+
+
+def _load_cached_signal_payload(
+    *,
+    session_state: dict[str, object] | None,
+    cache_key: str,
+    now_utc: pd.Timestamp,
+) -> dict[str, object] | None:
+    cache = _session_signal_cache(session_state, create=False)
+    raw = cache.get(cache_key)
+    if not isinstance(raw, dict):
+        return None
+    payload = raw.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    valid_until_ts = pd.to_datetime(raw.get("valid_until_ts"), utc=True, errors="coerce")
+    if valid_until_ts is None or pd.isna(valid_until_ts):
+        return None
+    if now_utc >= valid_until_ts:
+        cache.pop(cache_key, None)
+        return None
+    return payload
+
+
+def _store_cached_signal_payload(
+    *,
+    session_state: dict[str, object] | None,
+    cache_key: str,
+    payload: dict[str, object],
+    now_utc: pd.Timestamp,
+) -> None:
+    cache = _session_signal_cache(session_state)
+    valid_until_ts = _resolve_signal_cache_valid_until(payload=payload, now_utc=now_utc)
+    if valid_until_ts is None or pd.isna(valid_until_ts):
+        cache.pop(cache_key, None)
+        return
+    cache[cache_key] = {
+        "valid_until_ts": valid_until_ts.isoformat(),
+        "payload": payload,
+    }
+
+
+def _resolve_signal_cache_valid_until(
+    *,
+    payload: dict[str, object],
+    now_utc: pd.Timestamp,
+) -> pd.Timestamp | None:
+    transitions: list[pd.Timestamp] = []
+    for row in list(payload.get("offset_signals") or []):
+        if not isinstance(row, dict):
+            continue
+        for key in ("window_start_ts", "window_end_ts", "cycle_end_ts"):
+            ts = pd.to_datetime(row.get(key), utc=True, errors="coerce")
+            if ts is None or pd.isna(ts):
+                continue
+            if ts > now_utc:
+                transitions.append(ts)
+    if not transitions:
+        return None
+    return min(transitions)
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round(max(0.0, (time.perf_counter() - float(started_at)) * 1000.0), 3)
 
 
 def quote_live_latest(

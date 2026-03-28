@@ -118,3 +118,47 @@ def test_account_state_snapshot_reports_missing_env_prerequisites(tmp_path: Path
     assert payload["positions"]["reason"] == "missing_polymarket_user_address"
     assert payload["summary"]["visible_capital_usage_usd"] == 0.0
     assert payload["summary"]["cash_balance_available"] is False
+
+
+def test_account_state_snapshot_summary_ignores_zero_size_positions_in_active_market_counts(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    gateway = FakeGateway(
+        positions=[
+            PositionRecord(
+                market_id="market-zero",
+                condition_id="cond-zero",
+                token_id=None,
+                size=0.0,
+                redeemable=False,
+                outcome_index=0,
+                index_set=1,
+                current_value=0.0,
+                cash_pnl=0.0,
+                raw={"conditionId": "cond-zero"},
+            ),
+            PositionRecord(
+                market_id="market-live",
+                condition_id="cond-live",
+                token_id=None,
+                size=2.0,
+                redeemable=True,
+                outcome_index=0,
+                index_set=1,
+                current_value=1.0,
+                cash_pnl=0.1,
+                raw={"conditionId": "cond-live"},
+            ),
+        ],
+        cash_balance=100.0,
+    )
+
+    payload = build_account_state_snapshot(cfg, persist=False, gateway=gateway)
+
+    assert payload["positions"]["summary"]["total_positions"] == 2
+    assert payload["positions"]["summary"]["active_positions"] == 1
+    assert payload["positions"]["summary"]["market_ids"] == ["market-live"]
+    assert payload["positions"]["summary"]["by_market_id"] == {"market-live": 1}
+    assert payload["summary"]["active_market_ids"] == ["market-live"]
+    assert payload["summary"]["active_market_count"] == 1

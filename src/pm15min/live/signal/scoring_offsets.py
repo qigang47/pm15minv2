@@ -108,12 +108,22 @@ def build_inactive_score_signal(
     offset: int,
     coverage: dict[str, object],
     status: str,
+    window_start_ts: str | None = None,
+    window_end_ts: str | None = None,
+    cycle_start_ts: str | None = None,
+    cycle_end_ts: str | None = None,
+    window_duration_seconds: float = float(DEFAULT_OFFSET_WINDOW_SECONDS),
 ) -> dict[str, object]:
     return {
         "offset": offset,
         "status": str(status or "inactive_score_row"),
         "score_valid": False,
         "score_reason": str(status or "inactive_score_row"),
+        "window_start_ts": window_start_ts,
+        "window_end_ts": window_end_ts,
+        "window_duration_seconds": float(window_duration_seconds),
+        "cycle_start_ts": cycle_start_ts,
+        "cycle_end_ts": cycle_end_ts,
         "coverage": coverage,
     }
 
@@ -250,11 +260,43 @@ def _feature_cycle_context(
 
     active = cycle_start.notna() & cycle_end.notna() & cycle_start.le(now_utc) & cycle_end.gt(now_utc)
     if not bool(active.any()):
-        return None, None, latest_feature_decision_ts
+        inferred_cycle = _infer_current_cycle_bounds(
+            now_utc=now_utc,
+            cycle_start=cycle_start,
+            cycle_end=cycle_end,
+        )
+        if inferred_cycle is None:
+            return None, None, latest_feature_decision_ts
+        return inferred_cycle[0], inferred_cycle[1], latest_feature_decision_ts
 
     active_cycle_start = cycle_start.loc[active].max()
     active_cycle_end = cycle_end.loc[active & cycle_start.eq(active_cycle_start)].max()
     return active_cycle_start, active_cycle_end, latest_feature_decision_ts
+
+
+def _infer_current_cycle_bounds(
+    *,
+    now_utc: pd.Timestamp,
+    cycle_start: pd.Series,
+    cycle_end: pd.Series,
+) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    valid = cycle_start.notna() & cycle_end.notna() & cycle_end.gt(cycle_start)
+    if not bool(valid.any()):
+        return None
+    durations = (cycle_end.loc[valid] - cycle_start.loc[valid]).dropna()
+    if durations.empty:
+        return None
+    cycle_duration = durations.iloc[-1]
+    total_seconds = float(cycle_duration.total_seconds())
+    if total_seconds <= 0.0:
+        return None
+    minutes = total_seconds / 60.0
+    if abs(minutes - round(minutes)) > 1e-9:
+        return None
+    floor_freq = f"{int(round(minutes))}min"
+    current_cycle_start = now_utc.floor(floor_freq)
+    current_cycle_end = current_cycle_start + pd.to_timedelta(total_seconds, unit="s")
+    return current_cycle_start, current_cycle_end
 
 
 def _resolve_latest_live_row(
@@ -348,10 +390,29 @@ def build_offset_signal(
     if row is None:
         if inactive_reason == "missing_score_row":
             return build_missing_score_signal(offset=ctx.offset, coverage=coverage)
+        active_cycle_start, active_cycle_end, _ = _feature_cycle_context(
+            ctx=ctx,
+            now_utc=now_utc,
+        )
+        window_start_ts = None
+        window_end_ts = None
+        cycle_start_ts = iso_or_none_fn(active_cycle_start)
+        cycle_end_ts = iso_or_none_fn(active_cycle_end)
+        if active_cycle_start is not None:
+            window_start_dt = active_cycle_start + pd.to_timedelta(int(ctx.offset), unit="m")
+            window_end_dt = window_start_dt + pd.to_timedelta(DEFAULT_OFFSET_WINDOW_SECONDS, unit="s")
+            if active_cycle_end is not None:
+                window_end_dt = min(window_end_dt, active_cycle_end)
+            window_start_ts = iso_or_none_fn(window_start_dt)
+            window_end_ts = iso_or_none_fn(window_end_dt)
         return build_inactive_score_signal(
             offset=ctx.offset,
             coverage=coverage,
             status=str(inactive_reason or "inactive_score_row"),
+            window_start_ts=window_start_ts,
+            window_end_ts=window_end_ts,
+            cycle_start_ts=cycle_start_ts,
+            cycle_end_ts=cycle_end_ts,
         )
 
     nan_feature_columns = list(coverage.get("nan_feature_columns") or [])

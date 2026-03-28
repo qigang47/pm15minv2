@@ -13,6 +13,7 @@ import pandas as pd
 
 from ..config import DataConfig
 from ..contracts import OrderbookIndexRow, OrderbookSnapshotRecord
+from ..io.json_files import atomic_json_tmp_path
 from ..io.ndjson_zst import append_ndjson_zst, iter_ndjson_zst
 from ..io.parquet import read_parquet_if_exists, upsert_parquet
 from .market_catalog import sync_market_catalog
@@ -84,7 +85,7 @@ def summarize_captured_orderbook_batch(
 
 def _write_json_atomic_compact(payload: dict[str, Any], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path = atomic_json_tmp_path(path)
     tmp_path.write_text(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",

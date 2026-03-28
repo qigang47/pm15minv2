@@ -77,6 +77,27 @@ def test_decision_rejects_when_tail_space_guard_fails() -> None:
     assert "tail_space_too_far" in out["rejected_offsets"][0]["guard_reasons"]
 
 
+def test_decision_snapshot_preserves_signal_freshness_metadata() -> None:
+    row = _base_signal_row()
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "latest_feature_decision_ts": "2026-03-19T08:23:00+00:00",
+        "builder_feature_set": "v6_user_core",
+        "feature_rows": 384,
+        "offset_signals": [row],
+    }
+    out = build_decision_snapshot(payload)
+    assert out["latest_feature_decision_ts"] == "2026-03-19T08:23:00+00:00"
+    assert out["builder_feature_set"] == "v6_user_core"
+    assert out["feature_rows"] == 384
+
+
 def test_decision_rejects_when_entry_price_band_fails() -> None:
     row = _base_signal_row()
     row["p_down"] = 0.80
@@ -716,6 +737,71 @@ def test_decision_rejects_when_cash_balance_stop_hits(monkeypatch) -> None:
     assert "cash_balance_guard" in out["applied_guard_layers"]
     assert "cash_balance_stop" in out["rejected_offsets"][0]["guard_reasons"]
     assert out["rejected_offsets"][0]["account_context"]["cash_balance_usd"] == 80.0
+
+
+def test_decision_uses_compact_account_summary_without_raw_positions() -> None:
+    row = _base_signal_row()
+    row["recommended_side"] = "UP"
+    row["p_up"] = 0.80
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.29,
+                "quote_up_bid": 0.19,
+                "quote_down_bid": 0.28,
+                "reasons": [],
+            }
+        ],
+    }
+    account_state_payload = {
+        "snapshot_ts": "2026-03-19T15-00-05Z",
+        "open_orders": {
+            "status": "ok",
+            "summary": {
+                "total_orders": 1,
+                "market_ids": ["market-1"],
+                "by_market_id": {"market-1": 1},
+            },
+        },
+        "positions": {
+            "status": "ok",
+            "summary": {
+                "total_positions": 1,
+                "market_ids": ["market-1"],
+                "by_market_id": {"market-1": 1},
+            },
+            "cash_balance_usd": 250.0,
+            "cash_balance_status": "ok",
+        },
+        "summary": {
+            "cash_balance_usd": 250.0,
+            "cash_balance_available": True,
+            "active_market_ids": ["market-1"],
+            "active_market_count": 1,
+        },
+    }
+
+    out = build_decision_snapshot(payload, quote_payload, account_state_payload)
+
+    selected = (out["accepted_offsets"] or out["rejected_offsets"])[0]
+    assert selected["account_context"]["open_orders_count"] == 1
+    assert selected["account_context"]["position_count"] == 1
+    assert selected["account_context"]["current_market_active"] is True
 
 
 def test_decision_rejects_when_depth_fill_ratio_blocks_trade(tmp_path: Path) -> None:

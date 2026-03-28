@@ -67,6 +67,10 @@ def run_live_runner(
     untracked_log_interval_sec = _env_float("PM15MIN_RUNNER_UNTRACKED_LOG_INTERVAL_SEC", default=0.0)
     next_tracked_log_at = 0.0
     next_untracked_log_at = 0.0
+    runner_persist_interval_sec = _env_float("PM15MIN_RUNNER_SUMMARY_PERSIST_INTERVAL_SEC", default=0.0)
+    runner_persist_on_change = _env_bool("PM15MIN_RUNNER_SUMMARY_PERSIST_ON_CHANGE", default=True)
+    last_persist_signature: str | None = None
+    last_persisted_at = 0.0
 
     runner_log_path = layout.runner_log_path(
         market=cfg.asset.slug,
@@ -103,9 +107,24 @@ def run_live_runner(
             completed += 1
             last_iteration = iteration_payload
             if persist:
-                paths = persist_runner_iteration_fn(rewrite_root=cfg.layout.rewrite.root, payload=iteration_payload)
-                iteration_payload["latest_runner_path"] = str(paths["latest"])
-                iteration_payload["runner_snapshot_path"] = str(paths["snapshot"])
+                current_signature = _runner_persist_signature(iteration_payload)
+                now_persist_ts = time.time()
+                should_persist_runner = (
+                    attempted == 1
+                    or runner_persist_interval_sec <= 0.0
+                    or now_persist_ts - last_persisted_at >= runner_persist_interval_sec
+                    or (
+                        runner_persist_on_change
+                        and current_signature != last_persist_signature
+                    )
+                    or _runner_has_actionful_outcome(iteration_payload)
+                )
+                if should_persist_runner:
+                    paths = persist_runner_iteration_fn(rewrite_root=cfg.layout.rewrite.root, payload=iteration_payload)
+                    iteration_payload["latest_runner_path"] = str(paths["latest"])
+                    iteration_payload["runner_snapshot_path"] = str(paths["snapshot"])
+                    last_persist_signature = current_signature
+                    last_persisted_at = now_persist_ts
             now_ts = time.time()
             should_log, tracked_iteration = _should_log_runner_iteration(
                 iteration_payload=iteration_payload,
@@ -238,6 +257,13 @@ def _env_float(name: str, *, default: float) -> float:
         return max(0.0, float(default))
 
 
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
 def _should_log_runner_iteration(
     *,
     iteration_payload: dict[str, object],
@@ -277,6 +303,31 @@ def _runner_log_focal_offset(iteration_payload: dict[str, object]) -> int | None
     return None
 
 
+def _runner_persist_signature(iteration_payload: dict[str, object]) -> str:
+    decision = iteration_payload.get("decision") or {}
+    execution = iteration_payload.get("execution") or {}
+    order_action = iteration_payload.get("order_action") or {}
+    return "|".join(
+        [
+            str((decision or {}).get("status") or ""),
+            str((decision or {}).get("selected_offset") or ""),
+            str((execution or {}).get("status") or ""),
+            str((execution or {}).get("reason") or ""),
+            str((order_action or {}).get("status") or ""),
+            str((order_action or {}).get("reason") or ""),
+        ]
+    )
+
+
+def _runner_has_actionful_outcome(iteration_payload: dict[str, object]) -> bool:
+    order_action = iteration_payload.get("order_action") or {}
+    status = str((order_action or {}).get("status") or "").strip().lower()
+    reason = str((order_action or {}).get("reason") or "").strip().lower()
+    if status in {"error"}:
+        return True
+    return reason in {"order_submitted", "dry_run"}
+
+
 def _best_offset_row(rows: object) -> dict[str, object] | None:
     candidates = [dict(row) for row in list(rows or []) if isinstance(row, dict)]
     if not candidates:
@@ -305,6 +356,15 @@ def _int_or_none(value: object) -> int | None:
         if value is None:
             return None
         return int(value)
+    except Exception:
+        return None
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
     except Exception:
         return None
 
@@ -360,6 +420,7 @@ def _load_persisted_session_state(
         "market_offset_trade_count": {},
         "market_offset_side_trade_count": {},
         "action_gate_state": {},
+        "side_effect_state": {},
     }
     path = layout.latest_runner_path(
         market=market,
@@ -398,6 +459,20 @@ def _load_persisted_session_state(
                     if normalized:
                         gate_state[str(action_type)] = normalized
                 state["action_gate_state"] = gate_state
+            side_effect_raw = raw.get("side_effect_state")
+            if isinstance(side_effect_raw, dict):
+                normalized_side_effects: dict[str, dict[str, object]] = {}
+                for name, item in side_effect_raw.items():
+                    if not isinstance(item, dict):
+                        continue
+                    normalized_side_effects[str(name)] = {
+                        "last_started_at_epoch": _float_or_none(item.get("last_started_at_epoch")),
+                        "last_completed_at_epoch": _float_or_none(item.get("last_completed_at_epoch")),
+                        "last_snapshot_ts": item.get("last_snapshot_ts"),
+                        "last_status": item.get("last_status"),
+                        "last_reason": item.get("last_reason"),
+                    }
+                state["side_effect_state"] = normalized_side_effects
 
     audit_path = layout.runner_audit_log_path(
         market=market,

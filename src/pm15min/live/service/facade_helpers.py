@@ -200,8 +200,13 @@ def supports_feature_set(feature_set: str) -> bool:
     return _supports_feature_set_impl(feature_set)
 
 
-def build_live_feature_frame(cfg: LiveConfig, *, feature_set: str) -> pd.DataFrame:
-    return _build_live_feature_frame_impl(cfg, feature_set=feature_set)
+def build_live_feature_frame(
+    cfg: LiveConfig,
+    *,
+    feature_set: str,
+    retain_offsets: tuple[int, ...] | None = None,
+) -> pd.DataFrame:
+    return _build_live_feature_frame_impl(cfg, feature_set=feature_set, retain_offsets=retain_offsets)
 
 
 def load_live_account_context(

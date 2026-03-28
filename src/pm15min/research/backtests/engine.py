@@ -27,7 +27,7 @@ from pm15min.research.backtests.decision_engine_parity import (
 from pm15min.research.backtests.depth_replay import build_raw_depth_replay_frame
 from pm15min.research.backtests.data_surface_fallback import preflight_orderbook_index_dates
 from pm15min.research.backtests.fills import BacktestFillConfig, build_canonical_fills, build_depth_candidate_lookup
-from pm15min.research.backtests.guard_parity import apply_live_guard_parity
+from pm15min.research.backtests.guard_parity import GuardParitySummary
 from pm15min.research.backtests.hybrid import apply_hybrid_fallback
 from pm15min.research.backtests.live_state_parity import attach_live_state_parity
 from pm15min.research.backtests.orderbook_surface import attach_canonical_quote_surface
@@ -298,6 +298,7 @@ def run_research_backtest(
         decision_start=spec.decision_start,
         decision_end=spec.decision_end,
     )
+    _ensure_replay_labels_resolved(replay)
     if orderbook_preflight_summary is None:
         preflight_stage_index, preflight_stage_name = _start_stage("orderbook_preflight", "Preflighting orderbook coverage")
         orderbook_preflight_summary = _build_orderbook_preflight_summary(
@@ -307,6 +308,7 @@ def run_research_backtest(
             decision_end=spec.decision_end,
             heartbeat=progress.heartbeat(stage_index=preflight_stage_index, stage_name=preflight_stage_name),
         )
+    _assert_orderbook_preflight_is_usable(orderbook_preflight_summary)
     fill_config = _build_backtest_fill_config(spec=spec, profile_spec=profile_spec)
     label_runtime_summary = _load_label_runtime_summary(cfg=cfg, label_set=label_set)
     truth_runtime_summary = build_truth_runtime_summary(data_cfg)
@@ -572,7 +574,26 @@ def _build_orderbook_preflight_summary(
     )
     if heartbeat is not None and date_strings:
         heartbeat(f"Checking orderbook coverage for {len(date_strings)} date(s)")
-    return preflight_orderbook_index_dates(data_cfg, date_strings=date_strings)
+    return preflight_orderbook_index_dates(
+        data_cfg,
+        date_strings=date_strings,
+        expected_market_ids_by_date=_replay_market_ids_by_date(replay),
+    )
+
+
+def _assert_orderbook_preflight_is_usable(summary: dict[str, object] | None) -> None:
+    payload = dict(summary or {})
+    empty_dates = [str(value) for value in payload.get("empty_depth_source_dates") or [] if str(value)]
+    missing_dates = [str(value) for value in payload.get("missing_depth_dates") or [] if str(value)]
+    partial_dates = [str(value) for value in payload.get("partial_market_coverage_dates") or [] if str(value)]
+    if not empty_dates and not missing_dates and not partial_dates:
+        return
+    raise RuntimeError(
+        "backtest_orderbook_coverage_incomplete:"
+        f"empty_depth_source_dates={empty_dates}:"
+        f"missing_depth_dates={missing_dates}:"
+        f"partial_market_coverage_dates={partial_dates}"
+    )
 
 
 def _resolve_orderbook_preflight_dates(
@@ -618,6 +639,23 @@ def _replay_decision_dates(replay: pd.DataFrame) -> list[str]:
         return []
     normalized = decision_ts.dropna().dt.strftime("%Y-%m-%d")
     return sorted({str(value) for value in normalized.tolist() if str(value)})
+
+
+def _replay_market_ids_by_date(replay: pd.DataFrame) -> dict[str, set[str]]:
+    if replay.empty or "market_id" not in replay.columns:
+        return {}
+    decision_ts = pd.to_datetime(replay.get("decision_ts"), utc=True, errors="coerce")
+    market_ids = replay.get("market_id", pd.Series(index=replay.index, dtype="string")).astype("string").fillna("")
+    frame = pd.DataFrame({"decision_ts": decision_ts, "market_id": market_ids})
+    frame = frame.loc[frame["decision_ts"].notna() & frame["market_id"].ne("")].copy()
+    if frame.empty:
+        return {}
+    dates = frame["decision_ts"].dt.strftime("%Y-%m-%d")
+    grouped = frame.groupby(dates, dropna=False, sort=False)["market_id"]
+    return {
+        str(date_str): {str(value) for value in series.astype("string").tolist() if str(value)}
+        for date_str, series in grouped
+    }
 
 
 def _date_start_bound(date_text: str) -> pd.Timestamp:
@@ -878,15 +916,12 @@ def _build_guarded_policy_decisions(
         config=BacktestPolicyConfig(prob_floor=0.55, prob_gap_floor=0.0),
         model_source=model_source,
     )
-    if heartbeat is not None:
-        heartbeat("Applying live guard parity")
-    decisions, guard_summary = apply_live_guard_parity(
-        market=market,
-        profile=profile,
-        decisions=decisions,
-        profile_spec=profile_spec,
-        heartbeat=heartbeat,
-    )
+    decisions["guard_reasons"] = [[] for _ in range(len(decisions))]
+    decisions["guard_primary_reason"] = ""
+    decisions["guard_blocked"] = False
+    decisions["quote_metrics"] = [{} for _ in range(len(decisions))]
+    decisions["account_context"] = [{} for _ in range(len(decisions))]
+    guard_summary = GuardParitySummary(evaluated_rows=0, blocked_rows=0)
     if heartbeat is not None:
         heartbeat(f"Built guarded decisions: {len(decisions):,} rows")
     return decisions, guard_summary, decision_quote_summary
@@ -926,7 +961,9 @@ def _attach_decision_engine_surface(
         if missing_depth_mask.any():
             fallback = apply_decision_engine_parity(
                 frame.loc[missing_depth_mask].copy(),
-                config=DecisionEngineParityConfig(min_dir_prob_default=0.55),
+                config=decision_config,
+                up_price_columns=("quote_up_ask", "quote_prob_up", "p_up"),
+                down_price_columns=("quote_down_ask", "quote_prob_down", "p_down"),
                 min_dir_prob_boost_column="decision_engine_min_dir_prob_boost",
             )
             for column in DECISION_ENGINE_PARITY_COLUMNS:
@@ -1034,6 +1071,22 @@ def _decision_engine_min_dir_prob_boost(value: object) -> float:
 def _decision_quote_missing_depth_mask(frame: pd.DataFrame) -> pd.Series:
     values = frame.get("decision_quote_has_raw_depth", pd.Series(False, index=frame.index, dtype="boolean"))
     return ~values.astype("boolean").fillna(False).astype(bool)
+
+
+def _ensure_replay_labels_resolved(replay: pd.DataFrame) -> None:
+    if replay.empty:
+        return
+    resolved = pd.to_numeric(replay.get("resolved"), errors="coerce").fillna(0).astype(int).astype(bool)
+    winner_side = replay.get("winner_side", pd.Series("", index=replay.index, dtype="string")).astype("string").fillna("").astype(str).str.upper()
+    unresolved_mask = ~resolved | ~winner_side.isin(["UP", "DOWN"])
+    if not unresolved_mask.any():
+        return
+    sample = replay.loc[unresolved_mask, ["cycle_start_ts", "cycle_end_ts", "offset"]].head(5).copy()
+    raise RuntimeError(
+        "backtest_label_coverage_incomplete:"
+        f"rows={int(unresolved_mask.sum())}:"
+        f"samples={sample.to_dict(orient='records')}"
+    )
 
 
 def _build_backtest_fill_config(*, spec: BacktestRunSpec, profile_spec) -> BacktestFillConfig:

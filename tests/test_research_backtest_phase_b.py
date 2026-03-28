@@ -142,6 +142,78 @@ def test_attach_canonical_quote_surface_reads_orderbook_index_once_per_date(tmp_
     assert float(out.loc[0, "quote_down_ask"]) == 0.59
 
 
+def test_attach_canonical_quote_surface_backfills_blank_market_id_from_cycle_catalog(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "m-blank",
+                    "condition_id": "c-blank",
+                    "token_up": "tok-up-blank",
+                    "token_down": "tok-down-blank",
+                    "question": "SOL up?",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_324_100,
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "captured_ts_ms": 1_772_323_250_000,
+                    "market_id": "m-blank",
+                    "token_id": "tok-up-blank",
+                    "side": "up",
+                    "best_ask": 0.41,
+                    "best_bid": 0.39,
+                    "ask_size_1": 15.0,
+                    "bid_size_1": 10.0,
+                },
+                {
+                    "captured_ts_ms": 1_772_323_250_000,
+                    "market_id": "m-blank",
+                    "token_id": "tok-down-blank",
+                    "side": "down",
+                    "best_ask": 0.59,
+                    "best_bid": 0.57,
+                    "ask_size_1": 13.0,
+                    "bid_size_1": 11.0,
+                },
+            ]
+        ),
+        data_cfg.layout.orderbook_index_path("2026-03-01"),
+    )
+
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "",
+                "condition_id": "",
+            }
+        ]
+    )
+
+    out, summary = attach_canonical_quote_surface(replay=replay, data_cfg=data_cfg)
+
+    assert summary.quote_ready_rows == 1
+    assert out.loc[0, "market_id"] == "m-blank"
+    assert out.loc[0, "condition_id"] == "c-blank"
+    assert out.loc[0, "token_up"] == "tok-up-blank"
+    assert out.loc[0, "token_down"] == "tok-down-blank"
+    assert out.loc[0, "quote_status"] == "ok"
+    assert float(out.loc[0, "quote_up_ask"]) == 0.41
+    assert float(out.loc[0, "quote_down_ask"]) == 0.59
+
+
 def test_attach_canonical_quote_surface_rebuilds_stale_orderbook_index(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)

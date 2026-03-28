@@ -8,6 +8,7 @@ Usage: start_v2_orderbook_fleet.sh
 
 Env overrides:
   CONDA_ENV                           default: pm15min
+  V2_ORDERBOOK_FLEET_SKIP_CONDA       default: 0
   V2_ORDERBOOK_FLEET_MARKETS          default: btc,eth,sol,xrp
   V2_ORDERBOOK_FLEET_CYCLE            default: 15m
   V2_ORDERBOOK_FLEET_SURFACE          default: live
@@ -19,8 +20,55 @@ Env overrides:
   V2_ORDERBOOK_FLEET_ITERATIONS       default: 0
   V2_ORDERBOOK_FLEET_SLEEP_SEC        default: same as poll interval
   V2_ORDERBOOK_FLEET_LOG_PATH         default: var/live/logs/entrypoints/orderbook_fleet_<cycle>_<surface>.out
+  PM15MIN_ORDERBOOK_FLEET_SCHEDULER_MODE default: process_per_market
   MALLOC_ARENA_MAX                    default: 2
 EOF
+}
+
+is_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON|y|Y)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+orderbook_recorder_pattern() {
+  local market="$1"
+  printf '%s' "market='${market}', cycle='${CYCLE}', surface='${SURFACE}'"
+}
+
+orderbook_recorder_pids() {
+  local market="$1"
+  local pattern
+  pattern="$(orderbook_recorder_pattern "$market")"
+  pgrep -f -- "$pattern" || true
+}
+
+stop_orderbook_recorder_for_market() {
+  local market="$1"
+  local pids=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(orderbook_recorder_pids "$market")
+  if [[ ${#pids[@]} -eq 0 ]]; then
+    echo "No existing orderbook recorder found for market=${market} cycle=${CYCLE} surface=${SURFACE}"
+    return 0
+  fi
+  echo "Stopping orderbook recorder market=${market} cycle=${CYCLE} surface=${SURFACE} pids=${pids[*]}"
+  kill "${pids[@]}" 2>/dev/null || true
+  sleep 1
+  local remaining=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && remaining+=("$pid")
+  done < <(orderbook_recorder_pids "$market")
+  if [[ ${#remaining[@]} -gt 0 ]]; then
+    echo "Force stopping orderbook recorder market=${market} cycle=${CYCLE} surface=${SURFACE} pids=${remaining[*]}"
+    kill -9 "${remaining[@]}" 2>/dev/null || true
+  fi
 }
 
 while getopts "h" opt; do
@@ -46,7 +94,17 @@ export PYTHONPATH="$PROJECT_DIR/src:$PROJECT_DIR:${PYTHONPATH:-}"
 source "$SCRIPT_DIR/_python_env.sh"
 
 pm15min_load_project_env
-pm15min_activate_python
+if is_truthy "${V2_ORDERBOOK_FLEET_SKIP_CONDA:-0}"; then
+  PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
+  if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
+    echo "❌ V2_ORDERBOOK_FLEET_SKIP_CONDA=1 but no usable python3 found."
+    exit 1
+  fi
+  echo "⚠️  Skip conda activation for orderbook fleet"
+  echo "✓ Using Python: ${PYTHON_BIN}"
+else
+  pm15min_activate_python
+fi
 
 MARKETS_RAW="${V2_ORDERBOOK_FLEET_MARKETS:-btc,eth,sol,xrp}"
 MARKETS_CSV="$(echo "$MARKETS_RAW" | tr '[:space:]' ',' | tr -s ',')"
@@ -83,6 +141,19 @@ ITERATIONS="${V2_ORDERBOOK_FLEET_ITERATIONS:-0}"
 SLEEP_SEC="${V2_ORDERBOOK_FLEET_SLEEP_SEC:-$POLL_SEC}"
 LOG_PATH="${V2_ORDERBOOK_FLEET_LOG_PATH:-$PROJECT_DIR/var/live/logs/entrypoints/orderbook_fleet_${CYCLE}_${SURFACE}.out}"
 ALLOCATOR_ARENAS="${MALLOC_ARENA_MAX:-2}"
+SCHEDULER_MODE="${PM15MIN_ORDERBOOK_FLEET_SCHEDULER_MODE:-process_per_market}"
+
+export V2_ORDERBOOK_FLEET_MARKETS="$MARKETS_CSV"
+export V2_ORDERBOOK_FLEET_CYCLE="$CYCLE"
+export V2_ORDERBOOK_FLEET_SURFACE="$SURFACE"
+export V2_ORDERBOOK_FLEET_POLL_SEC="$POLL_SEC"
+export V2_ORDERBOOK_FLEET_TIMEOUT_SEC="$TIMEOUT_SEC"
+export V2_ORDERBOOK_FLEET_RECENT_WINDOW_MINUTES="$RECENT_WINDOW_MINUTES"
+export V2_ORDERBOOK_FLEET_MARKET_DEPTH="$MARKET_DEPTH"
+export V2_ORDERBOOK_FLEET_MARKET_START_OFFSET="$MARKET_START_OFFSET"
+export V2_ORDERBOOK_FLEET_ITERATIONS="$ITERATIONS"
+export V2_ORDERBOOK_FLEET_SLEEP_SEC="$SLEEP_SEC"
+export PM15MIN_ORDERBOOK_FLEET_SCHEDULER_MODE="$SCHEDULER_MODE"
 
 mkdir -p "$(dirname "$LOG_PATH")"
 touch "$LOG_PATH"
@@ -99,6 +170,7 @@ echo "Recent Window Minutes: $RECENT_WINDOW_MINUTES"
 echo "Market Depth: $MARKET_DEPTH"
 echo "Market Start Offset: $MARKET_START_OFFSET"
 echo "Iterations: $ITERATIONS"
+echo "Scheduler Mode: $SCHEDULER_MODE"
 echo "MALLOC_ARENA_MAX: $ALLOCATOR_ARENAS"
 echo "Wrapper Log: $LOG_PATH"
 echo "============================================="
@@ -106,20 +178,13 @@ echo "============================================="
 echo "Stopping previous v2 orderbook fleet processes..."
 pkill -f "pm15min data run orderbook-fleet" || true
 sleep 1
+for market in "${MARKETS_LIST[@]}"; do
+  stop_orderbook_recorder_for_market "$market"
+done
 
 cmd=(
-  "$PYTHON_BIN" -m pm15min data run orderbook-fleet
-  --markets "$MARKETS_CSV"
-  --cycle "$CYCLE"
-  --surface "$SURFACE"
-  --poll-interval-sec "$POLL_SEC"
-  --timeout-sec "$TIMEOUT_SEC"
-  --recent-window-minutes "$RECENT_WINDOW_MINUTES"
-  --market-depth "$MARKET_DEPTH"
-  --market-start-offset "$MARKET_START_OFFSET"
-  --loop
-  --iterations "$ITERATIONS"
-  --sleep-sec "$SLEEP_SEC"
+  "$PYTHON_BIN" -c
+  "import os; from pm15min.data.pipelines.orderbook_fleet import run_orderbook_recorder_fleet; run_orderbook_recorder_fleet(markets=os.environ['V2_ORDERBOOK_FLEET_MARKETS'], cycle=os.environ['V2_ORDERBOOK_FLEET_CYCLE'], surface=os.environ['V2_ORDERBOOK_FLEET_SURFACE'], poll_interval_sec=float(os.environ['V2_ORDERBOOK_FLEET_POLL_SEC']), orderbook_timeout_sec=float(os.environ['V2_ORDERBOOK_FLEET_TIMEOUT_SEC']), recent_window_minutes=int(os.environ['V2_ORDERBOOK_FLEET_RECENT_WINDOW_MINUTES']), market_depth=int(os.environ['V2_ORDERBOOK_FLEET_MARKET_DEPTH']), market_start_offset=int(os.environ['V2_ORDERBOOK_FLEET_MARKET_START_OFFSET']), iterations=int(os.environ['V2_ORDERBOOK_FLEET_ITERATIONS']), loop=True, sleep_sec=float(os.environ['V2_ORDERBOOK_FLEET_SLEEP_SEC']), root=os.environ.get('PM15MIN_PROJECT_DIR'), scheduler_mode=os.environ.get('PM15MIN_ORDERBOOK_FLEET_SCHEDULER_MODE'))"
 )
 
 nohup env MALLOC_ARENA_MAX="$ALLOCATOR_ARENAS" "${cmd[@]}" >> "$LOG_PATH" 2>&1 &

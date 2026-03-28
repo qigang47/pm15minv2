@@ -129,15 +129,14 @@ def build_fill_plan_frame(
     frame = rows.copy()
     frame["p_up"] = pd.to_numeric(frame.get("p_up"), errors="coerce")
     frame["p_down"] = pd.to_numeric(frame.get("p_down"), errors="coerce")
-    frame["predicted_side"] = np.where(frame["p_up"].fillna(-1.0) >= frame["p_down"].fillna(-1.0), "UP", "DOWN")
-    frame["predicted_prob"] = frame[["p_up", "p_down"]].max(axis=1, skipna=True)
+    frame["predicted_side"] = _predicted_side_series(frame)
+    frame["predicted_prob"] = _predicted_prob_series(frame)
     frame["entry_price"] = _entry_price(frame)
     frame["entry_price_source"] = _entry_price_source(frame)
-    frame["price_cap"] = max_price_for_target_roi(
-        frame["predicted_prob"],
-        roi_target=cfg.roi_target,
-        fee_bps=cfg.fee_bps,
-        slippage_bps=cfg.slippage_bps,
+    frame["price_cap"] = _price_cap_series(
+        frame,
+        config=cfg,
+        profile_spec=profile_spec,
     )
     frame["probability_edge"] = _resolve_probability_edge(
         frame["predicted_prob"],
@@ -342,6 +341,9 @@ def _apply_stake_multiplier(
 
 
 def _entry_price(frame: pd.DataFrame) -> pd.Series:
+    decision_entry = _numeric_series(frame, "decision_engine_entry_price")
+    decision_quote_up_ask = _numeric_series(frame, "decision_quote_up_ask")
+    decision_quote_down_ask = _numeric_series(frame, "decision_quote_down_ask")
     quote_up_ask = _numeric_series(frame, "quote_up_ask")
     quote_down_ask = _numeric_series(frame, "quote_down_ask")
     quote_up = _numeric_series(frame, "quote_prob_up")
@@ -350,12 +352,27 @@ def _entry_price(frame: pd.DataFrame) -> pd.Series:
     p_down = _numeric_series(frame, "p_down")
     predicted_side = _predicted_side_series(frame)
     entry = pd.Series(np.nan, index=frame.index, dtype=float)
-    entry.loc[predicted_side == "UP"] = quote_up_ask.loc[predicted_side == "UP"].fillna(quote_up.loc[predicted_side == "UP"]).fillna(p_up.loc[predicted_side == "UP"])
-    entry.loc[predicted_side == "DOWN"] = quote_down_ask.loc[predicted_side == "DOWN"].fillna(quote_down.loc[predicted_side == "DOWN"]).fillna(p_down.loc[predicted_side == "DOWN"])
+    entry.loc[predicted_side == "UP"] = (
+        decision_entry.loc[predicted_side == "UP"]
+        .fillna(decision_quote_up_ask.loc[predicted_side == "UP"])
+        .fillna(quote_up_ask.loc[predicted_side == "UP"])
+        .fillna(quote_up.loc[predicted_side == "UP"])
+        .fillna(p_up.loc[predicted_side == "UP"])
+    )
+    entry.loc[predicted_side == "DOWN"] = (
+        decision_entry.loc[predicted_side == "DOWN"]
+        .fillna(decision_quote_down_ask.loc[predicted_side == "DOWN"])
+        .fillna(quote_down_ask.loc[predicted_side == "DOWN"])
+        .fillna(quote_down.loc[predicted_side == "DOWN"])
+        .fillna(p_down.loc[predicted_side == "DOWN"])
+    )
     return entry
 
 
 def _entry_price_source(frame: pd.DataFrame) -> pd.Series:
+    decision_entry = _numeric_series(frame, "decision_engine_entry_price")
+    decision_quote_up_ask = _numeric_series(frame, "decision_quote_up_ask")
+    decision_quote_down_ask = _numeric_series(frame, "decision_quote_down_ask")
     quote_up_ask = _numeric_series(frame, "quote_up_ask")
     quote_down_ask = _numeric_series(frame, "quote_down_ask")
     quote_up = _numeric_series(frame, "quote_prob_up")
@@ -367,6 +384,9 @@ def _entry_price_source(frame: pd.DataFrame) -> pd.Series:
     source.loc[(predicted_side == "DOWN") & quote_down.notna()] = "quote_prob_down"
     source.loc[(predicted_side == "UP") & quote_up_ask.notna()] = "quote_up_ask"
     source.loc[(predicted_side == "DOWN") & quote_down_ask.notna()] = "quote_down_ask"
+    source.loc[(predicted_side == "UP") & decision_quote_up_ask.notna()] = "decision_quote_up_ask"
+    source.loc[(predicted_side == "DOWN") & decision_quote_down_ask.notna()] = "decision_quote_down_ask"
+    source.loc[decision_entry.notna()] = "decision_engine_entry_price"
     return source.astype(str)
 
 
@@ -395,6 +415,47 @@ def _predicted_side_series(frame: pd.DataFrame) -> pd.Series:
         dtype="string",
     ).astype(str)
     return normalized.where(normalized.isin(["UP", "DOWN"]), fallback)
+
+
+def _predicted_prob_series(frame: pd.DataFrame) -> pd.Series:
+    existing = _numeric_series(frame, "predicted_prob")
+    fallback = frame[["p_up", "p_down"]].max(axis=1, skipna=True)
+    return existing.where(existing.notna(), fallback)
+
+
+def _price_cap_series(
+    frame: pd.DataFrame,
+    *,
+    config: BacktestFillConfig,
+    profile_spec: LiveProfileSpec | None,
+) -> pd.Series:
+    predicted_prob = _predicted_prob_series(frame)
+    if profile_spec is None:
+        return max_price_for_target_roi(
+            predicted_prob,
+            roi_target=config.roi_target,
+            fee_bps=config.fee_bps,
+            slippage_bps=config.slippage_bps,
+        )
+
+    entry_price = _entry_price(frame)
+    offsets = pd.to_numeric(frame.get("offset"), errors="coerce")
+    slip = max(0.0, float(profile_spec.slippage_bps)) / 10_000.0
+    out = pd.Series(np.nan, index=frame.index, dtype=float)
+    for idx in frame.index:
+        prob = predicted_prob.loc[idx]
+        if pd.isna(prob):
+            continue
+        offset = offsets.loc[idx]
+        offset_value = int(offset) if pd.notna(offset) else 0
+        fee_reference_price = entry_price.loc[idx]
+        if pd.isna(fee_reference_price) or float(fee_reference_price) <= 0.0:
+            fee_reference_price = 0.5
+        fee_rate = float(profile_spec.fee_rate(price=float(fee_reference_price)))
+        roi_threshold = float(profile_spec.roi_threshold_for(offset=offset_value))
+        denom = max((1.0 + roi_threshold + fee_rate) * (1.0 + slip), 1e-9)
+        out.loc[idx] = max(1e-6, min(float(prob) / denom, 1.0))
+    return out
 
 
 def _materialize_fill_row(

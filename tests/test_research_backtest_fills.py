@@ -61,6 +61,71 @@ def test_build_fill_plan_frame_is_fee_and_stake_aware() -> None:
     assert summarize_fill_reasons(out) == {"below_min_edge": 1}
 
 
+def test_build_fill_plan_frame_prefers_decision_engine_entry_and_selected_probability() -> None:
+    profile_spec = resolve_backtest_profile_spec(profile="deep_otm")
+    rows = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "offset": 7,
+                "p_up": 0.81,
+                "p_down": 0.19,
+                "predicted_side": "DOWN",
+                "predicted_prob": 0.63,
+                "decision_engine_entry_price": 0.27,
+                "quote_down_ask": 0.29,
+                "quote_prob_down": 0.28,
+            }
+        ]
+    )
+
+    out = build_fill_plan_frame(
+        rows,
+        base_stake=1.0,
+        max_stake=1.0,
+        fee_bps=50.0,
+        high_conf_threshold=0.99,
+        high_conf_multiplier=1.0,
+        profile_spec=profile_spec,
+    )
+
+    assert out.iloc[0]["predicted_side"] == "DOWN"
+    assert float(out.iloc[0]["predicted_prob"]) == pytest.approx(0.63)
+    assert float(out.iloc[0]["entry_price"]) == pytest.approx(0.27)
+    assert out.iloc[0]["entry_price_source"] == "decision_engine_entry_price"
+
+
+def test_build_fill_plan_frame_uses_profile_price_cap_formula_when_available() -> None:
+    profile_spec = resolve_backtest_profile_spec(profile="deep_otm")
+    rows = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "offset": 7,
+                "p_up": 0.62,
+                "p_down": 0.38,
+                "predicted_side": "UP",
+                "predicted_prob": 0.62,
+                "decision_engine_entry_price": 0.20,
+            }
+        ]
+    )
+
+    out = build_fill_plan_frame(
+        rows,
+        base_stake=1.0,
+        max_stake=1.0,
+        fee_bps=50.0,
+        high_conf_threshold=0.99,
+        high_conf_multiplier=1.0,
+        profile_spec=profile_spec,
+    )
+
+    expected_fee_rate = profile_spec.fee_rate(price=0.20)
+    expected = 0.62 / ((1.0 + profile_spec.roi_threshold_for(offset=7) + expected_fee_rate) * (1.0 + 0.0))
+    assert float(out.iloc[0]["price_cap"]) == pytest.approx(expected)
+
+
 def test_build_fill_plan_frame_applies_regime_stake_scale() -> None:
     profile_spec = resolve_backtest_profile_spec(
         profile="deep_otm",
@@ -1637,7 +1702,7 @@ def test_build_canonical_fills_legacy_fak_refresh_rejects_repriced_net_edge_belo
     assert rejects["reason"].tolist() == ["repriced_net_edge_below_threshold"]
 
 
-def test_build_canonical_fills_legacy_fak_refresh_rejects_repriced_roi_below_threshold(tmp_path) -> None:
+def test_build_canonical_fills_legacy_fak_refresh_blocks_depth_when_reprice_exceeds_single_layer_price_cap(tmp_path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
     accepted = pd.DataFrame(
@@ -1725,8 +1790,11 @@ def test_build_canonical_fills_legacy_fak_refresh_rejects_repriced_roi_below_thr
         depth_replay=depth_replay,
     )
 
-    assert fills.empty
-    assert rejects["reason"].tolist() == ["repriced_roi_below_threshold"]
+    assert rejects.empty
+    assert len(fills) == 1
+    assert fills.loc[0, "fill_model"] == "canonical_quote"
+    assert fills.loc[0, "depth_status"] == "blocked"
+    assert fills.loc[0, "depth_reason"] == "depth_fill_unavailable"
 
 
 def test_build_canonical_fills_legacy_fak_refresh_keeps_partial_fill_without_quote_completion(tmp_path) -> None:

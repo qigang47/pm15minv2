@@ -30,6 +30,7 @@ from .utils import (
     utc_now_iso,
 )
 from ..service import decide_live_latest
+from ..service import prewarm_live_signal_cache
 from ..trading.gateway import LiveTradingGateway
 
 
@@ -66,6 +67,7 @@ def build_runner_iteration(
         run_live_data_foundation_fn=run_live_data_foundation,
         build_liquidity_state_snapshot_fn=build_liquidity_state_snapshot,
         decide_live_latest_fn=decide_live_latest,
+        prewarm_live_signal_cache_fn=prewarm_live_signal_cache,
         build_execution_snapshot_fn=build_execution_snapshot,
         persist_execution_snapshot_fn=persist_execution_snapshot,
         submit_execution_payload_fn=submit_execution_payload,

@@ -79,6 +79,8 @@ def build_runner_health_summary(
             _add_check(stage="account", code="account_state_skipped", status="skipped", severity="info", blocking=False)
         elif account_status == "ok":
             _add_check(stage="account", code="account_state_ok", status="ok", severity="info", blocking=False)
+        elif account_status == "skipped":
+            _add_check(stage="account", code="account_state_skipped", status="skipped", severity="info", blocking=False)
         else:
             _add_check(stage="account", code="account_state_sync_error", status="error", severity="error", blocking=True, detail={"open_orders_status": None if account_state_payload is None else (account_state_payload.get("open_orders") or {}).get("status"), "positions_status": None if account_state_payload is None else (account_state_payload.get("positions") or {}).get("status")})
 
@@ -142,6 +144,9 @@ def aggregate_runner_health_status(checks: list[dict[str, object]], *, stages: s
 def account_state_status(payload: dict[str, Any] | None) -> str | None:
     if payload is None:
         return None
+    payload_status = status_token(payload.get("status"))
+    if payload_status == "skipped":
+        return "skipped"
     open_orders_status = status_token((payload.get("open_orders") or {}).get("status"))
     positions_status = status_token((payload.get("positions") or {}).get("status"))
     if open_orders_status == "ok" and positions_status == "ok":

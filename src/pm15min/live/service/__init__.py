@@ -24,6 +24,7 @@ from .operation import (
 from ..signal.service import (
     check_live_latest as _check_live_latest_impl,
     decide_live_latest as _decide_live_latest_impl,
+    prewarm_live_signal_cache as _prewarm_live_signal_cache_impl,
     quote_live_latest as _quote_live_latest_impl,
     score_live_latest as _score_live_latest_impl,
 )
@@ -147,6 +148,24 @@ def decide_live_latest(
         session_state=session_state,
         orderbook_provider=orderbook_provider,
         **_decision_wiring(),
+    )
+
+
+def prewarm_live_signal_cache(
+    cfg: LiveConfig,
+    *,
+    target: str = "direction",
+    feature_set: str | None = None,
+    persist: bool = False,
+    session_state: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return _prewarm_live_signal_cache_impl(
+        cfg,
+        target=target,
+        feature_set=feature_set,
+        persist=persist,
+        session_state=session_state,
+        score_live_latest_fn=score_live_latest,
     )
 
 

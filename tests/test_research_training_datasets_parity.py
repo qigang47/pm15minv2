@@ -166,6 +166,59 @@ def test_build_label_frame_aliases_settlement_truth_to_truth() -> None:
     assert frame["label_source"].tolist() == ["settlement_truth"]
 
 
+def test_build_label_frame_truth_backfills_missing_cycles_from_oracle_prices() -> None:
+    truth = pd.DataFrame(
+        [
+            {
+                "asset": "btc",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+                "winner_side": "UP",
+                "label_updown": "UP",
+                "resolved": True,
+                "truth_source": "settlement_truth",
+                "full_truth": True,
+            }
+        ]
+    )
+    oracle = pd.DataFrame(
+        [
+            {
+                "asset": "btc",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "price_to_beat": 100.0,
+                "final_price": 101.0,
+                "has_both": True,
+                "source_price_to_beat": "oracle_prices",
+                "source_final_price": "chainlink_datafeeds",
+            },
+            {
+                "asset": "btc",
+                "cycle_start_ts": 1_772_324_100,
+                "cycle_end_ts": 1_772_325_000,
+                "price_to_beat": 101.0,
+                "final_price": 99.0,
+                "has_both": True,
+                "source_price_to_beat": "oracle_prices",
+                "source_final_price": "chainlink_datafeeds",
+            },
+        ]
+    )
+
+    frame = build_label_frame(label_set="truth", truth_table=truth, oracle_prices_table=oracle)
+
+    assert len(frame) == 2
+    assert frame["cycle_start_ts"].tolist() == [1_772_323_200, 1_772_324_100]
+    assert frame.iloc[0]["settlement_source"] == "settlement_truth"
+    assert frame.iloc[1]["settlement_source"] == "chainlink_datafeeds"
+    assert frame.iloc[1]["label_source"] == "datafeeds"
+    assert bool(frame.iloc[1]["resolved"]) is True
+    assert frame.iloc[1]["winner_side"] == "DOWN"
+
+
 def test_load_label_frame_uses_truth_for_settlement_truth_alias(tmp_path) -> None:
     root = tmp_path / "v2"
     cfg = ResearchConfig.build(

@@ -6,6 +6,8 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import threading
+import time
 
 import pandas as pd
 
@@ -14,7 +16,7 @@ from pm15min.data.pipelines.binance_klines import sync_binance_klines_1m
 from pm15min.data.pipelines.market_catalog import sync_market_catalog
 from pm15min.data.queries.loaders import load_binance_klines_1m, load_oracle_prices_table
 from pm15min.live.oracle import build_live_runtime_oracle_prices
-from ..account import summarize_account_state_payload
+from ..account import summarize_account_state_payload, summarize_open_orders_snapshot, summarize_positions_snapshot
 from ..account import load_latest_open_orders_snapshot, load_latest_positions_snapshot
 from ..layout import LiveStateLayout
 from ..persistence import write_live_payload_pair
@@ -29,6 +31,13 @@ DEFAULT_LIVE_MARKET_CATALOG_LOOKAHEAD_HOURS = 24
 DEFAULT_LIVE_BINANCE_LOOKBACK_MINUTES = 2880
 DEFAULT_LIVE_BINANCE_BATCH_LIMIT = 1000
 
+_LIVE_FEATURE_FRAME_CACHE: dict[tuple[str, str, int, str, tuple[int, ...], int], tuple[float, pd.DataFrame]] = {}
+_LIVE_FEATURE_FRAME_CACHE_LOCK = threading.Lock()
+_LIVE_ACCOUNT_CONTEXT_CACHE: dict[tuple[str, str], tuple[float, tuple[int | None, int | None], dict[str, object]]] = {}
+_LIVE_ACCOUNT_CONTEXT_CACHE_LOCK = threading.Lock()
+_LIVE_KLINES_TAIL_CACHE: dict[tuple[str, str], tuple[tuple[int | None, int | None], pd.DataFrame]] = {}
+_LIVE_KLINES_TAIL_CACHE_LOCK = threading.Lock()
+
 
 def supports_feature_set(feature_set: str) -> bool:
     try:
@@ -38,7 +47,27 @@ def supports_feature_set(feature_set: str) -> bool:
         return False
 
 
-def build_live_feature_frame(cfg, *, feature_set: str) -> pd.DataFrame:
+def build_live_feature_frame(
+    cfg,
+    *,
+    feature_set: str,
+    retain_offsets: tuple[int, ...] | None = None,
+) -> pd.DataFrame:
+    cache_ttl_seconds = _env_float("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", default=0.0)
+    resolved_retain_offsets = tuple(retain_offsets or _env_int_list("PM15MIN_LIVE_FEATURE_RETAIN_OFFSETS"))
+    tail_cycles = _env_int("PM15MIN_LIVE_FEATURE_TAIL_CYCLES", default=2)
+    cache_key = (
+        str(cfg.layout.rewrite.root),
+        str(cfg.asset.slug),
+        int(cfg.cycle_minutes),
+        str(feature_set),
+        tuple(resolved_retain_offsets),
+        int(tail_cycles),
+    )
+    if cache_ttl_seconds > 0.0:
+        cached = _load_cached_live_feature_frame(cache_key=cache_key)
+        if cached is not None:
+            return cached
     data_cfg = DataConfig.build(
         market=cfg.asset.slug,
         cycle=f"{int(cfg.cycle_minutes)}m",
@@ -46,7 +75,11 @@ def build_live_feature_frame(cfg, *, feature_set: str) -> pd.DataFrame:
         root=cfg.layout.rewrite.root,
     )
     ensure_live_trade_inputs_fresh(cfg)
-    raw_klines = load_binance_klines_1m(data_cfg)
+    raw_tail_bars = _live_feature_build_tail_bars(cycle_minutes=int(cfg.cycle_minutes), tail_cycles=tail_cycles)
+    raw_klines = _load_live_binance_klines_tail(
+        data_cfg=data_cfg,
+        tail_bars=raw_tail_bars,
+    )
     oracle_prices = build_live_runtime_oracle_prices(
         data_cfg=data_cfg,
         market_slug=cfg.asset.slug,
@@ -61,14 +94,129 @@ def build_live_feature_frame(cfg, *, feature_set: str) -> pd.DataFrame:
             surface="live",
             root=cfg.layout.rewrite.root,
         )
-        btc_klines = load_binance_klines_1m(btc_cfg, symbol="BTCUSDT")
-    return build_feature_frame_df(
+        btc_klines = _load_live_binance_klines_tail(
+            data_cfg=btc_cfg,
+            symbol="BTCUSDT",
+            tail_bars=raw_tail_bars,
+        )
+    features = build_feature_frame_df(
         raw_klines,
         feature_set=feature_set,
         oracle_prices=oracle_prices,
         btc_klines=btc_klines,
         cycle=f"{int(cfg.cycle_minutes)}m",
     )
+    features = _trim_live_feature_frame(
+        features,
+        cycle_minutes=int(cfg.cycle_minutes),
+        retain_offsets=resolved_retain_offsets,
+        tail_cycles=tail_cycles,
+    )
+    if cache_ttl_seconds > 0.0:
+        _store_cached_live_feature_frame(
+            cache_key=cache_key,
+            cache_ttl_seconds=cache_ttl_seconds,
+            features=features,
+        )
+    return features
+
+
+def _load_cached_live_feature_frame(*, cache_key: tuple[str, str, int, str, tuple[int, ...], int]) -> pd.DataFrame | None:
+    now_monotonic = time.monotonic()
+    with _LIVE_FEATURE_FRAME_CACHE_LOCK:
+        cached = _LIVE_FEATURE_FRAME_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        expires_at, frame = cached
+        if now_monotonic >= float(expires_at):
+            _LIVE_FEATURE_FRAME_CACHE.pop(cache_key, None)
+            return None
+        return frame.copy(deep=False)
+
+
+def _store_cached_live_feature_frame(
+    *,
+    cache_key: tuple[str, str, int, str, tuple[int, ...], int],
+    cache_ttl_seconds: float,
+    features: pd.DataFrame,
+) -> None:
+    with _LIVE_FEATURE_FRAME_CACHE_LOCK:
+        _LIVE_FEATURE_FRAME_CACHE[cache_key] = (
+            time.monotonic() + max(0.0, float(cache_ttl_seconds)),
+            features.copy(deep=False),
+        )
+
+
+def _trim_live_feature_frame(
+    features: pd.DataFrame,
+    *,
+    cycle_minutes: int,
+    retain_offsets: tuple[int, ...],
+    tail_cycles: int,
+) -> pd.DataFrame:
+    if not isinstance(features, pd.DataFrame) or features.empty:
+        return features
+    if int(cycle_minutes) <= 0:
+        return features
+    rows = features.copy()
+    cycle_start = pd.to_datetime(rows.get("cycle_start_ts"), utc=True, errors="coerce")
+    decision_ts = pd.to_datetime(rows.get("decision_ts"), utc=True, errors="coerce")
+    if not isinstance(cycle_start, pd.Series):
+        return rows
+    valid_cycle_start = cycle_start.dropna().drop_duplicates().sort_values()
+    if valid_cycle_start.empty:
+        if not isinstance(decision_ts, pd.Series):
+            return rows
+        tail_rows = max(int(cycle_minutes) * max(1, int(tail_cycles)), int(cycle_minutes))
+        return rows.sort_values("decision_ts").tail(tail_rows).reset_index(drop=True)
+
+    keep_cycle_count = max(1, int(tail_cycles))
+    latest_cycle_start = valid_cycle_start.iloc[-1]
+    keep_cycle_starts = set(valid_cycle_start.iloc[-keep_cycle_count:].tolist())
+    latest_cycle_mask = cycle_start.eq(latest_cycle_start)
+    keep_mask = latest_cycle_mask | cycle_start.isin(keep_cycle_starts)
+    if retain_offsets:
+        offset_series = pd.to_numeric(rows.get("offset"), errors="coerce")
+        active_offset_mask = offset_series.isin(list(retain_offsets))
+        keep_mask = latest_cycle_mask | (cycle_start.isin(keep_cycle_starts) & active_offset_mask)
+    trimmed = rows.loc[keep_mask].copy()
+    if trimmed.empty:
+        trimmed = rows.sort_values("decision_ts").tail(max(int(cycle_minutes), 1)).copy()
+    if "decision_ts" in trimmed.columns:
+        trimmed = trimmed.sort_values("decision_ts")
+    return trimmed.reset_index(drop=True)
+
+
+def _live_feature_build_tail_bars(*, cycle_minutes: int, tail_cycles: int) -> int:
+    requested = _env_int("PM15MIN_LIVE_FEATURE_BUILD_TAIL_BARS", default=384)
+    minimum = max(256, int(cycle_minutes) * max(4, int(tail_cycles) + 2))
+    return max(int(requested), int(minimum))
+
+
+def _load_live_binance_klines_tail(
+    *,
+    data_cfg: DataConfig,
+    symbol: str | None = None,
+    tail_bars: int,
+) -> pd.DataFrame:
+    path = data_cfg.layout.binance_klines_path(symbol=symbol)
+    cache_key = (str(path), str(symbol or data_cfg.asset.binance_symbol))
+    signature = _path_signature(path)
+    if signature[0] is not None:
+        with _LIVE_KLINES_TAIL_CACHE_LOCK:
+            cached = _LIVE_KLINES_TAIL_CACHE.get(cache_key)
+            if cached is not None and cached[0] == signature:
+                return cached[1].copy(deep=False)
+    raw = load_binance_klines_1m(data_cfg, symbol=symbol)
+    if isinstance(raw, pd.DataFrame) and not raw.empty and int(tail_bars) > 0 and len(raw) > int(tail_bars):
+        raw = raw.tail(int(tail_bars)).reset_index(drop=True)
+    if signature[0] is not None:
+        with _LIVE_KLINES_TAIL_CACHE_LOCK:
+            _LIVE_KLINES_TAIL_CACHE[cache_key] = (
+                signature,
+                raw.copy(deep=False),
+            )
+    return raw
 
 
 def ensure_live_trade_inputs_fresh(cfg) -> dict[str, object]:
@@ -263,7 +411,51 @@ def _env_float(name: str, *, default: float) -> float:
         return float(default)
 
 
+def _env_int(name: str, *, default: int) -> int:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def _env_int_list(name: str) -> tuple[int, ...]:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return tuple()
+    values: list[int] = []
+    for token in str(raw).split(","):
+        text = token.strip()
+        if not text:
+            continue
+        try:
+            values.append(int(text))
+        except Exception:
+            continue
+    return tuple(sorted(set(values)))
+
+
 def load_live_account_context(cfg, *, utc_snapshot_label_fn) -> dict[str, object]:
+    cache_ttl_seconds = _env_float("PM15MIN_LIVE_ACCOUNT_CONTEXT_CACHE_SEC", default=60.0)
+    cache_key = (
+        str(cfg.layout.rewrite.root),
+        str(cfg.asset.slug),
+    )
+    open_orders_path = LiveStateLayout.discover(root=cfg.layout.rewrite.root).latest_open_orders_path(market=cfg.asset.slug)
+    positions_path = LiveStateLayout.discover(root=cfg.layout.rewrite.root).latest_positions_path(market=cfg.asset.slug)
+    signature = (
+        _path_mtime_ns(open_orders_path),
+        _path_mtime_ns(positions_path),
+    )
+    if cache_ttl_seconds > 0.0:
+        cached = _load_cached_live_account_context(
+            cache_key=cache_key,
+            signature=signature,
+        )
+        if cached is not None:
+            return cached
     open_orders = load_latest_open_orders_snapshot(
         rewrite_root=cfg.layout.rewrite.root,
         market=cfg.asset.slug,
@@ -272,14 +464,101 @@ def load_live_account_context(cfg, *, utc_snapshot_label_fn) -> dict[str, object
         rewrite_root=cfg.layout.rewrite.root,
         market=cfg.asset.slug,
     )
+    open_orders_compact = _compact_live_open_orders_snapshot(open_orders)
+    positions_compact = _compact_live_positions_snapshot(positions)
     payload = {
         "snapshot_ts": utc_snapshot_label_fn(),
-        "open_orders": open_orders if isinstance(open_orders, dict) else None,
-        "positions": positions if isinstance(positions, dict) else None,
+        "open_orders": open_orders_compact,
+        "positions": positions_compact,
     }
-    payload["summary"] = summarize_account_state_payload(payload)
-    return {
+    payload["summary"] = summarize_account_state_payload(payload, include_heavy_fields=False)
+    resolved = {
         **payload,
+    }
+    if cache_ttl_seconds > 0.0:
+        _store_cached_live_account_context(
+            cache_key=cache_key,
+            cache_ttl_seconds=cache_ttl_seconds,
+            signature=signature,
+            payload=resolved,
+        )
+    return resolved
+
+
+def _load_cached_live_account_context(
+    *,
+    cache_key: tuple[str, str],
+    signature: tuple[int | None, int | None],
+) -> dict[str, object] | None:
+    now_monotonic = time.monotonic()
+    with _LIVE_ACCOUNT_CONTEXT_CACHE_LOCK:
+        cached = _LIVE_ACCOUNT_CONTEXT_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        expires_at, cached_signature, payload = cached
+        if now_monotonic >= float(expires_at) or cached_signature != signature:
+            _LIVE_ACCOUNT_CONTEXT_CACHE.pop(cache_key, None)
+            return None
+        return dict(payload)
+
+
+def _store_cached_live_account_context(
+    *,
+    cache_key: tuple[str, str],
+    cache_ttl_seconds: float,
+    signature: tuple[int | None, int | None],
+    payload: dict[str, object],
+) -> None:
+    with _LIVE_ACCOUNT_CONTEXT_CACHE_LOCK:
+        _LIVE_ACCOUNT_CONTEXT_CACHE[cache_key] = (
+            time.monotonic() + max(0.0, float(cache_ttl_seconds)),
+            signature,
+            dict(payload),
+        )
+
+
+def _path_mtime_ns(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _path_signature(path: Path) -> tuple[int | None, int | None]:
+    try:
+        stat = path.stat()
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+    except FileNotFoundError:
+        return (None, None)
+    except Exception:
+        return (None, None)
+
+
+def _compact_live_open_orders_snapshot(payload: dict[str, object] | None) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    open_orders_summary = summarize_open_orders_snapshot(payload)
+    return {
+        "status": payload.get("status"),
+        "reason": payload.get("reason"),
+        "snapshot_ts": payload.get("snapshot_ts"),
+        "summary": open_orders_summary if isinstance(open_orders_summary, dict) else None,
+    }
+
+
+def _compact_live_positions_snapshot(payload: dict[str, object] | None) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    positions_summary = summarize_positions_snapshot(payload, include_heavy_fields=False)
+    return {
+        "status": payload.get("status"),
+        "reason": payload.get("reason"),
+        "snapshot_ts": payload.get("snapshot_ts"),
+        "cash_balance_usd": payload.get("cash_balance_usd"),
+        "cash_balance_status": payload.get("cash_balance_status"),
+        "summary": positions_summary if isinstance(positions_summary, dict) else None,
     }
 
 

@@ -7,17 +7,30 @@ def summarize_open_orders_snapshot(payload: dict[str, Any] | None) -> dict[str, 
     if not isinstance(payload, dict):
         return None
     rows = payload.get("orders")
+    if not isinstance(rows, list):
+        existing = payload.get("summary")
+        if isinstance(existing, dict):
+            return dict(existing)
     return summarize_open_orders_rows(rows if isinstance(rows, list) else [])
 
 
-def summarize_positions_snapshot(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+def summarize_positions_snapshot(
+    payload: dict[str, Any] | None,
+    *,
+    include_heavy_fields: bool = True,
+) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     rows = payload.get("positions")
+    if not isinstance(rows, list):
+        existing = payload.get("summary")
+        if isinstance(existing, dict):
+            return dict(existing)
     redeem_plan = payload.get("redeem_plan")
     summary = summarize_positions_rows(
         rows if isinstance(rows, list) else [],
         redeem_plan=redeem_plan if isinstance(redeem_plan, dict) else {},
+        include_heavy_fields=include_heavy_fields,
     )
     cash_balance_usd = float_or_none(payload.get("cash_balance_usd"))
     summary["cash_balance_usd"] = cash_balance_usd
@@ -26,11 +39,18 @@ def summarize_positions_snapshot(payload: dict[str, Any] | None) -> dict[str, An
     return summary
 
 
-def summarize_account_state_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+def summarize_account_state_payload(
+    payload: dict[str, Any] | None,
+    *,
+    include_heavy_fields: bool = True,
+) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     open_orders_summary = summarize_open_orders_snapshot(payload.get("open_orders"))
-    positions_summary = summarize_positions_snapshot(payload.get("positions"))
+    positions_summary = summarize_positions_snapshot(
+        payload.get("positions"),
+        include_heavy_fields=include_heavy_fields,
+    )
     open_orders_notional = float_or_none(None if open_orders_summary is None else open_orders_summary.get("total_notional_usd")) or 0.0
     position_mark = float_or_none(None if positions_summary is None else positions_summary.get("current_value_sum")) or 0.0
     position_cash_pnl = float_or_none(None if positions_summary is None else positions_summary.get("cash_pnl_sum")) or 0.0
@@ -128,44 +148,59 @@ def summarize_open_orders_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def summarize_positions_rows(rows: list[dict[str, Any]], *, redeem_plan: dict[str, Any]) -> dict[str, Any]:
+def summarize_positions_rows(
+    rows: list[dict[str, Any]],
+    *,
+    redeem_plan: dict[str, Any],
+    include_heavy_fields: bool = True,
+) -> dict[str, Any]:
     condition_ids: set[str] = set()
     market_ids: set[str] = set()
+    by_market_id: dict[str, int] = {}
     total_size = 0.0
     current_value_sum = 0.0
     cash_pnl_sum = 0.0
     redeemable_positions = 0
     positions_without_market_id = 0
+    active_position_count = 0
     for row in rows:
         condition_id = str(row.get("condition_id") or "").strip()
         market_id = str(row.get("market_id") or "").strip()
         size = float_or_none(row.get("size")) or 0.0
+        has_active_size = float(size) > 0.0
         current_value = float_or_none(row.get("current_value")) or 0.0
         cash_pnl = float_or_none(row.get("cash_pnl")) or 0.0
         total_size += float(size)
         current_value_sum += float(current_value)
         cash_pnl_sum += float(cash_pnl)
-        if bool(row.get("redeemable")):
+        if has_active_size:
+            active_position_count += 1
+        if bool(row.get("redeemable")) and has_active_size:
             redeemable_positions += 1
-        if condition_id:
+        if condition_id and has_active_size:
             condition_ids.add(condition_id)
-        if market_id:
+        if market_id and has_active_size:
             market_ids.add(market_id)
-        else:
+            by_market_id[market_id] = by_market_id.get(market_id, 0) + 1
+        elif has_active_size:
             positions_without_market_id += 1
-    return {
+    summary = {
         "total_positions": len(rows),
+        "active_positions": int(active_position_count),
         "redeemable_positions": int(redeemable_positions),
         "redeemable_conditions": len(redeem_plan),
         "size_sum": total_size,
         "current_value_sum": current_value_sum,
         "cash_pnl_sum": cash_pnl_sum,
         "condition_count": len(condition_ids),
-        "condition_ids": sorted(condition_ids),
         "market_count": len(market_ids),
         "market_ids": sorted(market_ids),
+        "by_market_id": by_market_id,
         "positions_without_market_id": positions_without_market_id,
     }
+    if include_heavy_fields:
+        summary["condition_ids"] = sorted(condition_ids)
+    return summary
 
 
 def float_or_none(value: object) -> float | None:

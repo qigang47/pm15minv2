@@ -321,6 +321,29 @@ def test_attach_decision_engine_surface_arms_pre_submit_orderbook_retry_on_limit
     assert out.loc[0, "pre_submit_orderbook_retry_state_key"] == "orderbook_retry_count"
 
 
+def test_attach_decision_engine_surface_missing_depth_fallback_keeps_profile_entry_band() -> None:
+    rows = _decision_replay_rows(p_up=0.82, p_down=0.18, quote_up_ask=0.81, quote_down_ask=0.19)
+
+    out, summary = _attach_decision_engine_surface(
+        rows,
+        market="eth",
+        profile_spec=resolve_backtest_profile_spec(market="eth", profile="deep_otm_baseline"),
+        depth_replay=None,
+        fill_config=_decision_fill_config(raw_depth_fak_refresh_enabled=True),
+    )
+
+    assert out.loc[0, "decision_engine_action"] == "reject"
+    assert out.loc[0, "decision_engine_reason"] in {"entry_price_max", "direction_prob"}
+    assert pd.isna(out.loc[0, "decision_engine_side"])
+    assert bool(out.loc[0, "decision_quote_has_raw_depth"]) is False
+    assert summary.to_dict() == {
+        "raw_depth_rows": 0,
+        "repriced_rows": 0,
+        "limit_reject_rows": 0,
+        "orderbook_missing_rows": 0,
+    }
+
+
 def _decision_replay_rows(**overrides: object) -> pd.DataFrame:
     row = {
         "decision_ts": "2026-03-01T00:08:00Z",

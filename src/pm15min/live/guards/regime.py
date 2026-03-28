@@ -92,24 +92,39 @@ def build_account_context(
     open_orders_snapshot = state.get("open_orders") or {}
     positions_snapshot = state.get("positions") or {}
     account_summary = state.get("summary") if isinstance(state.get("summary"), dict) else {}
+    open_orders_summary = open_orders_snapshot.get("summary") if isinstance(open_orders_snapshot, dict) else {}
+    positions_summary = positions_snapshot.get("summary") if isinstance(positions_snapshot, dict) else {}
+    open_orders_summary = open_orders_summary if isinstance(open_orders_summary, dict) else {}
+    positions_summary = positions_summary if isinstance(positions_summary, dict) else {}
     open_orders = open_orders_snapshot.get("orders") if isinstance(open_orders_snapshot, dict) else open_orders_snapshot
     positions = positions_snapshot.get("positions") if isinstance(positions_snapshot, dict) else positions_snapshot
     open_orders = open_orders if isinstance(open_orders, list) else []
     positions = positions if isinstance(positions, list) else []
     active_market_ids = {
-        str(row.get("market_id") or "").strip()
-        for row in open_orders
-        if isinstance(row, dict) and str(row.get("market_id") or "").strip()
-    }
-    active_market_ids.update(
-        str(row.get("market_id") or "").strip()
-        for row in positions
-        if (
-            isinstance(row, dict)
-            and str(row.get("market_id") or "").strip()
-            and (float_or_none(row.get("size")) or 0.0) > 0.0
+        str(value)
+        for value in (
+            account_summary.get("active_market_ids")
+            or open_orders_summary.get("market_ids")
+            or positions_summary.get("market_ids")
+            or []
         )
-    )
+        if str(value)
+    }
+    if not active_market_ids:
+        active_market_ids = {
+            str(row.get("market_id") or "").strip()
+            for row in open_orders
+            if isinstance(row, dict) and str(row.get("market_id") or "").strip()
+        }
+        active_market_ids.update(
+            str(row.get("market_id") or "").strip()
+            for row in positions
+            if (
+                isinstance(row, dict)
+                and str(row.get("market_id") or "").strip()
+                and (float_or_none(row.get("size")) or 0.0) > 0.0
+            )
+        )
     cash_balance_usd = float_or_none(account_summary.get("cash_balance_usd"))
     cap_context = _resolve_trade_count_context(
         profile_spec=profile_spec,
@@ -151,20 +166,24 @@ def build_account_context(
             "cash_balance_available": cash_balance_usd is not None,
             **base_context,
         }
-    open_orders_count = sum(
-        1
-        for row in open_orders
-        if isinstance(row, dict) and str(row.get("market_id") or "").strip() == market_id
-    )
-    position_count = sum(
-        1
-        for row in positions
-        if (
-            isinstance(row, dict)
-            and str(row.get("market_id") or "").strip() == market_id
-            and (float_or_none(row.get("size")) or 0.0) > 0.0
+    open_orders_count = int_or_none((open_orders_summary.get("by_market_id") or {}).get(market_id))
+    if open_orders_count is None:
+        open_orders_count = sum(
+            1
+            for row in open_orders
+            if isinstance(row, dict) and str(row.get("market_id") or "").strip() == market_id
         )
-    )
+    position_count = int_or_none((positions_summary.get("by_market_id") or {}).get(market_id))
+    if position_count is None:
+        position_count = sum(
+            1
+            for row in positions
+            if (
+                isinstance(row, dict)
+                and str(row.get("market_id") or "").strip() == market_id
+                and (float_or_none(row.get("size")) or 0.0) > 0.0
+            )
+        )
     return {
         "market_id": market_id,
         "open_orders_count": int(open_orders_count),

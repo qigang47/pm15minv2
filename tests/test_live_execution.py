@@ -115,28 +115,10 @@ def test_execution_snapshot_reuses_precomputed_depth_plan(tmp_path: Path, monkey
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
     price_cap = 0.8 / 1.01
-    calls = {"repriced": 0}
-
     def _should_not_run(*args, **kwargs):
         raise AssertionError("depth plan should be reused from decision payload")
 
-    def _recomputed_repriced(*, spec, selected_row, repriced_entry_price):
-        calls["repriced"] += 1
-        return (
-            {
-                "repriced_entry_price": float(repriced_entry_price),
-                "repriced_effective_price": float(repriced_entry_price),
-                "repriced_fee_rate": 0.02,
-                "repriced_raw_edge": 0.55,
-                "repriced_min_net_edge_required": 0.01,
-                "repriced_roi_net": 2.75,
-                "repriced_roi_threshold_required": 0.0,
-            },
-            [],
-        )
-
     monkeypatch.setattr("pm15min.live.execution.build_depth_execution_plan", _should_not_run)
-    monkeypatch.setattr("pm15min.live.execution.repriced_order_guard", _recomputed_repriced)
 
     payload = {
         "market": "sol",
@@ -200,11 +182,10 @@ def test_execution_snapshot_reuses_precomputed_depth_plan(tmp_path: Path, monkey
     assert out["execution"]["depth_plan"]["status"] == "ok"
     assert out["execution"]["depth_plan_reused"] is True
     assert out["execution"]["repriced_metrics"]["repriced_entry_price"] == 0.2005
-    assert out["execution"]["repriced_metrics"]["repriced_fee_rate"] == 0.02
-    assert calls == {"repriced": 1}
+    assert out["execution"]["repriced_metrics"]["repriced_fee_rate"] == 0.01
 
 
-def test_execution_snapshot_blocks_when_reused_depth_plan_fails_repriced_guard(tmp_path: Path, monkeypatch) -> None:
+def test_execution_snapshot_does_not_recheck_repriced_guard_when_reusing_depth_plan(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
@@ -213,22 +194,7 @@ def test_execution_snapshot_blocks_when_reused_depth_plan_fails_repriced_guard(t
     def _should_not_run(*args, **kwargs):
         raise AssertionError("depth plan should be reused from decision payload")
 
-    def _blocked_repriced(*, spec, selected_row, repriced_entry_price):
-        return (
-            {
-                "repriced_entry_price": float(repriced_entry_price),
-                "repriced_effective_price": float(repriced_entry_price),
-                "repriced_fee_rate": 0.01,
-                "repriced_raw_edge": 0.05,
-                "repriced_min_net_edge_required": 0.10,
-                "repriced_roi_net": -0.02,
-                "repriced_roi_threshold_required": 0.0,
-            },
-            ["repriced_net_edge_below_threshold", "repriced_roi_below_threshold"],
-        )
-
     monkeypatch.setattr("pm15min.live.execution.build_depth_execution_plan", _should_not_run)
-    monkeypatch.setattr("pm15min.live.execution.repriced_order_guard", _blocked_repriced)
 
     payload = {
         "market": "sol",
@@ -288,17 +254,16 @@ def test_execution_snapshot_blocks_when_reused_depth_plan_fails_repriced_guard(t
 
     out = build_execution_snapshot(cfg, payload)
 
-    assert out["execution"]["status"] == "blocked"
+    assert out["execution"]["status"] == "plan"
     assert out["execution"]["depth_plan_reused"] is True
-    assert "repriced_net_edge_below_threshold" in out["execution"]["execution_reasons"]
-    assert "repriced_roi_below_threshold" in out["execution"]["execution_reasons"]
+    assert out["execution"]["execution_reasons"] == []
 
 
 def test_execution_snapshot_recomputes_when_cached_depth_plan_is_blocked(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
-    calls = {"depth": 0, "repriced": 0}
+    calls = {"depth": 0}
 
     def _recomputed_depth_plan(**kwargs):
         calls["depth"] += 1
@@ -312,23 +277,7 @@ def test_execution_snapshot_recomputes_when_cached_depth_plan_is_blocked(tmp_pat
             None,
         )
 
-    def _recomputed_repriced(*, spec, selected_row, repriced_entry_price):
-        calls["repriced"] += 1
-        return (
-            {
-                "repriced_entry_price": float(repriced_entry_price),
-                "repriced_effective_price": float(repriced_entry_price),
-                "repriced_fee_rate": 0.01,
-                "repriced_raw_edge": 0.5995,
-                "repriced_min_net_edge_required": 0.01,
-                "repriced_roi_net": 2.99002493765586,
-                "repriced_roi_threshold_required": 0.0,
-            },
-            [],
-        )
-
     monkeypatch.setattr("pm15min.live.execution.build_depth_execution_plan", _recomputed_depth_plan)
-    monkeypatch.setattr("pm15min.live.execution.repriced_order_guard", _recomputed_repriced)
 
     payload = {
         "market": "sol",
@@ -380,47 +329,23 @@ def test_execution_snapshot_recomputes_when_cached_depth_plan_is_blocked(tmp_pat
 
     assert out["execution"]["status"] == "plan"
     assert out["execution"]["depth_plan_reused"] is False
-    assert calls == {"depth": 1, "repriced": 1}
+    assert calls == {"depth": 1}
 
 
-def test_execution_snapshot_does_not_reuse_cached_depth_plan_when_live_depth_is_preferred(
+def test_execution_snapshot_reuses_cached_depth_plan_when_live_depth_is_preferred(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
-    calls = {"depth": 0, "repriced": 0}
+    calls = {"depth": 0}
 
-    def _fresh_depth_plan(**kwargs):
+    def _should_not_run(*args, **kwargs):
         calls["depth"] += 1
-        return (
-            {
-                "status": "ok",
-                "max_price": 0.201,
-                "fill_ratio": 1.0,
-                "filled_shares": 4.975124378109452,
-            },
-            None,
-        )
+        raise AssertionError("valid decision depth plan should be reused in live mode")
 
-    def _recomputed_repriced(*, spec, selected_row, repriced_entry_price):
-        calls["repriced"] += 1
-        return (
-            {
-                "repriced_entry_price": float(repriced_entry_price),
-                "repriced_effective_price": float(repriced_entry_price),
-                "repriced_fee_rate": 0.01,
-                "repriced_raw_edge": 0.599,
-                "repriced_min_net_edge_required": 0.01,
-                "repriced_roi_net": 2.97,
-                "repriced_roi_threshold_required": 0.0,
-            },
-            [],
-        )
-
-    monkeypatch.setattr("pm15min.live.execution.build_depth_execution_plan", _fresh_depth_plan)
-    monkeypatch.setattr("pm15min.live.execution.repriced_order_guard", _recomputed_repriced)
+    monkeypatch.setattr("pm15min.live.execution.build_depth_execution_plan", _should_not_run)
 
     payload = {
         "market": "sol",
@@ -472,9 +397,9 @@ def test_execution_snapshot_does_not_reuse_cached_depth_plan_when_live_depth_is_
     out = build_execution_snapshot(cfg, payload, prefer_live_depth=True)
 
     assert out["execution"]["status"] == "plan"
-    assert out["execution"]["depth_plan_reused"] is False
-    assert out["execution"]["depth_plan"]["max_price"] == 0.201
-    assert calls == {"depth": 1, "repriced": 1}
+    assert out["execution"]["depth_plan_reused"] is True
+    assert out["execution"]["depth_plan"]["max_price"] == 0.2005
+    assert calls == {"depth": 0}
 
 
 def test_execution_snapshot_blocks_when_depth_fill_ratio_is_too_small(tmp_path: Path, monkeypatch) -> None:
@@ -752,7 +677,7 @@ def test_execution_snapshot_plans_when_full_depth_is_sufficient(tmp_path: Path, 
     assert out["execution"]["requested_notional_usd"] == 1.0
     assert out["execution"]["depth_plan"]["status"] == "ok"
     assert out["execution"]["depth_plan"]["fill_ratio"] >= 1.0
-    assert out["execution"]["repriced_metrics"]["repriced_entry_price"] >= 0.20
+    assert out["execution"]["repriced_metrics"] is None
     assert out["execution"]["retry_policy"]["status"] == "armed"
     assert out["execution"]["retry_policy"]["post_submit_order_retry"]["retry_state_keys"] == [
         "attempts",
@@ -918,7 +843,7 @@ def test_execution_snapshot_uses_cash_balance_step_stake(tmp_path: Path, monkeyp
     assert out["execution"]["requested_shares"] == 10.0
 
 
-def test_execution_snapshot_blocks_when_repriced_entry_breaks_band(tmp_path: Path, monkeypatch) -> None:
+def test_execution_snapshot_does_not_block_when_depth_max_price_exceeds_original_entry_band(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
@@ -972,9 +897,9 @@ def test_execution_snapshot_blocks_when_repriced_entry_breaks_band(tmp_path: Pat
         ],
     }
     out = build_execution_snapshot(cfg, payload)
-    assert out["execution"]["status"] == "blocked"
-    assert "repriced_entry_price_max" in out["execution"]["execution_reasons"]
-    assert out["execution"]["retry_policy"]["status"] == "inactive"
+    assert out["execution"]["status"] == "plan"
+    assert out["execution"]["depth_plan"]["max_price"] == 0.301
+    assert out["execution"]["retry_policy"]["status"] == "armed"
 
 
 def test_execution_snapshot_marks_cancel_policy_ready_for_resting_order_near_end(

@@ -735,6 +735,60 @@ def test_load_persisted_session_state_ignores_dry_run_audit_entries(tmp_path: Pa
     }
 
 
+def test_load_persisted_session_state_preserves_side_effect_state(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    layout = LiveStateLayout.discover(root=root)
+    latest_path = layout.latest_runner_path(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        target="direction",
+    )
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    latest_path.write_text(
+        json.dumps(
+            {
+                "session_state": {
+                    "market_offset_trade_count": {"market-1_7": 1},
+                    "market_offset_side_trade_count": {"market-1_7_UP": 1},
+                    "action_gate_state": {},
+                    "side_effect_state": {
+                        "account_sync": {
+                            "last_started_at_epoch": 100.0,
+                            "last_completed_at_epoch": 101.5,
+                            "last_snapshot_ts": "2026-03-20T00-00-01Z",
+                            "last_status": "ok",
+                            "last_reason": None,
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = _load_persisted_session_state(
+        layout=layout,
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        target="direction",
+    )
+
+    assert state["market_offset_trade_count"] == {"market-1_7": 1}
+    assert state["market_offset_side_trade_count"] == {"market-1_7_UP": 1}
+    assert state["side_effect_state"] == {
+        "account_sync": {
+            "last_started_at_epoch": 100.0,
+            "last_completed_at_epoch": 101.5,
+            "last_snapshot_ts": "2026-03-20T00-00-01Z",
+            "last_status": "ok",
+            "last_reason": None,
+        }
+    }
+
+
 def test_run_live_runner_can_disable_side_effects(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
@@ -783,6 +837,80 @@ def test_run_live_runner_can_disable_side_effects(tmp_path: Path, monkeypatch) -
     alert_codes = [row["code"] for row in summary["last_iteration"]["risk_alerts"]]
     assert "decision_reject" in alert_codes
     assert "execution_no_action" in alert_codes
+
+
+def test_run_live_runner_can_throttle_account_sync_and_disable_cancel_redeem(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    calls = {"account": 0, "cancel": 0, "redeem": 0}
+    monkeypatch.setenv("PM15MIN_RUNNER_ACCOUNT_SYNC_INTERVAL_SEC", "60")
+    monkeypatch.setenv("PM15MIN_RUNNER_ENABLE_CANCEL_POLICY", "0")
+    monkeypatch.setenv("PM15MIN_RUNNER_ENABLE_REDEEM_POLICY", "0")
+
+    monkeypatch.setattr("pm15min.live.runner.run_live_data_foundation", lambda *args, **kwargs: {"status": "ok"})
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_liquidity_state_snapshot",
+        lambda *args, **kwargs: {"snapshot_ts": "2026-03-20T00-00-00Z", "status": "ok", "blocked": False, "reason": "ok"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.decide_live_latest",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-00Z",
+            "decision": {"status": "accept", "selected_offset": 7, "selected_side": "DOWN", "selected_quote_market_id": "market-1"},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_execution_snapshot",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-01Z",
+            "execution": {"status": "plan", "order_type": "FAK", "market_id": "market-1", "selected_offset": 7},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.persist_execution_snapshot",
+        lambda *args, **kwargs: {"latest": root / "latest.json", "snapshot": root / "snapshot.json"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.submit_execution_payload",
+        lambda *args, **kwargs: {"status": "ok", "reason": "order_submitted", "order_response": {"status": "live"}},
+    )
+
+    def _fake_account_state(*args, **kwargs):
+        calls["account"] += 1
+        return {
+            "snapshot_ts": f"2026-03-20T00-00-0{calls['account']}Z",
+            "open_orders": {"status": "ok"},
+            "positions": {"status": "ok"},
+        }
+
+    def _fake_cancel(*args, **kwargs):
+        calls["cancel"] += 1
+        return {"status": "ok", "reason": "cancel_policy_applied", "summary": {"cancelled_orders": 0}}
+
+    def _fake_redeem(*args, **kwargs):
+        calls["redeem"] += 1
+        return {"status": "ok", "reason": "redeem_policy_applied", "summary": {"redeemed_conditions": 0}}
+
+    monkeypatch.setattr("pm15min.live.runner.build_account_state_snapshot", _fake_account_state)
+    monkeypatch.setattr("pm15min.live.runner.apply_cancel_policy", _fake_cancel)
+    monkeypatch.setattr("pm15min.live.runner.apply_redeem_policy", _fake_redeem)
+
+    summary = run_live_runner(cfg, iterations=3, loop=True, sleep_sec=0.0, persist=True)
+
+    assert calls == {"account": 1, "cancel": 0, "redeem": 0}
+    assert summary["completed_iterations"] == 3
+    assert summary["last_iteration"]["order_action"]["status"] == "ok"
+    assert summary["last_iteration"]["account_state_payload"]["status"] == "skipped"
+    assert summary["last_iteration"]["account_state_payload"]["reason"] == "account_sync_interval_not_elapsed"
+    assert summary["last_iteration"]["cancel_action"]["status"] == "skipped"
+    assert summary["last_iteration"]["cancel_action_payload"]["reason"] == "cancel_policy_disabled"
+    assert summary["last_iteration"]["redeem_action"]["status"] == "skipped"
+    assert summary["last_iteration"]["redeem_action_payload"]["reason"] == "redeem_policy_disabled"
+    assert summary["last_iteration"]["runner_health"]["overall_status"] == "ok"
+    assert summary["last_iteration"]["runner_health"]["primary_blocker"] is None
+    assert "side_effect_state" in summary["session_state"]
+    assert summary["session_state"]["side_effect_state"]["account_sync"]["last_status"] == "skipped"
 
 
 def test_resolve_iteration_limit_supports_daemon_mode() -> None:
@@ -858,3 +986,77 @@ def test_run_live_runner_recovers_from_side_effect_step_errors(tmp_path: Path, m
     assert "account_state_sync_error" in alert_codes
     assert calls["cancel"] == 1
     assert calls["redeem"] == 1
+
+
+def test_run_live_runner_prewarms_signal_once_per_minute(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    prewarm_calls: list[None] = []
+    fake_now = {"value": 60.9}
+
+    monkeypatch.setenv("PM15MIN_RUNNER_ENABLE_SIGNAL_PREWARM", "1")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MIN_DELAY_SEC", "0.5")
+    monkeypatch.setenv("PM15MIN_RUNNER_SIGNAL_PREWARM_MAX_DELAY_SEC", "3.0")
+    monkeypatch.setattr("pm15min.live.runner.iteration.time.time", lambda: float(fake_now["value"]))
+    monkeypatch.setattr("pm15min.live.runner.run_live_data_foundation", lambda *args, **kwargs: {"status": "ok"})
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_liquidity_state_snapshot",
+        lambda *args, **kwargs: {"snapshot_ts": "2026-03-20T00-00-00Z", "status": "ok", "blocked": False, "reason": "ok"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.prewarm_live_signal_cache",
+        lambda *args, **kwargs: prewarm_calls.append(None) or {"status": "ok", "cache_hit": False, "elapsed_ms": 12.0, "snapshot_ts": "2026-03-20T00-01-00Z", "offsets": [7, 8, 9]},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.decide_live_latest",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-00Z",
+            "timings_ms": {
+                "signal_stage_ms": 0.5,
+                "quote_stage_ms": 1.0,
+                "account_context_stage_ms": 0.1,
+                "decision_build_stage_ms": 0.2,
+                "signal_cache_hit": True,
+            },
+            "decision": {"status": "reject"},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_execution_snapshot",
+        lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-01Z",
+            "timings_ms": {"depth_stage_ms": 0.1, "depth_plan_reused": True},
+            "execution": {"status": "no_action"},
+        },
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.submit_execution_payload",
+        lambda *args, **kwargs: {"status": "skipped", "reason": "execution_not_plan:no_action"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.build_account_state_snapshot",
+        lambda *args, **kwargs: {"snapshot_ts": "2026-03-20T00-00-02Z", "open_orders": {"status": "ok"}, "positions": {"status": "ok"}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_cancel_policy",
+        lambda *args, **kwargs: {"status": "skipped", "reason": "cancel_policy_disabled", "summary": {"cancelled_orders": 0}},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.runner.apply_redeem_policy",
+        lambda *args, **kwargs: {"status": "skipped", "reason": "redeem_policy_disabled", "summary": {"redeemed_conditions": 0}},
+    )
+
+    summary = run_live_runner(
+        cfg,
+        iterations=2,
+        loop=True,
+        sleep_sec=0.0,
+        persist=False,
+        run_foundation=False,
+        apply_side_effects=False,
+    )
+
+    assert len(prewarm_calls) == 1
+    assert summary["last_iteration"]["timings_ms"]["signal_prewarm_triggered"] is False
+    assert summary["last_iteration"]["signal_prewarm_payload"]["reason"] == "signal_prewarm_already_attempted_for_bucket"

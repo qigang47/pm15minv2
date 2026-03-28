@@ -469,36 +469,49 @@ def _prepare_market_table(df: pd.DataFrame) -> pd.DataFrame:
 def _attach_market_metadata(replay: pd.DataFrame, market_table: pd.DataFrame) -> pd.DataFrame:
     if market_table.empty:
         return replay
+    out = replay.copy()
     metadata_columns = [
         column
         for column in ("market_id", "condition_id", "token_up", "token_down", "question")
         if column in market_table.columns
     ]
     if "market_id" in replay.columns and "market_id" in metadata_columns:
-        merged = replay.merge(
+        merged = out.merge(
             market_table[metadata_columns].drop_duplicates(subset=["market_id"], keep="last"),
             on="market_id",
             how="left",
             suffixes=("", "_catalog"),
         )
-        return _coalesce_catalog_columns(merged)
+        out = _coalesce_catalog_columns(merged)
 
-    join_columns = [column for column in ("cycle_start_ts", "cycle_end_ts") if column in replay.columns and column in market_table.columns]
-    if len(join_columns) == 2:
-        selected_columns = [*join_columns, *[column for column in metadata_columns if column not in join_columns]]
-        merged = replay.merge(
-            market_table[selected_columns].drop_duplicates(subset=join_columns, keep="last"),
-            on=join_columns,
-            how="left",
-            suffixes=("", "_catalog"),
-        )
-        return _coalesce_catalog_columns(merged)
-    return replay
+    join_columns = [column for column in ("cycle_start_ts", "cycle_end_ts") if column in out.columns and column in market_table.columns]
+    if len(join_columns) != 2:
+        return out
+    fallback_mask = pd.Series(True, index=out.index)
+    if "market_id" in out.columns:
+        fallback_mask = out["market_id"].astype("string").fillna("").eq("")
+    if not bool(fallback_mask.any()):
+        return out
+    selected_columns = [*join_columns, *[column for column in metadata_columns if column not in join_columns]]
+    fallback_rows = out.loc[fallback_mask].copy()
+    fallback_rows["_row_idx"] = fallback_rows.index
+    merged = fallback_rows.merge(
+        market_table[selected_columns].drop_duplicates(subset=join_columns, keep="last"),
+        on=join_columns,
+        how="left",
+        suffixes=("", "_catalog"),
+    )
+    merged = _coalesce_catalog_columns(merged).set_index("_row_idx")
+    for column in merged.columns:
+        if column not in out.columns:
+            out[column] = pd.Series(index=out.index, dtype="object")
+        out.loc[merged.index, column] = merged[column]
+    return out
 
 
 def _coalesce_catalog_columns(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
-    for column in ("condition_id", "token_up", "token_down", "question"):
+    for column in ("market_id", "condition_id", "token_up", "token_down", "question"):
         catalog_column = f"{column}_catalog"
         if catalog_column not in out.columns:
             continue

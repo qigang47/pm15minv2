@@ -127,20 +127,21 @@ def _attach_market_metadata(replay: pd.DataFrame, market_table: pd.DataFrame) ->
         return replay
 
     metadata_columns = [column for column in ("market_id", "condition_id", "token_up", "token_down", "question") if column in market_table.columns]
-    if "market_id" in replay.columns and "market_id" in metadata_columns:
+    join_columns = [column for column in ("cycle_start_ts", "cycle_end_ts") if column in replay.columns and column in market_table.columns]
+    if len(join_columns) == 2:
+        selected_columns = [*join_columns, *[column for column in metadata_columns if column not in join_columns]]
         merged = replay.merge(
-            market_table[metadata_columns].drop_duplicates(subset=["market_id"], keep="last"),
-            on="market_id",
+            market_table[selected_columns].drop_duplicates(subset=join_columns, keep="last"),
+            on=join_columns,
             how="left",
             suffixes=("", "_catalog"),
         )
         return _coalesce_catalog_columns(merged)
 
-    join_columns = [column for column in ("cycle_start_ts", "cycle_end_ts") if column in replay.columns and column in market_table.columns]
-    if len(join_columns) == 2:
+    if "market_id" in replay.columns and "market_id" in metadata_columns:
         merged = replay.merge(
-            market_table[metadata_columns].drop_duplicates(subset=join_columns, keep="last"),
-            on=join_columns,
+            market_table[metadata_columns].drop_duplicates(subset=["market_id"], keep="last"),
+            on="market_id",
             how="left",
             suffixes=("", "_catalog"),
         )
@@ -150,7 +151,7 @@ def _attach_market_metadata(replay: pd.DataFrame, market_table: pd.DataFrame) ->
 
 def _coalesce_catalog_columns(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
-    for column in ("condition_id", "token_up", "token_down", "question"):
+    for column in ("market_id", "condition_id", "token_up", "token_down", "question"):
         catalog_column = f"{column}_catalog"
         if catalog_column not in out.columns:
             continue

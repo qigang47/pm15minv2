@@ -9,7 +9,6 @@ from .policy import (
     build_execution_record,
     build_policy_context,
     load_policy_state,
-    repriced_order_guard,
     resolve_dynamic_stake_base,
     resolve_execution_account_summary,
     resolve_regime_stake_multiplier,
@@ -44,7 +43,6 @@ def build_execution_snapshot(
         resolve_side_probability_fn=resolve_side_probability,
         float_or_none_fn=float_or_none,
         build_depth_execution_plan_fn=build_depth_execution_plan,
-        repriced_order_guard_fn=repriced_order_guard,
     )
 
 

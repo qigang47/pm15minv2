@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from .scoring_bundle import BundleResolution, LiveFeatureContext
 from .scoring_bundle import (
     prepare_live_features_and_states as _prepare_live_features_and_states,
@@ -88,6 +90,7 @@ def score_live_latest(
     feature_ctx = _prepare_live_features_and_states(
         cfg,
         builder_feature_set=bundle.builder_feature_set,
+        active_offsets=_bundle_offsets(bundle.bundle_dir),
         persist=persist,
         build_live_feature_frame_fn=build_live_feature_frame_fn,
     )
@@ -124,3 +127,13 @@ def score_live_latest(
         payload["latest_signal_path"] = str(paths["latest"])
         payload["snapshot_path"] = str(paths["snapshot"])
     return payload
+
+
+def _bundle_offsets(bundle_dir: Path) -> tuple[int, ...]:
+    offsets: list[int] = []
+    for path in sorted((bundle_dir / "offsets").glob("offset=*")):
+        try:
+            offsets.append(int(path.name.split("=", 1)[1]))
+        except Exception:
+            continue
+    return tuple(sorted(set(offsets)))
