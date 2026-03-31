@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
+import threading
+import time
+
 from pm15min.data.sources.orderbook_provider import (
     DirectOrderbookProvider,
     HubOrderbookProvider,
     InMemoryCachedOrderbookProvider,
+    WebsocketOrderbookProvider,
     build_orderbook_provider,
 )
 
@@ -51,6 +56,30 @@ class _FakeResponse:
 def test_build_orderbook_provider_defaults_to_direct() -> None:
     provider = build_orderbook_provider(client=_FakeClobClient(), hub_url=None, source_name="test")
     assert isinstance(provider, DirectOrderbookProvider)
+
+
+def test_build_orderbook_provider_can_use_websocket_streaming() -> None:
+    provider = build_orderbook_provider(
+        client=_FakeClobClient(),
+        hub_url=None,
+        source_name="test",
+        streaming=True,
+    )
+
+    assert isinstance(provider, WebsocketOrderbookProvider)
+
+
+def test_direct_orderbook_provider_tags_fetch_time_metadata() -> None:
+    provider = DirectOrderbookProvider(client=_FakeClobClient())
+
+    payload = provider.get_orderbook_summary("token-1", levels=20, timeout=1.2)
+
+    assert payload is not None
+    assert payload["token_id"] == "token-1"
+    assert payload["__provider_source"] == "direct"
+    assert isinstance(payload["__provider_fetched_at_ms"], int)
+    assert payload["__provider_cache_hit"] is False
+    assert payload["__provider_force_refresh_used"] is False
 
 
 def test_hub_orderbook_provider_falls_back_to_direct() -> None:
@@ -327,3 +356,126 @@ def test_in_memory_cached_orderbook_provider_prefetches_and_skips_unchanged_repl
     assert wrapped.sync_calls == 1
     assert wrapped.get_calls == 1
     assert payload["calls"] == 1
+
+
+def test_in_memory_cached_orderbook_provider_prefetches_in_parallel() -> None:
+    clock = _FakeClock()
+    wall_clock = _FakeWallClock(1_700_000_000_000)
+
+    class _ConcurrentProvider:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            del timeout, force_refresh
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.05)
+            with self.lock:
+                self.active -= 1
+            return {
+                "token_id": token_id,
+                "levels": levels,
+                "timestamp": wall_clock(),
+                "asks": [{"price": "0.12", "size": "5"}],
+                "bids": [{"price": "0.11", "size": "4"}],
+            }
+
+        def sync_subscriptions(self, token_ids, *, replace=True, prefetch=False, levels=0, timeout=1.2):
+            del token_ids, replace, prefetch, levels, timeout
+            return {"ok": True}
+
+    wrapped = _ConcurrentProvider()
+    provider = InMemoryCachedOrderbookProvider(
+        wrapped=wrapped,
+        max_age_ms=300,
+        monotonic_fn=clock,
+        now_ms_fn=wall_clock,
+    )
+
+    out = provider.sync_subscriptions(
+        ["token-1", "token-2", "token-3"],
+        replace=True,
+        prefetch=True,
+        levels=20,
+        timeout=1.2,
+    )
+
+    assert out["prefetched"] == 3
+    assert out["prefetch_workers"] >= 2
+    assert wrapped.max_active >= 2
+
+
+def test_websocket_orderbook_provider_uses_stream_cache_before_fallback() -> None:
+    class _FallbackProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            del token_id, levels, timeout, force_refresh
+            self.calls += 1
+            return None
+
+        def sync_subscriptions(self, token_ids, *, replace=True, prefetch=False, levels=0, timeout=1.2):
+            del token_ids, replace, prefetch, levels, timeout
+            return {"ok": True}
+
+    fallback = _FallbackProvider()
+    provider = WebsocketOrderbookProvider(
+        fallback_provider=fallback,
+        subscribe_on_read=True,
+        stream_wait_ms=0,
+        max_cached_levels=20,
+    )
+    provider._ensure_started = lambda: None  # type: ignore[method-assign]
+    provider.sync_subscriptions(["token-1"], replace=True, prefetch=False, levels=20, timeout=1.2)
+
+    provider._handle_stream_message(
+        json.dumps(
+            {
+                "event_type": "book",
+                "asset_id": "token-1",
+                "market": "market-1",
+                "timestamp": "2026-03-31T12:00:00Z",
+                "asks": [
+                    {"price": "0.25", "size": "4"},
+                    {"price": "0.26", "size": "3"},
+                ],
+                "bids": [
+                    {"price": "0.22", "size": "5"},
+                    {"price": "0.21", "size": "6"},
+                ],
+            }
+        )
+    )
+    provider._handle_stream_message(
+        json.dumps(
+            {
+                "event_type": "price_change",
+                "market": "market-1",
+                "timestamp": "2026-03-31T12:00:00.100Z",
+                "price_changes": [
+                    {
+                        "asset_id": "token-1",
+                        "side": "SELL",
+                        "price": "0.24",
+                        "size": "9",
+                        "best_bid": "0.22",
+                        "best_ask": "0.24",
+                    }
+                ],
+            }
+        )
+    )
+
+    payload = provider.get_orderbook_summary("token-1", levels=20, timeout=0.01)
+
+    assert payload is not None
+    assert payload["__provider_source"] == "websocket"
+    assert payload["best_ask"] == "0.24"
+    assert payload["best_bid"] == "0.22"
+    assert payload["asks"][0]["price"] == "0.24"
+    assert fallback.calls == 0

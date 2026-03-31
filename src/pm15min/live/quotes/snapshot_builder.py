@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pandas as pd
@@ -32,6 +33,7 @@ def build_quote_snapshot_impl(
     now_ts = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
     quote_now = now_ts.tz_convert("UTC") if now_ts.tzinfo is not None else now_ts.tz_localize("UTC")
     if orderbook_provider is not None and not market_table.empty:
+        prefetch_started_monotonic = time.monotonic()
         _prefetch_orderbooks_for_signal_rows(
             orderbook_provider=orderbook_provider,
             market_table=market_table,
@@ -39,6 +41,12 @@ def build_quote_snapshot_impl(
             quote_now=quote_now,
             timeout_sec=data_cfg.orderbook_timeout_sec,
         )
+        prefetch_elapsed_ms = max(
+            0,
+            int((time.monotonic() - prefetch_started_monotonic) * 1000.0),
+        )
+        if prefetch_elapsed_ms > 0:
+            quote_now = quote_now + pd.Timedelta(milliseconds=int(prefetch_elapsed_ms))
     provider_frame_cache: dict[tuple[str, str, str], pd.DataFrame] = {}
     index_frame_cache: dict[tuple[str, str | None], pd.DataFrame] = {}
     latest_full_snapshot_cache: dict[str, dict[str, object] | None] = {}

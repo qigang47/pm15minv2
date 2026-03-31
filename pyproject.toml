@@ -16,6 +16,7 @@ dependencies = [
   "pandas>=2.0",
   "requests>=2.31",
   "scikit-learn>=1.5",
+  "websockets>=15.0",
 ]
 
 [tool.setuptools]

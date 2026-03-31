@@ -664,7 +664,6 @@ def test_run_live_runner_uses_fixed_period_sleep(tmp_path: Path, monkeypatch) ->
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
     monkeypatch.setattr("pm15min.live.runner.build_orderbook_provider_from_env", lambda *args, **kwargs: object())
-    monkeypatch.setattr("pm15min.live.runner.build_in_memory_cached_orderbook_provider", lambda provider, **kwargs: provider)
     monkeypatch.setattr("pm15min.live.runner.append_jsonl", lambda *args, **kwargs: None)
     monkeypatch.setattr("pm15min.live.runner.write_json_atomic", lambda *args, **kwargs: None)
 
@@ -714,8 +713,91 @@ def test_run_live_runner_uses_fixed_period_sleep(tmp_path: Path, monkeypatch) ->
     summary = run_live_runner(cfg, iterations=3, loop=True, sleep_sec=0.3, persist=False)
 
     assert summary["completed_iterations"] == 3
-    assert starts == [0.0, 0.3, 0.6]
-    assert fake_time.sleeps == [0.25, 0.25]
+    assert starts == [0.0, 0.35, 0.7]
+    assert fake_time.sleeps == [0.3, 0.3]
+
+
+def test_run_live_runner_can_wake_early_on_orderbook_updates(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_RUNNER_ENABLE_ORDERBOOK_EVENT_WAKEUP", "1")
+    monkeypatch.setenv("PM15MIN_RUNNER_ORDERBOOK_EVENT_DEBOUNCE_SEC", "0.03")
+
+    class _FakeTime:
+        def __init__(self) -> None:
+            self.now = 0.0
+            self.sleeps: list[float] = []
+
+        def time(self) -> float:
+            return float(self.now)
+
+        def monotonic(self) -> float:
+            return float(self.now)
+
+        def sleep(self, seconds: float) -> None:
+            self.sleeps.append(float(seconds))
+            self.now += float(seconds)
+
+    class _UpdateProvider:
+        def __init__(self, fake_time: _FakeTime) -> None:
+            self.fake_time = fake_time
+            self.marker = 0
+            self.events = [0.06, 0.08]
+
+        def get_update_marker(self):
+            return int(self.marker)
+
+        def wait_for_update(self, *, since_marker, timeout_sec):
+            baseline = -1 if since_marker is None else int(since_marker)
+            if self.marker > baseline:
+                return int(self.marker)
+            deadline = float(self.fake_time.now) + float(timeout_sec)
+            if self.events and float(self.events[0]) <= deadline:
+                self.fake_time.now = float(self.events.pop(0))
+                self.marker += 1
+                return int(self.marker)
+            self.fake_time.now = deadline
+            return None
+
+    fake_time = _FakeTime()
+    provider = _UpdateProvider(fake_time)
+    monkeypatch.setattr("pm15min.live.runner.build_orderbook_provider_from_env", lambda *args, **kwargs: provider)
+    monkeypatch.setattr("pm15min.live.runner.append_jsonl", lambda *args, **kwargs: None)
+    monkeypatch.setattr("pm15min.live.runner.write_json_atomic", lambda *args, **kwargs: None)
+
+    starts: list[float] = []
+
+    def _build_runner_iteration(*args, **kwargs):
+        starts.append(round(fake_time.monotonic(), 3))
+        fake_time.now += 0.01
+        return {
+            "snapshot_ts": f"run-{len(starts)}",
+            "decision": {
+                "status": "reject",
+                "selected_offset": 7,
+                "selected_side": None,
+                "selected_quote_market_id": None,
+            },
+            "execution": {
+                "status": "no_action",
+                "reason": "decision_reject",
+            },
+            "runner_health": {"overall_status": "ok"},
+            "risk_alert_summary": {"has_critical": False},
+            "session_state": kwargs.get("session_state") or {},
+        }
+
+    monkeypatch.setattr("pm15min.live.runner.build_runner_iteration", _build_runner_iteration)
+    monkeypatch.setattr("pm15min.live.runner.runtime.time.time", fake_time.time)
+    monkeypatch.setattr("pm15min.live.runner.runtime.time.monotonic", fake_time.monotonic)
+    monkeypatch.setattr("pm15min.live.runner.runtime.time.sleep", fake_time.sleep)
+
+    summary = run_live_runner(cfg, iterations=3, loop=True, sleep_sec=0.3, persist=False)
+
+    assert summary["completed_iterations"] == 3
+    assert starts == [0.0, 0.11, 0.42]
+    assert fake_time.sleeps == []
 
 
 def test_load_persisted_session_state_ignores_dry_run_audit_entries(tmp_path: Path, monkeypatch) -> None:

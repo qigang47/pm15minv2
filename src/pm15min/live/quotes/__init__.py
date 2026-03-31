@@ -26,7 +26,10 @@ def build_quote_snapshot(
     if orderbook_provider is None:
         import os
 
-        if str(os.getenv("PM15MIN_ORDERBOOK_HUB_URL") or "").strip():
+        if (
+            str(os.getenv("PM15MIN_ORDERBOOK_HUB_URL") or "").strip()
+            or str(os.getenv("PM15MIN_ORDERBOOK_STREAMING") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+        ):
             orderbook_provider = build_orderbook_provider_from_env(
                 source_name=f"v2-live-quote:{cfg.asset.slug}:{int(cfg.cycle_minutes)}m",
                 subscribe_on_read=True,

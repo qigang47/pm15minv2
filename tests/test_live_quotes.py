@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import types
 
 import pandas as pd
 
@@ -1074,7 +1075,480 @@ def test_quote_snapshot_provider_only_skips_local_fallback(tmp_path: Path, monke
     assert "up_quote_missing" in row["reasons"]
     assert "down_quote_missing" in row["reasons"]
     assert row["quote_source_path"] is None
+    assert provider.calls == ["token-up", "token-down", "token-up", "token-down"]
+
+
+def test_quote_snapshot_provider_uses_best_bid_ask_when_stream_payload_has_no_depth(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setenv("PM15MIN_LIVE_ORDERBOOK_PROVIDER_ONLY", "1")
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    cycle_start = pd.Timestamp("2026-03-21T16:45:00Z")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "question": "Sol up or down",
+                    "source_snapshot_ts": "2026-03-21T16-45-00Z",
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+
+    class _TopOnlyProvider:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            del levels, timeout, force_refresh
+            self.calls.append(str(token_id))
+            if token_id == "token-up":
+                return {
+                    "timestamp": "2026-03-21T16:54:10Z",
+                    "best_ask": "0.24",
+                    "best_bid": "0.23",
+                }
+            if token_id == "token-down":
+                return {
+                    "timestamp": "2026-03-21T16:54:10Z",
+                    "best_ask": "0.76",
+                    "best_bid": "0.75",
+                }
+            return None
+
+        def sync_subscriptions(self, token_ids, *, replace=True, prefetch=False, levels=0, timeout=1.2):
+            del token_ids, replace, prefetch, levels, timeout
+            return {"ok": True}
+
+    provider = _TopOnlyProvider()
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 8,
+                    "decision_ts": "2026-03-21T16:54:00+00:00",
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                }
+            ],
+        },
+        persist=False,
+        now=pd.Timestamp("2026-03-21T16:54:15Z"),
+        orderbook_provider=provider,
+    )
+    row = quote["quote_rows"][0]
+
+    assert row["status"] == "ok"
+    assert row["quote_up_ask"] == 0.24
+    assert row["quote_down_bid"] == 0.75
     assert provider.calls == ["token-up", "token-down"]
+
+
+def test_quote_snapshot_retry_recomputes_provider_reference_for_late_refresh_rows(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setenv("PM15MIN_LIVE_ORDERBOOK_PROVIDER_ONLY", "1")
+    cfg = LiveConfig.build(market="btc", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="btc", cycle="15m", surface="live", root=root)
+    cycle_start = pd.Timestamp("2026-03-21T16:45:00Z")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "btc",
+                    "cycle": "15m",
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "question": "Btc up or down",
+                    "source_snapshot_ts": "2026-03-21T16-45-00Z",
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    now = pd.Timestamp("2026-03-21T16:54:10.000Z")
+    initial_fetched_at_ms = int((now + pd.Timedelta(milliseconds=1000)).timestamp() * 1000)
+    retry_fetched_at_ms = int((now + pd.Timedelta(milliseconds=1200)).timestamp() * 1000)
+    monotonic_calls = iter([10.0, 10.1, 11.2])
+    monotonic_state = {"last": 11.2}
+
+    def _row_builder_monotonic() -> float:
+        try:
+            value = next(monotonic_calls)
+        except StopIteration:
+            return float(monotonic_state["last"])
+        monotonic_state["last"] = float(value)
+        return float(value)
+
+    monkeypatch.setattr(
+        "pm15min.live.quotes.row_builder.time",
+        types.SimpleNamespace(monotonic=_row_builder_monotonic),
+    )
+
+    class _LateRefreshProvider:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, bool]] = []
+
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            del levels, timeout
+            self.calls.append((str(token_id), bool(force_refresh)))
+            fetched_at_ms = retry_fetched_at_ms if force_refresh else initial_fetched_at_ms
+            if token_id == "token-up":
+                return {
+                    "timestamp": fetched_at_ms,
+                    "__provider_fetched_at_ms": fetched_at_ms,
+                    "asks": [{"price": "0.24", "size": "5"}],
+                    "bids": [{"price": "0.23", "size": "6"}],
+                    "__provider_force_refresh_used": bool(force_refresh),
+                }
+            if token_id == "token-down":
+                return {
+                    "timestamp": fetched_at_ms,
+                    "__provider_fetched_at_ms": fetched_at_ms,
+                    "asks": [{"price": "0.76", "size": "5"}],
+                    "bids": [{"price": "0.75", "size": "6"}],
+                    "__provider_force_refresh_used": bool(force_refresh),
+                }
+            return None
+
+        def sync_subscriptions(self, token_ids, *, replace=True, prefetch=False, levels=0, timeout=1.2):
+            del token_ids, replace, prefetch, levels, timeout
+            return {"ok": True}
+
+    provider = _LateRefreshProvider()
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 8,
+                    "decision_ts": now.isoformat(),
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                }
+            ],
+        },
+        persist=False,
+        now=now,
+        orderbook_provider=provider,
+    )
+    row = quote["quote_rows"][0]
+
+    assert row["status"] == "ok"
+    assert row["quote_source_path"] == "provider"
+    assert row["quote_up_ask"] == 0.24
+    assert row["quote_down_ask"] == 0.76
+    assert row["provider_reference_floor_ts_ms"] >= int(now.timestamp() * 1000) + 1200
+    assert row["quote_force_refresh_attempted_up"] is True
+    assert row["quote_force_refresh_attempted_down"] is True
+    assert provider.calls == [
+        ("token-up", False),
+        ("token-down", False),
+        ("token-up", True),
+        ("token-down", True),
+    ]
+
+
+def test_quote_snapshot_provider_caps_future_skewed_provider_timestamp_to_receive_time(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setenv("PM15MIN_LIVE_ORDERBOOK_PROVIDER_ONLY", "1")
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    cycle_start = pd.Timestamp("2026-03-21T16:45:00Z")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "question": "Sol up or down",
+                    "source_snapshot_ts": "2026-03-21T16-45-00Z",
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    received_at_ms = int(pd.Timestamp("2026-03-21T16:54:10.100Z").timestamp() * 1000)
+
+    class _FutureSkewProvider:
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            del levels, timeout, force_refresh
+            if token_id == "token-up":
+                return {
+                    "timestamp": "2026-03-21T16:54:11.500Z",
+                    "__provider_fetched_at_ms": received_at_ms,
+                    "asks": [{"price": "0.24", "size": "5"}],
+                    "bids": [{"price": "0.23", "size": "6"}],
+                }
+            if token_id == "token-down":
+                return {
+                    "timestamp": "2026-03-21T16:54:11.500Z",
+                    "__provider_fetched_at_ms": received_at_ms,
+                    "asks": [{"price": "0.76", "size": "5"}],
+                    "bids": [{"price": "0.75", "size": "6"}],
+                }
+            return None
+
+        def sync_subscriptions(self, token_ids, *, replace=True, prefetch=False, levels=0, timeout=1.2):
+            del token_ids, replace, prefetch, levels, timeout
+            return {"ok": True}
+
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 8,
+                    "decision_ts": "2026-03-21T16:54:00+00:00",
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                }
+            ],
+        },
+        persist=False,
+        now=pd.Timestamp("2026-03-21T16:54:10.200Z"),
+        orderbook_provider=_FutureSkewProvider(),
+    )
+    row = quote["quote_rows"][0]
+
+    assert row["status"] == "ok"
+    assert row["quote_up_ask"] == 0.24
+    assert row["quote_down_ask"] == 0.76
+    assert row["provider_latest_ts_ms"] == received_at_ms
+
+
+def test_quote_snapshot_provider_uses_fetch_completion_time_for_reference_window(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setenv("PM15MIN_LIVE_ORDERBOOK_PROVIDER_ONLY", "1")
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    cycle_start = pd.Timestamp("2026-03-21T16:45:00Z")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "question": "Sol up or down",
+                    "source_snapshot_ts": "2026-03-21T16-45-00Z",
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    now = pd.Timestamp("2026-03-21T16:54:10.000Z")
+    fetched_at_ms = int((now + pd.Timedelta(milliseconds=350)).timestamp() * 1000)
+    monotonic_calls = iter([100.0, 100.4])
+    monotonic_state = {"last": 100.4}
+
+    def _row_builder_monotonic() -> float:
+        try:
+            value = next(monotonic_calls)
+        except StopIteration:
+            return float(monotonic_state["last"])
+        monotonic_state["last"] = float(value)
+        return float(value)
+
+    monkeypatch.setattr(
+        "pm15min.live.quotes.row_builder.time",
+        types.SimpleNamespace(monotonic=_row_builder_monotonic),
+    )
+
+    class _SlowProvider:
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            del levels, timeout, force_refresh
+            if token_id == "token-up":
+                return {
+                    "timestamp": fetched_at_ms,
+                    "__provider_fetched_at_ms": fetched_at_ms,
+                    "asks": [{"price": "0.24", "size": "5"}],
+                    "bids": [{"price": "0.23", "size": "6"}],
+                }
+            if token_id == "token-down":
+                return {
+                    "timestamp": fetched_at_ms,
+                    "__provider_fetched_at_ms": fetched_at_ms,
+                    "asks": [{"price": "0.76", "size": "5"}],
+                    "bids": [{"price": "0.75", "size": "6"}],
+                }
+            return None
+
+        def sync_subscriptions(self, token_ids, *, replace=True, prefetch=False, levels=0, timeout=1.2):
+            del token_ids, replace, prefetch, levels, timeout
+            return {"ok": True}
+
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 8,
+                    "decision_ts": now.isoformat(),
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                }
+            ],
+        },
+        persist=False,
+        now=now,
+        orderbook_provider=_SlowProvider(),
+    )
+    row = quote["quote_rows"][0]
+
+    assert row["status"] == "ok"
+    assert row["quote_up_ask"] == 0.24
+    assert row["quote_down_ask"] == 0.76
+    assert int(now.timestamp() * 1000) + 400 <= row["provider_reference_floor_ts_ms"] <= int(now.timestamp() * 1000) + 420
+
+
+def test_quote_snapshot_advances_quote_now_by_prefetch_elapsed_time(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setenv("PM15MIN_LIVE_ORDERBOOK_PROVIDER_ONLY", "1")
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    cycle_start = pd.Timestamp("2026-03-21T16:45:00Z")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "question": "Sol up or down",
+                    "source_snapshot_ts": "2026-03-21T16-45-00Z",
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    now = pd.Timestamp("2026-03-21T16:54:10.000Z")
+    fetched_at_ms = int((now + pd.Timedelta(milliseconds=500)).timestamp() * 1000)
+    snapshot_monotonic_calls = iter([10.0, 10.6])
+    snapshot_monotonic_state = {"last": 10.6}
+
+    def _snapshot_monotonic() -> float:
+        try:
+            value = next(snapshot_monotonic_calls)
+        except StopIteration:
+            return float(snapshot_monotonic_state["last"])
+        snapshot_monotonic_state["last"] = float(value)
+        return float(value)
+
+    monkeypatch.setattr(
+        "pm15min.live.quotes.snapshot_builder.time",
+        types.SimpleNamespace(monotonic=_snapshot_monotonic),
+    )
+    row_builder_monotonic_calls = iter([20.0, 20.0])
+    row_builder_monotonic_state = {"last": 20.0}
+
+    def _row_builder_monotonic() -> float:
+        try:
+            value = next(row_builder_monotonic_calls)
+        except StopIteration:
+            return float(row_builder_monotonic_state["last"])
+        row_builder_monotonic_state["last"] = float(value)
+        return float(value)
+
+    monkeypatch.setattr(
+        "pm15min.live.quotes.row_builder.time",
+        types.SimpleNamespace(monotonic=_row_builder_monotonic),
+    )
+
+    class _PrefetchElapsedProvider:
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            del levels, timeout, force_refresh
+            if token_id == "token-up":
+                return {
+                    "timestamp": fetched_at_ms,
+                    "__provider_fetched_at_ms": fetched_at_ms,
+                    "asks": [{"price": "0.24", "size": "5"}],
+                    "bids": [{"price": "0.23", "size": "6"}],
+                }
+            if token_id == "token-down":
+                return {
+                    "timestamp": fetched_at_ms,
+                    "__provider_fetched_at_ms": fetched_at_ms,
+                    "asks": [{"price": "0.76", "size": "5"}],
+                    "bids": [{"price": "0.75", "size": "6"}],
+                }
+            return None
+
+        def sync_subscriptions(self, token_ids, *, replace=True, prefetch=False, levels=0, timeout=1.2):
+            del token_ids, replace, prefetch, levels, timeout
+            return {"ok": True}
+
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 8,
+                    "decision_ts": now.isoformat(),
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                }
+            ],
+        },
+        persist=False,
+        now=now,
+        orderbook_provider=_PrefetchElapsedProvider(),
+    )
+    row = quote["quote_rows"][0]
+
+    assert row["status"] == "ok"
+    assert row["quote_up_ask"] == 0.24
+    assert row["quote_down_ask"] == 0.76
+    assert int(now.timestamp() * 1000) + 599 <= row["provider_reference_floor_ts_ms"] <= int(now.timestamp() * 1000) + 620
 
 
 def test_quote_snapshot_provider_retries_missing_side_with_force_refresh(tmp_path: Path, monkeypatch) -> None:
@@ -1159,6 +1633,96 @@ def test_quote_snapshot_provider_retries_missing_side_with_force_refresh(tmp_pat
         ("token-up", False),
         ("token-down", False),
         ("token-up", True),
+    ]
+
+
+def test_quote_snapshot_provider_retries_both_missing_sides_with_force_refresh(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setenv("PM15MIN_LIVE_ORDERBOOK_PROVIDER_ONLY", "1")
+    cfg = LiveConfig.build(market="btc", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="btc", cycle="15m", surface="live", root=root)
+    cycle_start = pd.Timestamp("2026-03-21T16:45:00Z")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "btc",
+                    "cycle": "15m",
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "question": "Btc up or down",
+                    "source_snapshot_ts": "2026-03-21T16-45-00Z",
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+
+    class _RetryBothSidesProvider:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, bool]] = []
+
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            del levels, timeout
+            self.calls.append((str(token_id), bool(force_refresh)))
+            if not force_refresh:
+                return None
+            if token_id == "token-up":
+                return {
+                    "timestamp": "2026-03-21T16:52:10Z",
+                    "asks": [{"price": "0.63", "size": "7"}],
+                    "bids": [{"price": "0.62", "size": "6"}],
+                }
+            if token_id == "token-down":
+                return {
+                    "timestamp": "2026-03-21T16:52:10Z",
+                    "asks": [{"price": "0.37", "size": "8"}],
+                    "bids": [{"price": "0.36", "size": "5"}],
+                }
+            return None
+
+        def sync_subscriptions(self, token_ids, *, replace=True, prefetch=False, levels=0, timeout=1.2):
+            del token_ids, replace, prefetch, levels, timeout
+            return {"ok": True}
+
+    provider = _RetryBothSidesProvider()
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 7,
+                    "decision_ts": "2026-03-21T16:52:00+00:00",
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                }
+            ],
+        },
+        persist=False,
+        now=pd.Timestamp("2026-03-21T16:52:15Z"),
+        orderbook_provider=provider,
+    )
+    row = quote["quote_rows"][0]
+    assert row["status"] == "ok"
+    assert row["quote_up_ask"] == 0.63
+    assert row["quote_down_ask"] == 0.37
+    assert row["quote_force_refresh_attempted_up"] is True
+    assert row["quote_force_refresh_attempted_down"] is True
+    assert row["quote_force_refresh_used_up"] is True
+    assert row["quote_force_refresh_used_down"] is True
+    assert provider.calls == [
+        ("token-up", False),
+        ("token-down", False),
+        ("token-up", True),
+        ("token-down", True),
     ]
 
 

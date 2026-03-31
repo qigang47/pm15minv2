@@ -42,6 +42,7 @@ def run_live_runner(
     append_jsonl_fn,
     write_json_atomic_fn,
     utc_now_iso_fn,
+    orderbook_provider=None,
 ) -> dict[str, object]:
     iteration_limit = _resolve_iteration_limit(iterations=iterations, loop=loop)
     sleep_sec = max(0.0, float(sleep_sec))
@@ -71,7 +72,8 @@ def run_live_runner(
     runner_persist_on_change = _env_bool("PM15MIN_RUNNER_SUMMARY_PERSIST_ON_CHANGE", default=True)
     last_persist_signature: str | None = None
     last_persisted_at = 0.0
-    next_iteration_at = time.monotonic()
+    orderbook_event_wakeup_enabled = _orderbook_event_wakeup_enabled(orderbook_provider=orderbook_provider)
+    orderbook_event_debounce_sec = _env_float("PM15MIN_RUNNER_ORDERBOOK_EVENT_DEBOUNCE_SEC", default=0.03)
 
     runner_log_path = layout.runner_log_path(
         market=cfg.asset.slug,
@@ -208,10 +210,16 @@ def run_live_runner(
         if iteration_limit is not None and attempted >= iteration_limit:
             break
         if sleep_sec > 0:
-            iteration_started_monotonic = max(next_iteration_at, time.monotonic())
-            next_iteration_at = max(next_iteration_at + sleep_sec, iteration_started_monotonic)
-            remaining_sleep = next_iteration_at - time.monotonic()
-            if remaining_sleep > 0:
+            sleep_deadline = time.monotonic() + sleep_sec
+            woke_early = False
+            if orderbook_event_wakeup_enabled:
+                woke_early = _wait_for_orderbook_or_deadline(
+                    provider=orderbook_provider,
+                    sleep_deadline=sleep_deadline,
+                    debounce_sec=orderbook_event_debounce_sec,
+                )
+            remaining_sleep = sleep_deadline - time.monotonic()
+            if not woke_early and remaining_sleep > 0:
                 time.sleep(remaining_sleep)
 
     last_iteration_alerts = {} if last_iteration is None else (last_iteration.get("risk_alert_summary") or {})
@@ -267,6 +275,58 @@ def _env_bool(name: str, *, default: bool) -> bool:
     if raw in (None, ""):
         return bool(default)
     return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _orderbook_event_wakeup_enabled(*, orderbook_provider) -> bool:
+    if not _env_bool("PM15MIN_RUNNER_ENABLE_ORDERBOOK_EVENT_WAKEUP", default=True):
+        return False
+    if orderbook_provider is None:
+        return False
+    getter = getattr(orderbook_provider, "get_update_marker", None)
+    waiter = getattr(orderbook_provider, "wait_for_update", None)
+    return callable(getter) and callable(waiter)
+
+
+def _wait_for_orderbook_or_deadline(
+    *,
+    provider,
+    sleep_deadline: float,
+    debounce_sec: float,
+) -> bool:
+    getter = getattr(provider, "get_update_marker", None)
+    waiter = getattr(provider, "wait_for_update", None)
+    if not callable(getter) or not callable(waiter):
+        return False
+    try:
+        marker = getter()
+    except Exception:
+        return False
+    while True:
+        remaining = float(sleep_deadline) - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        try:
+            updated_marker = waiter(since_marker=marker, timeout_sec=remaining)
+        except Exception:
+            return False
+        if updated_marker in (None, marker):
+            return False
+        marker = updated_marker
+        if debounce_sec <= 0.0:
+            return True
+        debounce_deadline = min(float(sleep_deadline), time.monotonic() + max(0.0, float(debounce_sec)))
+        while True:
+            remaining_debounce = debounce_deadline - time.monotonic()
+            if remaining_debounce <= 0.0:
+                return True
+            try:
+                updated_marker = waiter(since_marker=marker, timeout_sec=remaining_debounce)
+            except Exception:
+                return True
+            if updated_marker in (None, marker):
+                return True
+            marker = updated_marker
+            debounce_deadline = min(float(sleep_deadline), time.monotonic() + max(0.0, float(debounce_sec)))
 
 
 def _should_log_runner_iteration(

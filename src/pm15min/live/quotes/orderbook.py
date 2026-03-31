@@ -157,14 +157,24 @@ def build_orderbook_row_from_provider(
     if not isinstance(payload, dict):
         return None
     asks, bids, ts_ms = normalize_book(payload)
+    fetched_at_ms = _int_or_none(payload.get("__provider_fetched_at_ms"))
+    if (
+        ts_ms is not None
+        and fetched_at_ms is not None
+        and ts_ms > fetched_at_ms + live_provider_future_skew_tolerance_ms()
+    ):
+        ts_ms = int(fetched_at_ms)
+    if ts_ms is None:
+        if fetched_at_ms is not None:
+            ts_ms = fetched_at_ms
     if ts_ms is None:
         fetched_at = payload.get("__hub_fetched_at")
         if fetched_at not in (None, ""):
             ts_ms = int(pd.Timestamp(str(fetched_at), tz="UTC").timestamp() * 1000)
     if ts_ms is None:
         return None
-    best_ask = asks[0]["price"] if asks else None
-    best_bid = bids[0]["price"] if bids else None
+    best_ask = asks[0]["price"] if asks else float_or_none(payload.get("best_ask"))
+    best_bid = bids[0]["price"] if bids else float_or_none(payload.get("best_bid"))
     ask_size_1 = asks[0]["size"] if asks else None
     bid_size_1 = bids[0]["size"] if bids else None
     spread = None
@@ -180,6 +190,9 @@ def build_orderbook_row_from_provider(
         "ask_size_1": ask_size_1,
         "bid_size_1": bid_size_1,
         "spread": spread,
+        "provider_cache_hit": payload.get("__provider_cache_hit"),
+        "provider_cache_age_ms": _int_or_none(payload.get("__provider_cache_age_ms")),
+        "provider_force_refresh_used": bool(payload.get("__provider_force_refresh_used", force_refresh)),
     }
 
 
