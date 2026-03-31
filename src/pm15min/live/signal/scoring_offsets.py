@@ -167,6 +167,12 @@ def build_scored_signal(
     )
     p_up = float(row["p_up"])
     p_down = float(row["p_down"])
+    p_up_raw = float(row.get("p_up_raw", row.get("p_signal", p_up)))
+    p_down_raw = float(row.get("p_down_raw", 1.0 - p_up_raw))
+    p_eff_up = float(row.get("p_eff_up", p_up))
+    p_eff_down = float(row.get("p_eff_down", p_down))
+    p_up_lcb = float(row.get("p_up_lcb", p_eff_up))
+    p_up_ucb = float(row.get("p_up_ucb", 1.0 - p_eff_down))
     score_valid, score_reason = normalize_score_validity(
         score_valid=bool(row.get("score_valid", False)),
         score_reason=str(row.get("score_reason") or ""),
@@ -193,13 +199,19 @@ def build_scored_signal(
         "p_signal": float(row.get("p_signal", p_up)),
         "w_lgb": float(row.get("w_lgb", 0.5)),
         "w_lr": float(row.get("w_lr", 0.5)),
+        "p_up_raw": p_up_raw,
+        "p_down_raw": p_down_raw,
+        "p_eff_up": p_eff_up,
+        "p_eff_down": p_eff_down,
+        "p_up_lcb": p_up_lcb,
+        "p_up_ucb": p_up_ucb,
         "p_up": p_up,
         "p_down": p_down,
         "probability_mode": str(row.get("probability_mode") or ""),
         "model_context": row.get("model_context"),
-        "recommended_side": "UP" if p_up >= p_down else "DOWN",
-        "confidence": max(p_up, p_down),
-        "edge": abs(p_up - p_down),
+        "recommended_side": "UP" if p_up_raw >= p_down_raw else "DOWN",
+        "confidence": max(p_eff_up, p_eff_down),
+        "edge": abs(p_eff_up - p_eff_down),
         "applied_blacklist_columns": ctx.effective_blacklist,
         "not_allowed_blacklist_columns": ctx.not_allowed_blacklist,
         "feature_snapshot": feature_snapshot,

@@ -3058,7 +3058,7 @@ def test_show_live_latest_runner_surfaces_threshold_reject_diagnostics(tmp_path:
         ],
     }
     assert payload["next_actions"] == [
-        "latest quotes already price the selected side above live entry cap and above model fair value; keep side effects disabled for this cycle",
+        "latest quotes already price the selected side above live entry cap and above the model trigger price; keep side effects disabled for this cycle",
         "inspect operator_summary.decision_reject_diagnostics.best_rejected_offset before changing live profile thresholds",
     ]
 
@@ -3797,7 +3797,7 @@ def test_show_live_ready_marks_smoke_operational_when_only_strategy_rejects(tmp_
                 "risk_alert_summary": {"has_critical": False},
             },
             "next_actions": [
-                "latest quotes already price the selected side above live entry cap and above model fair value; keep side effects disabled for this cycle"
+                "latest quotes already price the selected side above live entry cap and above the model trigger price; keep side effects disabled for this cycle"
             ],
         },
     )
@@ -3980,7 +3980,7 @@ def test_show_live_ready_appends_foundation_rate_limit_context_even_when_strateg
                 "risk_alert_summary": {"has_critical": False},
             },
             "next_actions": [
-                "inspect latest decision confidence vs threshold and active bundle output before retrying"
+                "inspect latest decision trigger metric vs threshold and active bundle output before retrying"
             ],
         },
     )
@@ -3988,7 +3988,7 @@ def test_show_live_ready_appends_foundation_rate_limit_context_even_when_strateg
     payload = show_live_ready(cfg, target="direction", adapter="direct")
 
     assert payload["next_actions"] == [
-        "inspect latest decision confidence vs threshold and active bundle output before retrying",
+        "inspect latest decision trigger metric vs threshold and active bundle output before retrying",
         "wait for the direct oracle rate-limit window to clear, then rerun data run live-foundation or runner-once --dry-run-side-effects",
         "treat oracle_prices_table as temporary fail-open fallback until direct oracle recovers",
     ]

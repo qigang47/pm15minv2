@@ -69,10 +69,12 @@ def append_price_features(
         out["ret_30m"] = compute_log_returns(close, 30)
     if returns_needed[60]:
         out["ret_60m"] = compute_log_returns(close, 60)
-    if needs("rv_30", "rv_30_lag1", "regime_high_vol"):
+    if needs("rv_30", "rv_30_lag1", "rv_30_change", "regime_high_vol"):
         out["rv_30"] = realized_volatility(close, 30)
     if needs("rv_30_lag1"):
         out["rv_30_lag1"] = out["rv_30"].shift(1)
+    if needs("rv_30_change"):
+        out["rv_30_change"] = out["rv_30"] / out["rv_30"].shift(1).replace(0.0, np.nan) - 1.0
 
     if needs("ma_gap_5"):
         ma_5 = close.rolling(5).mean()

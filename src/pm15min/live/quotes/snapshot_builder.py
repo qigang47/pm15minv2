@@ -6,7 +6,8 @@ import pandas as pd
 
 from pm15min.data.config import DataConfig
 from pm15min.data.sources.orderbook_provider import OrderbookProvider
-from .market import read_market_table
+from .market import read_market_table, resolve_market_row
+from .orderbook import live_provider_orderbook_levels
 from .row_builder import build_offset_quote_row_impl
 from .snapshot_persistence import persist_quote_snapshot_impl
 
@@ -30,6 +31,14 @@ def build_quote_snapshot_impl(
     snapshot_ts = utc_snapshot_label_fn()
     now_ts = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
     quote_now = now_ts.tz_convert("UTC") if now_ts.tzinfo is not None else now_ts.tz_localize("UTC")
+    if orderbook_provider is not None and not market_table.empty:
+        _prefetch_orderbooks_for_signal_rows(
+            orderbook_provider=orderbook_provider,
+            market_table=market_table,
+            signal_payload=signal_payload,
+            quote_now=quote_now,
+            timeout_sec=data_cfg.orderbook_timeout_sec,
+        )
     provider_frame_cache: dict[tuple[str, str, str], pd.DataFrame] = {}
     index_frame_cache: dict[tuple[str, str | None], pd.DataFrame] = {}
     latest_full_snapshot_cache: dict[str, dict[str, object] | None] = {}
@@ -68,3 +77,47 @@ def build_quote_snapshot_impl(
         payload["latest_quote_path"] = str(paths["latest"])
         payload["quote_snapshot_path"] = str(paths["snapshot"])
     return payload
+
+
+def _prefetch_orderbooks_for_signal_rows(
+    *,
+    orderbook_provider: OrderbookProvider,
+    market_table: pd.DataFrame,
+    signal_payload: dict[str, Any],
+    quote_now: pd.Timestamp,
+    timeout_sec: float,
+) -> None:
+    tokens: list[str] = []
+    target = str(signal_payload.get("target") or "direction")
+    for signal_row in list(signal_payload.get("offset_signals") or []):
+        if not isinstance(signal_row, dict):
+            continue
+        window_end_ts = pd.to_datetime(signal_row.get("window_end_ts"), utc=True, errors="coerce")
+        if not pd.isna(window_end_ts) and quote_now >= window_end_ts:
+            continue
+        market_row = resolve_market_row(
+            market_table,
+            decision_ts=pd.to_datetime(signal_row.get("decision_ts"), utc=True, errors="coerce"),
+            cycle_start_ts=pd.to_datetime(signal_row.get("cycle_start_ts"), utc=True, errors="coerce"),
+            signal_cycle_end_ts=pd.to_datetime(signal_row.get("cycle_end_ts"), utc=True, errors="coerce"),
+            target=target,
+            now=quote_now,
+        )
+        if market_row is None:
+            continue
+        for token_key in ("token_up", "token_down"):
+            token_id = str(market_row.get(token_key) or "").strip()
+            if token_id:
+                tokens.append(token_id)
+    if not tokens:
+        return
+    try:
+        orderbook_provider.sync_subscriptions(
+            tokens,
+            replace=True,
+            prefetch=True,
+            levels=live_provider_orderbook_levels(),
+            timeout=timeout_sec,
+        )
+    except Exception:
+        return

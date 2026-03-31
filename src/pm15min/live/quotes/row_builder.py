@@ -12,6 +12,8 @@ from .orderbook import (
     ORDERBOOK_INDEX_COLUMNS,
     build_orderbook_frame_from_provider,
     float_or_none,
+    live_provider_future_skew_tolerance_ms,
+    live_provider_orderbook_levels,
     load_latest_full_snapshot_cached,
     load_orderbook_index_frame_cached,
     resolve_orderbook_row,
@@ -125,7 +127,8 @@ def build_offset_quote_row_impl(
         out["reasons"].append("decision_ts_missing")
         return out
     decision_ts_ms = int(decision_ts.timestamp() * 1000) if not pd.isna(decision_ts) else None
-    reference_ts_ms = int(now.timestamp() * 1000)
+    current_now_ts_ms = int(now.timestamp() * 1000)
+    reference_ts_ms = current_now_ts_ms
     window_start_ts_ms = int(window_start_ts.timestamp() * 1000) if not pd.isna(window_start_ts) else decision_ts_ms
     window_end_ts_ms = int(window_end_ts.timestamp() * 1000) if not pd.isna(window_end_ts) else None
     if not pd.isna(trade_cycle_start_ts) and trade_cycle_start_ts > now:
@@ -161,14 +164,23 @@ def build_offset_quote_row_impl(
                 token_up=str(out["token_up"]),
                 token_down=str(out["token_down"]),
                 timeout_sec=data_cfg.orderbook_timeout_sec,
+                levels=live_provider_orderbook_levels(),
             )
             if provider_frame_cache is not None:
                 provider_frame_cache[provider_key] = provider_df
             index_df = provider_df
         if not index_df.empty:
-            provider_reference_ts_ms = reference_ts_ms
-            if provider_reference_ts_ms is None and "captured_ts_ms" in index_df.columns:
-                provider_reference_ts_ms = int(pd.to_numeric(index_df["captured_ts_ms"], errors="coerce").max())
+            provider_latest_ts_ms = None
+            if "captured_ts_ms" in index_df.columns:
+                provider_ts_series = pd.to_numeric(index_df["captured_ts_ms"], errors="coerce").dropna()
+                if not provider_ts_series.empty:
+                    provider_latest_ts_ms = int(provider_ts_series.max())
+            provider_reference_floor_ts_ms = current_now_ts_ms if reference_ts_ms is None else int(reference_ts_ms)
+            provider_reference_ts_ms = provider_reference_floor_ts_ms
+            if provider_latest_ts_ms is not None:
+                future_skew_limit_ms = live_provider_future_skew_tolerance_ms()
+                if provider_latest_ts_ms <= provider_reference_floor_ts_ms + future_skew_limit_ms:
+                    provider_reference_ts_ms = max(provider_reference_floor_ts_ms, provider_latest_ts_ms)
             up_row = resolve_orderbook_row_within_window(
                 index_df,
                 market_id=out["market_id"],
@@ -189,6 +201,7 @@ def build_offset_quote_row_impl(
             )
             if up_row is not None and down_row is not None:
                 out["quote_source_path"] = "provider"
+                reference_ts_ms = provider_reference_ts_ms
     if not provider_only and (up_row is None or down_row is None):
         latest_snapshot = load_latest_full_snapshot_cached(
             snapshot_path=latest_full_snapshot_path,

@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import threading
 import time
+import inspect
+from typing import Callable
 
 import pandas as pd
 
@@ -14,8 +16,6 @@ from ..queries.loaders import load_market_catalog
 from ..sources.polymarket_oracle_api import PolymarketOracleApiClient
 from .oracle_prices import build_oracle_prices_table
 from .truth import build_truth_table
-from ...research.config import ResearchConfig
-from ...research.labels.datasets import build_label_frame_dataset
 
 
 DIRECT_ORACLE_COLUMNS = [
@@ -37,6 +37,8 @@ DIRECT_ORACLE_COLUMNS = [
     "source_priority",
     "fetched_at",
 ]
+
+LabelFrameRebuildFn = Callable[..., dict[str, object]]
 
 
 def _utc_now_label() -> str:
@@ -388,6 +390,7 @@ def backfill_direct_oracle_prices(
     max_retries: int = 6,
     sleep_sec: float = 0.0,
     skip_freshness: bool = True,
+    rebuild_label_frame_fn: LabelFrameRebuildFn | None = None,
 ) -> dict[str, object]:
     market_table = pd.read_parquet(cfg.layout.market_catalog_table_path, columns=["cycle_start_ts"])
     cycle_starts = sorted(set(pd.to_numeric(market_table["cycle_start_ts"], errors="coerce").dropna().astype(int).tolist()))
@@ -404,14 +407,9 @@ def backfill_direct_oracle_prices(
     if not pending:
         oracle = build_oracle_prices_table(cfg)
         truth = build_truth_table(cfg)
-        label = build_label_frame_dataset(
-            ResearchConfig.build(
-                market=cfg.asset.slug,
-                cycle=cfg.cycle,
-                source_surface=cfg.surface,
-                label_set="truth",
-                root=cfg.layout.storage.rewrite_root,
-            ),
+        label = _resolve_label_frame_rebuild_summary(
+            cfg,
+            rebuild_label_frame_fn=rebuild_label_frame_fn,
             skip_freshness=skip_freshness,
         )
         return {
@@ -535,14 +533,9 @@ def backfill_direct_oracle_prices(
     last_canonical_rows = _flush_rows(buffer)
     oracle = build_oracle_prices_table(cfg)
     truth = build_truth_table(cfg)
-    label = build_label_frame_dataset(
-        ResearchConfig.build(
-            market=cfg.asset.slug,
-            cycle=cfg.cycle,
-            source_surface=cfg.surface,
-            label_set="truth",
-            root=cfg.layout.storage.rewrite_root,
-        ),
+    label = _resolve_label_frame_rebuild_summary(
+        cfg,
+        rebuild_label_frame_fn=rebuild_label_frame_fn,
         skip_freshness=skip_freshness,
     )
     truth_table = pd.read_parquet(cfg.layout.truth_table_path, columns=["cycle_start_ts", "resolved"])
@@ -564,3 +557,28 @@ def backfill_direct_oracle_prices(
         "first": str(ts.min()) if not ts.empty else None,
         "last": str(ts.max()) if not ts.empty else None,
     }
+
+
+def _resolve_label_frame_rebuild_summary(
+    cfg: DataConfig,
+    *,
+    rebuild_label_frame_fn: LabelFrameRebuildFn | None,
+    skip_freshness: bool,
+) -> dict[str, object]:
+    if rebuild_label_frame_fn is None:
+        return {
+            "status": "skipped",
+            "reason": "research_label_frame_rebuild_moved_out_of_data_domain",
+            "market": cfg.asset.slug,
+            "cycle": cfg.cycle,
+            "surface": cfg.surface,
+            "skip_freshness_requested": bool(skip_freshness),
+        }
+    kwargs: dict[str, object] = {}
+    try:
+        signature = inspect.signature(rebuild_label_frame_fn)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None and "skip_freshness" in signature.parameters:
+        kwargs["skip_freshness"] = bool(skip_freshness)
+    return rebuild_label_frame_fn(cfg, **kwargs)

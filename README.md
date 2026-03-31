@@ -1427,15 +1427,11 @@ PYTHONPATH=src pytest -q tests
 - `docs/DATA_TECHNICAL_PLAN.md`
   Data 域长期 layout 和边界。
 - `docs/RESEARCH_TECHNICAL_PLAN.md`
-  Research 域长期对象模型和主链。
+  Research 域长期对象模型、active bundle 规则、workflow 和脚本边界。
 - `docs/LIVE_TECHNICAL_PLAN.md`
   Live 域长期 runtime contract。
 - `docs/LIVE_OPERATOR_RUNBOOK.md`
   operator 值班手册。
-- `docs/MODEL_BUNDLE_IMPORT_STATE.md`
-  当前 active bundle 入口说明。
-- `docs/POLY_EVAL_AND_SCRIPTS_MIGRATION_TECHNICAL_PLAN.md`
-  package 与脚本边界的迁移原则。
 
 ## 最后一句
 

@@ -8,13 +8,18 @@ from pm15min.data.queries.loaders import load_binance_klines_1m, load_oracle_pri
 from pm15min.research.config import ResearchConfig
 from pm15min.research.features.builders import build_feature_frame as build_feature_frame_df
 from pm15min.research.features.registry import feature_schema, feature_set_columns
-from pm15min.research.freshness import ensure_research_feature_dependencies_aligned
+from pm15min.research.freshness import prepare_research_feature_dependencies
 from pm15min.research.manifests import build_manifest, write_manifest
 
 
-def build_feature_frame_dataset(cfg: ResearchConfig, *, skip_freshness: bool = False) -> dict[str, object]:
+def build_feature_frame_dataset(
+    cfg: ResearchConfig,
+    *,
+    skip_freshness: bool = False,
+    dependency_mode: str = "auto_repair",
+) -> dict[str, object]:
     if not skip_freshness:
-        ensure_research_feature_dependencies_aligned(cfg)
+        prepare_research_feature_dependencies(cfg, mode=dependency_mode)
     data_cfg = DataConfig.build(
         market=cfg.asset.slug,
         cycle=cfg.cycle,

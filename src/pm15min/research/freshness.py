@@ -13,23 +13,127 @@ from pm15min.research.features.builders import build_feature_frame as build_feat
 from pm15min.research.labels.frames import build_label_frame as build_label_frame_df
 from pm15min.research.labels.sources import normalize_label_set
 
+# Backward-compatible aliases kept for tests and incremental refactors.
+build_oracle_prices_15m = build_oracle_prices_table
+build_truth_15m = build_truth_table
+
+DEPENDENCY_MODE_AUTO_REPAIR = "auto_repair"
+DEPENDENCY_MODE_FAIL_FAST = "fail_fast"
+
+
+def inspect_research_feature_dependencies(cfg: ResearchConfig) -> dict[str, object]:
+    data_cfg = _data_cfg(cfg)
+    return {
+        "oracle_prices_table": _inspect_oracle_prices_table_freshness(data_cfg),
+    }
+
+
+def inspect_research_label_dependencies(cfg: ResearchConfig) -> dict[str, object]:
+    data_cfg = _data_cfg(cfg)
+    summaries = inspect_research_feature_dependencies(cfg)
+    summaries["truth_table"] = _inspect_truth_table_freshness(data_cfg)
+    return summaries
+
+
+def prepare_research_feature_dependencies(
+    cfg: ResearchConfig,
+    *,
+    mode: str = DEPENDENCY_MODE_AUTO_REPAIR,
+) -> dict[str, object]:
+    resolved_mode = _normalize_dependency_mode(mode)
+    if resolved_mode == DEPENDENCY_MODE_FAIL_FAST:
+        summaries = inspect_research_feature_dependencies(cfg)
+        _raise_if_stale(summaries)
+        return summaries
+    return ensure_research_feature_dependencies_aligned(cfg)
+
+
+def prepare_research_label_dependencies(
+    cfg: ResearchConfig,
+    *,
+    mode: str = DEPENDENCY_MODE_AUTO_REPAIR,
+) -> dict[str, object]:
+    resolved_mode = _normalize_dependency_mode(mode)
+    if resolved_mode == DEPENDENCY_MODE_FAIL_FAST:
+        summaries = inspect_research_label_dependencies(cfg)
+        _raise_if_stale(summaries)
+        return summaries
+    return ensure_research_label_dependencies_aligned(cfg)
+
+
+def inspect_research_artifacts_freshness(
+    cfg: ResearchConfig,
+    *,
+    feature_set: str | None = None,
+    label_set: str | None = None,
+) -> dict[str, object]:
+    resolved_feature_set = str(feature_set or "").strip() or None
+    resolved_label_set = normalize_label_set(label_set) if label_set is not None else None
+    data_cfg = _data_cfg(cfg)
+    summaries: dict[str, object] = {}
+
+    if resolved_feature_set is not None or resolved_label_set is not None:
+        summaries["oracle_prices_table"] = _inspect_oracle_prices_table_freshness(data_cfg)
+    if resolved_label_set is not None:
+        summaries["truth_table"] = _inspect_truth_table_freshness(data_cfg)
+    if resolved_feature_set is not None:
+        summaries["feature_frame"] = _inspect_feature_frame_freshness(
+            _cfg_with_feature_set(cfg, feature_set=resolved_feature_set),
+        )
+    if resolved_label_set is not None:
+        summaries["label_frame"] = _inspect_label_frame_freshness(
+            _cfg_with_label_set(cfg, label_set=resolved_label_set),
+        )
+    return summaries
+
+
+def prepare_research_artifacts(
+    cfg: ResearchConfig,
+    *,
+    feature_set: str | None = None,
+    label_set: str | None = None,
+    mode: str = DEPENDENCY_MODE_AUTO_REPAIR,
+) -> dict[str, object]:
+    resolved_mode = _normalize_dependency_mode(mode)
+    if resolved_mode == DEPENDENCY_MODE_FAIL_FAST:
+        summaries = inspect_research_artifacts_freshness(
+            cfg,
+            feature_set=feature_set,
+            label_set=label_set,
+        )
+        _raise_if_stale(summaries)
+        return summaries
+    return ensure_research_artifacts_aligned(
+        cfg,
+        feature_set=feature_set,
+        label_set=label_set,
+    )
+
 
 def ensure_research_feature_dependencies_aligned(cfg: ResearchConfig) -> dict[str, object]:
     data_cfg = _data_cfg(cfg)
+    summaries = inspect_research_feature_dependencies(cfg)
+    lock_root = _lock_root(cfg)
     return {
-        "oracle_prices_table": _ensure_oracle_prices_table_aligned(
-            data_cfg,
-            lock_root=_lock_root(cfg),
-        )
+        "oracle_prices_table": _repair_artifact_if_needed(
+            summaries["oracle_prices_table"],
+            lock_root=lock_root,
+            lock_name=f"oracle_prices_{cfg.asset.slug}_{cfg.cycle}_{cfg.source_surface}",
+            inspect_fn=lambda: _inspect_oracle_prices_table_freshness(data_cfg),
+            build_fn=lambda: build_oracle_prices_15m(data_cfg),
+        ),
     }
 
 
 def ensure_research_label_dependencies_aligned(cfg: ResearchConfig) -> dict[str, object]:
     data_cfg = _data_cfg(cfg)
     summaries = ensure_research_feature_dependencies_aligned(cfg)
-    summaries["truth_table"] = _ensure_truth_table_aligned(
-        data_cfg,
+    summaries["truth_table"] = _repair_artifact_if_needed(
+        inspect_research_label_dependencies(cfg)["truth_table"],
         lock_root=_lock_root(cfg),
+        lock_name=f"truth_{cfg.asset.slug}_{cfg.cycle}_{cfg.source_surface}",
+        inspect_fn=lambda: _inspect_truth_table_freshness(data_cfg),
+        build_fn=lambda: build_truth_15m(data_cfg),
     )
     return summaries
 
@@ -42,80 +146,81 @@ def ensure_research_artifacts_aligned(
 ) -> dict[str, object]:
     resolved_feature_set = str(feature_set or "").strip() or None
     resolved_label_set = normalize_label_set(label_set) if label_set is not None else None
-    data_cfg = _data_cfg(cfg)
+    inspected = inspect_research_artifacts_freshness(
+        cfg,
+        feature_set=resolved_feature_set,
+        label_set=resolved_label_set,
+    )
     lock_root = _lock_root(cfg)
     summaries: dict[str, object] = {}
+    data_cfg = _data_cfg(cfg)
 
     if resolved_feature_set is not None or resolved_label_set is not None:
-        summaries["oracle_prices_table"] = _ensure_oracle_prices_table_aligned(
-            data_cfg,
+        summaries["oracle_prices_table"] = _repair_artifact_if_needed(
+            inspected["oracle_prices_table"],
             lock_root=lock_root,
+            lock_name=f"oracle_prices_{cfg.asset.slug}_{cfg.cycle}_{cfg.source_surface}",
+            inspect_fn=lambda: _inspect_oracle_prices_table_freshness(data_cfg),
+            build_fn=lambda: build_oracle_prices_15m(data_cfg),
         )
     if resolved_label_set is not None:
-        summaries["truth_table"] = _ensure_truth_table_aligned(
-            data_cfg,
+        summaries["truth_table"] = _repair_artifact_if_needed(
+            inspected["truth_table"],
             lock_root=lock_root,
+            lock_name=f"truth_{cfg.asset.slug}_{cfg.cycle}_{cfg.source_surface}",
+            inspect_fn=lambda: _inspect_truth_table_freshness(data_cfg),
+            build_fn=lambda: build_truth_15m(data_cfg),
         )
     if resolved_feature_set is not None:
-        summaries["feature_frame"] = _ensure_feature_frame_aligned(
-            _cfg_with_feature_set(cfg, feature_set=resolved_feature_set),
+        feature_cfg = _cfg_with_feature_set(cfg, feature_set=resolved_feature_set)
+        summaries["feature_frame"] = _repair_artifact_if_needed(
+            inspected["feature_frame"],
             lock_root=lock_root,
+            lock_name=f"feature_frame_{feature_cfg.asset.slug}_{feature_cfg.cycle}_{feature_cfg.source_surface}_{feature_cfg.feature_set}",
+            inspect_fn=lambda: _inspect_feature_frame_freshness(feature_cfg),
+            build_fn=lambda: _rebuild_feature_frame(feature_cfg),
         )
     if resolved_label_set is not None:
-        summaries["label_frame"] = _ensure_label_frame_aligned(
-            _cfg_with_label_set(cfg, label_set=resolved_label_set),
+        label_cfg = _cfg_with_label_set(cfg, label_set=resolved_label_set)
+        summaries["label_frame"] = _repair_artifact_if_needed(
+            inspected["label_frame"],
             lock_root=lock_root,
+            lock_name=f"label_frame_{label_cfg.asset.slug}_{label_cfg.cycle}_{label_cfg.label_set}",
+            inspect_fn=lambda: _inspect_label_frame_freshness(label_cfg),
+            build_fn=lambda: _rebuild_label_frame(label_cfg),
         )
     return summaries
 
 
-def _ensure_oracle_prices_table_aligned(
-    data_cfg: DataConfig,
-    *,
-    lock_root: Path,
-) -> dict[str, object]:
+def _inspect_oracle_prices_table_freshness(data_cfg: DataConfig) -> dict[str, object]:
     dependencies = [
         data_cfg.layout.market_catalog_table_path,
         data_cfg.layout.direct_oracle_source_path,
         *sorted(data_cfg.layout.streams_source_root.glob("year=*/month=*/data.parquet")),
         Path(build_oracle_prices_table.__code__.co_filename).resolve(),
     ]
-    return _ensure_artifact_aligned(
+    return _inspect_artifact_freshness(
         dataset="oracle_prices_table",
-        lock_root=lock_root,
-        lock_name=f"oracle_prices_{data_cfg.asset.slug}_{data_cfg.cycle}_{data_cfg.surface}",
         target_path=data_cfg.layout.oracle_prices_table_path,
         dependencies=dependencies,
-        build_fn=lambda: build_oracle_prices_table(data_cfg),
     )
 
 
-def _ensure_truth_table_aligned(
-    data_cfg: DataConfig,
-    *,
-    lock_root: Path,
-) -> dict[str, object]:
+def _inspect_truth_table_freshness(data_cfg: DataConfig) -> dict[str, object]:
     dependencies = [
         data_cfg.layout.market_catalog_table_path,
         data_cfg.layout.oracle_prices_table_path,
         data_cfg.layout.settlement_truth_source_path,
         Path(build_truth_table.__code__.co_filename).resolve(),
     ]
-    return _ensure_artifact_aligned(
+    return _inspect_artifact_freshness(
         dataset="truth_table",
-        lock_root=lock_root,
-        lock_name=f"truth_{data_cfg.asset.slug}_{data_cfg.cycle}_{data_cfg.surface}",
         target_path=data_cfg.layout.truth_table_path,
         dependencies=dependencies,
-        build_fn=lambda: build_truth_table(data_cfg),
     )
 
 
-def _ensure_feature_frame_aligned(
-    cfg: ResearchConfig,
-    *,
-    lock_root: Path,
-) -> dict[str, object]:
+def _inspect_feature_frame_freshness(cfg: ResearchConfig) -> dict[str, object]:
     data_cfg = _data_cfg(cfg)
     dependencies = [
         data_cfg.layout.binance_klines_path(),
@@ -130,45 +235,32 @@ def _ensure_feature_frame_aligned(
             root=cfg.layout.storage.rewrite_root,
         )
         dependencies.append(btc_cfg.layout.binance_klines_path(symbol="BTCUSDT"))
-    return _ensure_artifact_aligned(
+    return _inspect_artifact_freshness(
         dataset="feature_frame",
-        lock_root=lock_root,
-        lock_name=f"feature_frame_{cfg.asset.slug}_{cfg.cycle}_{cfg.source_surface}_{cfg.feature_set}",
         target_path=cfg.layout.feature_frame_path(cfg.feature_set, source_surface=cfg.source_surface),
         dependencies=dependencies,
-        build_fn=lambda: _rebuild_feature_frame(cfg),
     )
 
 
-def _ensure_label_frame_aligned(
-    cfg: ResearchConfig,
-    *,
-    lock_root: Path,
-) -> dict[str, object]:
+def _inspect_label_frame_freshness(cfg: ResearchConfig) -> dict[str, object]:
     data_cfg = _data_cfg(cfg)
     dependencies = [
         data_cfg.layout.truth_table_path,
         data_cfg.layout.oracle_prices_table_path,
         Path(build_label_frame_df.__code__.co_filename).resolve(),
     ]
-    return _ensure_artifact_aligned(
+    return _inspect_artifact_freshness(
         dataset="label_frame",
-        lock_root=lock_root,
-        lock_name=f"label_frame_{cfg.asset.slug}_{cfg.cycle}_{cfg.label_set}",
         target_path=cfg.layout.label_frame_path(cfg.label_set),
         dependencies=dependencies,
-        build_fn=lambda: _rebuild_label_frame(cfg),
     )
 
 
-def _ensure_artifact_aligned(
+def _inspect_artifact_freshness(
     *,
     dataset: str,
-    lock_root: Path,
-    lock_name: str,
     target_path: Path,
     dependencies: list[Path],
-    build_fn,
 ) -> dict[str, object]:
     reasons = _staleness_reasons(target_path=target_path, dependencies=dependencies)
     if not reasons:
@@ -178,18 +270,35 @@ def _ensure_artifact_aligned(
             "path": str(target_path),
             "reasons": [],
         }
+    return {
+        "dataset": dataset,
+        "status": "stale",
+        "path": str(target_path),
+        "reasons": reasons,
+    }
+
+
+def _repair_artifact_if_needed(
+    summary: dict[str, object],
+    *,
+    lock_root: Path,
+    lock_name: str,
+    inspect_fn,
+    build_fn,
+) -> dict[str, object]:
+    if str(summary.get("status") or "") != "stale":
+        return summary
+    target_path = Path(str(summary["path"]))
+    reasons = list(summary.get("reasons") or [])
     lock_path = lock_root / "artifacts_alignment" / f"{lock_name}.lock"
     with _exclusive_lock(lock_path):
-        reasons = _staleness_reasons(target_path=target_path, dependencies=dependencies)
-        if not reasons:
-            return {
-                "dataset": dataset,
-                "status": "fresh",
-                "path": str(target_path),
-                "reasons": [],
-            }
+        refreshed_summary = inspect_fn()
+        if str(refreshed_summary.get("status") or "") != "stale":
+            return refreshed_summary
         build_fn()
-        post_reasons = _staleness_reasons(target_path=target_path, dependencies=dependencies)
+        dataset = str(summary["dataset"])
+        post_check = inspect_fn()
+        post_reasons = list(post_check.get("reasons") or [])
         if post_reasons:
             raise RuntimeError(
                 f"research_artifact_still_stale:{dataset}:path={target_path}:reasons={','.join(post_reasons)}"
@@ -214,6 +323,30 @@ def _staleness_reasons(*, target_path: Path, dependencies: list[Path]) -> list[s
         if dep_mtime > target_mtime:
             reasons.append(f"dependency_newer:{dependency.name}")
     return reasons
+
+
+def _normalize_dependency_mode(mode: str | None) -> str:
+    value = str(mode or DEPENDENCY_MODE_AUTO_REPAIR).strip().lower()
+    if value not in {DEPENDENCY_MODE_AUTO_REPAIR, DEPENDENCY_MODE_FAIL_FAST}:
+        raise ValueError(
+            f"Unsupported dependency mode {mode!r}; expected one of "
+            f"{DEPENDENCY_MODE_AUTO_REPAIR!r}, {DEPENDENCY_MODE_FAIL_FAST!r}"
+        )
+    return value
+
+
+def _raise_if_stale(summaries: dict[str, object]) -> None:
+    stale = {
+        str(name): payload
+        for name, payload in summaries.items()
+        if isinstance(payload, dict) and str(payload.get("status") or "") == "stale"
+    }
+    if not stale:
+        return
+    details = ",".join(
+        sorted(f"{name}:{'|'.join((payload.get('reasons') or []))}" for name, payload in stale.items())
+    )
+    raise RuntimeError(f"research_dependencies_not_fresh:{details}")
 
 
 def _feature_frame_code_dependencies() -> list[Path]:

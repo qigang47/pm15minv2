@@ -8,7 +8,11 @@ import pandas as pd
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.config import ResearchConfig
-from pm15min.research.freshness import ensure_research_artifacts_aligned
+from pm15min.research.freshness import (
+    ensure_research_artifacts_aligned,
+    inspect_research_artifacts_freshness,
+    prepare_research_artifacts,
+)
 
 
 def _patch_v2_roots(monkeypatch, root: Path) -> None:
@@ -192,3 +196,81 @@ def test_ensure_research_artifacts_aligned_rebuilds_feature_frame_when_helper_mo
     assert calls == ["feature"]
     assert summary["feature_frame"]["status"] == "rebuilt"
     assert f"dependency_newer:{helper_path.name}" in summary["feature_frame"]["reasons"]
+
+
+def test_inspect_research_artifacts_freshness_reports_stale_without_rebuild(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = ResearchConfig.build(market="sol", cycle="15m", source_surface="backtest", root=root)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+
+    write_parquet_atomic(pd.DataFrame([{"market_id": "m-1"}]), data_cfg.layout.market_catalog_table_path)
+    write_parquet_atomic(
+        pd.DataFrame([{"asset": "sol", "cycle_start_ts": 1, "cycle_end_ts": 2, "price_to_beat": 100.0}]),
+        data_cfg.layout.direct_oracle_source_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame([{"asset": "sol", "extra_ts": 2, "price": 101.0}]),
+        data_cfg.layout.streams_partition_path(2026, 3),
+    )
+    write_parquet_atomic(
+        pd.DataFrame([{"asset": "sol", "cycle_start_ts": 1, "cycle_end_ts": 2, "winner_side": "UP", "full_truth": True}]),
+        data_cfg.layout.settlement_truth_source_path,
+    )
+    write_parquet_atomic(pd.DataFrame([{"stale": True}]), data_cfg.layout.oracle_prices_table_path)
+    write_parquet_atomic(pd.DataFrame([{"stale": True}]), data_cfg.layout.truth_table_path)
+    write_parquet_atomic(
+        pd.DataFrame([{"stale": True}]),
+        cfg.layout.feature_frame_path(cfg.feature_set, source_surface=cfg.source_surface),
+    )
+    write_parquet_atomic(pd.DataFrame([{"stale": True}]), cfg.layout.label_frame_path(cfg.label_set))
+
+    for path in (
+        data_cfg.layout.oracle_prices_table_path,
+        data_cfg.layout.truth_table_path,
+        cfg.layout.feature_frame_path(cfg.feature_set, source_surface=cfg.source_surface),
+        cfg.layout.label_frame_path(cfg.label_set),
+    ):
+        os.utime(path, (1, 1))
+
+    summary = inspect_research_artifacts_freshness(
+        cfg,
+        feature_set=cfg.feature_set,
+        label_set=cfg.label_set,
+    )
+
+    assert summary["oracle_prices_table"]["status"] == "stale"
+    assert summary["truth_table"]["status"] == "stale"
+    assert summary["feature_frame"]["status"] == "stale"
+    assert summary["label_frame"]["status"] == "stale"
+
+
+def test_prepare_research_artifacts_fail_fast_raises_on_stale_dependencies(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = ResearchConfig.build(market="sol", cycle="15m", source_surface="backtest", root=root)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+
+    write_parquet_atomic(pd.DataFrame([{"market_id": "m-1"}]), data_cfg.layout.market_catalog_table_path)
+    write_parquet_atomic(pd.DataFrame([{"stale": True}]), data_cfg.layout.oracle_prices_table_path)
+    os.utime(data_cfg.layout.oracle_prices_table_path, (1, 1))
+
+    try:
+        prepare_research_artifacts(
+            cfg,
+            feature_set=cfg.feature_set,
+            mode="fail_fast",
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected fail_fast mode to raise on stale dependencies")
+
+    assert "research_dependencies_not_fresh" in message
+    assert "oracle_prices_table" in message

@@ -61,7 +61,7 @@ from pm15min.research.bundles.loader import (
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import BacktestRunSpec
 from pm15min.research.datasets.loaders import load_feature_frame, load_label_frame
-from pm15min.research.freshness import ensure_research_artifacts_aligned
+from pm15min.research.freshness import prepare_research_artifacts
 from pm15min.research.inference.scorer import score_bundle_offset
 from pm15min.research.labels.sources import normalize_label_set
 from pm15min.research.labels.runtime import build_truth_runtime_summary
@@ -147,6 +147,7 @@ def run_research_backtest(
     spec: BacktestRunSpec,
     *,
     reporter: BacktestReporter | None = None,
+    dependency_mode: str = "auto_repair",
 ) -> dict[str, object]:
     progress = _BacktestProgressReporter(reporter, total_stages=_backtest_stage_total(spec=spec))
     stage_index = 0
@@ -167,10 +168,11 @@ def run_research_backtest(
     bundle_manifest = read_model_bundle_manifest(bundle_dir)
     feature_set = str(bundle_manifest.spec.get("feature_set") or cfg.feature_set)
     label_set = normalize_label_set(str(bundle_manifest.spec.get("label_set") or cfg.label_set))
-    ensure_research_artifacts_aligned(
+    prepare_research_artifacts(
         cfg,
         feature_set=feature_set,
         label_set=label_set,
+        mode=dependency_mode,
     )
 
     data_cfg = DataConfig.build(

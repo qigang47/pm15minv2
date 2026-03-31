@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from pm15min.live.execution.retry_policy import (
+from pm15min.core.retry_contracts import (
     FAK_IMMEDIATE_RETRY_ERROR_HINTS,
     FAST_RETRY_ERROR_HINTS,
     ORDERBOOK_RETRYABLE_REASONS,

@@ -27,12 +27,14 @@ def append_volume_features(
     low = pd.to_numeric(out["low"], errors="coerce")
     trades = pd.to_numeric(out.get("number_of_trades"), errors="coerce")
 
-    if needs("taker_buy_ratio", "taker_buy_ratio_z", "taker_buy_ratio_lag1"):
+    if needs("taker_buy_ratio", "taker_buy_ratio_z", "taker_buy_ratio_lag1", "taker_buy_ratio_change"):
         out["taker_buy_ratio"] = (taker_quote / quote_volume.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
     if needs("taker_buy_ratio_z"):
         out["taker_buy_ratio_z"] = rolling_zscore(out["taker_buy_ratio"], 100)
     if needs("taker_buy_ratio_lag1"):
         out["taker_buy_ratio_lag1"] = out["taker_buy_ratio"].shift(1)
+    if needs("taker_buy_ratio_change"):
+        out["taker_buy_ratio_change"] = out["taker_buy_ratio"].diff()
     if needs("trade_intensity"):
         out["trade_intensity"] = trades.pct_change().replace([np.inf, -np.inf], np.nan)
     if needs("volume_z"):

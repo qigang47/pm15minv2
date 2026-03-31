@@ -28,7 +28,7 @@ def append_decision_not_accept_followups(
         actions.append("inspect operator_summary.orderbook_hot_cache_summary to see whether recent orderbook cache is missing, empty, or stale")
         actions.append("rerun data run live-foundation or data record orderbooks if quote inputs are still missing")
     elif reject_category == "confidence_threshold":
-        actions.append("inspect latest decision confidence vs threshold and active bundle output before retrying")
+        actions.append("inspect latest decision trigger metric vs threshold and active bundle output before retrying")
     elif reject_category == "liquidity_guard":
         actions.append("run live sync-liquidity-state and inspect liquidity guard reason codes before retrying")
     elif reject_category == "regime_guard":
@@ -39,7 +39,7 @@ def append_decision_not_accept_followups(
             actions.append("inspect latest regime state and regime guard reasons before retrying")
     elif reject_category == "entry_or_quote_threshold":
         if reject_interpretation == "market_priced_through_signal":
-            actions.append("latest quotes already price the selected side above live entry cap and above model fair value; keep side effects disabled for this cycle")
+            actions.append("latest quotes already price the selected side above live entry cap and above the model trigger price; keep side effects disabled for this cycle")
             actions.append("inspect operator_summary.decision_reject_diagnostics.best_rejected_offset before changing live profile thresholds")
         elif reject_interpretation == "entry_price_above_live_cap":
             actions.append("latest quotes price the selected side above live entry_price_max; wait for a cheaper entry instead of forcing side effects")
@@ -47,7 +47,7 @@ def append_decision_not_accept_followups(
         elif reject_interpretation == "negative_quote_edge":
             actions.append("compare p_side vs quote ask on operator_summary.decision_reject_diagnostics.best_rejected_offset before changing live thresholds")
         else:
-            actions.append("inspect latest quote entry price / net edge / roi thresholds before retrying")
+            actions.append("inspect latest quote entry price cap and orderbook-derived entry price before retrying")
     elif reject_category == "tail_space_guard":
         actions.append("inspect ret_from_strike / move_z tail-space guards before retrying")
     else:

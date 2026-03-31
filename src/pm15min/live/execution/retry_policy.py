@@ -1,21 +1,12 @@
 from __future__ import annotations
 
+from pm15min.core.retry_contracts import (
+    FAK_IMMEDIATE_RETRY_ERROR_HINTS,
+    FAST_RETRY_ERROR_HINTS,
+    ORDERBOOK_RETRYABLE_REASONS,
+)
 
-ORDERBOOK_RETRYABLE_REASONS = {
-    "depth_snapshot_missing",
-    "depth_fill_unavailable",
-    "depth_fill_ratio_below_threshold",
-}
 NON_RESTING_ORDER_TYPES = {"FAK", "FOK"}
-FAK_IMMEDIATE_RETRY_ERROR_HINTS = (
-    "no orders found to match",
-)
-FAST_RETRY_ERROR_HINTS = (
-    "no orders found to match",
-    "fill and kill",
-    "fok orders are fully filled or killed",
-    "couldn't be fully filled",
-)
 
 
 def build_retry_policy(

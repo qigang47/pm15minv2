@@ -8,7 +8,15 @@ def categorize_decision_reject_reasons(reasons: list[object]) -> str | None:
     token_set = set(tokens)
     if "quote_missing_inputs" in token_set or any(token.startswith("quote_") for token in token_set):
         return "quote_inputs_missing"
-    if "confidence_below_threshold" in token_set or "regime_direction_prob" in token_set:
+    if (
+        "confidence_below_threshold" in token_set
+        or "regime_direction_prob" in token_set
+        or "up_lcb_below_threshold" in token_set
+        or "up_ucb_above_threshold" in token_set
+        or "up_raw_not_above_midpoint" in token_set
+        or "down_raw_not_below_midpoint" in token_set
+        or "confidence_missing" in token_set
+    ):
         return "confidence_threshold"
     if "liquidity_guard_blocked" in token_set or any(token.startswith("liquidity_") for token in token_set):
         return "liquidity_guard"

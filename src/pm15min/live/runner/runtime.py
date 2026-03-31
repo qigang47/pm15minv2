@@ -71,6 +71,7 @@ def run_live_runner(
     runner_persist_on_change = _env_bool("PM15MIN_RUNNER_SUMMARY_PERSIST_ON_CHANGE", default=True)
     last_persist_signature: str | None = None
     last_persisted_at = 0.0
+    next_iteration_at = time.monotonic()
 
     runner_log_path = layout.runner_log_path(
         market=cfg.asset.slug,
@@ -207,7 +208,11 @@ def run_live_runner(
         if iteration_limit is not None and attempted >= iteration_limit:
             break
         if sleep_sec > 0:
-            time.sleep(sleep_sec)
+            iteration_started_monotonic = max(next_iteration_at, time.monotonic())
+            next_iteration_at = max(next_iteration_at + sleep_sec, iteration_started_monotonic)
+            remaining_sleep = next_iteration_at - time.monotonic()
+            if remaining_sleep > 0:
+                time.sleep(remaining_sleep)
 
     last_iteration_alerts = {} if last_iteration is None else (last_iteration.get("risk_alert_summary") or {})
     has_iteration_critical = bool(last_iteration_alerts.get("has_critical"))

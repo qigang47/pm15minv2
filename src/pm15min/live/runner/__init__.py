@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pm15min.core.config import LiveConfig
 from pm15min.data.io.json_files import append_jsonl, write_json_atomic
 from pm15min.data.layout import utc_snapshot_label
 from pm15min.data.pipelines.foundation_runtime import run_live_data_foundation
-from pm15min.data.sources.orderbook_provider import build_orderbook_provider_from_env
+from pm15min.data.sources.orderbook_provider import (
+    build_in_memory_cached_orderbook_provider,
+    build_orderbook_provider_from_env,
+)
 from ..account import build_account_state_snapshot
 from ..actions import apply_cancel_policy, apply_redeem_policy, submit_execution_payload
 from ..execution import build_execution_snapshot, persist_execution_snapshot
@@ -133,6 +137,13 @@ def run_live_runner(
         source_name=f"v2-live-runner:{cfg.asset.slug}:{int(cfg.cycle_minutes)}m",
         subscribe_on_read=True,
     )
+    cache_max_age_ms = _live_orderbook_cache_max_age_ms()
+    if cache_max_age_ms > 0:
+        orderbook_provider = build_in_memory_cached_orderbook_provider(
+            provider=orderbook_provider,
+            max_age_ms=cache_max_age_ms,
+            background_refresh_ms=_live_orderbook_background_refresh_ms(),
+        )
     return _run_live_runner_impl(
         cfg,
         target=target,
@@ -157,3 +168,23 @@ def run_live_runner(
         write_json_atomic_fn=write_json_atomic,
         utc_now_iso_fn=utc_now_iso,
     )
+
+
+def _live_orderbook_cache_max_age_ms() -> int:
+    raw = os.getenv("PM15MIN_LIVE_ORDERBOOK_CACHE_MAX_AGE_MS")
+    if raw in (None, ""):
+        return 300
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 300
+
+
+def _live_orderbook_background_refresh_ms() -> int:
+    raw = os.getenv("PM15MIN_LIVE_ORDERBOOK_BACKGROUND_REFRESH_MS")
+    if raw in (None, ""):
+        return 200
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 200

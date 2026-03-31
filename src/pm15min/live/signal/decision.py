@@ -15,7 +15,7 @@ from ..execution.policy_helpers import (
     resolve_dynamic_stake_base,
     resolve_regime_stake_multiplier,
 )
-from ..execution.utils import float_or_none, resolve_side_probability
+from ..execution.utils import float_or_none, resolve_probability_interval_view, resolve_side_probability
 
 
 def build_decision_snapshot(
@@ -52,44 +52,50 @@ def build_decision_snapshot(
                 "status": "missing_quote_inputs",
                 "reasons": ["quote_row_missing"],
             }
-        quote_metrics_override = _build_decision_quote_metrics(
-            market=market,
-            cycle=cycle,
-            rewrite_root=rewrite_root,
-            profile_spec=spec,
-            signal_row=item,
-            quote_row=quote_row,
-            regime_state=regime_state,
-            account_state=account_state,
-            orderbook_provider=orderbook_provider,
-        )
-        reasons, quote_metrics, account_context = evaluate_signal_guard_reasons(
-            market=market,
-            profile_spec=spec,
-            signal_row=item,
-            quote_row=quote_row,
-            liquidity_state=liquidity_state,
-            regime_state=regime_state,
-            account_state=account_state,
-            session_state=session_state,
-            quote_metrics_override=quote_metrics_override,
-        )
-        threshold = spec.threshold_for(market=market, offset=offset)
+        accepted_candidates: list[dict[str, Any]] = []
+        for candidate in _build_trade_candidates(signal_row=item, profile_spec=spec):
+            quote_metrics_override = _build_decision_quote_metrics(
+                market=market,
+                cycle=cycle,
+                rewrite_root=rewrite_root,
+                profile_spec=spec,
+                signal_row=candidate,
+                quote_row=quote_row,
+                regime_state=regime_state,
+                account_state=account_state,
+                orderbook_provider=orderbook_provider,
+            )
+            reasons, quote_metrics, account_context = evaluate_signal_guard_reasons(
+                market=market,
+                profile_spec=spec,
+                signal_row=candidate,
+                quote_row=quote_row,
+                liquidity_state=liquidity_state,
+                regime_state=regime_state,
+                account_state=account_state,
+                session_state=session_state,
+                quote_metrics_override=quote_metrics_override,
+            )
+            threshold = spec.threshold_for(market=market, offset=offset)
 
-        enriched = {
-            **item,
-            "threshold": threshold,
-            "guard_reasons": reasons,
-            "quote_row": quote_row,
-            "quote_metrics": quote_metrics,
-            "account_context": account_context,
-        }
-        if reasons:
-            rejected.append(enriched)
-        else:
-            accepted.append(enriched)
+            enriched = {
+                **candidate,
+                "threshold": threshold,
+                "guard_reasons": reasons,
+                "quote_row": quote_row,
+                "quote_metrics": quote_metrics,
+                "account_context": account_context,
+            }
+            if reasons:
+                rejected.append(enriched)
+            else:
+                accepted_candidates.append(enriched)
 
-    best = max(accepted, key=lambda row: (float(row.get("confidence") or 0.0), float(row.get("edge") or 0.0)), default=None)
+        best_offset_candidate = _best_trade_candidate(accepted_candidates)
+        if best_offset_candidate is not None:
+            accepted.append(best_offset_candidate)
+
+    best = _best_trade_candidate(accepted)
     snapshot_ts = utc_snapshot_label()
     payload = {
         "domain": "live",
@@ -116,18 +122,17 @@ def build_decision_snapshot(
         "applied_guard_layers": [
             "active_market",
             "offset_enabled",
+            "trade_side_filter",
             "signal_valid",
             "feature_coverage",
             "bundle_blacklist_compatibility",
             "nan_feature_guard",
-            "min_dir_prob_threshold",
+            "probability_interval_threshold",
             "liquidity_guard",
             "regime_controller",
             "ret_30m_direction_guard",
             "tail_space_guard",
             "entry_price_band",
-            "net_edge_vs_quote",
-            "roi_threshold_vs_quote",
             "trade_count_cap",
             "cash_balance_guard",
             "max_open_markets_guard",
@@ -163,6 +168,11 @@ def build_decision_snapshot(
             "selected_entry_price": (best.get("quote_metrics") or {}).get("entry_price") if best else None,
             "selected_roi_net_vs_quote": (best.get("quote_metrics") or {}).get("roi_net_vs_quote") if best else None,
             "selected_quote_market_id": (best.get("quote_row") or {}).get("market_id") if best else None,
+            "selected_trigger_metric": best.get("trigger_metric") if best else None,
+            "selected_trigger_probability": float_or_none(best.get("trigger_probability")) if best else None,
+            "selected_p_up_raw": float_or_none(best.get("p_up_raw")) if best else None,
+            "selected_p_up_lcb": float_or_none(best.get("p_up_lcb")) if best else None,
+            "selected_p_up_ucb": float_or_none(best.get("p_up_ucb")) if best else None,
             "selected_p_lgb": float_or_none(best.get("p_lgb")) if best else None,
             "selected_p_lr": float_or_none(best.get("p_lr")) if best else None,
             "selected_p_signal": float_or_none(best.get("p_signal")) if best else None,
@@ -174,6 +184,109 @@ def build_decision_snapshot(
         "rejected_offsets": rejected,
     }
     return payload
+
+
+def _build_trade_candidates(*, signal_row: dict[str, Any], profile_spec) -> list[dict[str, Any]]:
+    del profile_spec
+    model_side = str(signal_row.get("recommended_side") or "").upper() or None
+    model_confidence = float_or_none(signal_row.get("confidence"))
+    model_edge = float_or_none(signal_row.get("edge"))
+    probability_view = resolve_probability_interval_view(selected_row=signal_row)
+    if probability_view is None:
+        candidate = dict(signal_row)
+        candidate["model_recommended_side"] = model_side
+        candidate["model_confidence"] = model_confidence
+        candidate["model_edge"] = model_edge
+        candidate["candidate_probability"] = resolve_side_probability(selected_row=signal_row, side=str(candidate.get("recommended_side") or ""))
+        candidate["opposite_probability"] = None
+        candidate["trigger_side"] = model_side
+        candidate["trigger_metric"] = "confidence"
+        candidate["trigger_probability"] = candidate["candidate_probability"]
+        return [candidate]
+
+    return [
+        _build_interval_trade_candidate(
+            signal_row=signal_row,
+            model_side=model_side,
+            model_confidence=model_confidence,
+            model_edge=model_edge,
+            probability_view=probability_view,
+        )
+    ]
+
+
+def _build_interval_trade_candidate(
+    *,
+    signal_row: dict[str, Any],
+    model_side: str | None,
+    model_confidence: float | None,
+    model_edge: float | None,
+    probability_view: dict[str, float],
+) -> dict[str, Any]:
+    raw = float(probability_view["p_up_raw"])
+    eff_up = float(probability_view["p_eff_up"])
+    eff_down = float(probability_view["p_eff_down"])
+    up_lcb = float(probability_view["p_up_lcb"])
+    up_ucb = float(probability_view["p_up_ucb"])
+    if raw > 0.5:
+        side = "UP"
+        confidence = up_lcb
+        candidate_probability = eff_up
+        opposite_probability = eff_down
+        trigger_metric = "p_up_lcb"
+        trigger_probability = up_lcb
+    elif raw < 0.5:
+        side = "DOWN"
+        confidence = eff_down
+        candidate_probability = eff_down
+        opposite_probability = eff_up
+        trigger_metric = "p_up_ucb"
+        trigger_probability = up_ucb
+    else:
+        side = model_side if model_side in {"UP", "DOWN"} else "UP"
+        confidence = up_lcb if side == "UP" else eff_down
+        candidate_probability = eff_up if side == "UP" else eff_down
+        opposite_probability = eff_down if side == "UP" else eff_up
+        trigger_metric = "p_up_raw"
+        trigger_probability = raw
+    candidate = dict(signal_row)
+    candidate["recommended_side"] = side
+    candidate["confidence"] = float(confidence)
+    candidate["edge"] = float(candidate_probability) - float(opposite_probability)
+    candidate["model_recommended_side"] = model_side
+    candidate["model_confidence"] = model_confidence
+    candidate["model_edge"] = model_edge
+    candidate["candidate_probability"] = float(candidate_probability)
+    candidate["opposite_probability"] = float(opposite_probability)
+    candidate["trigger_side"] = side
+    candidate["trigger_metric"] = trigger_metric
+    candidate["trigger_probability"] = float(trigger_probability)
+    candidate["p_up_raw"] = raw
+    candidate["p_down_raw"] = float(probability_view["p_down_raw"])
+    candidate["p_eff_up"] = eff_up
+    candidate["p_eff_down"] = eff_down
+    candidate["p_up_lcb"] = up_lcb
+    candidate["p_up_ucb"] = up_ucb
+    return candidate
+
+
+def _best_trade_candidate(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    candidates = [dict(row) for row in rows if isinstance(row, dict)]
+    if not candidates:
+        return None
+    return max(candidates, key=_trade_candidate_sort_key)
+
+
+def _trade_candidate_sort_key(row: dict[str, Any]) -> tuple[float, float, int]:
+    quote_metrics = row.get("quote_metrics") or {}
+    confidence = float_or_none(row.get("confidence"))
+    entry_price = float_or_none(quote_metrics.get("entry_price"))
+    offset = int(row.get("offset") or 0)
+    return (
+        float("-inf") if confidence is None else float(confidence),
+        float("-inf") if entry_price is None else -float(entry_price),
+        -offset,
+    )
 
 
 def _build_decision_quote_metrics(

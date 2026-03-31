@@ -21,11 +21,11 @@ from pm15min.research.labels.sources import normalize_label_set
 from pm15min.research.layout import normalize_target, slug_token
 
 
-DEFAULT_COMMAND_PREFIX = ("PYTHONPATH=v2/src", "python", "-m", "pm15min")
+DEFAULT_COMMAND_PREFIX = ("PYTHONPATH=src", "python", "-m", "pm15min")
 EXPERIMENT_SUITE_MODE_EXISTING = "existing"
 EXPERIMENT_SUITE_MODE_INLINE = "inline"
 _DEFAULT_COMPARE_REFERENCE_VARIANTS = ("default", "baseline", "control")
-_INLINE_SUITE_SPEC_PREVIEW_ROOT = Path("v2") / "research" / "experiments" / "suite_specs"
+_INLINE_SUITE_SPEC_PREVIEW_ROOT = Path("research") / "experiments" / "suite_specs"
 
 
 @dataclass(frozen=True)

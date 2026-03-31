@@ -56,23 +56,16 @@ def quote_guard_reasons(
     p_side = float_or_none(metrics.get("p_side"))
     if p_side is None:
         p_side = float_or_none(signal_row.get("p_up") if side == "UP" else signal_row.get("p_down"))
-    if p_side is None:
-        p_side = float_or_none(signal_row.get("confidence"))
     metrics["p_side"] = p_side
-    if p_side is None:
-        reasons.append("side_probability_missing")
-        return reasons, metrics
 
     raw_edge = float_or_none(metrics.get("edge_vs_quote"))
-    if raw_edge is None:
+    if raw_edge is None and p_side is not None:
         raw_edge = float(p_side) - float(entry_price)
     min_net_edge = float_or_none(metrics.get("min_net_edge_required"))
     if min_net_edge is None:
         min_net_edge = profile_spec.min_net_edge_for(offset=offset, entry_price=entry_price)
     metrics["edge_vs_quote"] = raw_edge
     metrics["min_net_edge_required"] = min_net_edge
-    if raw_edge < min_net_edge:
-        reasons.append("net_edge_below_quote_threshold")
 
     slippage_bps = float_or_none(metrics.get("slippage_bps"))
     if slippage_bps is None:
@@ -95,8 +88,6 @@ def quote_guard_reasons(
     metrics["effective_entry_price"] = effective_price
     metrics["roi_net_vs_quote"] = roi_net
     metrics["roi_threshold_required"] = roi_threshold
-    if roi_net < roi_threshold:
-        reasons.append("roi_net_below_threshold")
 
     return reasons, metrics
 

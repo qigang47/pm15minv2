@@ -35,6 +35,7 @@ from pm15min.research.service import (
     list_training_runs,
 )
 from pm15min.research.training.runner import train_research_run
+from pm15min.research.workflows import run_research_backfill_followups
 
 
 def _build_cli_deps() -> ResearchCliDeps:
@@ -61,6 +62,7 @@ def _build_cli_deps() -> ResearchCliDeps:
         run_calibration_evaluation=run_calibration_evaluation,
         run_drift_evaluation=run_drift_evaluation,
         run_poly_eval_report=run_poly_eval_report,
+        run_research_backfill_followups=run_research_backfill_followups,
     )
 
 
@@ -80,4 +82,3 @@ def _build_config(args: argparse.Namespace) -> ResearchConfig:
 
 def _parse_offsets(raw: str) -> tuple[int, ...]:
     return _parse_offsets_impl(raw)
-

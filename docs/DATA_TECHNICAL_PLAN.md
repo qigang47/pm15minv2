@@ -46,7 +46,7 @@ tests/
 
 - `src/pm15min/data/` 存实现。
 - `data/` 存持久化数据。
-- `var/live/` 存 runtime state、日志、热缓存。
+- `var/live/` 与 `var/backtest/` 存按 surface 划分的 data runtime state、日志、热缓存。
 - `var/research/` 存 research runtime cache、locks、logs。
 
 `core/layout.py` 同时兼容两种运行方式：
@@ -58,10 +58,18 @@ tests/
 
 ## 3. 目录分层
 
-`data/` 长期分两层 surface：
+当前正式 flow 使用两层 surface：
 
 - `data/live/`
 - `data/backtest/`
+
+仓库顶层仍可能存在：
+
+- `data/sources/`
+- `data/tables/`
+- `data/exports/`
+
+这些是 `DataLayout` 兼容根或历史遗留空壳；当前长期 contract 仍以 `data/<surface>/...` 为准。
 
 每个 surface 只允许三类产物：
 
@@ -113,13 +121,14 @@ data/<surface>/sources/binance/klines_1m/symbol=<symbol>/data.parquet
 
 只有 replay、审计或特殊 loader 才允许显式读取 source 层。
 
-### 4.2 live runtime 配套产物
+### 4.2 surface runtime 配套产物
 
-`data` 域会把部分 runtime 产物写进 `var/live/`，因为它们属于运行态，不属于历史数据仓：
+`data` 域会把部分 runtime 产物写进 `var/<surface>/`，因为它们属于运行态，不属于历史数据仓：
 
 ```text
-var/live/state/orderbooks/cycle=<cycle>/asset=<asset>/...
-var/live/logs/data/recorders/cycle=<cycle>/asset=<asset>/...
+var/<surface>/state/orderbooks/cycle=<cycle>/asset=<asset>/...
+var/<surface>/logs/data/recorders/cycle=<cycle>/asset=<asset>/...
+var/<surface>/state/summary/cycle=<cycle>/asset=<asset>/latest.json
 ```
 
 这类产物包括：
@@ -156,9 +165,24 @@ run
 PYTHONPATH=src python -m pm15min data show-layout --market sol --cycle 15m --surface live
 PYTHONPATH=src python -m pm15min data show-summary --market sol --cycle 15m --surface backtest
 PYTHONPATH=src python -m pm15min data run orderbook-fleet --markets btc,eth,sol,xrp --cycle 15m --surface live --iterations 1
+PYTHONPATH=src python -m pm15min data run live-foundation --market sol --cycle 15m --iterations 1
+PYTHONPATH=src python -m pm15min data run backtest-refresh --markets btc,eth,sol,xrp
 ```
 
 实际支持的子命令以 `PYTHONPATH=src python -m pm15min data --help` 为准。
+
+补充边界规则：
+
+- `data run backfill-direct-oracle`
+- `data run backfill-cycle-labels-gamma`
+
+这类 backfill / refresh 入口只负责刷新 `data/` surface 与必要的 `var/` runtime state。
+
+如果这些刷新会让 `research/label_frames/...` 等下游对象变 stale，后续 rebuild 必须从 `research` 域显式触发，例如：
+
+```bash
+PYTHONPATH=src python -m pm15min research build backfill-followups --markets sol,xrp --cycle 15m --source-surface backtest
+```
 
 ## 6. 对下游的约束
 
@@ -173,7 +197,8 @@ PYTHONPATH=src python -m pm15min data run orderbook-fleet --markets btc,eth,sol,
 
 - 在 research 模块里手搓目录扫描 source 文件。
 - 把 `exports/` 当成训练输入。
-- 直接依赖 `var/live/` 的运行时状态。
+- 直接依赖 `var/<surface>/` 的运行时状态。
+- 期待 `data` 命令顺手写 `research/*` 产物。
 
 ### 6.2 对 live
 

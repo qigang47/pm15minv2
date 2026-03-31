@@ -69,7 +69,6 @@ def check_live_latest(
         ok = (
             bool(row.get("score_valid", False))
             and int(coverage.get("effective_missing_feature_count") or 0) == 0
-            and int(coverage.get("not_allowed_blacklist_count") or 0) == 0
             and int(coverage.get("nan_feature_count") or 0) == 0
         )
         all_offsets_ok = all_offsets_ok and ok

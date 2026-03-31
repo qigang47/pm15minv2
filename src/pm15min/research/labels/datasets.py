@@ -3,7 +3,7 @@ from __future__ import annotations
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.config import ResearchConfig
-from pm15min.research.freshness import ensure_research_label_dependencies_aligned
+from pm15min.research.freshness import prepare_research_label_dependencies
 from pm15min.research.labels.frames import LABEL_FRAME_COLUMNS, build_label_frame, label_frame_metadata
 from pm15min.research.labels.loaders import load_label_inputs
 from pm15min.research.labels.runtime import build_label_runtime_summary, build_truth_runtime_summary
@@ -11,9 +11,14 @@ from pm15min.research.labels.sources import resolve_label_build_plan
 from pm15min.research.manifests import build_manifest, write_manifest
 
 
-def build_label_frame_dataset(cfg: ResearchConfig, *, skip_freshness: bool = False) -> dict[str, object]:
+def build_label_frame_dataset(
+    cfg: ResearchConfig,
+    *,
+    skip_freshness: bool = False,
+    dependency_mode: str = "auto_repair",
+) -> dict[str, object]:
     if not skip_freshness:
-        ensure_research_label_dependencies_aligned(cfg)
+        prepare_research_label_dependencies(cfg, mode=dependency_mode)
     data_cfg = DataConfig.build(
         market=cfg.asset.slug,
         cycle=cfg.cycle,

@@ -5,9 +5,9 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from pm15min.core.orderbook_index import load_orderbook_index_frame, resolve_orderbook_row
 from pm15min.data.config import DataConfig
 from pm15min.data.queries.loaders import load_market_catalog
-from pm15min.live.quotes.orderbook import load_orderbook_index_frame, resolve_orderbook_row
 from pm15min.research.backtests.data_surface_fallback import (
     ensure_orderbook_index_path,
     load_market_catalog_with_fallback,

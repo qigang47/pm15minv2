@@ -11,7 +11,7 @@ from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import TrainingRunSpec, TrainingSetSpec
 from pm15min.research.datasets.training_sets import build_training_set_dataset
-from pm15min.research.freshness import ensure_research_artifacts_aligned
+from pm15min.research.freshness import prepare_research_artifacts
 from pm15min.research.manifests import build_manifest, write_manifest
 from pm15min.research.training.metrics import blend_weights_from_brier, classification_metrics, feature_schema_rows
 from pm15min.research.training.calibration import build_reliability_bins
@@ -41,11 +41,13 @@ def train_research_run(
     spec: TrainingRunSpec,
     *,
     reporter: TrainingProgressReporter | None = None,
+    dependency_mode: str = "auto_repair",
 ) -> dict[str, object]:
-    ensure_research_artifacts_aligned(
+    prepare_research_artifacts(
         cfg,
         feature_set=spec.feature_set,
         label_set=spec.label_set,
+        mode=dependency_mode,
     )
     run_dir = cfg.layout.training_run_dir(
         model_family=spec.model_family,

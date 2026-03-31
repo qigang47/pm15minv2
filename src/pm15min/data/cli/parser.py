@@ -226,7 +226,7 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
 
     backfill_direct_oracle = run_sub.add_parser(
         "backfill-direct-oracle",
-        help="Backfill direct Polymarket oracle rows and rebuild oracle/truth/label outputs.",
+        help="Backfill direct Polymarket oracle rows and rebuild canonical oracle/truth outputs.",
     )
     add_market_cycle_surface_args(backfill_direct_oracle, surface_default="backtest")
     backfill_direct_oracle.add_argument("--workers", type=int, default=1)
@@ -237,7 +237,7 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
 
     backfill_gamma = run_sub.add_parser(
         "backfill-cycle-labels-gamma",
-        help="Backfill market catalog and truth/label frames from Gamma outcome prices.",
+        help="Backfill market catalog and truth from Gamma outcome prices; research label rebuild now belongs to research workflows.",
     )
     backfill_gamma.add_argument("--markets", default="btc,eth,sol,xrp", help="Comma-separated markets or all.")
     backfill_gamma.add_argument("--cycle", default="15m", choices=["5m", "15m"])

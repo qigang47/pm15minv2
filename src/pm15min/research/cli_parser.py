@@ -12,6 +12,19 @@ from pm15min.research.cli_args import (
 )
 
 
+def _add_dependency_mode_arg(
+    parser: argparse.ArgumentParser,
+    *,
+    default: str = "auto_repair",
+) -> None:
+    parser.add_argument(
+        "--dependency-mode",
+        default=default,
+        choices=["auto_repair", "fail_fast"],
+        help="How to handle stale upstream artifacts.",
+    )
+
+
 def attach_research_subcommands(
     subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
@@ -148,10 +161,23 @@ def attach_research_subcommands(
     add_market_cycle_profile_args(feature_frame)
     feature_frame.add_argument("--source-surface", default="backtest", choices=["live", "backtest"])
     feature_frame.add_argument("--feature-set", default="deep_otm_v1")
+    _add_dependency_mode_arg(feature_frame, default="fail_fast")
 
     label_frame = build_sub.add_parser("label-frame", help="Plan the canonical label-frame build.")
     add_market_cycle_profile_args(label_frame)
     label_frame.add_argument("--label-set", default="truth")
+    _add_dependency_mode_arg(label_frame, default="fail_fast")
+
+    backfill_followups = build_sub.add_parser(
+        "backfill-followups",
+        help="Run explicit research follow-up rebuilds after data-domain backfills.",
+    )
+    backfill_followups.add_argument("--markets", default="btc,eth,sol,xrp", help="Comma-separated markets.")
+    add_cycle_arg(backfill_followups)
+    backfill_followups.add_argument("--source-surface", default="backtest", choices=["live", "backtest"])
+    backfill_followups.add_argument("--label-set", default="truth")
+    backfill_followups.add_argument("--skip-freshness", action="store_true")
+    _add_dependency_mode_arg(backfill_followups, default="fail_fast")
 
     training_set = build_sub.add_parser("training-set", help="Build the canonical training-set dataset.")
     add_market_cycle_profile_args(training_set)
@@ -161,6 +187,7 @@ def attach_research_subcommands(
     training_set.add_argument("--window-start", required=True)
     training_set.add_argument("--window-end", required=True)
     training_set.add_argument("--offset", type=int, required=True)
+    _add_dependency_mode_arg(training_set, default="fail_fast")
 
     train = research_sub.add_parser("train", help="Train research models.")
     train_sub = train.add_subparsers(dest="research_train_command")
@@ -175,6 +202,7 @@ def attach_research_subcommands(
     train_run.add_argument("--window-end", required=True)
     train_run.add_argument("--run-label", default="planned")
     train_run.add_argument("--parallel-workers", type=int, default=None)
+    _add_dependency_mode_arg(train_run, default="fail_fast")
 
     bundle = research_sub.add_parser("bundle", help="Build deployable model bundles.")
     bundle_sub = bundle.add_subparsers(dest="research_bundle_command")
@@ -203,6 +231,7 @@ def attach_research_subcommands(
     backtest_run.add_argument("--secondary-bundle-label", default=None)
     backtest_run.add_argument("--fallback-reasons", default=None, help="Comma-separated hybrid fallback reasons.")
     backtest_run.add_argument("--parity-json", default=None, help="JSON mapping with backtest parity overrides.")
+    _add_dependency_mode_arg(backtest_run, default="fail_fast")
 
     experiment = research_sub.add_parser("experiment", help="Run research experiment suites.")
     experiment_sub = experiment.add_subparsers(dest="research_experiment_command")

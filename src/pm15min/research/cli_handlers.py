@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -60,6 +61,7 @@ class ResearchCliDeps:
     run_calibration_evaluation: Callable[..., dict[str, Any]]
     run_drift_evaluation: Callable[..., dict[str, Any]]
     run_poly_eval_report: Callable[..., dict[str, Any]]
+    run_research_backfill_followups: Callable[..., dict[str, Any]]
 
 
 def _print_payload(payload: Any, *, sort_keys: bool = True) -> int:
@@ -840,6 +842,26 @@ def _run_poly_eval_scope_dispatch(
 
 
 def run_research_command(args: argparse.Namespace, *, deps: ResearchCliDeps) -> int:
+    try:
+        return _run_research_command_impl(args, deps=deps)
+    except RuntimeError as exc:
+        message = str(exc)
+        if not message.startswith("research_dependencies_not_fresh:"):
+            raise
+        print(_format_dependency_error(message), file=sys.stderr)
+        return 2
+
+
+def _format_dependency_error(message: str) -> str:
+    details = message.split(":", 1)[1] if ":" in message else message
+    return (
+        "Research dependencies are not fresh. "
+        f"{details}. "
+        "Prepare the required artifacts first, or rerun with `--dependency-mode auto_repair`."
+    )
+
+
+def _run_research_command_impl(args: argparse.Namespace, *, deps: ResearchCliDeps) -> int:
     if args.research_command == "show-config":
         cfg = _build_config(args, deps)
         return _print_payload(deps.describe_research_runtime(cfg))
@@ -886,11 +908,24 @@ def run_research_command(args: argparse.Namespace, *, deps: ResearchCliDeps) -> 
 
     if args.research_command == "build" and args.research_build_command == "feature-frame":
         cfg = _build_config(args, deps)
-        return _print_payload(deps.build_feature_frame_dataset(cfg))
+        return _print_payload(deps.build_feature_frame_dataset(cfg, dependency_mode=args.dependency_mode))
 
     if args.research_command == "build" and args.research_build_command == "label-frame":
         cfg = _build_config(args, deps)
-        return _print_payload(deps.build_label_frame_dataset(cfg))
+        return _print_payload(deps.build_label_frame_dataset(cfg, dependency_mode=args.dependency_mode))
+
+    if args.research_command == "build" and args.research_build_command == "backfill-followups":
+        markets = [item.strip().lower() for item in str(args.markets or "").split(",") if item.strip()]
+        return _print_payload(
+            deps.run_research_backfill_followups(
+                markets=markets or ["btc", "eth", "sol", "xrp"],
+                cycle=args.cycle,
+                source_surface=args.source_surface,
+                label_set=args.label_set,
+                skip_freshness=bool(args.skip_freshness),
+                dependency_mode=args.dependency_mode,
+            )
+        )
 
     if args.research_command == "build" and args.research_build_command == "training-set":
         cfg = _build_config(args, deps)
@@ -901,7 +936,7 @@ def run_research_command(args: argparse.Namespace, *, deps: ResearchCliDeps) -> 
             window=deps.DateWindow.from_bounds(args.window_start, args.window_end),
             offset=args.offset,
         )
-        return _print_payload(deps.build_training_set_dataset(cfg, spec))
+        return _print_payload(deps.build_training_set_dataset(cfg, spec, dependency_mode=args.dependency_mode))
 
     if args.research_command == "train" and args.research_train_command == "run":
         cfg = _build_config(args, deps)
@@ -915,7 +950,7 @@ def run_research_command(args: argparse.Namespace, *, deps: ResearchCliDeps) -> 
             offsets=_parse_offsets(args.offsets),
             parallel_workers=args.parallel_workers,
         )
-        return _print_payload(deps.train_research_run(cfg, spec))
+        return _print_payload(deps.train_research_run(cfg, spec, dependency_mode=args.dependency_mode))
 
     if args.research_command == "bundle" and args.research_bundle_command == "build":
         cfg = _build_config(args, deps)
@@ -944,7 +979,7 @@ def run_research_command(args: argparse.Namespace, *, deps: ResearchCliDeps) -> 
             max_notional_usd=args.max_notional_usd,
             parity=_parse_json_mapping(args.parity_json),
         )
-        return _print_payload(deps.run_research_backtest(cfg, spec))
+        return _print_payload(deps.run_research_backtest(cfg, spec, dependency_mode=args.dependency_mode))
 
     if args.research_command == "experiment" and args.research_experiment_command == "run-suite":
         cfg = _build_config(args, deps)

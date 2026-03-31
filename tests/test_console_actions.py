@@ -226,7 +226,7 @@ def test_build_console_action_request_normalizes_research_actions() -> None:
     assert experiment["normalized_request"]["suite"] == "main_suite"
     assert experiment["normalized_request"]["run_label"] == "exp_one"
     assert experiment["normalized_request"]["suite_mode"] == "existing"
-    assert experiment["command_preview"].startswith("PYTHONPATH=v2/src python -m pm15min ")
+    assert experiment["command_preview"].startswith("PYTHONPATH=src python -m pm15min ")
 
     inline_experiment = build_console_action_request(
         "research_experiment_run_suite",
@@ -254,7 +254,7 @@ def test_build_console_action_request_normalizes_research_actions() -> None:
     assert inline_experiment["normalized_request"]["suite_mode"] == "inline"
     assert inline_experiment["normalized_request"]["suite"] == "feature_matrix"
     assert inline_experiment["normalized_request"]["run_label"] == "inline_exp"
-    assert inline_experiment["normalized_request"]["suite_spec_path"] == "v2/research/experiments/suite_specs/feature_matrix.json"
+    assert inline_experiment["normalized_request"]["suite_spec_path"] == "research/experiments/suite_specs/feature_matrix.json"
     assert inline_experiment["normalized_request"]["feature_set_variants"] == [
         {"label": "baseline", "feature_set": "deep_otm_v1"},
         {"label": "wide", "feature_set": "deep_otm_v2"},
@@ -274,7 +274,7 @@ def test_build_console_action_request_normalizes_research_actions() -> None:
     assert inline_payload["markets"][0]["stakes_usd"] == [1.0, 5.0, 10.0]
     assert inline_payload["runtime_policy"]["parallel_case_workers"] == 3
     assert "--suite" in inline_experiment["pm15min_args"]
-    assert "v2/research/experiments/suite_specs/feature_matrix.json" in inline_experiment["command_preview"]
+    assert "research/experiments/suite_specs/feature_matrix.json" in inline_experiment["command_preview"]
 
 
 def test_build_console_action_request_rejects_invalid_requests() -> None:

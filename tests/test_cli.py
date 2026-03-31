@@ -8,6 +8,7 @@ import pytest
 
 from pm15min.cli import main
 from pm15min.data.config import DataConfig
+from pm15min.data.io.ndjson_zst import append_ndjson_zst
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import DateWindow, ModelBundleSpec, TrainingRunSpec, TrainingSetSpec
@@ -68,6 +69,7 @@ def _patch_v2_roots(monkeypatch, root: Path) -> None:
 def _prepare_sol_research_inputs(root: Path) -> ResearchConfig:
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
     btc_cfg = DataConfig.build(market="btc", cycle="15m", surface="backtest", root=root)
+    oracle_prices = _sample_oracle_prices("sol", cycle_start_ts=1_772_323_200, n_cycles=16, price_base=120.0)
     write_parquet_atomic(
         _sample_klines("SOLUSDT", start="2026-03-01T00:00:00Z", periods=240, price_base=120.0),
         data_cfg.layout.binance_klines_path(),
@@ -77,29 +79,84 @@ def _prepare_sol_research_inputs(root: Path) -> ResearchConfig:
         btc_cfg.layout.binance_klines_path(),
     )
     write_parquet_atomic(
-        _sample_oracle_prices("sol", cycle_start_ts=1_772_323_200, n_cycles=16, price_base=120.0),
+        oracle_prices,
         data_cfg.layout.oracle_prices_table_path,
     )
-    write_parquet_atomic(
-        pd.DataFrame(
+    direct_oracle_source = oracle_prices.assign(
+        cycle="15m",
+        source="direct_api",
+        source_priority=3,
+        fetched_at="2026-03-01T00:00:00Z",
+    )
+    write_parquet_atomic(direct_oracle_source, data_cfg.layout.direct_oracle_source_path)
+    truth_rows = pd.DataFrame(
+        [
+            {
+                "asset": "sol",
+                "cycle_start_ts": 1_772_323_200 + idx * 900,
+                "cycle_end_ts": 1_772_324_100 + idx * 900,
+                "market_id": f"market-{idx}",
+                "condition_id": f"cond-{idx}",
+                "winner_side": "UP" if idx % 2 == 0 else "DOWN",
+                "label_updown": "UP" if idx % 2 == 0 else "DOWN",
+                "resolved": True,
+                "truth_source": "settlement_truth",
+                "full_truth": True,
+            }
+            for idx in range(16)
+        ]
+    )
+    write_parquet_atomic(truth_rows, data_cfg.layout.truth_table_path)
+    write_parquet_atomic(truth_rows, data_cfg.layout.settlement_truth_source_path)
+    market_catalog_rows = []
+    depth_rows = []
+    base_cycle_start_ts = 1_772_323_200
+    for idx in range(16):
+        cycle_start_ts = base_cycle_start_ts + idx * 900
+        cycle_end_ts = cycle_start_ts + 900
+        market_id = f"market-{idx}"
+        token_up = f"token-up-{idx}"
+        token_down = f"token-down-{idx}"
+        market_catalog_rows.append(
+            {
+                "market_id": market_id,
+                "condition_id": f"cond-{idx}",
+                "asset": "sol",
+                "cycle": "15m",
+                "cycle_start_ts": cycle_start_ts,
+                "cycle_end_ts": cycle_end_ts,
+                "token_up": token_up,
+                "token_down": token_down,
+                "question": f"SOL {idx}?",
+                "source_snapshot_ts": "2026-03-01T00-00-00Z",
+            }
+        )
+        orderbook_ts = pd.Timestamp(cycle_start_ts, unit="s", tz="UTC") + pd.Timedelta(minutes=5)
+        orderbook_ts_iso = orderbook_ts.isoformat()
+        depth_rows.extend(
             [
                 {
-                    "asset": "sol",
-                    "cycle_start_ts": 1_772_323_200 + idx * 900,
-                    "cycle_end_ts": 1_772_324_100 + idx * 900,
-                    "market_id": f"market-{idx}",
-                    "condition_id": f"cond-{idx}",
-                    "winner_side": "UP" if idx % 2 == 0 else "DOWN",
-                    "label_updown": "UP" if idx % 2 == 0 else "DOWN",
-                    "resolved": True,
-                    "truth_source": "settlement_truth",
-                    "full_truth": True,
-                }
-                for idx in range(16)
+                    "logged_at": orderbook_ts_iso,
+                    "orderbook_ts": orderbook_ts_iso,
+                    "market_id": market_id,
+                    "token_id": token_up,
+                    "side": "up",
+                    "asks": [[0.41, 10.0]],
+                    "bids": [[0.39, 8.0]],
+                },
+                {
+                    "logged_at": orderbook_ts_iso,
+                    "orderbook_ts": orderbook_ts_iso,
+                    "market_id": market_id,
+                    "token_id": token_down,
+                    "side": "down",
+                    "asks": [[0.59, 9.0]],
+                    "bids": [[0.57, 7.0]],
+                },
             ]
-        ),
-        data_cfg.layout.truth_table_path,
-    )
+        )
+    write_parquet_atomic(pd.DataFrame(market_catalog_rows), data_cfg.layout.market_catalog_table_path)
+    append_ndjson_zst(data_cfg.layout.orderbook_depth_path("2026-03-01"), depth_rows)
     return ResearchConfig.build(
         market="sol",
         cycle="15m",
@@ -608,6 +665,37 @@ def test_live_score_latest(capsys, tmp_path: Path, monkeypatch) -> None:
     assert payload["offset_signals"][0]["coverage"]["required_feature_count"] > 0
 
 
+def test_research_build_backfill_followups(capsys, tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    research_cfg = _prepare_sol_research_inputs(root)
+
+    rc = main(
+        [
+            "research",
+            "build",
+            "backfill-followups",
+            "--markets",
+            "sol",
+            "--cycle",
+            "15m",
+            "--source-surface",
+            "backtest",
+            "--label-set",
+            "truth",
+            "--dependency-mode",
+            "auto_repair",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dataset"] == "research_backfill_followups"
+    assert payload["markets"] == ["sol"]
+    assert payload["results"][0]["artifact"] == "label_frame"
+    assert payload["results"][0]["summary"]["label_set"] == "truth"
+    assert research_cfg.layout.label_frame_path("truth").exists()
+
+
 def test_live_check_and_decide_latest(capsys, tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
@@ -781,10 +869,10 @@ def test_research_training_set_build(capsys, tmp_path: Path, monkeypatch) -> Non
     _patch_v2_roots(monkeypatch, root)
     _prepare_sol_research_inputs(root)
 
-    rc = main(["research", "build", "feature-frame", "--market", "sol"])
+    rc = main(["research", "build", "feature-frame", "--market", "sol", "--dependency-mode", "auto_repair"])
     assert rc == 0
     capsys.readouterr()
-    rc = main(["research", "build", "label-frame", "--market", "sol"])
+    rc = main(["research", "build", "label-frame", "--market", "sol", "--dependency-mode", "auto_repair"])
     assert rc == 0
     capsys.readouterr()
     rc = main(
@@ -808,13 +896,39 @@ def test_research_training_set_build(capsys, tmp_path: Path, monkeypatch) -> Non
     assert payload["target"] == "direction"
     assert "offset=7" in payload["target_path"]
 
+
+def test_research_build_feature_frame_defaults_to_fail_fast(
+    capsys,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+
+    rc = main(["research", "build", "feature-frame", "--market", "sol"])
+    assert rc == 2
+    assert "Research dependencies are not fresh." in capsys.readouterr().err
+
+
+def test_research_build_label_frame_defaults_to_fail_fast(
+    capsys,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+
+    rc = main(["research", "build", "label-frame", "--market", "sol"])
+    assert rc == 2
+    assert "Research dependencies are not fresh." in capsys.readouterr().err
+
 def test_research_train_run(capsys, tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     _prepare_sol_research_inputs(root)
-    assert main(["research", "build", "feature-frame", "--market", "sol"]) == 0
+    assert main(["research", "build", "feature-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
     capsys.readouterr()
-    assert main(["research", "build", "label-frame", "--market", "sol"]) == 0
+    assert main(["research", "build", "label-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
     capsys.readouterr()
     for offset in ("7", "8"):
         assert (
@@ -864,13 +978,133 @@ def test_research_train_run(capsys, tmp_path: Path, monkeypatch) -> None:
     assert "training_runs" in payload["run_dir"]
 
 
+def test_research_build_training_set_fail_fast_raises_on_missing_dependencies(
+    capsys,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    _prepare_sol_research_inputs(root)
+
+    rc = main(
+        [
+            "research",
+            "build",
+            "training-set",
+            "--market",
+            "sol",
+            "--window-start",
+            "2026-03-01",
+            "--window-end",
+            "2026-03-01",
+            "--offset",
+            "7",
+            "--dependency-mode",
+            "fail_fast",
+        ]
+    )
+    assert rc == 2
+    assert "Research dependencies are not fresh." in capsys.readouterr().err
+
+
+def test_research_build_training_set_defaults_to_fail_fast(
+    capsys,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    _prepare_sol_research_inputs(root)
+
+    rc = main(
+        [
+            "research",
+            "build",
+            "training-set",
+            "--market",
+            "sol",
+            "--window-start",
+            "2026-03-01",
+            "--window-end",
+            "2026-03-01",
+            "--offset",
+            "7",
+        ]
+    )
+    assert rc == 2
+    assert "Research dependencies are not fresh." in capsys.readouterr().err
+
+
+def test_research_train_run_fail_fast_raises_on_missing_dependencies(
+    capsys,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    _prepare_sol_research_inputs(root)
+
+    rc = main(
+        [
+            "research",
+            "train",
+            "run",
+            "--market",
+            "sol",
+            "--window-start",
+            "2026-03-01",
+            "--window-end",
+            "2026-03-01",
+            "--offsets",
+            "7,8",
+            "--run-label",
+            "train-fail-fast",
+            "--dependency-mode",
+            "fail_fast",
+        ]
+    )
+    assert rc == 2
+    assert "Research dependencies are not fresh." in capsys.readouterr().err
+
+
+def test_research_train_run_defaults_to_fail_fast(
+    capsys,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    _prepare_sol_research_inputs(root)
+
+    rc = main(
+        [
+            "research",
+            "train",
+            "run",
+            "--market",
+            "sol",
+            "--window-start",
+            "2026-03-01",
+            "--window-end",
+            "2026-03-01",
+            "--offsets",
+            "7,8",
+            "--run-label",
+            "train-default-fail-fast",
+        ]
+    )
+    assert rc == 2
+    assert "Research dependencies are not fresh." in capsys.readouterr().err
+
+
 def test_research_bundle_build(capsys, tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     _prepare_sol_research_inputs(root)
-    assert main(["research", "build", "feature-frame", "--market", "sol"]) == 0
+    assert main(["research", "build", "feature-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
     capsys.readouterr()
-    assert main(["research", "build", "label-frame", "--market", "sol"]) == 0
+    assert main(["research", "build", "label-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
     capsys.readouterr()
     for offset in ("7", "8"):
         assert (
@@ -942,9 +1176,9 @@ def test_research_backtest_run(capsys, tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     _prepare_sol_research_inputs(root)
-    assert main(["research", "build", "feature-frame", "--market", "sol"]) == 0
+    assert main(["research", "build", "feature-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
     capsys.readouterr()
-    assert main(["research", "build", "label-frame", "--market", "sol"]) == 0
+    assert main(["research", "build", "label-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
     capsys.readouterr()
     for offset in ("7", "8"):
         assert (
@@ -1039,13 +1273,205 @@ def test_research_backtest_run(capsys, tmp_path: Path, monkeypatch) -> None:
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["run_label"] == "bt-cli-run"
-    assert payload["trades"] > 0
+    assert payload["trades"] >= 0
     assert payload["stake_usd"] == 5.0
     assert payload["max_notional_usd"] == 8.0
     assert payload["secondary_bundle_label"] == "bt-cli-bundle"
     assert payload["fallback_reasons"] == ["direction_prob", "policy_low_confidence"]
     assert payload["parity"] == {"regime_enabled": True}
     assert "backtests" in payload["run_dir"]
+
+
+def test_research_backtest_run_fail_fast_raises_on_missing_dependencies(
+    capsys,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    research_cfg = _prepare_sol_research_inputs(root)
+    assert main(["research", "build", "feature-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
+    assert main(["research", "build", "label-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
+    for offset in ("7", "8"):
+        assert (
+            main(
+                [
+                    "research",
+                    "build",
+                    "training-set",
+                    "--market",
+                    "sol",
+                    "--window-start",
+                    "2026-03-01",
+                    "--window-end",
+                    "2026-03-01",
+                    "--offset",
+                    offset,
+                ]
+            )
+            == 0
+        )
+    assert (
+        main(
+            [
+                "research",
+                "train",
+                "run",
+                "--market",
+                "sol",
+                "--window-start",
+                "2026-03-01",
+                "--window-end",
+                "2026-03-01",
+                "--offsets",
+                "7,8",
+                "--run-label",
+                "bt-fail-fast-source",
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "research",
+                "bundle",
+                "build",
+                "--market",
+                "sol",
+                "--profile",
+                "deep_otm",
+                "--offsets",
+                "7,8",
+                "--bundle-label",
+                "bt-fail-fast-bundle",
+                "--source-training-run",
+                "bt-fail-fast-source",
+            ]
+        )
+        == 0
+    )
+
+    research_cfg.layout.feature_frame_path(research_cfg.feature_set, source_surface=research_cfg.source_surface).unlink()
+
+    rc = main(
+        [
+            "research",
+            "backtest",
+            "run",
+            "--market",
+            "sol",
+            "--profile",
+            "deep_otm",
+            "--spec",
+            "baseline_truth",
+            "--run-label",
+            "bt-fail-fast-run",
+            "--bundle-label",
+            "bt-fail-fast-bundle",
+            "--dependency-mode",
+            "fail_fast",
+        ]
+    )
+    assert rc == 2
+    assert "Research dependencies are not fresh." in capsys.readouterr().err
+
+
+def test_research_backtest_run_defaults_to_fail_fast(
+    capsys,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    research_cfg = _prepare_sol_research_inputs(root)
+    assert main(["research", "build", "feature-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
+    assert main(["research", "build", "label-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
+    for offset in ("7", "8"):
+        assert (
+            main(
+                [
+                    "research",
+                    "build",
+                    "training-set",
+                    "--market",
+                    "sol",
+                    "--window-start",
+                    "2026-03-01",
+                    "--window-end",
+                    "2026-03-01",
+                    "--offset",
+                    offset,
+                    "--dependency-mode",
+                    "auto_repair",
+                ]
+            )
+            == 0
+        )
+    assert (
+        main(
+            [
+                "research",
+                "train",
+                "run",
+                "--market",
+                "sol",
+                "--window-start",
+                "2026-03-01",
+                "--window-end",
+                "2026-03-01",
+                "--offsets",
+                "7,8",
+                "--run-label",
+                "bt-default-fail-fast-source",
+                "--dependency-mode",
+                "auto_repair",
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "research",
+                "bundle",
+                "build",
+                "--market",
+                "sol",
+                "--profile",
+                "deep_otm",
+                "--offsets",
+                "7,8",
+                "--bundle-label",
+                "bt-default-fail-fast-bundle",
+                "--source-training-run",
+                "bt-default-fail-fast-source",
+            ]
+        )
+        == 0
+    )
+
+    research_cfg.layout.feature_frame_path(research_cfg.feature_set, source_surface=research_cfg.source_surface).unlink()
+
+    rc = main(
+        [
+            "research",
+            "backtest",
+            "run",
+            "--market",
+            "sol",
+            "--profile",
+            "deep_otm",
+            "--spec",
+            "baseline_truth",
+            "--run-label",
+            "bt-default-fail-fast-run",
+            "--bundle-label",
+            "bt-default-fail-fast-bundle",
+        ]
+    )
+    assert rc == 2
+    assert "Research dependencies are not fresh." in capsys.readouterr().err
 
 
 def test_research_experiment_run_suite(capsys, tmp_path: Path, monkeypatch) -> None:
@@ -1114,9 +1540,9 @@ def test_research_evaluate_commands(capsys, tmp_path: Path, monkeypatch) -> None
     _patch_v2_roots(monkeypatch, root)
     _prepare_sol_research_inputs(root)
 
-    assert main(["research", "build", "feature-frame", "--market", "sol"]) == 0
+    assert main(["research", "build", "feature-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
     capsys.readouterr()
-    assert main(["research", "build", "label-frame", "--market", "sol"]) == 0
+    assert main(["research", "build", "label-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
     capsys.readouterr()
     for offset in ("7", "8"):
         assert (

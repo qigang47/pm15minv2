@@ -10,6 +10,7 @@ from pm15min.data.config import DataConfig
 from pm15min.data.io.ndjson_zst import iter_ndjson_zst
 from pm15min.data.sources.orderbook_provider import OrderbookProvider, build_orderbook_provider_from_env
 from pm15min.data.sources.polymarket_clob import normalize_book
+from ..quotes.orderbook import live_provider_orderbook_levels
 from .utils import (
     normalize_levels,
     quote_captured_ts_ms,
@@ -18,7 +19,7 @@ from .utils import (
 
 
 POST_DECISION_EXECUTION_TOLERANCE_MS = 120_000
-DEFAULT_LIVE_ORDERBOOK_LEVELS = 50
+DEFAULT_LIVE_ORDERBOOK_LEVELS = 20
 DEFAULT_LIVE_ORDERBOOK_TIMEOUT_SEC = 1.2
 DEFAULT_LOCAL_ORDERBOOK_MAX_AGE_MS = 5_000
 
@@ -41,7 +42,7 @@ def build_depth_execution_plan(
     min_fill_ratio: float,
     orderbook_provider: OrderbookProvider | None = None,
     prefer_live_provider: bool = False,
-    provider_levels: int = DEFAULT_LIVE_ORDERBOOK_LEVELS,
+    provider_levels: int | None = None,
     provider_timeout_sec: float = DEFAULT_LIVE_ORDERBOOK_TIMEOUT_SEC,
 ) -> tuple[dict[str, Any] | None, str | None]:
     import pandas as pd
@@ -208,7 +209,7 @@ def build_live_depth_execution_plan_from_provider(
     max_slippage_bps: float,
     min_fill_ratio: float,
     orderbook_provider: OrderbookProvider | None = None,
-    provider_levels: int = DEFAULT_LIVE_ORDERBOOK_LEVELS,
+    provider_levels: int | None = None,
     provider_timeout_sec: float = DEFAULT_LIVE_ORDERBOOK_TIMEOUT_SEC,
 ) -> tuple[dict[str, Any] | None, str | None] | None:
     if not market_id or not token_id:
@@ -225,9 +226,14 @@ def build_live_depth_execution_plan_from_provider(
     if provider is None:
         return None
     try:
+        resolved_levels = (
+            live_provider_orderbook_levels()
+            if provider_levels is None
+            else max(0, int(provider_levels))
+        )
         payload = provider.get_orderbook_summary(
             token_id,
-            levels=max(0, int(provider_levels)),
+            levels=resolved_levels,
             timeout=max(0.1, float(provider_timeout_sec)),
             force_refresh=False,
         )

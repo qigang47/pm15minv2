@@ -14,11 +14,10 @@ from pm15min.data.pipelines.direct_sync import sync_settlement_truth_from_gamma,
 from pm15min.data.pipelines.market_catalog import backfill_market_catalog_from_closed_markets, sync_market_catalog
 from pm15min.data.pipelines.truth import build_truth_15m, build_truth_table
 from pm15min.data.pipelines.oracle_prices import build_oracle_prices_15m
-from pm15min.research.config import ResearchConfig
-from pm15min.research.labels.datasets import build_label_frame_dataset
 
 
 BacktestRefreshStep = Callable[[DataConfig], dict[str, Any]]
+LabelFrameRebuildFn = Callable[[DataConfig], dict[str, object]]
 
 
 @dataclass(frozen=True)
@@ -125,6 +124,7 @@ def backfill_cycle_labels_from_gamma(
     workers: int = 4,
     refresh_market_catalog: bool = True,
     skip_freshness: bool = True,
+    rebuild_label_frame_fn: LabelFrameRebuildFn | None = None,
 ) -> dict[str, object]:
     cfgs = [
         DataConfig.build(
@@ -187,14 +187,9 @@ def backfill_cycle_labels_from_gamma(
             workers=max(1, int(workers)),
         )
         truth = build_truth_table(cfg)
-        label = build_label_frame_dataset(
-            ResearchConfig.build(
-                market=cfg.asset.slug,
-                cycle=cfg.cycle,
-                source_surface=cfg.surface,
-                label_set="truth",
-                root=cfg.layout.storage.rewrite_root,
-            ),
+        label = _resolve_label_frame_rebuild_summary(
+            cfg,
+            rebuild_label_frame_fn=rebuild_label_frame_fn,
             skip_freshness=skip_freshness,
         )
         truth_df = pd.read_parquet(cfg.layout.truth_table_path, columns=["cycle_start_ts", "resolved", "full_truth"])
@@ -231,3 +226,21 @@ def backfill_cycle_labels_from_gamma(
         "market_catalog_results": market_catalog_results,
         "results": results,
     }
+
+
+def _resolve_label_frame_rebuild_summary(
+    cfg: DataConfig,
+    *,
+    rebuild_label_frame_fn: LabelFrameRebuildFn | None,
+    skip_freshness: bool,
+) -> dict[str, object]:
+    if rebuild_label_frame_fn is None:
+        return {
+            "status": "skipped",
+            "reason": "research_label_frame_rebuild_moved_out_of_data_domain",
+            "market": cfg.asset.slug,
+            "cycle": cfg.cycle,
+            "surface": cfg.surface,
+            "skip_freshness_requested": bool(skip_freshness),
+        }
+    return rebuild_label_frame_fn(cfg)

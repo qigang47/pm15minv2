@@ -32,7 +32,7 @@ def build_decision_reject_diagnostics(*, last_iteration: dict[str, object]) -> d
         rejected_offsets,
         key=lambda row: (
             float("-inf") if row["confidence"] is None else float(row["confidence"]),
-            float("-inf") if row["edge_vs_quote"] is None else float(row["edge_vs_quote"]),
+            float("-inf") if row["entry_price"] is None else -float(row["entry_price"]),
         ),
         default=None,
     )
@@ -53,7 +53,7 @@ def build_decision_reject_diagnostics(*, last_iteration: dict[str, object]) -> d
 def compact_rejected_offset_summary(row: dict[str, object]) -> dict[str, object]:
     quote_metrics = row.get("quote_metrics") or {}
     quote_row = row.get("quote_row") or {}
-    return {
+    payload = {
         "offset": int_or_none(row.get("offset")),
         "decision_ts": row.get("decision_ts"),
         "side": str(row.get("recommended_side") or "") or None,
@@ -71,6 +71,22 @@ def compact_rejected_offset_summary(row: dict[str, object]) -> dict[str, object]
         "quote_market_id": quote_metrics.get("quote_market_id") or quote_row.get("market_id"),
         "guard_reasons": [str(reason) for reason in (row.get("guard_reasons") or []) if str(reason)],
     }
+    trigger_metric = str(row.get("trigger_metric") or "") or None
+    trigger_probability = float_or_none(row.get("trigger_probability"))
+    p_up_raw = float_or_none(row.get("p_up_raw"))
+    p_up_lcb = float_or_none(row.get("p_up_lcb"))
+    p_up_ucb = float_or_none(row.get("p_up_ucb"))
+    if trigger_metric is not None:
+        payload["trigger_metric"] = trigger_metric
+    if trigger_probability is not None:
+        payload["trigger_probability"] = trigger_probability
+    if p_up_raw is not None:
+        payload["p_up_raw"] = p_up_raw
+    if p_up_lcb is not None:
+        payload["p_up_lcb"] = p_up_lcb
+    if p_up_ucb is not None:
+        payload["p_up_ucb"] = p_up_ucb
+    return payload
 
 
 def shared_guard_reasons_for_offsets(rejected_offsets: list[dict[str, object]]) -> list[str]:
@@ -94,13 +110,7 @@ def classify_decision_reject_interpretation(
         for row in rejected_offsets
         if row.get("entry_price") is not None and row.get("p_side") is not None
     ]
-    if (
-        "entry_price_max" in shared
-        and "net_edge_below_quote_threshold" in shared
-        and "roi_net_below_threshold" in shared
-        and comparable_rows
-        and all(float(row["entry_price"]) > float(row["p_side"]) for row in comparable_rows)
-    ):
+    if "entry_price_max" in shared and comparable_rows and all(float(row["entry_price"]) > float(row["p_side"]) for row in comparable_rows):
         return "market_priced_through_signal"
     if "entry_price_max" in shared:
         return "entry_price_above_live_cap"

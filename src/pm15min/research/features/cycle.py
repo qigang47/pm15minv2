@@ -62,6 +62,7 @@ def append_cycle_features(
         "pullback_from_cycle_high",
         "rebound_from_cycle_low",
         "cycle_range_pos",
+        "cycle_range_vs_rv",
         "move_z",
         "first_half_ret",
         "second_half_ret_proxy",
@@ -72,11 +73,11 @@ def append_cycle_features(
     cycle_open = close.groupby(cycle_start).transform("first")
     if needs("ret_from_cycle_open", "move_z", "first_half_ret", "second_half_ret_proxy"):
         out["ret_from_cycle_open"] = close / cycle_open - 1.0
-    if needs("pullback_from_cycle_high", "cycle_range_pos"):
+    if needs("pullback_from_cycle_high", "cycle_range_pos", "cycle_range_vs_rv"):
         cycle_high = close.groupby(cycle_start).cummax()
     else:
         cycle_high = None
-    if needs("rebound_from_cycle_low", "cycle_range_pos"):
+    if needs("rebound_from_cycle_low", "cycle_range_pos", "cycle_range_vs_rv"):
         cycle_low = close.groupby(cycle_start).cummin()
     else:
         cycle_low = None
@@ -87,6 +88,9 @@ def append_cycle_features(
     if needs("cycle_range_pos") and cycle_high is not None and cycle_low is not None:
         rng = (cycle_high - cycle_low).replace(0.0, np.nan)
         out["cycle_range_pos"] = (close - cycle_low) / rng
+    if needs("cycle_range_vs_rv") and cycle_high is not None and cycle_low is not None:
+        cycle_range_ret = cycle_high / cycle_low.replace(0.0, np.nan) - 1.0
+        out["cycle_range_vs_rv"] = cycle_range_ret / pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
     if needs("move_z"):
         out["move_z"] = out["ret_from_cycle_open"] / pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
     if needs("first_half_ret", "second_half_ret_proxy"):

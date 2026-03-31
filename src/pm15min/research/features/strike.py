@@ -38,6 +38,8 @@ def append_strike_features(
         "has_oracle_strike",
         "has_cl_strike",
         "move_z_strike",
+        "strike_abs_z",
+        "strike_flip_count_cycle",
         "q_bs_up_strike",
         "q_bs_up_strike_centered",
     ):
@@ -78,10 +80,29 @@ def append_strike_features(
             out["has_cl_strike"] = out["has_oracle_strike"].astype(int)
     if needs("basis_bp"):
         out["basis_bp"] = (basis_ratio.fillna(0.0) * 1e4).astype(float)
-    if needs("ret_from_strike", "move_z_strike", "q_bs_up_strike", "q_bs_up_strike_centered"):
+    if needs(
+        "ret_from_strike",
+        "move_z_strike",
+        "strike_abs_z",
+        "strike_flip_count_cycle",
+        "q_bs_up_strike",
+        "q_bs_up_strike_centered",
+    ):
         out["ret_from_strike"] = ((1.0 + ret_cycle) * (1.0 + basis_ratio.fillna(0.0)) - 1.0).astype(float)
     if needs("move_z_strike"):
         out["move_z_strike"] = out["ret_from_strike"] / pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
+    if needs("strike_abs_z"):
+        out["strike_abs_z"] = out["ret_from_strike"].abs() / pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
+    if needs("strike_flip_count_cycle"):
+        strike_side = pd.Series(np.nan, index=out.index, dtype=float)
+        strike_ret = pd.to_numeric(out["ret_from_strike"], errors="coerce")
+        strike_side.loc[strike_ret.gt(0.0)] = 1.0
+        strike_side.loc[strike_ret.lt(0.0)] = -1.0
+        cycle_key = pd.to_datetime(out["cycle_start_ts"], utc=True, errors="coerce")
+        active_side = strike_side.groupby(cycle_key).ffill()
+        previous_side = active_side.groupby(cycle_key).shift(1)
+        flipped = active_side.notna() & previous_side.notna() & active_side.ne(previous_side)
+        out["strike_flip_count_cycle"] = flipped.astype(int).groupby(cycle_key).cumsum().astype(float)
 
     if needs("q_bs_up_strike", "q_bs_up_strike_centered"):
         decision_ts = pd.to_datetime(out["decision_ts"], utc=True, errors="coerce")

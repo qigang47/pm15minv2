@@ -107,6 +107,8 @@ def _resolve_required_feature_columns(
     # materialize downstream columns used by live guards and strike features.
     if required.intersection({"move_z"}):
         required.update({"ret_from_cycle_open", "rv_30"})
+    if required.intersection({"cycle_range_vs_rv"}):
+        required.update({"rv_30"})
     if required.intersection(
         {
             "ret_from_strike",
@@ -114,6 +116,8 @@ def _resolve_required_feature_columns(
             "has_oracle_strike",
             "has_cl_strike",
             "move_z_strike",
+            "strike_abs_z",
+            "strike_flip_count_cycle",
             "q_bs_up_strike",
             "q_bs_up_strike_centered",
         }

@@ -16,6 +16,15 @@ def _base_signal_row() -> dict[str, object]:
         "offset": 7,
         "decision_ts": "2026-03-19T08:23:00+00:00",
         "recommended_side": "DOWN",
+        "p_signal": 0.20,
+        "p_up_raw": 0.20,
+        "p_down_raw": 0.80,
+        "p_eff_up": 0.20,
+        "p_eff_down": 0.80,
+        "p_up_lcb": 0.20,
+        "p_up_ucb": 0.20,
+        "p_up": 0.20,
+        "p_down": 0.80,
         "confidence": 0.80,
         "edge": 0.20,
         "score_valid": True,
@@ -30,6 +39,50 @@ def _base_signal_row() -> dict[str, object]:
             "move_z": 1.0,
         },
     }
+
+
+def _set_up_interval_signal(
+    row: dict[str, object],
+    *,
+    raw: float = 0.70,
+    lcb: float = 0.70,
+    eff_up: float | None = None,
+    ucb: float | None = None,
+) -> None:
+    eff_up = lcb if eff_up is None else eff_up
+    ucb = raw if ucb is None else ucb
+    row["recommended_side"] = "UP"
+    row["p_signal"] = raw
+    row["p_up_raw"] = raw
+    row["p_down_raw"] = 1.0 - raw
+    row["p_eff_up"] = eff_up
+    row["p_eff_down"] = 1.0 - ucb
+    row["p_up_lcb"] = lcb
+    row["p_up_ucb"] = ucb
+    row["p_up"] = eff_up
+    row["p_down"] = 1.0 - ucb
+    row["confidence"] = eff_up
+
+
+def _set_down_interval_signal(
+    row: dict[str, object],
+    *,
+    raw: float = 0.28,
+    eff_down: float = 0.72,
+    ucb: float | None = None,
+) -> None:
+    ucb = raw if ucb is None else ucb
+    row["recommended_side"] = "DOWN"
+    row["p_signal"] = raw
+    row["p_up_raw"] = raw
+    row["p_down_raw"] = 1.0 - raw
+    row["p_eff_up"] = raw
+    row["p_eff_down"] = eff_down
+    row["p_up_lcb"] = raw
+    row["p_up_ucb"] = ucb
+    row["p_up"] = raw
+    row["p_down"] = eff_down
+    row["confidence"] = eff_down
 
 
 def test_decision_rejects_when_ret_30m_guard_fails() -> None:
@@ -54,21 +107,25 @@ def test_decision_rejects_when_ret_30m_guard_fails() -> None:
     assert out["rejected_offsets"][0]["guard_reasons"] == ["ret30m_down_ceiling"]
 
 
-def test_deep_otm_baseline_ret30_thresholds_match_relaxed_btc_eth_policy() -> None:
+def test_deep_otm_baseline_ret30_thresholds_match_tightened_btc_eth_policy() -> None:
     spec = resolve_live_profile_spec("deep_otm_baseline")
 
-    assert spec.ret_30m_up_floor_for("btc") == -0.04
-    assert spec.ret_30m_up_floor_for("eth") == -0.04
+    assert spec.tail_space_guard_enabled is False
+    assert spec.min_net_edge_for(offset=7, entry_price=0.30) == 0.0
+    assert spec.min_net_edge_for(offset=8, entry_price=0.10) == 0.0
+    assert spec.min_net_edge_for(offset=9, entry_price=0.05) == 0.0
+    assert spec.ret_30m_up_floor_for("btc") == 0.002
+    assert spec.ret_30m_up_floor_for("eth") == 0.0015
     assert spec.ret_30m_up_floor_for("xrp") == -0.04
-    assert spec.ret_30m_down_ceiling_for("btc") == 0.009
-    assert spec.ret_30m_down_ceiling_for("eth") == 0.009
+    assert spec.ret_30m_down_ceiling_for("btc") == 0.0
+    assert spec.ret_30m_down_ceiling_for("eth") == 0.0
     assert spec.ret_30m_down_ceiling_for("xrp") == 0.009
     assert spec.ret_30m_down_ceiling_for("sol") == 0.002
 
 
 def test_decision_rejects_when_tail_space_guard_fails() -> None:
     row = _base_signal_row()
-    row["recommended_side"] = "UP"
+    _set_up_interval_signal(row)
     row["feature_snapshot"] = {
         "ret_30m": 0.0,
         "ret_from_strike": -0.01,
@@ -87,6 +144,40 @@ def test_decision_rejects_when_tail_space_guard_fails() -> None:
     out = build_decision_snapshot(payload)
     assert out["decision"]["status"] == "reject"
     assert "tail_space_too_far" in out["rejected_offsets"][0]["guard_reasons"]
+
+
+def test_decision_rejects_when_trade_side_blocked_by_env(monkeypatch) -> None:
+    monkeypatch.setenv("PM15MIN_ALLOWED_TRADE_SIDES", "DOWN")
+    row = _base_signal_row()
+    _set_up_interval_signal(row)
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.29,
+                "quote_up_bid": 0.19,
+                "quote_down_bid": 0.28,
+                "reasons": [],
+            }
+        ],
+    }
+    out = build_decision_snapshot(payload, quote_payload)
+    assert out["decision"]["status"] == "reject"
+    assert "trade_side_blocked" in out["rejected_offsets"][0]["guard_reasons"]
 
 
 def test_decision_snapshot_preserves_signal_freshness_metadata() -> None:
@@ -112,7 +203,7 @@ def test_decision_snapshot_preserves_signal_freshness_metadata() -> None:
 
 def test_decision_rejects_when_entry_price_band_fails() -> None:
     row = _base_signal_row()
-    row["p_down"] = 0.80
+    _set_down_interval_signal(row, raw=0.20, eff_down=0.80)
     payload = {
         "market": "sol",
         "profile": "deep_otm",
@@ -143,9 +234,9 @@ def test_decision_rejects_when_entry_price_band_fails() -> None:
     assert "entry_price_max" in out["rejected_offsets"][0]["guard_reasons"]
 
 
-def test_decision_rejects_when_net_edge_vs_quote_fails() -> None:
+def test_decision_rejects_when_down_ucb_is_not_below_threshold() -> None:
     row = _base_signal_row()
-    row["p_down"] = 0.59
+    _set_down_interval_signal(row, raw=0.41, eff_down=0.59, ucb=0.41)
     payload = {
         "market": "sol",
         "profile": "deep_otm",
@@ -164,7 +255,7 @@ def test_decision_rejects_when_net_edge_vs_quote_fails() -> None:
                 "status": "ok",
                 "market_id": "market-1",
                 "quote_up_ask": 0.20,
-                "quote_down_ask": 0.585,
+                "quote_down_ask": 0.29,
                 "quote_up_bid": 0.19,
                 "quote_down_bid": 0.58,
                 "reasons": [],
@@ -173,12 +264,12 @@ def test_decision_rejects_when_net_edge_vs_quote_fails() -> None:
     }
     out = build_decision_snapshot(payload, quote_payload)
     assert out["decision"]["status"] == "reject"
-    assert "net_edge_below_quote_threshold" in out["rejected_offsets"][0]["guard_reasons"]
+    assert "up_ucb_above_threshold" in out["rejected_offsets"][0]["guard_reasons"]
 
 
 def test_decision_accepts_when_quote_guards_pass() -> None:
     row = _base_signal_row()
-    row["p_down"] = 0.70
+    _set_down_interval_signal(row, raw=0.28, eff_down=0.72, ucb=0.28)
     payload = {
         "market": "sol",
         "profile": "deep_otm",
@@ -207,10 +298,188 @@ def test_decision_accepts_when_quote_guards_pass() -> None:
     out = build_decision_snapshot(payload, quote_payload)
     assert out["decision"]["status"] == "accept"
     assert "entry_price_band" in out["applied_guard_layers"]
-    assert "net_edge_vs_quote" in out["applied_guard_layers"]
-    assert "roi_threshold_vs_quote" in out["applied_guard_layers"]
+    assert "probability_interval_threshold" in out["applied_guard_layers"]
     assert out["decision"]["selected_entry_price"] == 0.29
+    assert out["decision"]["selected_trigger_metric"] == "p_up_ucb"
+    assert out["accepted_offsets"][0]["trigger_probability"] == 0.28
     assert out["accepted_offsets"][0]["quote_metrics"]["roi_net_vs_quote"] > 0.0
+
+
+def test_decision_rejects_up_when_lcb_is_not_above_threshold() -> None:
+    row = _base_signal_row()
+    _set_up_interval_signal(row, raw=0.68, lcb=0.60, eff_up=0.60, ucb=0.68)
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.05,
+                "quote_up_bid": 0.19,
+                "quote_down_bid": 0.04,
+                "reasons": [],
+            }
+        ],
+    }
+    out = build_decision_snapshot(payload, quote_payload)
+    assert out["decision"]["status"] == "reject"
+    assert "up_lcb_below_threshold" in out["rejected_offsets"][0]["guard_reasons"]
+
+
+def test_decision_keeps_up_side_when_up_interval_passes_even_if_down_is_cheaper(monkeypatch) -> None:
+    monkeypatch.delenv("PM15MIN_ALLOWED_TRADE_SIDES", raising=False)
+    row = _base_signal_row()
+    _set_up_interval_signal(row, raw=0.70, lcb=0.65, eff_up=0.65, ucb=0.70)
+    row["edge"] = 0.07
+    row["feature_snapshot"] = {
+        "ret_30m": 0.0,
+        "ret_from_strike": 0.0,
+        "move_z": 1.0,
+    }
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.29,
+                "quote_down_ask": 0.05,
+                "quote_up_bid": 0.28,
+                "quote_down_bid": 0.04,
+                "reasons": [],
+            }
+        ],
+    }
+
+    out = build_decision_snapshot(payload, quote_payload)
+
+    assert out["decision"]["status"] == "accept"
+    assert out["decision"]["selected_side"] == "UP"
+    assert out["accepted_offsets"][0]["recommended_side"] == "UP"
+    assert out["accepted_offsets"][0]["model_recommended_side"] == "UP"
+    assert out["accepted_offsets"][0]["trigger_side"] == "UP"
+    assert out["accepted_offsets"][0]["trigger_metric"] == "p_up_lcb"
+    assert out["accepted_offsets"][0]["trigger_probability"] == 0.65
+    assert out["accepted_offsets"][0]["quote_metrics"]["roi_net_vs_quote"] > 0.0
+
+
+def test_decision_deep_otm_uses_down_confidence_to_buy_down_side(monkeypatch) -> None:
+    monkeypatch.delenv("PM15MIN_ALLOWED_TRADE_SIDES", raising=False)
+    row = _base_signal_row()
+    _set_down_interval_signal(row, raw=0.28, eff_down=0.72, ucb=0.28)
+    row["edge"] = 0.44
+    row["feature_snapshot"] = {
+        "ret_30m": 0.0,
+        "ret_from_strike": 0.0,
+        "move_z": 1.0,
+    }
+    payload = {
+        "market": "xrp",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.74,
+                "quote_down_ask": 0.05,
+                "quote_up_bid": 0.73,
+                "quote_down_bid": 0.04,
+                "reasons": [],
+            }
+        ],
+    }
+
+    out = build_decision_snapshot(payload, quote_payload)
+
+    assert out["decision"]["status"] == "accept"
+    assert out["decision"]["selected_side"] == "DOWN"
+    assert out["accepted_offsets"][0]["recommended_side"] == "DOWN"
+    assert out["accepted_offsets"][0]["model_recommended_side"] == "DOWN"
+    assert out["accepted_offsets"][0]["trigger_side"] == "DOWN"
+    assert out["accepted_offsets"][0]["trigger_metric"] == "p_up_ucb"
+    assert out["accepted_offsets"][0]["trigger_probability"] == 0.28
+
+
+def test_decision_dual_candidate_falls_back_without_explicit_side_probabilities() -> None:
+    row = _base_signal_row()
+    for key in (
+        "p_signal",
+        "p_up_raw",
+        "p_down_raw",
+        "p_eff_up",
+        "p_eff_down",
+        "p_up_lcb",
+        "p_up_ucb",
+        "p_up",
+        "p_down",
+    ):
+        row.pop(key, None)
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.29,
+                "quote_up_bid": 0.19,
+                "quote_down_bid": 0.28,
+                "reasons": [],
+            }
+        ],
+    }
+
+    out = build_decision_snapshot(payload, quote_payload)
+
+    assert out["decision"]["status"] == "accept"
+    assert out["decision"]["selected_side"] == "DOWN"
+    assert out["accepted_offsets"][0]["recommended_side"] == "DOWN"
+    assert out["accepted_offsets"][0]["model_recommended_side"] == "DOWN"
+    assert out["accepted_offsets"][0]["opposite_probability"] is None
 
 
 def test_decision_rejects_when_liquidity_guard_blocks() -> None:
@@ -316,10 +585,12 @@ def test_decision_rejects_when_regime_direction_pressure_blocks() -> None:
     assert "regime_direction_pressure" in out["rejected_offsets"][0]["guard_reasons"]
 
 
-def test_decision_does_not_reject_when_liquidity_blocking_disabled() -> None:
+def test_decision_does_not_reject_when_liquidity_blocking_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("PM15MIN_ALLOWED_TRADE_SIDES", raising=False)
+    monkeypatch.delenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", raising=False)
+    monkeypatch.delenv("PM15MIN_MAX_TRADES_PER_MARKET", raising=False)
     row = _base_signal_row()
-    row["recommended_side"] = "UP"
-    row["p_up"] = 0.80
+    _set_up_interval_signal(row, raw=0.80, lcb=0.80, eff_up=0.80, ucb=0.80)
     payload = {
         "market": "sol",
         "profile": "deep_otm",
@@ -375,7 +646,7 @@ def test_decision_does_not_reject_when_liquidity_blocking_disabled() -> None:
 
 
 def test_decision_rejects_when_env_trade_count_cap_hits(monkeypatch) -> None:
-    monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", "3")
+    monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", "1")
 
     row = _base_signal_row()
     row["p_down"] = 0.70
@@ -408,14 +679,14 @@ def test_decision_rejects_when_env_trade_count_cap_hits(monkeypatch) -> None:
     out = build_decision_snapshot(
         payload,
         quote_payload,
-        session_state={"market_offset_trade_count": {"market-1_7": 3}},
+        session_state={"market_offset_trade_count": {"market-1_7": 1}},
     )
 
     assert out["decision"]["status"] == "reject"
     assert "trade_count_cap" in out["applied_guard_layers"]
     assert out["rejected_offsets"][0]["guard_reasons"] == ["max_trades_per_offset"]
-    assert out["rejected_offsets"][0]["account_context"]["session_trade_count"] == 3
-    assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_effective"] == 3
+    assert out["rejected_offsets"][0]["account_context"]["session_trade_count"] == 1
+    assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_effective"] == 1
     assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_source"] == "PM15MIN_MAX_TRADES_PER_MARKET_SOL"
     monkeypatch.delenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", raising=False)
 
@@ -454,14 +725,14 @@ def test_decision_rejects_when_repeat_same_decision_cap_hits_by_default(monkeypa
     out = build_decision_snapshot(
         payload,
         quote_payload,
-        session_state={"market_offset_trade_count": {"market-1_7": 3}},
+        session_state={"market_offset_trade_count": {"market-1_7": 1}},
     )
 
     assert out["decision"]["status"] == "reject"
     assert out["rejected_offsets"][0]["guard_reasons"] == ["max_trades_per_offset"]
-    assert out["rejected_offsets"][0]["account_context"]["session_trade_count"] == 3
+    assert out["rejected_offsets"][0]["account_context"]["session_trade_count"] == 1
     assert out["rejected_offsets"][0]["account_context"]["session_trade_count_lock_side"] is False
-    assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_effective"] == 3
+    assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_effective"] == 1
     assert out["rejected_offsets"][0]["account_context"]["max_trades_per_market_source"] == "repeat_same_decision_max_trades"
 
 
@@ -504,9 +775,9 @@ def test_decision_rejects_when_repeat_same_decision_cap_hits_per_side(monkeypatc
         payload,
         quote_payload,
         session_state={
-            "market_offset_trade_count": {"market-1_7": 3},
+            "market_offset_trade_count": {"market-1_7": 1},
             "market_offset_side_trade_count": {
-                "market-1_7_DOWN": 3,
+                "market-1_7_DOWN": 1,
                 "market-1_7_UP": 0,
             },
         },
@@ -514,12 +785,13 @@ def test_decision_rejects_when_repeat_same_decision_cap_hits_per_side(monkeypatc
 
     assert out["decision"]["status"] == "reject"
     assert out["rejected_offsets"][0]["guard_reasons"] == ["max_trades_per_offset"]
-    assert out["rejected_offsets"][0]["account_context"]["session_trade_count"] == 3
+    assert out["rejected_offsets"][0]["account_context"]["session_trade_count"] == 1
     assert out["rejected_offsets"][0]["account_context"]["session_trade_count_key"] == "market-1_7_DOWN"
     assert out["rejected_offsets"][0]["account_context"]["session_trade_count_lock_side"] is True
 
 
 def test_decision_allows_opposite_side_when_repeat_same_decision_cap_is_side_locked(monkeypatch) -> None:
+    monkeypatch.delenv("PM15MIN_ALLOWED_TRADE_SIDES", raising=False)
     monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", "")
     monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET", "")
     base_spec = resolve_live_profile_spec("deep_otm")
@@ -527,9 +799,7 @@ def test_decision_allows_opposite_side_when_repeat_same_decision_cap_is_side_loc
     monkeypatch.setattr("pm15min.live.signal.decision.resolve_live_profile_spec", lambda profile: side_locked_spec)
 
     row = _base_signal_row()
-    row["recommended_side"] = "UP"
-    row["p_up"] = 0.70
-    row["p_down"] = 0.30
+    _set_up_interval_signal(row, raw=0.70, lcb=0.70, eff_up=0.70, ucb=0.70)
     payload = {
         "market": "sol",
         "profile": "deep_otm",
@@ -570,15 +840,14 @@ def test_decision_allows_opposite_side_when_repeat_same_decision_cap_is_side_loc
 
 
 def test_decision_repeat_same_decision_lock_side_uses_side_counts_when_available(monkeypatch) -> None:
+    monkeypatch.delenv("PM15MIN_ALLOWED_TRADE_SIDES", raising=False)
     monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", "")
     monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET", "")
     base_spec = resolve_live_profile_spec("deep_otm")
     side_locked_spec = replace(base_spec, repeat_same_decision_lock_side=True)
     monkeypatch.setattr("pm15min.live.signal.decision.resolve_live_profile_spec", lambda profile: side_locked_spec)
     row = _base_signal_row()
-    row["recommended_side"] = "UP"
-    row["p_up"] = 0.70
-    row["p_down"] = 0.30
+    _set_up_interval_signal(row, raw=0.70, lcb=0.70, eff_up=0.70, ucb=0.70)
     payload = {
         "market": "sol",
         "profile": "deep_otm",
@@ -608,21 +877,20 @@ def test_decision_repeat_same_decision_lock_side_uses_side_counts_when_available
     rejected = build_decision_snapshot(
         payload,
         quote_payload,
-        session_state={"market_offset_side_trade_count": {"market-1_7_UP": 3}},
+        session_state={"market_offset_side_trade_count": {"market-1_7_UP": 1}},
     )
 
     assert rejected["decision"]["status"] == "reject"
-    assert rejected["rejected_offsets"][0]["account_context"]["session_trade_count"] == 3
-    assert rejected["rejected_offsets"][0]["account_context"]["session_trade_count_key"] == "market-1_7_UP"
-    assert rejected["rejected_offsets"][0]["account_context"]["session_trade_count_scope"] == "market_offset_side"
+    rejected_up = next(row for row in rejected["rejected_offsets"] if row.get("recommended_side") == "UP")
+    assert rejected_up["account_context"]["session_trade_count"] == 1
+    assert rejected_up["account_context"]["session_trade_count_key"] == "market-1_7_UP"
+    assert rejected_up["account_context"]["session_trade_count_scope"] == "market_offset_side"
 
-    row["recommended_side"] = "DOWN"
-    row["p_up"] = 0.30
-    row["p_down"] = 0.70
+    _set_down_interval_signal(row, raw=0.30, eff_down=0.70, ucb=0.30)
     accepted = build_decision_snapshot(
         payload,
         quote_payload,
-        session_state={"market_offset_side_trade_count": {"market-1_7_UP": 3}},
+        session_state={"market_offset_side_trade_count": {"market-1_7_UP": 1}},
     )
 
     assert accepted["decision"]["status"] == "accept"
@@ -635,7 +903,7 @@ def test_decision_rejects_when_regime_trade_count_cap_hits(monkeypatch) -> None:
     monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET_SOL", "")
     monkeypatch.setenv("PM15MIN_MAX_TRADES_PER_MARKET", "")
     base_spec = resolve_live_profile_spec("deep_otm")
-    capped_spec = replace(base_spec, regime_defense_max_trades_per_market=1)
+    capped_spec = replace(base_spec, repeat_same_decision_max_trades=3, regime_defense_max_trades_per_market=1)
     monkeypatch.setattr("pm15min.live.signal.decision.resolve_live_profile_spec", lambda profile: capped_spec)
 
     row = _base_signal_row()
@@ -753,8 +1021,7 @@ def test_decision_rejects_when_cash_balance_stop_hits(monkeypatch) -> None:
 
 def test_decision_uses_compact_account_summary_without_raw_positions() -> None:
     row = _base_signal_row()
-    row["recommended_side"] = "UP"
-    row["p_up"] = 0.80
+    _set_up_interval_signal(row, raw=0.80, lcb=0.80, eff_up=0.80, ucb=0.80)
     payload = {
         "market": "sol",
         "profile": "deep_otm",
@@ -816,7 +1083,8 @@ def test_decision_uses_compact_account_summary_without_raw_positions() -> None:
     assert selected["account_context"]["current_market_active"] is True
 
 
-def test_decision_rejects_when_depth_fill_ratio_blocks_trade(tmp_path: Path) -> None:
+def test_decision_rejects_when_depth_fill_ratio_blocks_trade(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PM15MIN_LIVE_DECISION_DEPTH_ENFORCED", "1")
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="xrp", cycle="15m", surface="live", root=root)
     captured_ts_ms = int(pd.Timestamp("2026-03-20T00:08:30Z").timestamp() * 1000)
