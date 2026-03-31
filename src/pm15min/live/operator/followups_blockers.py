@@ -23,7 +23,14 @@ def append_decision_not_accept_followups(
     reject_interpretation: str,
     reject_reasons: list[object],
 ) -> None:
-    if reject_category == "quote_inputs_missing":
+    if reject_category == "signal_not_ready":
+        if {"signal_window_not_open", "offset_not_yet_open"} & set(reject_reasons):
+            actions.append("wait for the next live offset window to open before retrying side effects")
+        elif {"signal_window_expired", "offset_window_expired"} & set(reject_reasons):
+            actions.append("the live offset window already expired; wait for the next cycle before retrying")
+        else:
+            actions.append("inspect latest signal snapshot and signal refresh markers to confirm the offset has a ready decision_ts")
+    elif reject_category == "quote_inputs_missing":
         actions.append("inspect latest quote snapshot and orderbook_index coverage for the rejected market before retrying")
         actions.append("inspect operator_summary.orderbook_hot_cache_summary to see whether recent orderbook cache is missing, empty, or stale")
         actions.append("rerun data run live-foundation or data record orderbooks if quote inputs are still missing")

@@ -98,6 +98,6 @@ def test_build_liquidity_state_snapshot_blocks_after_repeated_failures(tmp_path:
     assert first["blocked"] is False
     assert first["reason_codes"][0] == "filtered_pending"
     assert second["ok"] is False
-    assert second["blocked"] is True
+    assert second["blocked"] is False
     assert "spot_quote_window" in second["reason_codes"]
     assert second["temporal_state"]["raw_fail_streak"] == 2

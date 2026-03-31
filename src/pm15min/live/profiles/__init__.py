@@ -42,6 +42,8 @@ def resolve_max_trades_per_market(
 
 @lru_cache(maxsize=1)
 def _ensure_env_loaded() -> None:
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return
     load_dotenv()
 
 

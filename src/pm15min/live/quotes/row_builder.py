@@ -11,6 +11,7 @@ from .market import resolve_market_row
 from .orderbook import (
     ORDERBOOK_INDEX_COLUMNS,
     build_orderbook_frame_from_provider,
+    build_orderbook_row_from_provider,
     float_or_none,
     live_provider_future_skew_tolerance_ms,
     live_provider_orderbook_levels,
@@ -85,11 +86,24 @@ def build_offset_quote_row_impl(
         "quote_source_path": None,
         "reasons": [],
     }
+    signal_status = str(signal_row.get("status") or "").strip()
+    signal_not_ready_statuses = {
+        "offset_not_yet_open",
+        "offset_window_expired",
+        "missing_score_row",
+        "inactive_score_row",
+    }
     if not pd.isna(window_start_ts) and now < window_start_ts:
+        out["status"] = "signal_not_ready"
         out["reasons"].append("signal_window_not_open")
         return out
     if not pd.isna(window_end_ts) and now >= window_end_ts:
+        out["status"] = "signal_not_ready"
         out["reasons"].append("signal_window_expired")
+        return out
+    if pd.isna(decision_ts):
+        out["status"] = "signal_not_ready"
+        out["reasons"].append(signal_status if signal_status in signal_not_ready_statuses else "signal_decision_ts_missing")
         return out
     if market_table.empty:
         out["reasons"].append("market_catalog_missing")
@@ -124,7 +138,8 @@ def build_offset_quote_row_impl(
     out["trade_cycle_start_ts"] = None if pd.isna(trade_cycle_start_ts) else trade_cycle_start_ts.isoformat()
     out["cycle_end_ts"] = None if pd.isna(cycle_end_ts) else cycle_end_ts.isoformat()
     if not date_str:
-        out["reasons"].append("decision_ts_missing")
+        out["status"] = "signal_not_ready"
+        out["reasons"].append(signal_status if signal_status in signal_not_ready_statuses else "signal_decision_ts_missing")
         return out
     decision_ts_ms = int(decision_ts.timestamp() * 1000) if not pd.isna(decision_ts) else None
     current_now_ts_ms = int(now.timestamp() * 1000)
@@ -202,6 +217,68 @@ def build_offset_quote_row_impl(
             if up_row is not None and down_row is not None:
                 out["quote_source_path"] = "provider"
                 reference_ts_ms = provider_reference_ts_ms
+            elif up_row is None or down_row is None:
+                retry_rows: list[dict[str, object]] = []
+                if up_row is None:
+                    retry_row = build_orderbook_row_from_provider(
+                        provider=orderbook_provider,
+                        market_id=str(out["market_id"]),
+                        token_id=str(out["token_up"]),
+                        side="up",
+                        timeout_sec=data_cfg.orderbook_timeout_sec,
+                        levels=live_provider_orderbook_levels(),
+                        force_refresh=True,
+                    )
+                    if retry_row is not None:
+                        retry_rows.append(retry_row)
+                if down_row is None:
+                    retry_row = build_orderbook_row_from_provider(
+                        provider=orderbook_provider,
+                        market_id=str(out["market_id"]),
+                        token_id=str(out["token_down"]),
+                        side="down",
+                        timeout_sec=data_cfg.orderbook_timeout_sec,
+                        levels=live_provider_orderbook_levels(),
+                        force_refresh=True,
+                    )
+                    if retry_row is not None:
+                        retry_rows.append(retry_row)
+                if retry_rows:
+                    retry_df = pd.DataFrame(retry_rows)
+                    if index_df.empty:
+                        index_df = retry_df
+                    else:
+                        index_df = (
+                            pd.concat([index_df, retry_df], ignore_index=True)
+                            .sort_values("captured_ts_ms")
+                            .drop_duplicates(subset=["market_id", "token_id", "side"], keep="last")
+                            .reset_index(drop=True)
+                        )
+                    if provider_frame_cache is not None:
+                        provider_frame_cache[provider_key] = index_df
+                    if up_row is None:
+                        up_row = resolve_orderbook_row_within_window(
+                            index_df,
+                            market_id=out["market_id"],
+                            token_id=out["token_up"],
+                            side="up",
+                            reference_ts_ms=provider_reference_ts_ms,
+                            window_start_ts_ms=window_start_ts_ms,
+                            window_end_ts_ms=window_end_ts_ms,
+                        )
+                    if down_row is None:
+                        down_row = resolve_orderbook_row_within_window(
+                            index_df,
+                            market_id=out["market_id"],
+                            token_id=out["token_down"],
+                            side="down",
+                            reference_ts_ms=provider_reference_ts_ms,
+                            window_start_ts_ms=window_start_ts_ms,
+                            window_end_ts_ms=window_end_ts_ms,
+                        )
+                    if up_row is not None and down_row is not None:
+                        out["quote_source_path"] = "provider"
+                        reference_ts_ms = provider_reference_ts_ms
     if not provider_only and (up_row is None or down_row is None):
         latest_snapshot = load_latest_full_snapshot_cached(
             snapshot_path=latest_full_snapshot_path,

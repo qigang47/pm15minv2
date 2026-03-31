@@ -21,7 +21,15 @@ def quote_guard_reasons(
     metrics.setdefault("quote_reasons", list(quote_row.get("reasons") or []))
     metrics.setdefault("quote_market_id", quote_row.get("market_id"))
 
-    if str(quote_row.get("status") or "") != "ok":
+    quote_status = str(quote_row.get("status") or "")
+    if quote_status != "ok":
+        if quote_status == "signal_not_ready":
+            reasons.append("signal_not_ready")
+            for reason in quote_row.get("reasons") or []:
+                token = str(reason or "").strip()
+                if token:
+                    reasons.append(token)
+            return reasons, metrics
         reasons.append("quote_missing_inputs")
         for reason in quote_row.get("reasons") or []:
             reasons.append(f"quote_{reason}")

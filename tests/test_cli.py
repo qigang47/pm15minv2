@@ -186,7 +186,7 @@ def test_top_level_layout_command(capsys) -> None:
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["market"] == "sol"
-    assert payload["rewrite_root"].endswith("pm15min/v2")
+    assert Path(payload["rewrite_root"]).name == "v2"
     assert payload["surface"] == "backtest"
 
 
@@ -268,8 +268,8 @@ def test_live_show_config_marks_noncanonical_profile_as_compatibility_view(capsy
     assert payload["canonical_live_scope"]["ok"] is False
     assert payload["canonical_live_scope"]["market_in_scope"] is False
     assert payload["canonical_live_scope"]["profile_in_scope"] is False
-    assert payload["profile_spec_resolution"]["status"] == "compatibility_fallback"
-    assert payload["profile_spec_resolution"]["resolved_profile_spec"] == "default"
+    assert payload["profile_spec_resolution"]["status"] == "exact_match"
+    assert payload["profile_spec_resolution"]["resolved_profile_spec"] == "deep_otm_baseline"
     assert payload["cli_boundary"]["requested_scope_classification"] == "non_canonical_scope"
     assert payload["cli_boundary"]["canonical_live_contract"]["profile"] == "deep_otm"
 
@@ -845,7 +845,7 @@ def test_live_quote_latest_reports_missing_inputs(capsys, tmp_path: Path, monkey
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["market"] == "sol"
-    assert payload["quote_rows"][0]["status"] == "missing_quote_inputs"
+    assert payload["quote_rows"][0]["status"] == "signal_not_ready"
 
 
 def test_research_list_runs_is_json(capsys) -> None:

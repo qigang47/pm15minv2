@@ -107,12 +107,12 @@ def classify_live_runner_smoke_status(
     if blocker == "foundation_ok_with_errors":
         return "foundation_warning_only"
     if blocker == "decision_not_accept":
-        if reject_category == "quote_inputs_missing":
+        if reject_category in {"quote_inputs_missing", "signal_not_ready"}:
             return "data_blocked"
         return "strategy_only_blocked"
     if blocker == "execution_not_plan":
         if execution_reason == "decision_reject":
-            if reject_category == "quote_inputs_missing":
+            if reject_category in {"quote_inputs_missing", "signal_not_ready"}:
                 return "data_blocked"
             return "strategy_only_blocked"
         return "infra_blocked"

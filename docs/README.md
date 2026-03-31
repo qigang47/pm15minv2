@@ -12,6 +12,8 @@
   - `live` 域的长期 runtime contract。
 - `LIVE_OPERATOR_RUNBOOK.md`
   - operator 值班手册。
+- `DEEP_OTM_BASELINE_UP_DIAGNOSIS.md`
+  - `deep_otm_baseline` 的 `Up` 方向诊断、因子分组和后续收缩方向。
 
 清理规则：
 

@@ -180,6 +180,45 @@ def test_decision_rejects_when_trade_side_blocked_by_env(monkeypatch) -> None:
     assert "trade_side_blocked" in out["rejected_offsets"][0]["guard_reasons"]
 
 
+def test_decision_applies_market_scoped_trade_side_override(monkeypatch) -> None:
+    monkeypatch.setenv("PM15MIN_ALLOWED_TRADE_SIDES", "DOWN")
+    monkeypatch.setenv("PM15MIN_ALLOWED_TRADE_SIDES_SOL", "UP")
+    row = _base_signal_row()
+    _set_up_interval_signal(row)
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.29,
+                "quote_up_bid": 0.19,
+                "quote_down_bid": 0.28,
+                "reasons": [],
+            }
+        ],
+    }
+
+    allowed = build_decision_snapshot(payload, quote_payload)
+    blocked = build_decision_snapshot({**payload, "market": "xrp"}, quote_payload)
+
+    assert allowed["decision"]["status"] == "accept"
+    assert blocked["decision"]["status"] == "reject"
+    assert "trade_side_blocked" in blocked["rejected_offsets"][0]["guard_reasons"]
+
+
 def test_decision_snapshot_preserves_signal_freshness_metadata() -> None:
     row = _base_signal_row()
     payload = {

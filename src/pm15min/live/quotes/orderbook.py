@@ -135,6 +135,54 @@ def resolve_latest_full_snapshot_row(
     }
 
 
+def build_orderbook_row_from_provider(
+    *,
+    provider: OrderbookProvider,
+    market_id: str,
+    token_id: str,
+    side: str,
+    timeout_sec: float = 1.2,
+    levels: int = DEFAULT_LIVE_PROVIDER_ORDERBOOK_LEVELS,
+    force_refresh: bool = False,
+) -> dict[str, object] | None:
+    try:
+        payload = provider.get_orderbook_summary(
+            str(token_id),
+            levels=max(1, int(levels)),
+            timeout=timeout_sec,
+            force_refresh=force_refresh,
+        )
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict):
+        return None
+    asks, bids, ts_ms = normalize_book(payload)
+    if ts_ms is None:
+        fetched_at = payload.get("__hub_fetched_at")
+        if fetched_at not in (None, ""):
+            ts_ms = int(pd.Timestamp(str(fetched_at), tz="UTC").timestamp() * 1000)
+    if ts_ms is None:
+        return None
+    best_ask = asks[0]["price"] if asks else None
+    best_bid = bids[0]["price"] if bids else None
+    ask_size_1 = asks[0]["size"] if asks else None
+    bid_size_1 = bids[0]["size"] if bids else None
+    spread = None
+    if best_ask is not None and best_bid is not None:
+        spread = round(float(best_ask) - float(best_bid), 8)
+    return {
+        "captured_ts_ms": int(ts_ms),
+        "market_id": str(market_id),
+        "token_id": str(token_id),
+        "side": str(side).strip().lower(),
+        "best_ask": best_ask,
+        "best_bid": best_bid,
+        "ask_size_1": ask_size_1,
+        "bid_size_1": bid_size_1,
+        "spread": spread,
+    }
+
+
 def build_orderbook_frame_from_provider(
     *,
     provider: OrderbookProvider,
@@ -146,44 +194,17 @@ def build_orderbook_frame_from_provider(
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for side, token_id in (("up", token_up), ("down", token_down)):
-        try:
-            payload = provider.get_orderbook_summary(
-                str(token_id),
-                levels=max(1, int(levels)),
-                timeout=timeout_sec,
-                force_refresh=False,
-            )
-        except Exception:
-            payload = None
-        if not isinstance(payload, dict):
-            continue
-        asks, bids, ts_ms = normalize_book(payload)
-        if ts_ms is None:
-            fetched_at = payload.get("__hub_fetched_at")
-            if fetched_at not in (None, ""):
-                ts_ms = int(pd.Timestamp(str(fetched_at), tz="UTC").timestamp() * 1000)
-        if ts_ms is None:
-            continue
-        best_ask = asks[0]["price"] if asks else None
-        best_bid = bids[0]["price"] if bids else None
-        ask_size_1 = asks[0]["size"] if asks else None
-        bid_size_1 = bids[0]["size"] if bids else None
-        spread = None
-        if best_ask is not None and best_bid is not None:
-            spread = round(float(best_ask) - float(best_bid), 8)
-        rows.append(
-            {
-                "captured_ts_ms": int(ts_ms),
-                "market_id": str(market_id),
-                "token_id": str(token_id),
-                "side": side,
-                "best_ask": best_ask,
-                "best_bid": best_bid,
-                "ask_size_1": ask_size_1,
-                "bid_size_1": bid_size_1,
-                "spread": spread,
-            }
+        row = build_orderbook_row_from_provider(
+            provider=provider,
+            market_id=str(market_id),
+            token_id=str(token_id),
+            side=side,
+            timeout_sec=timeout_sec,
+            levels=levels,
+            force_refresh=False,
         )
+        if row is not None:
+            rows.append(row)
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows)

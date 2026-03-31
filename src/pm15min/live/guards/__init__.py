@@ -60,6 +60,7 @@ def evaluate_signal_guard_reasons(
     )
     reasons.extend(
         configured_trade_side_guard_reasons(
+            market=market,
             signal_row=signal_row,
         )
     )
@@ -170,8 +171,8 @@ def probability_guard_reasons(
     return ["recommended_side_missing"]
 
 
-def configured_trade_side_guard_reasons(*, signal_row: dict[str, Any]) -> list[str]:
-    raw = os.getenv("PM15MIN_ALLOWED_TRADE_SIDES")
+def configured_trade_side_guard_reasons(*, market: str, signal_row: dict[str, Any]) -> list[str]:
+    raw = _configured_trade_sides_env(market=market)
     if raw in (None, ""):
         return []
     allowed = {
@@ -186,3 +187,12 @@ def configured_trade_side_guard_reasons(*, signal_row: dict[str, Any]) -> list[s
     if selected_side is None or selected_side in allowed:
         return []
     return ["trade_side_blocked"]
+
+
+def _configured_trade_sides_env(*, market: str) -> str | None:
+    market_token = str(market or "").strip().upper()
+    if market_token:
+        scoped = os.getenv(f"PM15MIN_ALLOWED_TRADE_SIDES_{market_token}")
+        if scoped not in (None, ""):
+            return scoped
+    return os.getenv("PM15MIN_ALLOWED_TRADE_SIDES")

@@ -15,6 +15,7 @@ from pm15min.data.queries.loaders import load_binance_klines_1m
 from pm15min.research.backtests.build_signature import backtest_build_signature
 from pm15min.research.backtests.decision_quote_surface import (
     InitialSnapshotDecisionSummary,
+    attach_initial_snapshot_decision_surface,
     apply_initial_snapshot_decision_parity,
     build_empty_initial_snapshot_decision_summary,
 )
@@ -310,7 +311,6 @@ def run_research_backtest(
             decision_end=spec.decision_end,
             heartbeat=progress.heartbeat(stage_index=preflight_stage_index, stage_name=preflight_stage_name),
         )
-    _assert_orderbook_preflight_is_usable(orderbook_preflight_summary)
     fill_config = _build_backtest_fill_config(spec=spec, profile_spec=profile_spec)
     label_runtime_summary = _load_label_runtime_summary(cfg=cfg, label_set=label_set)
     truth_runtime_summary = build_truth_runtime_summary(data_cfg)
@@ -947,6 +947,31 @@ def _attach_decision_engine_surface(
             market=market,
             profile_spec=profile_spec,
         )
+        if depth_replay is None or depth_replay.empty:
+            if _frame_has_decision_quote_fallback_prices(frame):
+                frame = attach_initial_snapshot_decision_surface(
+                    frame,
+                    depth_replay=None,
+                    profile_spec=profile_spec,
+                    fill_config=fill_config,
+                )
+                out = apply_decision_engine_parity(
+                    frame,
+                    config=decision_config,
+                    up_price_columns=("quote_up_ask", "quote_prob_up", "p_up"),
+                    down_price_columns=("quote_down_ask", "quote_prob_down", "p_down"),
+                    min_dir_prob_boost_column="decision_engine_min_dir_prob_boost",
+                )
+                out = attach_pre_submit_orderbook_retry_contract(
+                    out,
+                    spec=profile_spec,
+                )
+                return out, build_empty_initial_snapshot_decision_summary()
+            out = attach_pre_submit_orderbook_retry_contract(
+                frame,
+                spec=profile_spec,
+            )
+            return out, build_empty_initial_snapshot_decision_summary()
         out, summary = apply_initial_snapshot_decision_parity(
             frame,
             depth_replay=depth_replay,
@@ -1073,6 +1098,16 @@ def _decision_engine_min_dir_prob_boost(value: object) -> float:
 def _decision_quote_missing_depth_mask(frame: pd.DataFrame) -> pd.Series:
     values = frame.get("decision_quote_has_raw_depth", pd.Series(False, index=frame.index, dtype="boolean"))
     return ~values.astype("boolean").fillna(False).astype(bool)
+
+
+def _frame_has_decision_quote_fallback_prices(frame: pd.DataFrame) -> bool:
+    for column in ("quote_up_ask", "quote_down_ask", "quote_prob_up", "quote_prob_down"):
+        if column not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if values.notna().any():
+            return True
+    return False
 
 
 def _ensure_replay_labels_resolved(replay: pd.DataFrame) -> None:

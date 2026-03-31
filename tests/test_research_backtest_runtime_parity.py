@@ -43,7 +43,7 @@ def test_build_backtest_retry_contract_reflects_live_profile_retry_fields() -> N
 def test_resolve_backtest_profile_spec_marks_current_market_active() -> None:
     profile_spec = resolve_backtest_profile_spec(market="btc", profile="deep_otm_baseline")
 
-    assert profile_spec.active_markets == ("sol", "xrp", "btc")
+    assert set(profile_spec.active_markets) == {"btc", "eth", "sol", "xrp"}
     assert profile_spec.entry_price_min == 0.01
     assert profile_spec.entry_price_max == 0.30
     assert profile_spec.threshold_for(market="btc", offset=7) == 0.60

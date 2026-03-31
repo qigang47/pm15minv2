@@ -7,8 +7,11 @@ def test_research_layout_market_paths() -> None:
     layout = ResearchLayout.discover()
     market = layout.for_market("sol", cycle="15m")
 
-    assert str(layout.research_root).endswith("pm15min/v2/research")
-    assert str(layout.var_root).endswith("pm15min/v2/var/research")
+    assert layout.research_root.name == "research"
+    assert layout.research_root.parent.name == "v2"
+    assert layout.var_root.name == "research"
+    assert layout.var_root.parent.name == "var"
+    assert layout.var_root.parent.parent.name == "v2"
     assert market.feature_frame_path("deep_otm_v1").name == "data.parquet"
     assert "feature_set=deep_otm_v1" in str(market.feature_frame_path("deep_otm_v1"))
     assert "label_set=truth" in str(market.label_frame_path("truth"))

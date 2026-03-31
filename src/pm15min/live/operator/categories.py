@@ -6,6 +6,14 @@ def categorize_decision_reject_reasons(reasons: list[object]) -> str | None:
     if not tokens:
         return None
     token_set = set(tokens)
+    if (
+        "signal_not_ready" in token_set
+        or "offset_not_yet_open" in token_set
+        or "offset_window_expired" in token_set
+        or "missing_score_row" in token_set
+        or any(token.startswith("signal_") for token in token_set)
+    ):
+        return "signal_not_ready"
     if "quote_missing_inputs" in token_set or any(token.startswith("quote_") for token in token_set):
         return "quote_inputs_missing"
     if (

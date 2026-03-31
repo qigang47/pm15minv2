@@ -2906,6 +2906,74 @@ def test_show_live_latest_runner_recommends_quote_actions_for_decision_reject(tm
     ]
 
 
+def test_show_live_latest_runner_recommends_signal_ready_actions_for_decision_reject(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    latest_path = (
+        root
+        / "var"
+        / "live"
+        / "state"
+        / "runner"
+        / "cycle=15m"
+        / "asset=sol"
+        / "profile=deep_otm"
+        / "target=direction"
+        / "latest.json"
+    )
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    latest_path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "run_started_at": "2026-03-20T00:00:00Z",
+                "completed_iterations": 1,
+                "errors": 0,
+                "runner_log_path": str(root / "var" / "live" / "logs" / "runner.jsonl"),
+                "last_iteration": {
+                    "snapshot_ts": "2026-03-20T00-00-01Z",
+                    "runner_health": {
+                        "overall_status": "warning",
+                        "pre_side_effect_status": "blocked",
+                        "post_side_effect_status": "dry_run",
+                        "primary_blocker": "decision_not_accept",
+                        "blocker_stage": "decision",
+                        "blocking_issue_count": 2,
+                        "warning_issue_count": 1,
+                        "checks": [],
+                    },
+                    "risk_summary": {
+                        "decision": {
+                            "status": "reject",
+                            "top_reject_reasons": [
+                                "signal_not_ready",
+                                "offset_not_yet_open",
+                            ],
+                        },
+                        "execution": {"status": "no_action", "reason": "decision_reject"},
+                    },
+                    "risk_alerts": [{"severity": "warning", "code": "decision_reject", "detail": ["signal_not_ready"]}],
+                    "decision": {"status": "reject"},
+                    "execution": {"status": "no_action", "reason": "decision_reject"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = show_live_latest_runner(cfg, target="direction", risk_only=True)
+
+    assert payload["operator_summary"]["decision_reject_category"] == "signal_not_ready"
+    assert payload["operator_summary"]["decision_top_reject_reasons"] == [
+        "signal_not_ready",
+        "offset_not_yet_open",
+    ]
+    assert payload["next_actions"] == [
+        "wait for the next live offset window to open before retrying side effects",
+    ]
+
+
 def test_show_live_latest_runner_surfaces_threshold_reject_diagnostics(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)

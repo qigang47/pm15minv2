@@ -286,7 +286,7 @@ def test_quote_snapshot_rejects_expired_signal_window(tmp_path: Path, monkeypatc
         now=pd.Timestamp("2026-03-20T12:48:00Z"),
     )
     row = quote["quote_rows"][0]
-    assert row["status"] == "missing_quote_inputs"
+    assert row["status"] == "signal_not_ready"
     assert row["market_id"] is None
     assert row["condition_id"] is None
     assert row["quote_up_ask"] is None
@@ -1075,6 +1075,119 @@ def test_quote_snapshot_provider_only_skips_local_fallback(tmp_path: Path, monke
     assert "down_quote_missing" in row["reasons"]
     assert row["quote_source_path"] is None
     assert provider.calls == ["token-up", "token-down"]
+
+
+def test_quote_snapshot_provider_retries_missing_side_with_force_refresh(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setenv("PM15MIN_LIVE_ORDERBOOK_PROVIDER_ONLY", "1")
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
+    cycle_start = pd.Timestamp("2026-03-21T16:45:00Z")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "sol",
+                    "cycle": "15m",
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "question": "Sol up or down",
+                    "source_snapshot_ts": "2026-03-21T16-45-00Z",
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+
+    class _RetryMissingSideProvider:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, bool]] = []
+
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            del levels, timeout
+            self.calls.append((str(token_id), bool(force_refresh)))
+            if token_id == "token-up" and not force_refresh:
+                return None
+            if token_id == "token-up":
+                return {
+                    "timestamp": "2026-03-21T16:54:10Z",
+                    "asks": [{"price": "0.31", "size": "7"}],
+                    "bids": [{"price": "0.30", "size": "6"}],
+                }
+            if token_id == "token-down":
+                return {
+                    "timestamp": "2026-03-21T16:54:10Z",
+                    "asks": [{"price": "0.69", "size": "8"}],
+                    "bids": [{"price": "0.68", "size": "5"}],
+                }
+            return None
+
+        def sync_subscriptions(self, token_ids, *, replace=True, prefetch=False, levels=0, timeout=1.2):
+            del token_ids, replace, prefetch, levels, timeout
+            return {"ok": True}
+
+    provider = _RetryMissingSideProvider()
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 8,
+                    "decision_ts": "2026-03-21T16:54:00+00:00",
+                    "cycle_start_ts": cycle_start.isoformat(),
+                    "cycle_end_ts": cycle_end.isoformat(),
+                }
+            ],
+        },
+        persist=False,
+        now=pd.Timestamp("2026-03-21T16:54:15Z"),
+        orderbook_provider=provider,
+    )
+    row = quote["quote_rows"][0]
+    assert row["status"] == "ok"
+    assert row["quote_up_ask"] == 0.31
+    assert row["quote_down_ask"] == 0.69
+    assert provider.calls == [
+        ("token-up", False),
+        ("token-down", False),
+        ("token-up", True),
+    ]
+
+
+def test_quote_snapshot_marks_missing_decision_ts_as_signal_not_ready(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    quote = build_quote_snapshot(
+        cfg=cfg,
+        signal_payload={
+            "target": "direction",
+            "snapshot_ts": "manual",
+            "offset_signals": [
+                {
+                    "offset": 7,
+                    "status": "missing_score_row",
+                    "window_start_ts": "2026-03-21T16:52:00+00:00",
+                    "window_end_ts": "2026-03-21T16:53:00+00:00",
+                    "cycle_start_ts": "2026-03-21T16:45:00+00:00",
+                    "cycle_end_ts": "2026-03-21T17:00:00+00:00",
+                }
+            ],
+        },
+        persist=False,
+        now=pd.Timestamp("2026-03-21T16:52:15Z"),
+    )
+    row = quote["quote_rows"][0]
+    assert row["status"] == "signal_not_ready"
+    assert row["reasons"] == ["missing_score_row"]
 
 
 def test_quote_snapshot_loads_index_once_per_iteration(tmp_path: Path, monkeypatch) -> None:

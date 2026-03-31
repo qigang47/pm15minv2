@@ -47,11 +47,14 @@ class LiveClosedBarNotReadyError(RuntimeError):
 
 
 _LIVE_FEATURE_FRAME_CACHE: dict[
-    tuple[str, str, int, str, tuple[int, ...], int],
+    tuple[str, str, int, str, tuple[int, ...], int, tuple[str, ...]],
     tuple[float, tuple[object, ...], pd.DataFrame],
 ] = {}
 _LIVE_FEATURE_FRAME_CACHE_LOCK = threading.Lock()
-_LIVE_FEATURE_STATE_CACHE: dict[tuple[str, str, int, str, tuple[int, ...], int], LiveFeatureState] = {}
+_LIVE_FEATURE_STATE_CACHE: dict[
+    tuple[str, str, int, str, tuple[int, ...], int, tuple[str, ...]],
+    LiveFeatureState,
+] = {}
 _LIVE_FEATURE_STATE_CACHE_LOCK = threading.Lock()
 _LIVE_ACCOUNT_CONTEXT_CACHE: dict[tuple[str, str], tuple[float, tuple[int | None, int | None], dict[str, object]]] = {}
 _LIVE_ACCOUNT_CONTEXT_CACHE_LOCK = threading.Lock()
@@ -79,13 +82,18 @@ def build_live_feature_frame(
     cache_ttl_seconds = _env_float("PM15MIN_LIVE_FEATURE_FRAME_CACHE_SEC", default=0.0)
     resolved_retain_offsets = tuple(retain_offsets or _env_int_list("PM15MIN_LIVE_FEATURE_RETAIN_OFFSETS"))
     tail_cycles = _env_int("PM15MIN_LIVE_FEATURE_TAIL_CYCLES", default=2)
-    cache_key = (
-        str(cfg.layout.rewrite.root),
-        str(cfg.asset.slug),
-        int(cfg.cycle_minutes),
-        str(feature_set),
-        tuple(resolved_retain_offsets),
-        int(tail_cycles),
+    selected_required_feature_columns = _resolve_live_feature_columns_request(
+        feature_set=feature_set,
+        required_feature_columns=required_feature_columns,
+    )
+    cache_key = _live_feature_cache_key(
+        rewrite_root=cfg.layout.rewrite.root,
+        market=cfg.asset.slug,
+        cycle_minutes=int(cfg.cycle_minutes),
+        feature_set=feature_set,
+        retain_offsets=resolved_retain_offsets,
+        tail_cycles=int(tail_cycles),
+        required_feature_columns=selected_required_feature_columns,
     )
     data_cfg = DataConfig.build(
         market=cfg.asset.slug,
@@ -201,14 +209,27 @@ def build_live_feature_frame(
     builder_raw_klines = _slice_feature_builder_tail(raw_klines, tail_bars=build_tail_bars)
     builder_btc_klines = _slice_feature_builder_tail(btc_klines, tail_bars=build_tail_bars)
     builder_started = time.perf_counter()
-    features = build_feature_frame_df(
-        builder_raw_klines,
-        feature_set=feature_set,
-        oracle_prices=oracle_prices,
-        btc_klines=builder_btc_klines,
-        cycle=f"{int(cfg.cycle_minutes)}m",
-        requested_columns=required_feature_columns,
-    )
+    builder_kwargs = {
+        "feature_set": feature_set,
+        "oracle_prices": oracle_prices,
+        "btc_klines": builder_btc_klines,
+        "cycle": f"{int(cfg.cycle_minutes)}m",
+    }
+    if selected_required_feature_columns is not None:
+        builder_kwargs["requested_columns"] = selected_required_feature_columns
+    try:
+        features = build_feature_frame_df(
+            builder_raw_klines,
+            **builder_kwargs,
+        )
+    except TypeError as exc:
+        if "requested_columns" not in builder_kwargs or "requested_columns" not in str(exc):
+            raise
+        builder_kwargs.pop("requested_columns", None)
+        features = build_feature_frame_df(
+            builder_raw_klines,
+            **builder_kwargs,
+        )
     timings_ms["builder_call_stage_ms"] = _elapsed_ms(builder_started)
     trim_started = time.perf_counter()
     features = _trim_live_feature_frame(
@@ -260,7 +281,7 @@ def _attach_live_feature_timings(features: pd.DataFrame, *, timings_ms: dict[str
 
 def _load_cached_live_feature_frame(
     *,
-    cache_key: tuple[str, str, int, str, tuple[int, ...], int],
+    cache_key: tuple[str, str, int, str, tuple[int, ...], int, tuple[str, ...]],
     source_signature: tuple[object, ...],
 ) -> pd.DataFrame | None:
     now_monotonic = time.monotonic()
@@ -277,7 +298,7 @@ def _load_cached_live_feature_frame(
 
 def _store_cached_live_feature_frame(
     *,
-    cache_key: tuple[str, str, int, str, tuple[int, ...], int],
+    cache_key: tuple[str, str, int, str, tuple[int, ...], int, tuple[str, ...]],
     cache_ttl_seconds: float,
     source_signature: tuple[object, ...],
     features: pd.DataFrame,
@@ -346,7 +367,7 @@ def _normalize_signature_value(value: object) -> object:
 
 def _load_live_feature_state(
     *,
-    cache_key: tuple[str, str, int, str, tuple[int, ...], int],
+    cache_key: tuple[str, str, int, str, tuple[int, ...], int, tuple[str, ...]],
     source_signature: tuple[object, ...],
 ) -> pd.DataFrame | None:
     with _LIVE_FEATURE_STATE_CACHE_LOCK:
@@ -358,7 +379,7 @@ def _load_live_feature_state(
 
 def _load_any_live_feature_state(
     *,
-    cache_key: tuple[str, str, int, str, tuple[int, ...], int],
+    cache_key: tuple[str, str, int, str, tuple[int, ...], int, tuple[str, ...]],
 ) -> LiveFeatureState | None:
     with _LIVE_FEATURE_STATE_CACHE_LOCK:
         state = _LIVE_FEATURE_STATE_CACHE.get(cache_key)
@@ -374,7 +395,7 @@ def _load_any_live_feature_state(
 
 def _store_live_feature_state(
     *,
-    cache_key: tuple[str, str, int, str, tuple[int, ...], int],
+    cache_key: tuple[str, str, int, str, tuple[int, ...], int, tuple[str, ...]],
     source_signature: tuple[object, ...],
     features: pd.DataFrame,
     build_tail_bars: int,
@@ -387,6 +408,45 @@ def _store_live_feature_state(
             build_tail_bars=int(build_tail_bars),
             build_mode=str(build_mode),
         )
+
+
+def _resolve_live_feature_columns_request(
+    *,
+    feature_set: str,
+    required_feature_columns: set[str] | None,
+) -> set[str] | None:
+    if required_feature_columns is not None:
+        return {str(column) for column in required_feature_columns}
+    if str(feature_set).strip().lower() == "v6_user_core":
+        return {
+            *feature_set_columns("v6_user_core"),
+            *feature_set_columns("bs_q_replace_direction"),
+        }
+    return None
+
+
+def _live_feature_cache_key(
+    *,
+    rewrite_root: Path,
+    market: str,
+    cycle_minutes: int,
+    feature_set: str,
+    retain_offsets: tuple[int, ...],
+    tail_cycles: int,
+    required_feature_columns: set[str] | None,
+) -> tuple[str, str, int, str, tuple[int, ...], int, tuple[str, ...]]:
+    required_columns_key = ()
+    if required_feature_columns is not None:
+        required_columns_key = tuple(sorted(str(column) for column in required_feature_columns))
+    return (
+        str(rewrite_root),
+        str(market),
+        int(cycle_minutes),
+        str(feature_set),
+        tuple(retain_offsets),
+        int(tail_cycles),
+        required_columns_key,
+    )
 
 
 def _trim_live_feature_frame(

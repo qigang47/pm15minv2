@@ -19,7 +19,7 @@ DEFAULT_RPC_FALLBACKS = (
 
 
 def load_trading_auth_config_from_env() -> TradingAuthConfig:
-    load_dotenv()
+    _load_dotenv_if_enabled()
     return TradingAuthConfig(
         host=_clean(os.getenv("POLYMARKET_HOST")) or DEFAULT_CLOB_HOST,
         chain_id=_int_or_default(os.getenv("POLYMARKET_CHAIN_ID"), default=DEFAULT_CHAIN_ID),
@@ -30,7 +30,7 @@ def load_trading_auth_config_from_env() -> TradingAuthConfig:
 
 
 def load_data_api_config_from_env() -> DataApiConfig:
-    load_dotenv()
+    _load_dotenv_if_enabled()
     return DataApiConfig(
         user_address=_clean(os.getenv("POLYMARKET_USER_ADDRESS")),
         base_url=_clean(os.getenv("POLYMARKET_DATA_API_BASE")) or DEFAULT_DATA_API_BASE,
@@ -38,7 +38,7 @@ def load_data_api_config_from_env() -> DataApiConfig:
 
 
 def load_redeem_relay_config_from_env() -> RedeemRelayConfig:
-    load_dotenv()
+    _load_dotenv_if_enabled()
     rpc_urls = _resolve_rpc_candidates_from_env()
     return RedeemRelayConfig(
         rpc_urls=tuple(rpc_urls),
@@ -54,6 +54,12 @@ def _clean(value: object) -> str | None:
         return None
     out = str(value).strip()
     return out or None
+
+
+def _load_dotenv_if_enabled() -> None:
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return
+    load_dotenv()
 
 
 def _int_or_default(value: object, *, default: int) -> int:
