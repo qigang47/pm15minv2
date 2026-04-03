@@ -188,7 +188,11 @@ class WebsocketOrderbookProvider:
             force_refresh=force_refresh,
         )
         if isinstance(payload, dict):
-            self._store_fallback_payload(token_id=token, payload=payload)
+            self._store_fallback_payload(
+                token_id=token,
+                payload=payload,
+                requested_levels=requested_levels,
+            )
         return payload
 
     def sync_subscriptions(
@@ -241,7 +245,11 @@ class WebsocketOrderbookProvider:
                             continue
                         if not isinstance(payload, dict):
                             continue
-                        self._store_fallback_payload(token_id=token, payload=payload)
+                        self._store_fallback_payload(
+                            token_id=token,
+                            payload=payload,
+                            requested_levels=requested_levels,
+                        )
                         prefetched_direct += 1
         return {
             "ok": True,
@@ -656,23 +664,38 @@ class WebsocketOrderbookProvider:
             payload["spread"] = _format_decimal(best_ask - best_bid)
         return payload
 
-    def _store_fallback_payload(self, *, token_id: str, payload: dict[str, Any]) -> None:
+    def _store_fallback_payload(
+        self,
+        *,
+        token_id: str,
+        payload: dict[str, Any],
+        requested_levels: int,
+    ) -> None:
         asks = _normalize_price_levels(payload.get("asks"), reverse=False)
         bids = _normalize_price_levels(payload.get("bids"), reverse=True)
         snapshot_ts_ms = _payload_snapshot_ts_ms(payload)
+        kept_asks = asks[: self.max_cached_levels]
+        kept_bids = bids[: self.max_cached_levels]
+        requested_levels = max(0, int(requested_levels))
         entry = _StreamingOrderbookEntry(
             token_id=str(token_id),
             market=str(payload.get("market") or "").strip() or None,
-            asks=asks[: self.max_cached_levels],
-            bids=bids[: self.max_cached_levels],
+            asks=kept_asks,
+            bids=kept_bids,
             best_ask=asks[0]["price"] if asks else _float_or_none(payload.get("best_ask")),
             best_bid=bids[0]["price"] if bids else _float_or_none(payload.get("best_bid")),
             snapshot_ts_ms=snapshot_ts_ms,
             received_at_ms=int(time.time() * 1000),
             event_type=str(payload.get("event_type") or "direct_fallback"),
             depth_complete=True,
-            truncated_asks=False,
-            truncated_bids=False,
+            truncated_asks=bool(
+                len(asks) > len(kept_asks)
+                or (requested_levels > self.max_cached_levels and len(kept_asks) >= self.max_cached_levels)
+            ),
+            truncated_bids=bool(
+                len(bids) > len(kept_bids)
+                or (requested_levels > self.max_cached_levels and len(kept_bids) >= self.max_cached_levels)
+            ),
         )
         self._publish_entry(token_id=str(token_id), entry=entry)
 
@@ -682,6 +705,9 @@ class WebsocketOrderbookProvider:
 
     def _publish_entry(self, *, token_id: str, entry: _StreamingOrderbookEntry) -> None:
         with self._lock:
+            existing = self._entries.get(str(token_id))
+            if not _should_replace_streaming_entry(existing=existing, incoming=entry):
+                return
             self._entries[str(token_id)] = entry
             self._update_marker += 1
             self._data_ready.notify_all()
@@ -1372,3 +1398,25 @@ def _float_or_none(raw: object) -> float | None:
         return float(raw)
     except Exception:
         return None
+
+
+def _should_replace_streaming_entry(
+    *,
+    existing: _StreamingOrderbookEntry | None,
+    incoming: _StreamingOrderbookEntry,
+) -> bool:
+    if existing is None:
+        return True
+    existing_ts_ms = existing.snapshot_ts_ms
+    incoming_ts_ms = incoming.snapshot_ts_ms
+    if existing_ts_ms is not None and incoming_ts_ms is not None:
+        if int(incoming_ts_ms) < int(existing_ts_ms):
+            return False
+        if int(incoming_ts_ms) > int(existing_ts_ms):
+            return True
+        return int(incoming.received_at_ms) >= int(existing.received_at_ms)
+    if existing_ts_ms is None and incoming_ts_ms is not None:
+        return True
+    if existing_ts_ms is not None and incoming_ts_ms is None:
+        return False
+    return int(incoming.received_at_ms) >= int(existing.received_at_ms)

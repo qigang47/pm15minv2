@@ -479,3 +479,97 @@ def test_websocket_orderbook_provider_uses_stream_cache_before_fallback() -> Non
     assert payload["best_bid"] == "0.22"
     assert payload["asks"][0]["price"] == "0.24"
     assert fallback.calls == 0
+
+
+def test_websocket_orderbook_provider_does_not_let_older_fallback_overwrite_newer_stream() -> None:
+    class _FallbackProvider:
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            del token_id, levels, timeout, force_refresh
+            return {
+                "timestamp": "2026-03-31T11:59:59Z",
+                "__provider_fetched_at_ms": 1_743_422_399_000,
+                "asks": [{"price": "0.10", "size": "9"}],
+                "bids": [{"price": "0.09", "size": "8"}],
+            }
+
+        def sync_subscriptions(self, token_ids, *, replace=True, prefetch=False, levels=0, timeout=1.2):
+            del token_ids, replace, prefetch, levels, timeout
+            return {"ok": True}
+
+    provider = WebsocketOrderbookProvider(
+        fallback_provider=_FallbackProvider(),
+        subscribe_on_read=True,
+        stream_wait_ms=0,
+        max_cached_levels=20,
+    )
+    provider._ensure_started = lambda: None  # type: ignore[method-assign]
+    provider._handle_stream_message(
+        json.dumps(
+            {
+                "event_type": "book",
+                "asset_id": "token-1",
+                "market": "market-1",
+                "timestamp": "2026-03-31T12:00:00Z",
+                "asks": [{"price": "0.25", "size": "4"}],
+                "bids": [{"price": "0.24", "size": "5"}],
+            }
+        )
+    )
+
+    first = provider.get_orderbook_summary("token-1", levels=20, timeout=0.01)
+    second = provider.get_orderbook_summary("token-1", levels=20, timeout=0.01, force_refresh=True)
+    third = provider.get_orderbook_summary("token-1", levels=20, timeout=0.01)
+
+    assert first is not None
+    assert second is not None
+    assert third is not None
+    assert first["asks"][0]["price"] == "0.25"
+    assert second["asks"][0]["price"] == "0.10"
+    assert third["asks"][0]["price"] == "0.25"
+
+
+def test_websocket_orderbook_provider_does_not_treat_truncated_fallback_as_full_deeper_cache() -> None:
+    class _FallbackProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_orderbook_summary(self, token_id, *, levels=0, timeout=1.2, force_refresh=False):
+            del token_id, timeout, force_refresh
+            self.calls += 1
+            return {
+                "timestamp": "2026-03-31T12:00:00Z",
+                "__provider_fetched_at_ms": 1_743_422_400_000,
+                "asks": [
+                    {"price": f"{0.10 + idx * 0.01:.2f}", "size": "1"}
+                    for idx in range(max(0, int(levels)))
+                ],
+                "bids": [
+                    {"price": f"{0.09 - idx * 0.01:.2f}", "size": "1"}
+                    for idx in range(max(0, int(levels)))
+                ],
+            }
+
+        def sync_subscriptions(self, token_ids, *, replace=True, prefetch=False, levels=0, timeout=1.2):
+            del token_ids, replace, prefetch, levels, timeout
+            return {"ok": True}
+
+    fallback = _FallbackProvider()
+    provider = WebsocketOrderbookProvider(
+        fallback_provider=fallback,
+        subscribe_on_read=True,
+        stream_wait_ms=0,
+        max_cached_levels=20,
+    )
+    provider._ensure_started = lambda: None  # type: ignore[method-assign]
+
+    first = provider.get_orderbook_summary("token-1", levels=50, timeout=0.01)
+    second = provider.get_orderbook_summary("token-1", levels=50, timeout=0.01)
+    third = provider.get_orderbook_summary("token-1", levels=20, timeout=0.01)
+
+    assert first is not None
+    assert second is not None
+    assert third is not None
+    assert len(first["asks"]) == 50
+    assert len(second["asks"]) == 50
+    assert len(third["asks"]) == 20
+    assert fallback.calls == 2
