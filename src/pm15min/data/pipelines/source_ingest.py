@@ -286,6 +286,11 @@ def import_legacy_settlement_truth(
     *,
     source_path: Path | None = None,
 ) -> dict[str, object]:
+    if source_path is None and cfg.cycle != "15m":
+        raise ValueError(
+            f"Legacy settlement truth import for cycle={cfg.cycle} requires explicit source_path; "
+            "default discovery only supports legacy 15m CSV."
+        )
     source_path = source_path or discover_legacy_settlement_truth_csv()
     if source_path is None or not source_path.exists():
         raise FileNotFoundError("Could not locate legacy settlement-truth CSV.")
