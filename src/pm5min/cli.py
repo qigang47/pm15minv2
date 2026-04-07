@@ -21,7 +21,7 @@ def rewrite_pm5min_argv(argv: list[str]) -> list[str]:
         live_command = out[1] if len(out) > 1 and not out[1].startswith("-") else None
         if live_command is None:
             return out
-        if live_command != "show-layout" and not _has_flag(out, "--cycle-minutes"):
+        if not _has_flag(out, "--cycle-minutes"):
             out.extend(["--cycle-minutes", str(DEFAULT_CYCLE_MINUTES)])
         if not _has_flag(out, "--profile"):
             out.extend(["--profile", DEFAULT_LIVE_PROFILE])

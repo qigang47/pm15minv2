@@ -1,4 +1,6 @@
-from pm5min.cli import rewrite_pm5min_argv
+import json
+
+from pm5min.cli import main, rewrite_pm5min_argv
 
 
 def test_rewrite_pm5min_argv_injects_5m_defaults() -> None:
@@ -79,12 +81,24 @@ def test_rewrite_pm5min_argv_respects_equals_form_values() -> None:
     ]
 
 
-def test_rewrite_pm5min_argv_skips_cycle_minutes_for_live_show_layout() -> None:
+def test_rewrite_pm5min_argv_injects_cycle_minutes_for_live_show_layout() -> None:
     assert rewrite_pm5min_argv(["live", "show-layout", "--market", "sol"]) == [
         "live",
         "show-layout",
         "--market",
         "sol",
+        "--cycle-minutes",
+        "5",
         "--profile",
         "deep_otm_5m",
     ]
+
+
+def test_pm5min_live_show_layout_uses_5m_profile_and_cycle(capsys) -> None:
+    rc = main(["live", "show-layout", "--market", "sol"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cycle_minutes"] == 5
+    assert payload["profile"] == "deep_otm_5m"
+    assert payload["profile_spec_resolution"]["status"] == "exact_match"

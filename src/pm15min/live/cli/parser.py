@@ -5,7 +5,6 @@ import argparse
 from .common import (
     add_adapter_arg,
     add_feature_set_arg,
-    add_market_profile_args,
     add_market_profile_cycle_args,
     add_no_persist_arg,
     add_target_arg,
@@ -23,7 +22,7 @@ def attach_live_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
     show_config.add_argument("--decision-poll-interval-sec", type=float, default=1.0)
 
     show_layout = live_sub.add_parser("show-layout", help="Show live runtime layout plus canonical-scope boundary metadata.")
-    add_market_profile_args(show_layout)
+    add_market_profile_cycle_args(show_layout)
 
     check_trading_gateway_parser = live_sub.add_parser("check-trading-gateway", help="Validate the current live trading adapter config and optional read-only probes.")
     add_market_profile_cycle_args(check_trading_gateway_parser)
