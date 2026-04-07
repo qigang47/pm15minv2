@@ -56,6 +56,7 @@ SETTLEMENT_SOURCE_COLUMNS = [
 
 LEGACY_ORDERBOOK_DEPTH_RE = re.compile(r"orderbook_depth_(\d{8})\.ndjson\.zst$")
 LEGACY_MARKET_SNAPSHOT_RE = re.compile(r"_(\d{8}_\d{6})\.(?:csv|json)$")
+LEGACY_SETTLEMENT_TRUTH_CYCLE_RE = re.compile(r"polymarket_(\d+m)_settlement_truth\.csv$", re.IGNORECASE)
 
 
 def _utc_now_label() -> str:
@@ -83,6 +84,35 @@ def _latest_path(paths: list[Path]) -> Path | None:
     if not paths:
         return None
     return max(paths, key=lambda path: path.stat().st_mtime_ns)
+
+
+def _infer_legacy_settlement_truth_cycle(source_path: Path, df: pd.DataFrame) -> str | None:
+    match = LEGACY_SETTLEMENT_TRUTH_CYCLE_RE.search(source_path.name)
+    if match:
+        return str(match.group(1)).strip().lower()
+
+    if "cycle" in df.columns:
+        values = {
+            str(value).strip().lower()
+            for value in df["cycle"].dropna().tolist()
+            if str(value).strip()
+        }
+        if len(values) == 1:
+            return next(iter(values))
+
+    if "slug" in df.columns:
+        values: set[str] = set()
+        for value in df["slug"].dropna().tolist():
+            text = str(value).strip().lower()
+            if not text:
+                continue
+            for token in re.split(r"[^0-9a-z]+", text):
+                if re.fullmatch(r"\d+m", token):
+                    values.add(token)
+        if len(values) == 1:
+            return next(iter(values))
+
+    return None
 
 
 def discover_legacy_streams_csv() -> Path | None:
@@ -296,6 +326,17 @@ def import_legacy_settlement_truth(
         raise FileNotFoundError("Could not locate legacy settlement-truth CSV.")
 
     df = pd.read_csv(source_path, low_memory=False)
+    source_cycle = _infer_legacy_settlement_truth_cycle(source_path, df)
+    if source_cycle is not None and source_cycle != cfg.cycle:
+        raise ValueError(
+            f"Legacy settlement truth source {source_path} is not compatible with cycle={cfg.cycle}; "
+            f"detected cycle={source_cycle}."
+        )
+    if cfg.cycle != "15m" and source_cycle is None:
+        raise ValueError(
+            f"Legacy settlement truth source {source_path} is not compatible with cycle={cfg.cycle}; "
+            "unable to validate source cycle."
+        )
     required = {"asset", "end_ts", "market_id", "winner_side", "label_updown"}
     missing = sorted(required - set(df.columns))
     if missing:

@@ -321,6 +321,34 @@ def test_import_legacy_settlement_truth_supports_5m_with_explicit_source(tmp_pat
     assert df.iloc[0]["source_file"] == str(source_path)
 
 
+def test_import_legacy_settlement_truth_rejects_explicit_15m_source_for_5m(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
+    source_path = tmp_path / "polymarket_15m_settlement_truth.csv"
+    pd.DataFrame(
+        [
+            {
+                "asset": "eth",
+                "end_ts": 1766032200,
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "slug": "eth-updown-15m-1766031300",
+                "question": "Ethereum Up or Down",
+                "resolution_source": "legacy-15m",
+                "winner_side": "DOWN",
+                "label_updown": "DOWN",
+                "onchain_resolved": True,
+                "stream_match_exact": True,
+                "full_truth": True,
+                "stream_price": 2042.5,
+                "stream_extra_ts": 1766032200,
+            }
+        ]
+    ).to_csv(source_path, index=False)
+
+    with pytest.raises(ValueError, match="compatible with cycle=5m"):
+        import_legacy_settlement_truth(cfg, source_path=source_path)
+
+
 def test_sync_settlement_truth_from_gamma_writes_source_table(tmp_path: Path) -> None:
     cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
 
