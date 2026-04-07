@@ -98,13 +98,14 @@ def build_feature_pruning_plan(
     *,
     feature_set: str,
     market: str,
+    root: str | None = None,
     extra_drop_columns: list[str] | tuple[str, ...] = (),
     apply_shared_blacklist: bool = False,
 ) -> FeaturePruningPlan:
     ordered_columns = [str(column) for column in columns]
-    allowed = set(feature_set_columns(feature_set))
+    allowed = set(feature_set_columns(feature_set, root=root))
     shared = _LEGACY_SHARED_BLACKLIST.get(str(market).strip().lower(), ()) if apply_shared_blacklist else ()
-    feature_set_blacklist = feature_set_drop_columns(feature_set)
+    feature_set_blacklist = feature_set_drop_columns(feature_set, root=root)
 
     requested = tuple(dict.fromkeys(str(column) for column in extra_drop_columns if str(column)))
     effective_drop = tuple(dict.fromkeys([*requested, *(_SHARED_META_BLACKLIST if apply_shared_blacklist else ()), *shared, *feature_set_blacklist]))
@@ -131,6 +132,7 @@ def resolve_feature_pruning(
     *,
     available_columns: list[str] | tuple[str, ...],
     market: str = "",
+    root: str | None = None,
     extra_blacklist: list[str] | tuple[str, ...] = (),
     apply_shared_blacklist: bool = True,
 ) -> FeaturePruningReport:
@@ -138,6 +140,7 @@ def resolve_feature_pruning(
         available_columns,
         feature_set=feature_set,
         market=market,
+        root=root,
         extra_drop_columns=extra_blacklist,
         apply_shared_blacklist=apply_shared_blacklist,
     )
@@ -175,6 +178,7 @@ def prune_feature_frame(
     *,
     feature_set: str,
     market: str = "",
+    root: str | None = None,
     extra_blacklist: list[str] | tuple[str, ...] = (),
     apply_shared_blacklist: bool = True,
 ) -> tuple[pd.DataFrame, FeaturePruningReport]:
@@ -182,6 +186,7 @@ def prune_feature_frame(
         feature_set,
         available_columns=[str(column) for column in frame.columns],
         market=market,
+        root=root,
         extra_blacklist=extra_blacklist,
         apply_shared_blacklist=apply_shared_blacklist,
     )

@@ -17,6 +17,13 @@
 - `DEEP_OTM_BASELINE_RETRAIN_PLAN.md`
   - `deep_otm_baseline` 的重训方案文档，和诊断文档分开维护；当前已经落了完整的重训框架，包括目标、基线定义、训练目标、样本口径、加权、特征方案、切分、实验矩阵、评估、通过条件和决策流程。
 
+Repo 内自动化入口：
+
+- `program.md`
+  - 外部 `codex` 每一轮读取的仓库内研究指令。
+- `scripts/research/README.md`
+  - `codex_background_loop.sh`、`status_autorun.sh`、`run_one_experiment.sh` 等控制面脚本的使用说明。
+
 清理规则：
 
 - 长期规范和 runbook 留在 `docs/`

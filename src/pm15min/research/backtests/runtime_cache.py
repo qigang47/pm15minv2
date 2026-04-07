@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from threading import RLock
 
@@ -9,6 +11,16 @@ import pandas as pd
 
 
 DEFAULT_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES = 8
+
+
+def _default_backtest_runtime_cache_max_entries() -> int:
+    raw = str(os.environ.get("PM15MIN_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES") or "").strip()
+    if not raw:
+        return DEFAULT_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return DEFAULT_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES
 
 
 @dataclass(frozen=True)
@@ -39,7 +51,7 @@ class BacktestPreparedRuntime:
     replay_summary: object
     depth_replay: pd.DataFrame
     depth_replay_summary: object
-    depth_candidate_lookup: dict[tuple[object, ...], list[dict[str, object]]]
+    depth_candidate_lookup: Mapping[tuple[object, ...], list[dict[str, object]]]
     runtime_replay: pd.DataFrame
     quote_summary: object
     state_summary: object
@@ -101,7 +113,9 @@ class BacktestRuntimeStageCache:
             self._entries.clear()
 
 
-_PROCESS_BACKTEST_RUNTIME_CACHE = BacktestRuntimeStageCache()
+_PROCESS_BACKTEST_RUNTIME_CACHE = BacktestRuntimeStageCache(
+    max_entries=_default_backtest_runtime_cache_max_entries()
+)
 
 
 def process_backtest_runtime_cache() -> BacktestRuntimeStageCache:

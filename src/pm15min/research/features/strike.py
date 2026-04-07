@@ -8,31 +8,8 @@ import pandas as pd
 from pm15min.research.features.cycle import _pandas_cycle_freq
 
 
-def _normal_cdf(values: pd.Series) -> pd.Series:
-    arr = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float, copy=False)
-    out = np.full(arr.shape, np.nan, dtype=float)
-    mask = np.isfinite(arr)
-    if bool(mask.any()):
-        out[mask] = [0.5 * (1.0 + erf(float(v) / sqrt(2.0))) for v in arr[mask]]
-    return pd.Series(out, index=values.index, dtype=float)
-
-
-def append_strike_features(
-    frame: pd.DataFrame,
-    *,
-    oracle_prices: pd.DataFrame,
-    cycle: str = "15m",
-    requested_columns: set[str] | None = None,
-) -> pd.DataFrame:
-    out = frame.copy()
-    requested = None if requested_columns is None else {str(column) for column in requested_columns}
-
-    def needs(*columns: str) -> bool:
-        if requested is None:
-            return True
-        return any(str(column) in requested for column in columns)
-
-    if not needs(
+STRIKE_FEATURE_COLUMNS = frozenset(
+    {
         "ret_from_strike",
         "basis_bp",
         "has_oracle_strike",
@@ -42,18 +19,47 @@ def append_strike_features(
         "strike_flip_count_cycle",
         "q_bs_up_strike",
         "q_bs_up_strike_centered",
-    ):
-        return out
+    }
+)
 
-    freq = _pandas_cycle_freq(cycle)
-    if needs("has_oracle_strike", "has_cl_strike"):
-        out["has_oracle_strike"] = 0
-    if needs("basis_bp"):
-        out["basis_bp"] = 0.0
 
-    ret_cycle = pd.to_numeric(out["ret_from_cycle_open"], errors="coerce")
-    strike = pd.Series(np.nan, index=out.index, dtype=float)
+def _normal_cdf(values: pd.Series) -> pd.Series:
+    arr = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float, copy=False)
+    out = np.full(arr.shape, np.nan, dtype=float)
+    mask = np.isfinite(arr)
+    if bool(mask.any()):
+        out[mask] = [0.5 * (1.0 + erf(float(v) / sqrt(2.0))) for v in arr[mask]]
+    return pd.Series(out, index=values.index, dtype=float)
 
+
+def recompute_strike_features(
+    frame: pd.DataFrame,
+    *,
+    price_to_beat: pd.Series | None = None,
+    cycle: str = "15m",
+    requested_columns: set[str] | None = None,
+) -> pd.DataFrame:
+    strike = (
+        pd.to_numeric(price_to_beat, errors="coerce")
+        if price_to_beat is not None
+        else pd.to_numeric(frame.get("price_to_beat"), errors="coerce")
+    )
+    return _append_strike_feature_columns(
+        frame,
+        strike=strike,
+        cycle=cycle,
+        requested_columns=requested_columns,
+    )
+
+
+def append_strike_features(
+    frame: pd.DataFrame,
+    *,
+    oracle_prices: pd.DataFrame,
+    cycle: str = "15m",
+    requested_columns: set[str] | None = None,
+) -> pd.DataFrame:
+    strike = pd.Series(np.nan, index=frame.index, dtype=float)
     if not oracle_prices.empty:
         oracle = oracle_prices.copy()
         oracle["cycle_start_ts"] = pd.to_numeric(oracle["cycle_start_ts"], errors="coerce")
@@ -64,10 +70,42 @@ def append_strike_features(
                 "price_to_beat"
             ]
             cycle_start_sec = (
-                pd.to_datetime(out["cycle_start_ts"], utc=True, errors="coerce").astype("int64") // 10**9
+                pd.to_datetime(frame["cycle_start_ts"], utc=True, errors="coerce").astype("int64") // 10**9
             ).astype("int64")
             strike = cycle_start_sec.map(strike_map).astype(float)
+    return _append_strike_feature_columns(
+        frame,
+        strike=strike,
+        cycle=cycle,
+        requested_columns=requested_columns,
+    )
 
+
+def _append_strike_feature_columns(
+    frame: pd.DataFrame,
+    *,
+    strike: pd.Series,
+    cycle: str,
+    requested_columns: set[str] | None = None,
+) -> pd.DataFrame:
+    out = frame.copy()
+    requested = None if requested_columns is None else {str(column) for column in requested_columns}
+
+    def needs(*columns: str) -> bool:
+        if requested is None:
+            return True
+        return any(str(column) in requested for column in columns)
+
+    if not needs(*sorted(STRIKE_FEATURE_COLUMNS)):
+        return out
+
+    freq = _pandas_cycle_freq(cycle)
+    if needs("has_oracle_strike", "has_cl_strike"):
+        out["has_oracle_strike"] = 0
+    if needs("basis_bp"):
+        out["basis_bp"] = 0.0
+
+    ret_cycle = pd.to_numeric(out["ret_from_cycle_open"], errors="coerce")
     denom = (1.0 + ret_cycle).replace(0.0, np.nan)
     cycle_open_close = pd.to_numeric(out["close"], errors="coerce") / denom
     basis_ratio = (cycle_open_close / strike) - 1.0
@@ -99,14 +137,18 @@ def append_strike_features(
         strike_side.loc[strike_ret.gt(0.0)] = 1.0
         strike_side.loc[strike_ret.lt(0.0)] = -1.0
         cycle_key = pd.to_datetime(out["cycle_start_ts"], utc=True, errors="coerce")
-        active_side = strike_side.groupby(cycle_key).ffill()
-        previous_side = active_side.groupby(cycle_key).shift(1)
+        entity_key = _strike_entity_key(out, strike=strike)
+        active_side = strike_side.groupby([cycle_key, entity_key]).ffill()
+        previous_side = active_side.groupby([cycle_key, entity_key]).shift(1)
         flipped = active_side.notna() & previous_side.notna() & active_side.ne(previous_side)
-        out["strike_flip_count_cycle"] = flipped.astype(int).groupby(cycle_key).cumsum().astype(float)
+        out["strike_flip_count_cycle"] = flipped.astype(int).groupby([cycle_key, entity_key]).cumsum().astype(float)
 
     if needs("q_bs_up_strike", "q_bs_up_strike_centered"):
         decision_ts = pd.to_datetime(out["decision_ts"], utc=True, errors="coerce")
-        cycle_end = decision_ts.dt.floor(freq) + pd.Timedelta(freq)
+        if "cycle_end_ts" in out.columns:
+            cycle_end = pd.to_datetime(out["cycle_end_ts"], utc=True, errors="coerce")
+        else:
+            cycle_end = decision_ts.dt.floor(freq) + pd.Timedelta(freq)
         minutes_left = ((cycle_end - decision_ts).dt.total_seconds() / 60.0).clip(lower=0.0)
         log_moneyness = pd.Series(np.nan, index=out.index, dtype=float)
         valid_ret = pd.to_numeric(out["ret_from_strike"], errors="coerce") > -1.0
@@ -124,3 +166,19 @@ def append_strike_features(
         if needs("q_bs_up_strike_centered"):
             out["q_bs_up_strike_centered"] = (q_bs.fillna(0.5) - 0.5).astype(float)
     return out
+
+
+def _strike_entity_key(frame: pd.DataFrame, *, strike: pd.Series) -> pd.Series:
+    market_id = (
+        frame["market_id"].astype("string").fillna("").str.strip()
+        if "market_id" in frame.columns
+        else pd.Series("", index=frame.index, dtype="string")
+    )
+    condition_id = (
+        frame["condition_id"].astype("string").fillna("").str.strip()
+        if "condition_id" in frame.columns
+        else pd.Series("", index=frame.index, dtype="string")
+    )
+    strike_key = pd.to_numeric(strike, errors="coerce").round(10).astype("string").fillna("")
+    entity_key = market_id.where(market_id.ne(""), condition_id)
+    return entity_key.where(entity_key.ne(""), strike_key)

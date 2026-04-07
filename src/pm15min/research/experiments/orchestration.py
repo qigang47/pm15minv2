@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from pm15min.research._contracts_training import offset_weight_overrides_payload
+
 from .specs import ExperimentRuntimePolicy
 
 
@@ -159,6 +161,16 @@ def build_case_row_prefix(market_spec, *, case_key: str) -> dict[str, object]:
         "tags_json": _json_text(list(_tags(market_spec))),
         "stake_usd": _stake_usd(market_spec),
         "max_notional_usd": _max_notional_usd(market_spec),
+        "weight_variant_label": str(getattr(market_spec, "weight_variant_label", "default") or "default"),
+        "balance_classes": getattr(market_spec, "balance_classes", None),
+        "weight_by_vol": getattr(market_spec, "weight_by_vol", None),
+        "inverse_vol": getattr(market_spec, "inverse_vol", None),
+        "contrarian_weight": getattr(market_spec, "contrarian_weight", None),
+        "contrarian_quantile": getattr(market_spec, "contrarian_quantile", None),
+        "contrarian_return_col": getattr(market_spec, "contrarian_return_col", None),
+        "offset_weight_overrides_json": _json_text(
+            offset_weight_overrides_payload(getattr(market_spec, "offset_weight_overrides", None))
+        ),
     }
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -45,6 +45,38 @@ class _RawDepthLevelState:
     ever_seen: bool = False
     had_attrition: bool = False
     last_credit_ts_ms: int | None = None
+
+
+class DepthCandidateLookup(Mapping[tuple[object, ...], list[dict[str, object]]]):
+    def __init__(self, depth_replay: pd.DataFrame | None = None) -> None:
+        frame = depth_replay if depth_replay is not None else pd.DataFrame()
+        self._frame = frame
+        self._positions = _build_depth_candidate_positions(frame)
+
+    def __getitem__(self, key: tuple[object, ...]) -> list[dict[str, object]]:
+        positions = self._positions[key]
+        return self._materialize(positions)
+
+    def __iter__(self) -> Iterator[tuple[object, ...]]:
+        return iter(self._positions)
+
+    def __len__(self) -> int:
+        return len(self._positions)
+
+    def get(
+        self,
+        key: tuple[object, ...],
+        default: list[dict[str, object]] | None = None,
+    ) -> list[dict[str, object]] | None:
+        positions = self._positions.get(key)
+        if positions is None:
+            return default
+        return self._materialize(positions)
+
+    def _materialize(self, positions: tuple[int, ...]) -> list[dict[str, object]]:
+        if not positions:
+            return []
+        return self._frame.iloc[list(positions)].to_dict(orient="records")
 
 
 def build_fill_plan_frame(
@@ -186,7 +218,7 @@ def build_canonical_fills(
     config: BacktestFillConfig | None = None,
     profile_spec: LiveProfileSpec | None = None,
     depth_replay: pd.DataFrame | None = None,
-    depth_candidate_lookup: dict[tuple[object, ...], list[dict[str, object]]] | None = None,
+    depth_candidate_lookup: Mapping[tuple[object, ...], list[dict[str, object]]] | None = None,
     heartbeat: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     return _build_fills_impl(
@@ -207,7 +239,7 @@ def _build_fills_impl(
     config: BacktestFillConfig,
     profile_spec: LiveProfileSpec | None = None,
     depth_replay: pd.DataFrame | None = None,
-    depth_candidate_lookup: dict[tuple[object, ...], list[dict[str, object]]] | None = None,
+    depth_candidate_lookup: Mapping[tuple[object, ...], list[dict[str, object]]] | None = None,
     heartbeat: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cfg = config or BacktestFillConfig()
@@ -731,6 +763,9 @@ def _resolve_raw_depth_fill(
         source_path = str(candidate.get("depth_source_path") or "")
         record = candidate.get(side_key)
         snapshot_ts_ms = _int_or_none(candidate.get(side_ts_key))
+        resolved_snapshot_ts_ms = snapshot_ts_ms if snapshot_ts_ms is not None else (
+            raw_snapshot_ts_ms(record) if isinstance(record, dict) else None
+        )
         if not isinstance(record, dict):
             last_payload = {
                 "status": "missing",
@@ -752,7 +787,7 @@ def _resolve_raw_depth_fill(
                 "status": "blocked",
                 "depth_source_path": source_path,
                 "price_cap": price_cap,
-                **_snapshot_metrics(snapshot_ts_ms=raw_snapshot_ts_ms(record), target_ts_ms=target_ts_ms),
+                **_snapshot_metrics(snapshot_ts_ms=resolved_snapshot_ts_ms, target_ts_ms=target_ts_ms),
             }
             last_reason = str(incremental_meta.get("reason") or "depth_fill_unavailable")
             stalled_after_progress = stalled_after_progress or (progress_count > 0 and last_reason == "queue_path_stalled")
@@ -768,7 +803,7 @@ def _resolve_raw_depth_fill(
                 "status": "blocked",
                 "depth_source_path": source_path,
                 "price_cap": price_cap,
-                **_snapshot_metrics(snapshot_ts_ms=raw_snapshot_ts_ms(record), target_ts_ms=target_ts_ms),
+                **_snapshot_metrics(snapshot_ts_ms=resolved_snapshot_ts_ms, target_ts_ms=target_ts_ms),
             }
             last_reason = "depth_fill_unavailable"
             continue
@@ -782,7 +817,7 @@ def _resolve_raw_depth_fill(
             "status": "ok",
             "depth_source_path": source_path,
             "price_cap": price_cap,
-            **_snapshot_metrics(snapshot_ts_ms=raw_snapshot_ts_ms(record), target_ts_ms=target_ts_ms),
+            **_snapshot_metrics(snapshot_ts_ms=resolved_snapshot_ts_ms, target_ts_ms=target_ts_ms),
             **fill,
         }
         aggregate_payload = _accumulate_depth_fill_payload(
@@ -1367,17 +1402,32 @@ def _resolve_depth_constraints(config: BacktestFillConfig) -> tuple[float, float
     return max(0.0, max_slippage_bps), max(0.0, min_fill_ratio)
 
 
-def build_depth_candidate_lookup(depth_replay: pd.DataFrame | None) -> dict[tuple[object, ...], list[dict[str, object]]]:
-    if depth_replay is None or depth_replay.empty:
+def build_depth_candidate_lookup(
+    depth_replay: pd.DataFrame | None,
+) -> Mapping[tuple[object, ...], list[dict[str, object]]]:
+    return DepthCandidateLookup(depth_replay)
+
+
+def _build_depth_candidate_positions(frame: pd.DataFrame) -> dict[tuple[object, ...], tuple[int, ...]]:
+    if frame is None or frame.empty:
         return {}
-    frame = depth_replay.copy()
-    if "depth_snapshot_rank" in frame.columns:
-        frame["depth_snapshot_rank"] = pd.to_numeric(frame["depth_snapshot_rank"], errors="coerce")
-        frame = frame.sort_values([*REPLAY_KEY_COLUMNS, "depth_snapshot_rank"], kind="stable", na_position="last")
-    lookup: dict[tuple[object, ...], list[dict[str, object]]] = {}
-    for record in frame.to_dict(orient="records"):
-        lookup.setdefault(_replay_key_tuple(record), []).append(record)
-    return lookup
+    grouped: dict[tuple[object, ...], list[int]] = {}
+    for idx, replay_key in enumerate(_build_replay_key_rows(frame)):
+        grouped.setdefault(replay_key, []).append(idx)
+    return {key: tuple(positions) for key, positions in grouped.items()}
+
+
+def _build_replay_key_rows(frame: pd.DataFrame) -> list[tuple[object, ...]]:
+    columns: dict[str, list[object]] = {}
+    for column in REPLAY_KEY_COLUMNS:
+        if column == "offset":
+            raw_values = frame[column].tolist() if column in frame.columns else [None] * len(frame)
+            columns[column] = [_int_or_none(value) for value in raw_values]
+            continue
+        raw_series = frame[column] if column in frame.columns else pd.Series(index=frame.index, dtype="object")
+        normalized = pd.to_datetime(raw_series, utc=True, errors="coerce")
+        columns[column] = [None if pd.isna(value) else pd.Timestamp(value).isoformat() for value in normalized.tolist()]
+    return [tuple(columns[column][idx] for column in REPLAY_KEY_COLUMNS) for idx in range(len(frame))]
 
 
 def _raw_depth_candidate_total_count(raw_depth_candidates: list[dict[str, object]] | None) -> int:

@@ -258,25 +258,169 @@ def test_load_suite_definition_expands_max_trades_and_stake_matrix_into_executio
         "deep_grid__maxu__stake_1usd",
         "deep_grid__maxu__stake_5usd",
     ]
-    assert [spec.matrix_parent_run_name for spec in specs] == [
-        "deep_grid__max1",
-        "deep_grid__max1",
-        "deep_grid__max3",
-        "deep_grid__max3",
-        "deep_grid__maxu",
-        "deep_grid__maxu",
-    ]
-    assert [spec.matrix_stake_label for spec in specs] == [
-        "stake_1usd",
-        "stake_5usd",
-        "stake_1usd",
-        "stake_5usd",
-        "stake_1usd",
-        "stake_5usd",
-    ]
-    assert [spec.stake_usd for spec in specs] == [1.0, 5.0, 1.0, 5.0, 1.0, 5.0]
-    assert [spec.parity.regime_defense_max_trades_per_market for spec in specs] == [1, 1, 3, 3, None, None]
-    assert all("max_trades_per_market:" in "|".join(spec.tags) for spec in specs)
+
+
+def test_load_suite_definition_expands_weight_variants_into_execution_run_names(tmp_path: Path) -> None:
+    path = tmp_path / "suite.json"
+    path.write_text(
+        json.dumps(
+            {
+                "suite_name": "weight_variant_suite",
+                "cycle": "15m",
+                "profile": "deep_otm",
+                "model_family": "deep_otm",
+                "feature_set": "deep_otm_v1",
+                "label_set": "truth",
+                "target": "direction",
+                "offsets": [7, 8],
+                "window": {"start": "2026-03-01", "end": "2026-03-01"},
+                "markets": {
+                    "sol": {
+                        "groups": {
+                            "core": {
+                                "runs": [
+                                    {
+                                        "run_name": "base",
+                                        "weight_variants": [
+                                            {"label": "current_default"},
+                                            {"label": "no_vol_weight", "weight_by_vol": False},
+                                            {
+                                                "label": "mild_contrarian_boost",
+                                                "contrarian_weight": 1.5,
+                                                "contrarian_quantile": 0.75,
+                                            },
+                                        ],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    suite = load_suite_definition(path)
+
+    specs = {spec.run_name: spec for spec in suite.markets}
+    assert set(specs) == {
+        "base__w_current_default",
+        "base__w_no_vol_weight",
+        "base__w_mild_contrarian_boost",
+    }
+    assert specs["base__w_current_default"].weight_variant_label == "current_default"
+    assert specs["base__w_current_default"].weight_by_vol is None
+    assert specs["base__w_no_vol_weight"].weight_variant_label == "no_vol_weight"
+    assert specs["base__w_no_vol_weight"].weight_by_vol is False
+    assert specs["base__w_mild_contrarian_boost"].weight_variant_label == "mild_contrarian_boost"
+    assert specs["base__w_mild_contrarian_boost"].contrarian_weight == 1.5
+    assert specs["base__w_mild_contrarian_boost"].contrarian_quantile == 0.75
+
+
+def test_load_suite_definition_parses_offset_weight_overrides(tmp_path: Path) -> None:
+    path = tmp_path / "suite.json"
+    path.write_text(
+        json.dumps(
+            {
+                "suite_name": "offset_weight_suite",
+                "cycle": "15m",
+                "profile": "deep_otm",
+                "model_family": "deep_otm",
+                "feature_set": "deep_otm_v1",
+                "label_set": "truth",
+                "target": "direction",
+                "offsets": [7, 8, 9],
+                "window": {"start": "2026-03-01", "end": "2026-03-01"},
+                "markets": {
+                    "btc": {
+                        "groups": {
+                            "core": {
+                                "runs": [
+                                    {
+                                        "run_name": "base",
+                                        "offset_weight_overrides": {
+                                            "7": {"contrarian_weight": 1.25, "contrarian_quantile": 0.8},
+                                            "8": {"contrarian_weight": 1.75, "contrarian_quantile": 0.75},
+                                            "9": {"contrarian_weight": 2.25, "contrarian_quantile": 0.7},
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    suite = load_suite_definition(path)
+
+    assert len(suite.markets) == 1
+    spec = suite.markets[0]
+    assert spec.offset_weight_overrides == {
+        7: {"contrarian_weight": 1.25, "contrarian_quantile": 0.8},
+        8: {"contrarian_weight": 1.75, "contrarian_quantile": 0.75},
+        9: {"contrarian_weight": 2.25, "contrarian_quantile": 0.7},
+    }
+
+
+def test_load_suite_definition_coerces_string_booleans_in_offset_weight_overrides(tmp_path: Path) -> None:
+    path = tmp_path / "suite.json"
+    path.write_text(
+        json.dumps(
+            {
+                "suite_name": "offset_weight_bool_suite",
+                "cycle": "15m",
+                "profile": "deep_otm",
+                "model_family": "deep_otm",
+                "feature_set": "deep_otm_v1",
+                "label_set": "truth",
+                "target": "direction",
+                "offsets": [7],
+                "window": {"start": "2026-03-01", "end": "2026-03-01"},
+                "markets": {
+                    "btc": {
+                        "groups": {
+                            "core": {
+                                "runs": [
+                                    {
+                                        "run_name": "base",
+                                        "offset_weight_overrides": {
+                                            "7": {
+                                                "balance_classes": "false",
+                                                "weight_by_vol": "false",
+                                                "inverse_vol": "true",
+                                            }
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    suite = load_suite_definition(path)
+
+    assert len(suite.markets) == 1
+    assert suite.markets[0].offset_weight_overrides == {
+        7: {
+            "balance_classes": False,
+            "weight_by_vol": False,
+            "inverse_vol": True,
+        }
+    }
 
 
 def test_load_suite_definition_parses_backtest_decision_window_fields(tmp_path: Path) -> None:

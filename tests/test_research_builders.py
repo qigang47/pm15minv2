@@ -144,6 +144,58 @@ def test_build_feature_frame_dataset(tmp_path: Path) -> None:
     assert float(cycle_boundary_row.iloc[0]["first_half_ret"]) == 0.0
 
 
+def test_build_feature_frame_dataset_uses_custom_feature_sets_from_cfg_root(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    btc_cfg = DataConfig.build(market="btc", cycle="15m", surface="backtest", root=root)
+    (root / "research" / "experiments").mkdir(parents=True, exist_ok=True)
+    (root / "research" / "experiments" / "custom_feature_sets.json").write_text(
+        json.dumps(
+            {
+                "focus_sol_4_v1": {
+                    "columns": [
+                        "q_bs_up_strike",
+                        "first_half_ret",
+                        "bb_pos_20",
+                        "ret_from_cycle_open",
+                    ]
+                }
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    write_parquet_atomic(
+        _sample_klines("SOLUSDT", start="2026-03-01T00:00:00Z", periods=180, price_base=120.0),
+        data_cfg.layout.binance_klines_path(),
+    )
+    write_parquet_atomic(
+        _sample_klines("BTCUSDT", start="2026-03-01T00:00:00Z", periods=180, price_base=50000.0),
+        btc_cfg.layout.binance_klines_path(),
+    )
+    write_parquet_atomic(
+        _sample_oracle_prices("sol", cycle_start_ts=1_772_323_200, n_cycles=16, price_base=120.0),
+        data_cfg.layout.oracle_prices_table_path,
+    )
+
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        source_surface="backtest",
+        feature_set="focus_sol_4_v1",
+        root=root,
+    )
+
+    summary = build_feature_frame_dataset(cfg, skip_freshness=True)
+    out = pd.read_parquet(cfg.layout.feature_frame_path(cfg.feature_set, source_surface=cfg.source_surface))
+
+    assert summary["feature_set"] == "focus_sol_4_v1"
+    assert {"q_bs_up_strike", "first_half_ret", "bb_pos_20", "ret_from_cycle_open"}.issubset(out.columns)
+
+
 def test_build_feature_frame_uses_decision_time_definitions(tmp_path: Path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)

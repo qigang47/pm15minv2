@@ -69,6 +69,7 @@ class TrainerConfig:
     apply_shared_blacklist: bool = False
     extra_drop_columns: tuple[str, ...] = ()
     parallel_workers: int = 1
+    feature_set_root: os.PathLike[str] | str | None = None
 
 
 def training_features(df: pd.DataFrame) -> list[str]:
@@ -109,6 +110,7 @@ def prepare_training_matrix(
         feature_cols,
         feature_set=feature_set,
         market=market,
+        root=None if cfg is None else cfg.feature_set_root,
         extra_drop_columns=tuple(cfg.extra_drop_columns) if cfg is not None else (),
         apply_shared_blacklist=bool(cfg.apply_shared_blacklist) if cfg is not None else False,
     )

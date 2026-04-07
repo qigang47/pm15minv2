@@ -214,6 +214,113 @@ def test_attach_canonical_quote_surface_backfills_blank_market_id_from_cycle_cat
     assert float(out.loc[0, "quote_down_ask"]) == 0.59
 
 
+def test_attach_canonical_quote_surface_keeps_market_specific_metadata_with_shared_cycle(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "m-1",
+                    "condition_id": "c-1",
+                    "token_up": "tok-up-1",
+                    "token_down": "tok-down-1",
+                    "question": "SOL up contract 1?",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_324_100,
+                },
+                {
+                    "market_id": "m-2",
+                    "condition_id": "c-2",
+                    "token_up": "tok-up-2",
+                    "token_down": "tok-down-2",
+                    "question": "SOL up contract 2?",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_324_100,
+                },
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "captured_ts_ms": 1_772_323_250_000,
+                    "market_id": "m-1",
+                    "token_id": "tok-up-1",
+                    "side": "up",
+                    "best_ask": 0.41,
+                    "best_bid": 0.39,
+                    "ask_size_1": 15.0,
+                    "bid_size_1": 10.0,
+                },
+                {
+                    "captured_ts_ms": 1_772_323_250_000,
+                    "market_id": "m-1",
+                    "token_id": "tok-down-1",
+                    "side": "down",
+                    "best_ask": 0.59,
+                    "best_bid": 0.57,
+                    "ask_size_1": 13.0,
+                    "bid_size_1": 11.0,
+                },
+                {
+                    "captured_ts_ms": 1_772_323_250_000,
+                    "market_id": "m-2",
+                    "token_id": "tok-up-2",
+                    "side": "up",
+                    "best_ask": 0.25,
+                    "best_bid": 0.23,
+                    "ask_size_1": 7.0,
+                    "bid_size_1": 6.0,
+                },
+                {
+                    "captured_ts_ms": 1_772_323_250_000,
+                    "market_id": "m-2",
+                    "token_id": "tok-down-2",
+                    "side": "down",
+                    "best_ask": 0.75,
+                    "best_bid": 0.73,
+                    "ask_size_1": 8.0,
+                    "bid_size_1": 7.0,
+                },
+            ]
+        ),
+        data_cfg.layout.orderbook_index_path("2026-03-01"),
+    )
+
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+            },
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-2",
+                "condition_id": "c-2",
+            },
+        ]
+    )
+
+    out, summary = attach_canonical_quote_surface(replay=replay, data_cfg=data_cfg)
+
+    assert summary.quote_ready_rows == 2
+    out = out.sort_values("market_id").reset_index(drop=True)
+    assert out.loc[0, "token_up"] == "tok-up-1"
+    assert out.loc[0, "quote_up_ask"] == 0.41
+    assert out.loc[1, "token_up"] == "tok-up-2"
+    assert out.loc[1, "quote_up_ask"] == 0.25
+
+
 def test_attach_canonical_quote_surface_rebuilds_stale_orderbook_index(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)

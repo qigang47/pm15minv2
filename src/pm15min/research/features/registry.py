@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from pathlib import Path
+
+from pm15min.core.layout import rewrite_root
+from pm15min.research.layout import slug_token
 
 
 @dataclass(frozen=True)
@@ -309,6 +315,8 @@ _FEATURE_SET_DROP_COLUMNS = {
     ),
 }
 
+_CUSTOM_FEATURE_SET_FILE_NAME = "custom_feature_sets.json"
+
 
 def feature_group(name: str) -> str | None:
     return _FEATURE_GROUP_BY_NAME.get(str(name))
@@ -318,22 +326,96 @@ def feature_registry() -> dict[str, FeatureDefinition]:
     return {feature.name: feature for feature in _FEATURES}
 
 
-def feature_set_columns(feature_set: str) -> tuple[str, ...]:
+def feature_set_columns(feature_set: str, *, root: Path | str | None = None) -> tuple[str, ...]:
     key = str(feature_set).strip().lower()
     try:
         return _FEATURE_SET_COLUMNS[key]
     except KeyError as exc:
+        custom_sets = _custom_feature_sets(root=root)
+        if key in custom_sets:
+            return custom_sets[key]["columns"]
+        available = sorted(set(_FEATURE_SET_COLUMNS) | set(custom_sets))
         raise ValueError(
-            f"Unsupported feature_set {feature_set!r}. Expected one of: {', '.join(sorted(_FEATURE_SET_COLUMNS))}"
+            f"Unsupported feature_set {feature_set!r}. Expected one of: {', '.join(available)}"
         ) from exc
 
 
-def feature_schema(feature_set: str) -> list[dict[str, str]]:
+def feature_schema(feature_set: str, *, root: Path | str | None = None) -> list[dict[str, str]]:
     registry = feature_registry()
-    return [registry[name].to_dict() for name in feature_set_columns(feature_set) if name in registry]
+    return [registry[name].to_dict() for name in feature_set_columns(feature_set, root=root) if name in registry]
 
 
-def feature_set_drop_columns(feature_set: str) -> tuple[str, ...]:
+def feature_set_drop_columns(feature_set: str, *, root: Path | str | None = None) -> tuple[str, ...]:
     key = str(feature_set).strip().lower()
-    feature_set_columns(key)
-    return _FEATURE_SET_DROP_COLUMNS.get(key, ())
+    feature_set_columns(key, root=root)
+    if key in _FEATURE_SET_DROP_COLUMNS:
+        return _FEATURE_SET_DROP_COLUMNS[key]
+    custom_sets = _custom_feature_sets(root=root)
+    if key in custom_sets:
+        return custom_sets[key]["drop_columns"]
+    return ()
+
+
+def custom_feature_sets_path(*, root: Path | str | None = None) -> Path:
+    base_root = Path(root) if root is not None else Path(rewrite_root())
+    return base_root / "research" / "experiments" / _CUSTOM_FEATURE_SET_FILE_NAME
+
+
+def _custom_feature_sets(*, root: Path | str | None = None) -> dict[str, dict[str, tuple[str, ...]]]:
+    path = custom_feature_sets_path(root=root)
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"Expected custom feature set registry mapping at {path}, got: {payload!r}")
+    known_features = set(feature_registry())
+    out: dict[str, dict[str, tuple[str, ...]]] = {}
+    for raw_name, raw_item in payload.items():
+        name = slug_token(str(raw_name), default="")
+        if not name:
+            continue
+        if isinstance(raw_item, Mapping):
+            columns_raw = raw_item.get("columns") or raw_item.get("feature_columns") or ()
+            drop_columns_raw = raw_item.get("drop_columns") or ()
+        else:
+            columns_raw = raw_item
+            drop_columns_raw = ()
+        columns = _normalize_feature_column_list(
+            columns_raw,
+            known_features=known_features,
+            context=f"{path}:{raw_name}:columns",
+        )
+        drop_columns = _normalize_feature_column_list(
+            drop_columns_raw,
+            known_features=known_features,
+            context=f"{path}:{raw_name}:drop_columns",
+        )
+        if not columns:
+            raise ValueError(f"Custom feature set {raw_name!r} at {path} must define at least one feature column")
+        out[name] = {
+            "columns": columns,
+            "drop_columns": drop_columns,
+        }
+    return out
+
+
+def _normalize_feature_column_list(
+    raw: object,
+    *,
+    known_features: set[str],
+    context: str,
+) -> tuple[str, ...]:
+    if raw is None or raw == "":
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise TypeError(f"Expected a list of feature columns at {context}, got: {raw!r}")
+    out: list[str] = []
+    for item in raw:
+        name = str(item).strip()
+        if not name:
+            continue
+        if name not in known_features:
+            raise ValueError(f"Unknown feature column {name!r} referenced at {context}")
+        if name not in out:
+            out.append(name)
+    return tuple(out)

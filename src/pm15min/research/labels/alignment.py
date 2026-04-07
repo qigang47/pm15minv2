@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from pm15min.research.features.strike import STRIKE_FEATURE_COLUMNS, recompute_strike_features
 from pm15min.research.labels.sources import summarize_label_sources
 
 
@@ -43,14 +44,24 @@ def merge_feature_and_label_frames(
     label_frame = label_frame.dropna(subset=["cycle_start_ts", "cycle_end_ts"]).copy()
     label_frame["cycle_start_ts"] = pd.to_datetime(label_frame["cycle_start_ts"].astype("int64"), unit="s", utc=True)
     label_frame["cycle_end_ts"] = pd.to_datetime(label_frame["cycle_end_ts"].astype("int64"), unit="s", utc=True)
-    label_frame = label_frame.drop_duplicates(subset=["cycle_start_ts", "cycle_end_ts"], keep="last").copy()
+    label_frame["market_id"] = _string_column(label_frame, "market_id")
+    label_frame["condition_id"] = _string_column(label_frame, "condition_id")
+    label_frame = label_frame.drop_duplicates(
+        subset=["cycle_start_ts", "cycle_end_ts", "market_id", "condition_id"],
+        keep="last",
+    ).copy()
 
-    merged = feature_frame.merge(
-        label_frame,
-        on=["cycle_start_ts", "cycle_end_ts"],
-        how="left",
-        suffixes=("", "_label"),
-    ).sort_values("decision_ts").reset_index(drop=True)
+    merged = (
+        feature_frame.merge(
+            label_frame,
+            on=["cycle_start_ts", "cycle_end_ts"],
+            how="left",
+            suffixes=("", "_label"),
+        )
+        .sort_values([column for column in ("decision_ts", "market_id", "condition_id") if column in feature_frame.columns or column in label_frame.columns])
+        .reset_index(drop=True)
+    )
+    merged = _recompute_contract_strike_features(merged, feature_columns=set(feature_frame.columns))
     merged["label_alignment_mode"] = "cycle_boundary_join"
     merged["label_alignment_status"] = "missing_label"
     if "label_set" in merged.columns:
@@ -98,3 +109,22 @@ def align_feature_and_label_frames(
             decision_after_cycle_start_rows=int(metadata["decision_after_cycle_start_rows"]),
         ),
     )
+
+
+def _recompute_contract_strike_features(frame: pd.DataFrame, *, feature_columns: set[str]) -> pd.DataFrame:
+    strike_columns = {column for column in STRIKE_FEATURE_COLUMNS if column in feature_columns}
+    if not strike_columns or "price_to_beat" not in frame.columns:
+        return frame
+    if not {"close", "ret_from_cycle_open"}.issubset(feature_columns):
+        return frame
+    return recompute_strike_features(
+        frame,
+        price_to_beat=frame["price_to_beat"],
+        requested_columns=strike_columns,
+    )
+
+
+def _string_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series("", index=frame.index, dtype="string")
+    return frame[column].astype("string").fillna("").str.strip()

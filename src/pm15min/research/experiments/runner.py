@@ -11,6 +11,10 @@ from typing import Protocol
 import pandas as pd
 
 from pm15min.data.io.parquet import write_parquet_atomic
+from pm15min.research._contracts_training import (
+    normalize_offset_weight_overrides,
+    offset_weight_overrides_payload,
+)
 from pm15min.research.backtests.engine import run_research_backtest
 from pm15min.research.bundles.builder import build_model_bundle
 from pm15min.research.config import ResearchConfig
@@ -61,6 +65,19 @@ class _ExperimentCaseResult:
     failed_row: dict[str, object] | None
     log_events: tuple[dict[str, object], ...]
     success: bool
+
+
+def _partition_label(path_or_label: object) -> str:
+    token = str(path_or_label or "").strip()
+    if not token:
+        return ""
+    name = Path(token).name
+    if "=" not in name:
+        return name
+    prefix, value = name.split("=", 1)
+    if prefix in {"run", "bundle"} and value:
+        return value
+    return name
 
 
 def run_experiment_suite(
@@ -150,6 +167,20 @@ def run_experiment_suite(
             case_progress_markers = _case_progress_markers(has_secondary=bool(market_spec.hybrid_secondary_target))
             case_key = _case_key(market_spec)
             case_row_prefix = build_case_row_prefix(market_spec, case_key=case_key)
+            if (
+                runtime_policy.completed_cases == "resume"
+                and case_key not in run_state.backtest_rows_by_case_key
+            ):
+                recovered_backtest_row = _recover_existing_backtest_row(
+                    cfg=cfg,
+                    suite=suite,
+                    run_label=run_label,
+                    market_spec=market_spec,
+                    case_key=case_key,
+                    case_row_prefix=case_row_prefix,
+                )
+                if recovered_backtest_row is not None:
+                    run_state.set_backtest_row(recovered_backtest_row)
             case_plan = run_state.plan_case(
                 market_spec=market_spec,
                 case_key=case_key,
@@ -1421,6 +1452,10 @@ def _build_market_cfg(
 
 def _load_backtest_metrics(summary_path: Path) -> dict[str, object]:
     payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    return _backtest_metrics_from_payload(payload)
+
+
+def _backtest_metrics_from_payload(payload: dict[str, object]) -> dict[str, object]:
     return {
         "trades": int(payload.get("trades", 0)),
         "rejects": int(payload.get("rejects", 0)),
@@ -1429,6 +1464,43 @@ def _load_backtest_metrics(summary_path: Path) -> dict[str, object]:
         "pnl_sum": float(payload.get("pnl_sum", 0.0)),
         "stake_sum": float(payload.get("stake_sum", 0.0)),
         "roi_pct": float(payload.get("roi_pct", 0.0)),
+    }
+
+
+def _recover_existing_backtest_row(
+    *,
+    cfg: ResearchConfig,
+    suite,
+    run_label: str,
+    market_spec,
+    case_key: str,
+    case_row_prefix: dict[str, object],
+) -> dict[str, object] | None:
+    market_cfg = _build_market_cfg(
+        root_cfg=cfg,
+        cycle=suite.cycle,
+        market_spec=market_spec,
+        target=market_spec.target,
+    )
+    backtest_run_dir = market_cfg.layout.backtest_run_dir(
+        profile=market_spec.profile,
+        spec_name=market_spec.backtest_spec,
+        run_label_text=_backtest_run_label(run_label=run_label, market_spec=market_spec, case_key=case_key),
+    )
+    summary_path = backtest_run_dir / "summary.json"
+    if not summary_path.exists():
+        return None
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    return {
+        **case_row_prefix,
+        "feature_set": market_spec.feature_set,
+        "bundle_dir": payload.get("bundle_dir"),
+        "secondary_bundle_dir": payload.get("secondary_bundle_dir"),
+        "backtest_run_dir": str(backtest_run_dir),
+        "summary_path": str(summary_path),
+        "resumed_from_existing": False,
+        "parity_spec_json": _json_text(market_spec.parity.to_dict()),
+        **_backtest_metrics_from_payload(payload),
     }
 
 
@@ -1479,10 +1551,18 @@ def _seed_training_cache(rows) -> dict[str, dict[str, object]]:
             target=str(row.get("target") or ""),
             window_label=str(row.get("window") or ""),
             offsets=offsets,
+            weight_variant_label=str(row.get("weight_variant_label") or "default"),
+            balance_classes=row.get("balance_classes"),
+            weight_by_vol=row.get("weight_by_vol"),
+            inverse_vol=row.get("inverse_vol"),
+            contrarian_weight=row.get("contrarian_weight"),
+            contrarian_quantile=row.get("contrarian_quantile"),
+            contrarian_return_col=row.get("contrarian_return_col"),
+            offset_weight_overrides=normalize_offset_weight_overrides(row.get("offset_weight_overrides_json")),
         )
         cache[key] = {
             "run_dir": training_run_dir,
-            "run_label": Path(training_run_dir).name,
+            "run_label": _partition_label(training_run_dir),
         }
     return cache
 
@@ -1502,11 +1582,11 @@ def _seed_bundle_cache(rows) -> dict[str, dict[str, object]]:
             profile=str(row.get("profile") or ""),
             target=str(row.get("target") or ""),
             offsets=offsets,
-            training_run_label=Path(training_run_dir).name,
+            training_run_label=_partition_label(training_run_dir),
         )
         cache[key] = {
             "bundle_dir": bundle_dir,
-            "bundle_label": Path(bundle_dir).name,
+            "bundle_label": _partition_label(bundle_dir),
         }
     return cache
 
@@ -1597,6 +1677,14 @@ def _resolve_training_summary(
             target=target,
             window_label=market_spec.window.label,
             offsets=offsets,
+            weight_variant_label=str(getattr(market_spec, "weight_variant_label", "default") or "default"),
+            balance_classes=getattr(market_spec, "balance_classes", None),
+            weight_by_vol=getattr(market_spec, "weight_by_vol", None),
+            inverse_vol=getattr(market_spec, "inverse_vol", None),
+            contrarian_weight=getattr(market_spec, "contrarian_weight", None),
+            contrarian_quantile=getattr(market_spec, "contrarian_quantile", None),
+            contrarian_return_col=getattr(market_spec, "contrarian_return_col", None),
+            offset_weight_overrides=getattr(market_spec, "offset_weight_overrides", None),
         ),
     )
     cache_key = _training_cache_key(
@@ -1608,10 +1696,21 @@ def _resolve_training_summary(
         target=target,
         window_label=market_spec.window.label,
         offsets=offsets,
+        weight_variant_label=str(getattr(market_spec, "weight_variant_label", "default") or "default"),
+        balance_classes=getattr(market_spec, "balance_classes", None),
+        weight_by_vol=getattr(market_spec, "weight_by_vol", None),
+        inverse_vol=getattr(market_spec, "inverse_vol", None),
+        contrarian_weight=getattr(market_spec, "contrarian_weight", None),
+        contrarian_quantile=getattr(market_spec, "contrarian_quantile", None),
+        contrarian_return_col=getattr(market_spec, "contrarian_return_col", None),
+        offset_weight_overrides=getattr(market_spec, "offset_weight_overrides", None),
     )
     cached = training_cache.get(cache_key)
     if cached is not None:
-        return cached, True
+        cached_run_dir = Path(str(cached.get("run_dir") or "").strip())
+        if cached_run_dir.exists():
+            return cached, True
+        training_cache.pop(cache_key, None)
     spec = TrainingRunSpec(
         model_family=market_spec.model_family,
         feature_set=market_spec.feature_set,
@@ -1620,6 +1719,14 @@ def _resolve_training_summary(
         window=market_spec.window,
         run_label=training_run_label,
         offsets=offsets,
+        weight_variant_label=str(getattr(market_spec, "weight_variant_label", "default") or "default"),
+        balance_classes=getattr(market_spec, "balance_classes", None),
+        weight_by_vol=getattr(market_spec, "weight_by_vol", None),
+        inverse_vol=getattr(market_spec, "inverse_vol", None),
+        contrarian_weight=getattr(market_spec, "contrarian_weight", None),
+        contrarian_quantile=getattr(market_spec, "contrarian_quantile", None),
+        contrarian_return_col=getattr(market_spec, "contrarian_return_col", None),
+        offset_weight_overrides=getattr(market_spec, "offset_weight_overrides", None),
     )
     try:
         summary = train_research_run(
@@ -1657,7 +1764,10 @@ def _resolve_bundle_summary(
     )
     cached = bundle_cache.get(cache_key)
     if cached is not None:
-        return cached, True
+        cached_bundle_dir = Path(str(cached.get("bundle_dir") or "").strip())
+        if cached_bundle_dir.exists():
+            return cached, True
+        bundle_cache.pop(cache_key, None)
     summary = build_model_bundle(
         market_cfg,
         ModelBundleSpec(
@@ -1890,6 +2000,16 @@ def _case_key(market_spec) -> str:
         "variant_notes": market_spec.variant_notes,
         "stake_usd": _stake_usd(market_spec),
         "max_notional_usd": _max_notional_usd(market_spec),
+        "weight_variant_label": str(getattr(market_spec, "weight_variant_label", "default") or "default"),
+        "balance_classes": getattr(market_spec, "balance_classes", None),
+        "weight_by_vol": getattr(market_spec, "weight_by_vol", None),
+        "inverse_vol": getattr(market_spec, "inverse_vol", None),
+        "contrarian_weight": getattr(market_spec, "contrarian_weight", None),
+        "contrarian_quantile": getattr(market_spec, "contrarian_quantile", None),
+        "contrarian_return_col": str(getattr(market_spec, "contrarian_return_col", "") or "").strip() or None,
+        "offset_weight_overrides": offset_weight_overrides_payload(
+            getattr(market_spec, "offset_weight_overrides", None)
+        ),
         "hybrid_secondary_target": market_spec.hybrid_secondary_target,
         "hybrid_secondary_offsets": None if market_spec.hybrid_secondary_offsets is None else [int(value) for value in market_spec.hybrid_secondary_offsets],
         "hybrid_fallback_reasons": [str(value) for value in market_spec.hybrid_fallback_reasons],
@@ -1976,6 +2096,14 @@ def _training_cache_key(
     target: str,
     window_label: str,
     offsets: tuple[int, ...],
+    weight_variant_label: str = "default",
+    balance_classes: bool | None = None,
+    weight_by_vol: bool | None = None,
+    inverse_vol: bool | None = None,
+    contrarian_weight: float | None = None,
+    contrarian_quantile: float | None = None,
+    contrarian_return_col: str | None = None,
+    offset_weight_overrides: dict[int, dict[str, object]] | None = None,
 ) -> str:
     payload = {
         "market": market,
@@ -1986,6 +2114,14 @@ def _training_cache_key(
         "target": target,
         "window": window_label,
         "offsets": [int(value) for value in offsets],
+        "weight_variant_label": str(weight_variant_label or "default"),
+        "balance_classes": balance_classes,
+        "weight_by_vol": weight_by_vol,
+        "inverse_vol": inverse_vol,
+        "contrarian_weight": contrarian_weight,
+        "contrarian_quantile": contrarian_quantile,
+        "contrarian_return_col": str(contrarian_return_col or "").strip() or None,
+        "offset_weight_overrides": offset_weight_overrides_payload(offset_weight_overrides),
     }
     return _stable_key(payload)
 

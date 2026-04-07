@@ -34,6 +34,23 @@ DEPTH_REPLAY_SURFACE_COLUMNS = [
     "depth_up_snapshot_ts_ms",
     "depth_down_snapshot_ts_ms",
 ]
+DEPTH_REPLAY_METADATA_COLUMNS = [
+    "market_id",
+    "condition_id",
+    "token_up",
+    "token_down",
+    "question",
+]
+DEPTH_REPLAY_INTERNAL_COLUMNS = [
+    *REPLAY_KEY_COLUMNS,
+    "window_start_ts",
+    "window_end_ts",
+    *DEPTH_REPLAY_METADATA_COLUMNS,
+]
+DEPTH_REPLAY_OUTPUT_COLUMNS = [
+    *REPLAY_KEY_COLUMNS,
+    *DEPTH_REPLAY_METADATA_COLUMNS,
+]
 
 
 @dataclass(frozen=True)
@@ -172,7 +189,7 @@ def build_raw_depth_replay_frame(
                 bucket = buckets.get(bucket_key)
                 if bucket is None:
                     continue
-                bucket[side] = raw
+                bucket[side] = _compact_depth_snapshot_record(raw)
                 bucket[f"{side}_snapshot_ts_ms"] = record_ts_ms
                 bucket["match_strategies"].add(strategy)
 
@@ -213,7 +230,9 @@ def build_raw_depth_replay_frame(
 
 def _empty_depth_replay_frame(replay: pd.DataFrame) -> pd.DataFrame:
     frame = replay.iloc[0:0].copy()
-    for column in DEPTH_REPLAY_SURFACE_COLUMNS:
+    keep_columns = [column for column in DEPTH_REPLAY_OUTPUT_COLUMNS if column in frame.columns]
+    frame = frame.loc[:, keep_columns].copy()
+    for column in [*DEPTH_REPLAY_OUTPUT_COLUMNS, *DEPTH_REPLAY_SURFACE_COLUMNS]:
         if column not in frame.columns:
             frame[column] = pd.Series(dtype="object")
     return frame
@@ -239,7 +258,13 @@ def _prepare_replay_frame(
     for column in ("market_id", "condition_id", "token_up", "token_down", "question"):
         if column not in frame.columns:
             frame[column] = pd.Series(index=frame.index, dtype="object")
-    return frame, int(len(market_table))
+    for column in ("window_start_ts", "window_end_ts"):
+        if column not in frame.columns:
+            frame[column] = pd.Series(index=frame.index, dtype="datetime64[ns, UTC]")
+        else:
+            frame[column] = pd.to_datetime(frame[column], utc=True, errors="coerce")
+    keep_columns = [column for column in DEPTH_REPLAY_INTERNAL_COLUMNS if column in frame.columns]
+    return frame.loc[:, keep_columns].copy(), int(len(market_table))
 
 
 def _build_date_lookups(
@@ -410,7 +435,11 @@ def _build_depth_replay_output(
 
     rows: list[dict[str, Any]] = []
     for (row_idx, snapshot_ts_ms), bucket in buckets.items():
-        replay_row = prepared.iloc[int(row_idx)].to_dict()
+        replay_row = {
+            column: prepared.iloc[int(row_idx)][column]
+            for column in DEPTH_REPLAY_OUTPUT_COLUMNS
+            if column in prepared.columns
+        }
         up_record = bucket.get("up")
         down_record = bucket.get("down")
         missing: list[str] = []
@@ -453,6 +482,13 @@ def _collapse_match_strategies(strategies: set[str]) -> str:
     if len(cleaned) == 1:
         return next(iter(cleaned))
     return "mixed"
+
+
+def _compact_depth_snapshot_record(raw: dict[str, Any]) -> dict[str, object]:
+    asks = raw.get("asks")
+    return {
+        "asks": asks if isinstance(asks, list) else [],
+    }
 
 
 def _prepare_market_table(df: pd.DataFrame) -> pd.DataFrame:

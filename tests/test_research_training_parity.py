@@ -13,6 +13,7 @@ from pm15min.research.contracts import DateWindow, TrainingRunSpec, TrainingSetS
 from pm15min.research.datasets.feature_frames import build_feature_frame_dataset
 from pm15min.research.datasets.training_sets import build_training_set_dataset
 from pm15min.research.labels.datasets import build_label_frame_dataset
+from pm15min.research.training.reports import render_offset_training_report, render_training_run_report
 from pm15min.research.training.runner import train_research_run
 from pm15min.research.training.splits import build_purged_time_series_splits
 from pm15min.research.training.trainers import TrainerConfig, fit_lgbm, generate_oof_predictions
@@ -298,3 +299,160 @@ def test_train_research_run_reports_offset_progress_and_oof_heartbeats(tmp_path:
     assert artifact_events
     assert all("writing artifacts" in str(event["summary"]).lower() for event in artifact_events)
     assert {"summary": "Writing training outputs", "current": 2, "total": 2, "current_stage": "training_finalize", "progress_pct": 100, "heartbeat": None} in events
+
+
+def test_train_research_run_honors_weight_overrides(tmp_path: Path) -> None:
+    cfg = _prepare_cfg(tmp_path)
+    build_feature_frame_dataset(cfg)
+    build_label_frame_dataset(cfg)
+    build_training_set_dataset(
+        cfg,
+        TrainingSetSpec(
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+            offset=7,
+        ),
+    )
+
+    default_summary = train_research_run(
+        cfg,
+        TrainingRunSpec(
+            model_family="deep_otm",
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+            run_label="weights-default",
+            offsets=(7,),
+            weight_variant_label="current_default",
+        ),
+    )
+    novol_summary = train_research_run(
+        cfg,
+        TrainingRunSpec(
+            model_family="deep_otm",
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+            run_label="weights-novol",
+            offsets=(7,),
+            weight_variant_label="no_vol_weight",
+            weight_by_vol=False,
+        ),
+    )
+
+    default_offset = json.loads(
+        (Path(default_summary["run_dir"]) / "offsets" / "offset=7" / "summary.json").read_text(encoding="utf-8")
+    )
+    novol_offset = json.loads(
+        (Path(novol_summary["run_dir"]) / "offsets" / "offset=7" / "summary.json").read_text(encoding="utf-8")
+    )
+
+    assert default_offset["weight_summary"]["max_weight"] != novol_offset["weight_summary"]["max_weight"]
+    assert default_offset["weight_summary"]["mean_weight"] != novol_offset["weight_summary"]["mean_weight"]
+
+
+def test_train_research_run_honors_offset_weight_overrides(tmp_path: Path) -> None:
+    cfg = _prepare_cfg(tmp_path)
+    build_feature_frame_dataset(cfg)
+    build_label_frame_dataset(cfg)
+    for offset in (7, 8):
+        build_training_set_dataset(
+            cfg,
+            TrainingSetSpec(
+                feature_set="deep_otm_v1",
+                label_set="truth",
+                target="direction",
+                window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+                offset=offset,
+            ),
+        )
+
+    summary = train_research_run(
+        cfg,
+        TrainingRunSpec(
+            model_family="deep_otm",
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+            run_label="weights-offset-specific",
+            offsets=(7, 8),
+            weight_variant_label="direction_offset_reversal_mild",
+            offset_weight_overrides={
+                7: {"contrarian_weight": 1.25, "contrarian_quantile": 0.8},
+                8: {"contrarian_weight": 2.0, "contrarian_quantile": 0.75},
+            },
+        ),
+    )
+
+    run_dir = Path(summary["run_dir"])
+    offset7 = json.loads((run_dir / "offsets" / "offset=7" / "summary.json").read_text(encoding="utf-8"))
+    offset8 = json.loads((run_dir / "offsets" / "offset=8" / "summary.json").read_text(encoding="utf-8"))
+    training_summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert offset7["weight_summary"]["contrarian_weight"] == 1.25
+    assert offset7["weight_summary"]["contrarian_quantile"] == 0.8
+    assert offset8["weight_summary"]["contrarian_weight"] == 2.0
+    assert offset8["weight_summary"]["contrarian_quantile"] == 0.75
+    assert offset7["weight_summary"]["mean_weight"] != offset8["weight_summary"]["mean_weight"]
+    assert training_summary["offset_weight_overrides"] == {
+        "7": {"contrarian_weight": 1.25, "contrarian_quantile": 0.8},
+        "8": {"contrarian_weight": 2.0, "contrarian_quantile": 0.75},
+    }
+
+
+def test_training_reports_fall_back_without_tabulate(monkeypatch) -> None:
+    def _raise_import_error(self, *args, **kwargs):
+        raise ImportError("Missing optional dependency 'tabulate'")
+
+    monkeypatch.setattr(pd.DataFrame, "to_markdown", _raise_import_error)
+
+    offset_report = render_offset_training_report(
+        offset=7,
+        rows=12,
+        positive_rate=0.5,
+        feature_count=3,
+        dropped_features=["a"],
+        metrics={"blend": {"brier": 0.1, "logloss": 0.2, "auc": 0.8}},
+        explainability={
+            "top_logreg_coefficients": [{"feature": "x", "coefficient": 1.2}],
+            "top_lgb_importance": [{"feature": "x", "gain_share": 0.7}],
+            "top_positive_factors": [{"feature": "x", "direction_score": 0.4}],
+            "top_negative_factors": [{"feature": "y", "direction_score": -0.2}],
+        },
+    )
+    run_report = render_training_run_report(
+        {
+            "market": "btc",
+            "cycle": "15m",
+            "model_family": "deep_otm",
+            "feature_set": "bs_q_replace_direction",
+            "label_set": "truth",
+            "target": "direction",
+            "window": "2025-10-27_2026-03-27",
+            "weight_variant_label": "offset_reversal_mild",
+            "offset_summaries": [
+                {
+                    "offset": 7,
+                    "rows": 12,
+                    "positive_rate": 0.5,
+                    "dropped_features": ["a"],
+                    "brier_lgb": 0.2,
+                    "brier_lr": 0.3,
+                    "brier_blend": 0.1,
+                    "auc_lgb": 0.7,
+                    "auc_lr": 0.6,
+                    "auc_blend": 0.8,
+                }
+            ],
+        }
+    )
+
+    assert "# Training Offset 7" in offset_report
+    assert "| feature |" in offset_report
+    assert "# Training Run Summary" in run_report
+    assert "| offset | rows |" in run_report

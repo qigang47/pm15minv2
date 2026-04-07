@@ -417,29 +417,31 @@ def score_bundle_offset(
         score_valid = pd.Series(True, index=rows.index, dtype=bool)
         score_reason = pd.Series("", index=rows.index, dtype=object)
 
-    return pd.DataFrame(
-        {
-            "decision_ts": pd.to_datetime(rows["decision_ts"], utc=True, errors="coerce"),
-            "cycle_start_ts": pd.to_datetime(rows["cycle_start_ts"], utc=True, errors="coerce"),
-            "cycle_end_ts": pd.to_datetime(rows["cycle_end_ts"], utc=True, errors="coerce"),
-            "offset": rows["offset"].astype(int),
-            "p_lgb": p_lgb,
-            "p_lr": p_lr,
-            "p_signal": p_signal,
-            "w_lgb": [runtime.w_lgb] * len(rows),
-            "w_lr": [runtime.w_lr] * len(rows),
-            "p_up_raw": p_up_raw,
-            "p_down_raw": p_down_raw,
-            "p_eff_up": p_up,
-            "p_eff_down": p_down,
-            "p_up": p_up,
-            "p_down": p_down,
-            "probability_mode": ["conservative_reliability_bin" if runtime.reliability_bins else "raw_blend"] * len(rows),
-            "model_context": [model_context] * len(rows),
-            "score_valid": score_valid.values,
-            "score_reason": score_reason.values,
-        }
-    )
+    payload = {
+        "decision_ts": pd.to_datetime(rows["decision_ts"], utc=True, errors="coerce"),
+        "cycle_start_ts": pd.to_datetime(rows["cycle_start_ts"], utc=True, errors="coerce"),
+        "cycle_end_ts": pd.to_datetime(rows["cycle_end_ts"], utc=True, errors="coerce"),
+        "offset": rows["offset"].astype(int),
+        "p_lgb": p_lgb,
+        "p_lr": p_lr,
+        "p_signal": p_signal,
+        "w_lgb": [runtime.w_lgb] * len(rows),
+        "w_lr": [runtime.w_lr] * len(rows),
+        "p_up_raw": p_up_raw,
+        "p_down_raw": p_down_raw,
+        "p_eff_up": p_up,
+        "p_eff_down": p_down,
+        "p_up": p_up,
+        "p_down": p_down,
+        "probability_mode": ["conservative_reliability_bin" if runtime.reliability_bins else "raw_blend"] * len(rows),
+        "model_context": [model_context] * len(rows),
+        "score_valid": score_valid.values,
+        "score_reason": score_reason.values,
+    }
+    for column in ("market_id", "condition_id"):
+        if column in rows.columns:
+            payload[column] = rows[column].astype("string").fillna("").astype(str)
+    return pd.DataFrame(payload)
 
 
 def _load_offset_scoring_runtime(offset_dir: Path) -> _OffsetScoringRuntime:

@@ -11,7 +11,7 @@ from pm15min.research.backtests.decision_engine_parity import (
     DecisionEngineParityConfig,
     apply_decision_engine_parity,
 )
-from pm15min.research.backtests.fills import BacktestFillConfig
+from pm15min.research.backtests.fills import BacktestFillConfig, build_depth_candidate_lookup
 from pm15min.research.backtests.replay_loader import REPLAY_KEY_COLUMNS
 
 
@@ -110,7 +110,7 @@ def attach_initial_snapshot_decision_surface(
         frame["decision_quote_orderbook_missing"] = False
         return frame
 
-    lookup = _build_depth_candidate_lookup(depth_replay)
+    lookup = build_depth_candidate_lookup(depth_replay)
     replay_keys = _build_replay_key_rows(frame)
     probability_up = frame["p_up"].tolist() if "p_up" in frame.columns else [None] * len(frame)
     probability_down = frame["p_down"].tolist() if "p_down" in frame.columns else [None] * len(frame)
@@ -263,17 +263,6 @@ def _resolve_probability_price_cap(
     return max(1e-6, min(prob / max(denom, 1e-9), 1.0))
 
 
-def _build_depth_candidate_lookup(depth_replay: pd.DataFrame) -> dict[tuple[object, ...], list[dict[str, object]]]:
-    frame = depth_replay.copy()
-    if "depth_snapshot_rank" in frame.columns:
-        frame["depth_snapshot_rank"] = pd.to_numeric(frame["depth_snapshot_rank"], errors="coerce")
-        frame = frame.sort_values([*REPLAY_KEY_COLUMNS, "depth_snapshot_rank"], kind="stable", na_position="last")
-    lookup: dict[tuple[object, ...], list[dict[str, object]]] = {}
-    for record in frame.to_dict(orient="records"):
-        lookup.setdefault(_replay_key_tuple(record), []).append(record)
-    return lookup
-
-
 def _build_replay_key_rows(frame: pd.DataFrame) -> list[tuple[object, ...]]:
     columns: dict[str, list[object]] = {}
     for column in REPLAY_KEY_COLUMNS:
@@ -285,18 +274,6 @@ def _build_replay_key_rows(frame: pd.DataFrame) -> list[tuple[object, ...]]:
         normalized = pd.to_datetime(raw_series, utc=True, errors="coerce")
         columns[column] = [None if pd.isna(value) else pd.Timestamp(value).isoformat() for value in normalized.tolist()]
     return [tuple(columns[column][idx] for column in REPLAY_KEY_COLUMNS) for idx in range(len(frame))]
-
-
-def _replay_key_tuple(row: pd.Series | dict[str, object]) -> tuple[object, ...]:
-    out: list[object] = []
-    for column in REPLAY_KEY_COLUMNS:
-        value = row.get(column) if isinstance(row, dict) else row.get(column)
-        if column == "offset":
-            out.append(_int_or_none(value))
-        else:
-            ts = pd.to_datetime(value, utc=True, errors="coerce")
-            out.append(None if pd.isna(ts) else pd.Timestamp(ts).isoformat())
-    return tuple(out)
 
 
 def _apply_decision_engine_reject(

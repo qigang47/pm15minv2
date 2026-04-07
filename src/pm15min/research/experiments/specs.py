@@ -6,6 +6,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pm15min.research._contracts_training import (
+    normalize_offset_weight_overrides,
+    offset_weight_overrides_payload,
+)
 from pm15min.research.contracts import DateWindow
 from pm15min.research._contracts_runs import BacktestParitySpec
 from pm15min.research.labels.sources import normalize_label_set
@@ -130,6 +134,14 @@ class ExperimentMarketSpec:
     variant_notes: str = ""
     stake_usd: float | None = None
     max_notional_usd: float | None = None
+    weight_variant_label: str = "default"
+    balance_classes: bool | None = None
+    weight_by_vol: bool | None = None
+    inverse_vol: bool | None = None
+    contrarian_weight: float | None = None
+    contrarian_quantile: float | None = None
+    contrarian_return_col: str | None = None
+    offset_weight_overrides: dict[int, dict[str, Any]] = field(default_factory=dict)
     matrix_parent_run_name: str = ""
     matrix_stake_label: str = ""
     hybrid_secondary_target: str | None = None
@@ -158,6 +170,22 @@ class ExperimentMarketSpec:
             payload.pop("stake_usd", None)
         if self.max_notional_usd is None:
             payload.pop("max_notional_usd", None)
+        if self.balance_classes is None:
+            payload.pop("balance_classes", None)
+        if self.weight_by_vol is None:
+            payload.pop("weight_by_vol", None)
+        if self.inverse_vol is None:
+            payload.pop("inverse_vol", None)
+        if self.contrarian_weight is None:
+            payload.pop("contrarian_weight", None)
+        if self.contrarian_quantile is None:
+            payload.pop("contrarian_quantile", None)
+        if self.contrarian_return_col is None:
+            payload.pop("contrarian_return_col", None)
+        if not self.offset_weight_overrides:
+            payload.pop("offset_weight_overrides", None)
+        else:
+            payload["offset_weight_overrides"] = offset_weight_overrides_payload(self.offset_weight_overrides)
         if not self.matrix_parent_run_name:
             payload.pop("matrix_parent_run_name", None)
         if not self.matrix_stake_label:
@@ -211,6 +239,14 @@ def load_suite_definition(path: Path) -> ExperimentSuiteDefinition:
             )
         ),
         "max_notional_usd": _coerce_optional_float(payload.get("max_notional_usd")),
+        "weight_variant_label": str(payload.get("weight_variant_label") or "default"),
+        "balance_classes": _coerce_optional_bool(payload.get("balance_classes")),
+        "weight_by_vol": _coerce_optional_bool(payload.get("weight_by_vol")),
+        "inverse_vol": _coerce_optional_bool(payload.get("inverse_vol")),
+        "contrarian_weight": _coerce_optional_float(payload.get("contrarian_weight")),
+        "contrarian_quantile": _coerce_optional_float(payload.get("contrarian_quantile")),
+        "contrarian_return_col": _coerce_optional_string(payload.get("contrarian_return_col")),
+        "offset_weight_overrides": normalize_offset_weight_overrides(payload.get("offset_weight_overrides")),
         "matrix_parent_run_name": "",
         "matrix_stake_label": "",
         "hybrid_secondary_target": payload.get("hybrid_secondary_target"),
@@ -222,6 +258,7 @@ def load_suite_definition(path: Path) -> ExperimentSuiteDefinition:
         "tags": _parse_string_seq(payload.get("tags")),
         "notes": str(payload.get("notes") or ""),
         "backtest_variants": _parse_backtest_variants(payload.get("backtest_variants")),
+        "weight_variants": _parse_weight_variants(_first_present_value(payload, "weight_variants", "sample_weight_variants")),
         "feature_set_variants": _parse_feature_set_variants(
             _first_present_value(payload, "feature_set_variants", "factor_variants", "feature_variants")
         ),
@@ -259,6 +296,19 @@ def _coerce_optional_float(raw: Any) -> float | None:
     if _is_missing_value(raw):
         return None
     return float(raw)
+
+
+def _coerce_optional_bool(raw: Any) -> bool | None:
+    if _is_missing_value(raw):
+        return None
+    if isinstance(raw, bool):
+        return raw
+    token = str(raw).strip().lower()
+    if token in {"1", "true", "yes", "y", "on"}:
+        return True
+    if token in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Unsupported boolean value: {raw!r}")
 
 
 def _coerce_optional_string(raw: Any) -> str | None:
@@ -375,6 +425,13 @@ class _FeatureSetVariantConfig:
     overrides: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class _WeightVariantConfig:
+    label: str
+    notes: str = ""
+    overrides: dict[str, Any] | None = None
+
+
 def _parse_backtest_variants(raw: Any) -> tuple[_BacktestVariantConfig, ...]:
     if _is_missing_value(raw):
         return ()
@@ -422,6 +479,24 @@ def _parse_feature_set_variants(raw: Any) -> tuple[_FeatureSetVariantConfig, ...
                 overrides=overrides,
             )
         )
+    return tuple(variants)
+
+
+def _parse_weight_variants(raw: Any) -> tuple[_WeightVariantConfig, ...]:
+    if _is_missing_value(raw):
+        return ()
+    if isinstance(raw, Mapping) or isinstance(raw, str):
+        raise TypeError(f"Expected list of weight variants, got: {raw!r}")
+    variants: list[_WeightVariantConfig] = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            raise TypeError(f"Unsupported weight variant item: {item!r}")
+        label = str(item.get("label") or item.get("name") or "").strip()
+        if not label:
+            raise ValueError(f"Missing weight variant label at index={idx}")
+        notes = str(item.get("notes") or "")
+        overrides = {str(key): value for key, value in item.items() if str(key) not in {"label", "name", "notes"}}
+        variants.append(_WeightVariantConfig(label=label, notes=notes, overrides=overrides))
     return tuple(variants)
 
 
@@ -507,7 +582,7 @@ def _expand_runs(
 def _materialize_feature_set_variants(context: dict[str, Any]) -> list[ExperimentMarketSpec]:
     variants = tuple(context.get("feature_set_variants") or ())
     if not variants:
-        return _materialize_variants(context)
+        return _materialize_weight_variants(context)
     specs: list[ExperimentMarketSpec] = []
     for variant in variants:
         feature_context = _merge_context(
@@ -522,7 +597,29 @@ def _materialize_feature_set_variants(context: dict[str, Any]) -> list[Experimen
             context.get("tags"),
             (f"feature_set:{slug_token(str(variant.feature_set))}",),
         )
-        specs.extend(_materialize_variants(feature_context))
+        specs.extend(_materialize_weight_variants(feature_context))
+    return specs
+
+
+def _materialize_weight_variants(context: dict[str, Any]) -> list[ExperimentMarketSpec]:
+    variants = tuple(context.get("weight_variants") or ())
+    if not variants:
+        return _materialize_variants(context)
+    specs: list[ExperimentMarketSpec] = []
+    for variant in variants:
+        weight_context = _merge_context(
+            context,
+            variant.overrides or {},
+            group_name=str(context.get("group_name") or ""),
+            run_name=_weight_variant_run_name(str(context.get("run_name") or ""), str(variant.label or "default")),
+        )
+        weight_context["weight_variant_label"] = str(variant.label or "default")
+        weight_context["notes"] = str(variant.notes or weight_context.get("notes") or "")
+        weight_context["tags"] = _merge_tags(
+            context.get("tags"),
+            (f"weight_variant:{slug_token(str(variant.label), default='default')}",),
+        )
+        specs.extend(_materialize_variants(weight_context))
     return specs
 
 
@@ -612,6 +709,14 @@ def _context_to_market_spec(context: dict[str, Any]) -> ExperimentMarketSpec:
         variant_notes=str(context["variant_notes"] or ""),
         stake_usd=_coerce_optional_float(context.get("stake_usd")),
         max_notional_usd=_coerce_optional_float(context.get("max_notional_usd")),
+        weight_variant_label=str(context.get("weight_variant_label") or "default"),
+        balance_classes=_coerce_optional_bool(context.get("balance_classes")),
+        weight_by_vol=_coerce_optional_bool(context.get("weight_by_vol")),
+        inverse_vol=_coerce_optional_bool(context.get("inverse_vol")),
+        contrarian_weight=_coerce_optional_float(context.get("contrarian_weight")),
+        contrarian_quantile=_coerce_optional_float(context.get("contrarian_quantile")),
+        contrarian_return_col=_coerce_optional_string(context.get("contrarian_return_col")),
+        offset_weight_overrides=normalize_offset_weight_overrides(context.get("offset_weight_overrides")),
         matrix_parent_run_name=str(context.get("matrix_parent_run_name") or ""),
         matrix_stake_label=str(context.get("matrix_stake_label") or ""),
         hybrid_secondary_target=(
@@ -664,6 +769,18 @@ def _merge_context(
         )
     if "max_notional_usd" in payload:
         merged["max_notional_usd"] = _coerce_optional_float(payload.get("max_notional_usd"))
+    if "weight_variant_label" in payload and not _is_missing_value(payload.get("weight_variant_label")):
+        merged["weight_variant_label"] = str(payload.get("weight_variant_label") or "default")
+    for key in ("balance_classes", "weight_by_vol", "inverse_vol"):
+        if key in payload:
+            merged[key] = _coerce_optional_bool(payload.get(key))
+    for key in ("contrarian_weight", "contrarian_quantile"):
+        if key in payload:
+            merged[key] = _coerce_optional_float(payload.get(key))
+    if "contrarian_return_col" in payload:
+        merged["contrarian_return_col"] = _coerce_optional_string(payload.get("contrarian_return_col"))
+    if "offset_weight_overrides" in payload:
+        merged["offset_weight_overrides"] = normalize_offset_weight_overrides(payload.get("offset_weight_overrides"))
     if not _is_missing_value(payload.get("offsets")):
         merged["offsets"] = tuple(int(value) for value in payload.get("offsets") or ())
     if _has_window_override(payload):
@@ -697,6 +814,8 @@ def _merge_context(
     )
     variants = _parse_backtest_variants(payload.get("backtest_variants"))
     merged["backtest_variants"] = variants if variants else tuple(merged.get("backtest_variants") or ())
+    weight_variants = _parse_weight_variants(_first_present_value(payload, "weight_variants", "sample_weight_variants"))
+    merged["weight_variants"] = weight_variants if weight_variants else tuple(merged.get("weight_variants") or ())
     return merged
 
 
@@ -705,6 +824,13 @@ def _feature_set_run_name(base_run_name: str, label: str) -> str:
     if not base_run_name:
         return token
     return f"{base_run_name}__fs_{token}"
+
+
+def _weight_variant_run_name(base_run_name: str, label: str) -> str:
+    token = slug_token(label, default="default")
+    if not base_run_name:
+        return f"w_{token}"
+    return f"{base_run_name}__w_{token}"
 
 
 def _merge_tags(*parts: Any) -> tuple[str, ...]:

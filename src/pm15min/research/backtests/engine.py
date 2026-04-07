@@ -25,7 +25,7 @@ from pm15min.research.backtests.decision_engine_parity import (
     apply_decision_engine_parity,
     build_profile_decision_engine_parity_config,
 )
-from pm15min.research.backtests.depth_replay import build_raw_depth_replay_frame
+from pm15min.research.backtests.depth_replay import DepthReplaySummary, build_raw_depth_replay_frame
 from pm15min.research.backtests.data_surface_fallback import preflight_orderbook_index_dates
 from pm15min.research.backtests.fills import BacktestFillConfig, build_canonical_fills, build_depth_candidate_lookup
 from pm15min.research.backtests.guard_parity import GuardParitySummary
@@ -64,9 +64,30 @@ from pm15min.research.contracts import BacktestRunSpec
 from pm15min.research.datasets.loaders import load_feature_frame, load_label_frame
 from pm15min.research.freshness import prepare_research_artifacts
 from pm15min.research.inference.scorer import score_bundle_offset
+from pm15min.research.labels.alignment import merge_feature_and_label_frames
 from pm15min.research.labels.sources import normalize_label_set
 from pm15min.research.labels.runtime import build_truth_runtime_summary
 from pm15min.research.manifests import build_manifest, read_manifest, write_manifest
+
+
+_BACKTEST_FEATURE_KEY_COLUMNS = ("decision_ts", "cycle_start_ts", "cycle_end_ts", "offset")
+_BACKTEST_LABEL_REQUIRED_COLUMNS = (
+    "asset",
+    "cycle_start_ts",
+    "cycle_end_ts",
+    "market_id",
+    "condition_id",
+    "label_set",
+    "settlement_source",
+    "label_source",
+    "resolved",
+    "price_to_beat",
+    "final_price",
+    "winner_side",
+    "direction_up",
+    "full_truth",
+)
+_REVERSAL_ANCHOR_COLUMNS = ("ret_from_strike", "ret_from_cycle_open")
 
 
 class BacktestReporter(Protocol):
@@ -188,7 +209,26 @@ def run_research_backtest(
         parity=spec.parity,
     )
     liquidity_proxy_mode = str(spec.parity.liquidity_proxy_mode or "spot_kline_mirror")
+    secondary_bundle_dir, secondary_target = _resolve_secondary_bundle_context(
+        cfg=cfg,
+        spec=spec,
+    )
+    required_bundle_dirs = tuple(
+        bundle for bundle in (bundle_dir, secondary_bundle_dir) if bundle is not None
+    )
+    required_targets = tuple(
+        target_text
+        for target_text in (spec.target, secondary_target if secondary_bundle_dir is not None else None)
+        if target_text
+    )
+    required_offsets = sorted(
+        {
+            *(_bundle_offsets(bundle_dir)),
+            *(_bundle_offsets(secondary_bundle_dir) if secondary_bundle_dir is not None else []),
+        }
+    )
     retry_contract_summary = build_backtest_retry_contract(profile_spec)
+    fill_config = _build_backtest_fill_config(spec=spec, profile_spec=profile_spec)
     orderbook_preflight_summary: dict[str, object] | None = None
     prepared_runtime = _load_cached_primary_runtime(
         cfg=cfg,
@@ -201,9 +241,26 @@ def run_research_backtest(
     )
     runtime_cache_status = "reused" if prepared_runtime is not None else "built"
     if prepared_runtime is None:
-        features = load_feature_frame(cfg, feature_set=feature_set)
-        labels = load_label_frame(cfg, label_set=label_set)
-        raw_klines = load_binance_klines_1m(data_cfg)
+        features = _load_scoped_backtest_feature_frame(
+            cfg=cfg,
+            feature_set=feature_set,
+            bundle_dirs=required_bundle_dirs,
+            targets=required_targets,
+            available_offsets=required_offsets,
+            decision_start=spec.decision_start,
+            decision_end=spec.decision_end,
+        )
+        labels = _load_scoped_backtest_label_frame(
+            cfg=cfg,
+            label_set=label_set,
+            scoped_features=features,
+        )
+        raw_klines = _scope_backtest_klines(
+            load_binance_klines_1m(data_cfg),
+            decision_start=spec.decision_start,
+            decision_end=spec.decision_end,
+            required_lookback_minutes=_required_backtest_klines_lookback_minutes(profile_spec),
+        )
         _start_stage("bundle_replay", "Scoring bundle replay")
         replay, replay_summary, available_offsets = _build_bundle_replay(
             bundle_dir=bundle_dir,
@@ -224,12 +281,12 @@ def run_research_backtest(
             heartbeat=progress.heartbeat(stage_index=preflight_stage_index, stage_name=preflight_stage_name),
         )
         depth_stage_index, depth_stage_name = _start_stage("depth_replay", "Replaying raw depth snapshots")
-        depth_replay, depth_replay_summary = build_raw_depth_replay_frame(
+        depth_replay, depth_replay_summary, depth_candidate_lookup = _build_decision_depth_runtime(
             replay=replay,
             data_cfg=data_cfg,
+            fill_config=fill_config,
             heartbeat=progress.heartbeat(stage_index=depth_stage_index, stage_name=depth_stage_name),
         )
-        depth_candidate_lookup = build_depth_candidate_lookup(depth_replay)
         quote_stage_index, quote_stage_name = _start_stage("quote_surface", "Attaching quote surface")
         live_state_stage_index, live_state_stage_name = _start_stage("live_state_surface", "Attaching live state parity")
         runtime_replay, quote_summary, state_summary = _attach_replay_runtime_surface(
@@ -311,7 +368,6 @@ def run_research_backtest(
             decision_end=spec.decision_end,
             heartbeat=progress.heartbeat(stage_index=preflight_stage_index, stage_name=preflight_stage_name),
         )
-    fill_config = _build_backtest_fill_config(spec=spec, profile_spec=profile_spec)
     label_runtime_summary = _load_label_runtime_summary(cfg=cfg, label_set=label_set)
     truth_runtime_summary = build_truth_runtime_summary(data_cfg)
     build_signature = backtest_build_signature()
@@ -364,13 +420,21 @@ def run_research_backtest(
     fills_stage_index, fills_stage_name = _start_stage("fills_materialization", "Materializing canonical fills")
     policy_rejects = build_policy_reject_frame(decisions)
     accepted = decisions.loc[decisions["policy_action"].eq("trade")].copy()
+    fill_depth_replay = depth_replay
+    fill_depth_candidate_lookup = depth_candidate_lookup
+    if bool(fill_config.raw_depth_fak_refresh_enabled) or depth_replay.empty:
+        fill_depth_replay, _fill_depth_replay_summary, fill_depth_candidate_lookup = _build_fill_depth_runtime(
+            accepted=accepted,
+            data_cfg=data_cfg,
+            heartbeat=progress.heartbeat(stage_index=fills_stage_index, stage_name=fills_stage_name),
+        )
     fills, fill_rejects = build_canonical_fills(
         accepted,
         data_cfg=data_cfg,
         config=fill_config,
         profile_spec=profile_spec,
-        depth_replay=depth_replay,
-        depth_candidate_lookup=depth_candidate_lookup,
+        depth_replay=fill_depth_replay,
+        depth_candidate_lookup=fill_depth_candidate_lookup,
         heartbeat=progress.heartbeat(stage_index=fills_stage_index, stage_name=fills_stage_name),
     )
     _start_stage("settlement_summary", "Settling fills and building summaries")
@@ -561,6 +625,60 @@ def _backtest_stage_total(*, spec: BacktestRunSpec) -> int:
     return 11 if spec.secondary_bundle_label else 10
 
 
+def _build_empty_depth_runtime() -> tuple[pd.DataFrame, DepthReplaySummary, object]:
+    depth_replay = pd.DataFrame()
+    summary = DepthReplaySummary(
+        market_rows_loaded=0,
+        replay_rows=0,
+        source_files_scanned=0,
+        raw_records_scanned=0,
+        raw_record_matches=0,
+        snapshot_rows=0,
+        complete_snapshot_rows=0,
+        partial_snapshot_rows=0,
+        decision_key_snapshot_rows=0,
+        token_window_snapshot_rows=0,
+        mixed_strategy_snapshot_rows=0,
+        replay_rows_with_snapshots=0,
+        replay_rows_without_snapshots=0,
+    )
+    return depth_replay, summary, build_depth_candidate_lookup(depth_replay)
+
+
+def _build_decision_depth_runtime(
+    *,
+    replay: pd.DataFrame,
+    data_cfg: DataConfig,
+    fill_config: BacktestFillConfig,
+    heartbeat: Callable[[str], None] | None = None,
+) -> tuple[pd.DataFrame, DepthReplaySummary, object]:
+    if not bool(fill_config.raw_depth_fak_refresh_enabled):
+        return _build_empty_depth_runtime()
+    depth_replay, summary = build_raw_depth_replay_frame(
+        replay=replay,
+        data_cfg=data_cfg,
+        max_snapshots_per_replay_row=1,
+        heartbeat=heartbeat,
+    )
+    return depth_replay, summary, build_depth_candidate_lookup(depth_replay)
+
+
+def _build_fill_depth_runtime(
+    *,
+    accepted: pd.DataFrame,
+    data_cfg: DataConfig,
+    heartbeat: Callable[[str], None] | None = None,
+) -> tuple[pd.DataFrame, DepthReplaySummary, object]:
+    if accepted.empty:
+        return _build_empty_depth_runtime()
+    depth_replay, summary = build_raw_depth_replay_frame(
+        replay=accepted,
+        data_cfg=data_cfg,
+        heartbeat=heartbeat,
+    )
+    return depth_replay, summary, build_depth_candidate_lookup(depth_replay)
+
+
 def _build_orderbook_preflight_summary(
     *,
     data_cfg: DataConfig,
@@ -744,6 +862,193 @@ def _bundle_feature_columns(bundle_dir: Path) -> tuple[str, ...]:
     return tuple(columns)
 
 
+def _resolve_secondary_bundle_context(
+    *,
+    cfg: ResearchConfig,
+    spec: BacktestRunSpec,
+) -> tuple[Path | None, str]:
+    secondary_target = str(spec.secondary_target or spec.target)
+    if not spec.secondary_bundle_label:
+        return None, secondary_target
+    secondary_cfg = cfg if secondary_target == cfg.target else ResearchConfig.build(
+        market=cfg.asset.slug,
+        cycle=cfg.cycle,
+        profile=cfg.profile,
+        source_surface=cfg.source_surface,
+        feature_set=cfg.feature_set,
+        label_set=cfg.label_set,
+        target=secondary_target,
+        model_family=cfg.model_family,
+        root=cfg.layout.storage.rewrite_root,
+    )
+    bundle_dir = resolve_model_bundle_dir(
+        secondary_cfg,
+        profile=spec.profile,
+        target=secondary_target,
+        bundle_label=spec.secondary_bundle_label,
+    )
+    return bundle_dir, secondary_target
+
+
+def _required_backtest_feature_columns(
+    *,
+    bundle_dirs: tuple[Path, ...],
+    targets: tuple[str, ...],
+) -> list[str]:
+    columns: list[str] = list(_BACKTEST_FEATURE_KEY_COLUMNS)
+    seen = set(columns)
+    for bundle_dir in bundle_dirs:
+        for column in _bundle_feature_columns(bundle_dir):
+            if not column or column in seen:
+                continue
+            seen.add(column)
+            columns.append(column)
+    for target in targets:
+        if str(target).strip().lower() != "reversal":
+            continue
+        for column in _REVERSAL_ANCHOR_COLUMNS:
+            if column in seen:
+                continue
+            seen.add(column)
+            columns.append(column)
+    return columns
+
+
+def _load_scoped_backtest_feature_frame(
+    *,
+    cfg: ResearchConfig,
+    feature_set: str,
+    bundle_dirs: tuple[Path, ...],
+    targets: tuple[str, ...],
+    available_offsets: list[int],
+    decision_start: str | None,
+    decision_end: str | None,
+) -> pd.DataFrame:
+    features = load_feature_frame(
+        cfg,
+        feature_set=feature_set,
+        columns=_required_backtest_feature_columns(bundle_dirs=bundle_dirs, targets=targets),
+    )
+    return _scope_backtest_feature_frame(
+        features,
+        available_offsets=available_offsets,
+        decision_start=decision_start,
+        decision_end=decision_end,
+    )
+
+
+def _scope_backtest_feature_frame(
+    features: pd.DataFrame,
+    *,
+    available_offsets: list[int],
+    decision_start: str | None,
+    decision_end: str | None,
+) -> pd.DataFrame:
+    if features.empty:
+        return features
+    decision_ts = pd.to_datetime(features.get("decision_ts"), utc=True, errors="coerce")
+    offset_values = pd.to_numeric(features.get("offset"), errors="coerce")
+    mask = decision_ts.notna()
+    if available_offsets:
+        mask &= offset_values.isin([int(offset) for offset in available_offsets])
+
+    start_bound = _parse_window_bound(decision_start, is_end=False)
+    if start_bound is not None:
+        mask &= decision_ts.ge(start_bound)
+
+    end_bound = _parse_window_bound(decision_end, is_end=True)
+    if end_bound is not None:
+        if _looks_like_date_only(decision_end):
+            mask &= decision_ts.lt(end_bound)
+        else:
+            mask &= decision_ts.le(end_bound)
+
+    return features.loc[mask].reset_index(drop=True)
+
+
+def _load_scoped_backtest_label_frame(
+    *,
+    cfg: ResearchConfig,
+    label_set: str,
+    scoped_features: pd.DataFrame,
+) -> pd.DataFrame:
+    labels = load_label_frame(
+        cfg,
+        label_set=label_set,
+        columns=_BACKTEST_LABEL_REQUIRED_COLUMNS,
+    )
+    return _scope_backtest_label_frame(labels, scoped_features=scoped_features)
+
+
+def _scope_backtest_label_frame(
+    labels: pd.DataFrame,
+    *,
+    scoped_features: pd.DataFrame,
+) -> pd.DataFrame:
+    if labels.empty or scoped_features.empty:
+        return labels.iloc[0:0].copy()
+
+    feature_pairs = scoped_features.loc[:, ["cycle_start_ts", "cycle_end_ts"]].copy()
+    feature_pairs["cycle_start_ts"] = pd.to_datetime(feature_pairs["cycle_start_ts"], utc=True, errors="coerce")
+    feature_pairs["cycle_end_ts"] = pd.to_datetime(feature_pairs["cycle_end_ts"], utc=True, errors="coerce")
+    feature_pairs = feature_pairs.dropna().drop_duplicates().reset_index(drop=True)
+    if feature_pairs.empty:
+        return labels.iloc[0:0].copy()
+
+    label_start = pd.to_numeric(labels.get("cycle_start_ts"), errors="coerce")
+    label_end = pd.to_numeric(labels.get("cycle_end_ts"), errors="coerce")
+    valid = label_start.notna() & label_end.notna()
+    if not bool(valid.any()):
+        return labels.iloc[0:0].copy()
+
+    label_pairs = pd.DataFrame(
+        {
+            "cycle_start_ts": pd.to_datetime(label_start.loc[valid].astype("int64"), unit="s", utc=True),
+            "cycle_end_ts": pd.to_datetime(label_end.loc[valid].astype("int64"), unit="s", utc=True),
+        }
+    )
+    allowed_pairs = pd.MultiIndex.from_frame(feature_pairs)
+    keep_mask = pd.Series(False, index=labels.index, dtype=bool)
+    keep_mask.loc[label_pairs.index] = pd.MultiIndex.from_frame(label_pairs).isin(allowed_pairs)
+    return labels.loc[keep_mask].reset_index(drop=True)
+
+
+def _required_backtest_klines_lookback_minutes(profile_spec) -> int:
+    lookback = int(getattr(profile_spec, "liquidity_guard_lookback_minutes", 0) or 0)
+    baseline = int(getattr(profile_spec, "liquidity_guard_baseline_minutes", 0) or 0)
+    return max(30, lookback + baseline)
+
+
+def _scope_backtest_klines(
+    raw_klines: pd.DataFrame,
+    *,
+    decision_start: str | None,
+    decision_end: str | None,
+    required_lookback_minutes: int,
+) -> pd.DataFrame:
+    if raw_klines is None or raw_klines.empty or "open_time" not in raw_klines.columns:
+        return raw_klines
+    start_bound = _parse_window_bound(decision_start, is_end=False)
+    end_bound = _parse_window_bound(decision_end, is_end=True)
+    if start_bound is None and end_bound is None:
+        return raw_klines
+
+    open_time = pd.to_datetime(raw_klines.get("open_time"), utc=True, errors="coerce")
+    mask = open_time.notna()
+
+    if start_bound is not None:
+        lower_bound = start_bound - pd.Timedelta(minutes=max(0, int(required_lookback_minutes)))
+        mask &= open_time.ge(lower_bound)
+
+    if end_bound is not None:
+        if _looks_like_date_only(decision_end):
+            mask &= open_time.lt(end_bound)
+        else:
+            mask &= open_time.le(end_bound)
+
+    return raw_klines.loc[mask].reset_index(drop=True)
+
+
 def _load_cached_primary_runtime(
     *,
     cfg: ResearchConfig,
@@ -846,7 +1151,8 @@ def _build_bundle_replay(
     labels: pd.DataFrame,
 ) -> tuple[pd.DataFrame, object, list[int]]:
     available_offsets = _bundle_offsets(bundle_dir)
-    score_frames = [score_bundle_offset(bundle_dir, features, offset=offset) for offset in available_offsets]
+    aligned_features, _alignment_metadata = merge_feature_and_label_frames(features, labels)
+    score_frames = [score_bundle_offset(bundle_dir, aligned_features, offset=offset) for offset in available_offsets]
     scores = (
         pd.concat(score_frames, ignore_index=True, sort=False)
         if score_frames

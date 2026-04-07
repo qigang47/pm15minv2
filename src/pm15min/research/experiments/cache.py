@@ -10,6 +10,10 @@ import pandas as pd
 
 from pm15min.data.io.json_files import write_json_atomic
 from pm15min.data.io.parquet import read_parquet_if_exists, write_parquet_atomic
+from pm15min.research._contracts_training import (
+    normalize_offset_weight_overrides,
+    offset_weight_overrides_payload,
+)
 from pm15min.research.layout import ResearchLayout
 
 
@@ -36,6 +40,14 @@ _TRAINING_REUSE_COLUMNS = [
     "target",
     "window",
     "offsets_json",
+    "weight_variant_label",
+    "balance_classes",
+    "weight_by_vol",
+    "inverse_vol",
+    "contrarian_weight",
+    "contrarian_quantile",
+    "contrarian_return_col",
+    "offset_weight_overrides_json",
     "run_label",
     "run_dir",
     "source_suite_name",
@@ -91,6 +103,14 @@ def training_cache_key(
     target: str,
     window_label: str,
     offsets: tuple[int, ...],
+    weight_variant_label: str = "default",
+    balance_classes: bool | None = None,
+    weight_by_vol: bool | None = None,
+    inverse_vol: bool | None = None,
+    contrarian_weight: float | None = None,
+    contrarian_quantile: float | None = None,
+    contrarian_return_col: str | None = None,
+    offset_weight_overrides: dict[int, dict[str, object]] | None = None,
 ) -> str:
     return stable_key(
         {
@@ -102,6 +122,14 @@ def training_cache_key(
             "target": str(target).strip(),
             "window": str(window_label).strip(),
             "offsets": [int(value) for value in offsets],
+            "weight_variant_label": str(weight_variant_label or "default").strip(),
+            "balance_classes": balance_classes,
+            "weight_by_vol": weight_by_vol,
+            "inverse_vol": inverse_vol,
+            "contrarian_weight": contrarian_weight,
+            "contrarian_quantile": contrarian_quantile,
+            "contrarian_return_col": str(contrarian_return_col).strip() if contrarian_return_col else None,
+            "offset_weight_overrides": offset_weight_overrides_payload(offset_weight_overrides),
         }
     )
 
@@ -128,6 +156,41 @@ def bundle_cache_key(
 def stable_key(payload: dict[str, object]) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()
+
+
+def _clean_optional_bool(value: object) -> bool | None:
+    if _is_missing(value):
+        return None
+    if isinstance(value, bool):
+        return value
+    token = str(value).strip().lower()
+    if token in {"1", "true", "yes", "y", "on"}:
+        return True
+    if token in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _clean_optional_float(value: object) -> float | None:
+    if _is_missing(value):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _partition_label(path_or_label: object) -> str:
+    token = str(path_or_label or "").strip()
+    if not token:
+        return ""
+    name = Path(token).name
+    if "=" not in name:
+        return name
+    prefix, value = name.split("=", 1)
+    if prefix in {"run", "bundle"} and value:
+        return value
+    return name
 
 
 def normalize_offsets(raw: object) -> tuple[int, ...]:
@@ -288,6 +351,14 @@ class ExperimentSharedCache:
         target: str,
         window_label: str,
         offsets: tuple[int, ...],
+        weight_variant_label: str = "default",
+        balance_classes: bool | None = None,
+        weight_by_vol: bool | None = None,
+        inverse_vol: bool | None = None,
+        contrarian_weight: float | None = None,
+        contrarian_quantile: float | None = None,
+        contrarian_return_col: str | None = None,
+        offset_weight_overrides: dict[int, dict[str, object]] | None = None,
     ) -> dict[str, object] | None:
         key = training_cache_key(
             market=market,
@@ -298,6 +369,14 @@ class ExperimentSharedCache:
             target=target,
             window_label=window_label,
             offsets=offsets,
+            weight_variant_label=weight_variant_label,
+            balance_classes=balance_classes,
+            weight_by_vol=weight_by_vol,
+            inverse_vol=inverse_vol,
+            contrarian_weight=contrarian_weight,
+            contrarian_quantile=contrarian_quantile,
+            contrarian_return_col=contrarian_return_col,
+            offset_weight_overrides=offset_weight_overrides,
         )
         cached = self.training_reuse.get(key)
         return None if cached is None else dict(cached)
@@ -315,6 +394,14 @@ class ExperimentSharedCache:
         offsets: tuple[int, ...],
         run_dir: str,
         run_label: str | None = None,
+        weight_variant_label: str = "default",
+        balance_classes: bool | None = None,
+        weight_by_vol: bool | None = None,
+        inverse_vol: bool | None = None,
+        contrarian_weight: float | None = None,
+        contrarian_quantile: float | None = None,
+        contrarian_return_col: str | None = None,
+        offset_weight_overrides: dict[int, dict[str, object]] | None = None,
         source_suite_name: str | None = None,
         source_run_label: str | None = None,
         updated_at: str | None = None,
@@ -330,8 +417,16 @@ class ExperimentSharedCache:
             target=target,
             window_label=window_label,
             offsets=normalized_offsets,
+            weight_variant_label=weight_variant_label,
+            balance_classes=balance_classes,
+            weight_by_vol=weight_by_vol,
+            inverse_vol=inverse_vol,
+            contrarian_weight=contrarian_weight,
+            contrarian_quantile=contrarian_quantile,
+            contrarian_return_col=contrarian_return_col,
+            offset_weight_overrides=offset_weight_overrides,
         )
-        normalized_run_label = str(run_label or Path(normalized_run_dir).name).strip()
+        normalized_run_label = _partition_label(run_label or normalized_run_dir)
         previous = self.training_reuse.get(cache_key)
         if previous is not None:
             previous_run_label = str(previous.get("run_label") or "").strip()
@@ -354,12 +449,22 @@ class ExperimentSharedCache:
             "target": str(target).strip(),
             "window": str(window_label).strip(),
             "offsets": normalized_offsets,
+            "weight_variant_label": str(weight_variant_label or "default").strip(),
+            "balance_classes": balance_classes,
+            "weight_by_vol": weight_by_vol,
+            "inverse_vol": inverse_vol,
+            "contrarian_weight": contrarian_weight,
+            "contrarian_quantile": contrarian_quantile,
+            "contrarian_return_col": _clean_optional_text(contrarian_return_col),
+            "offset_weight_overrides": normalize_offset_weight_overrides(offset_weight_overrides),
             "run_label": normalized_run_label,
             "run_dir": normalized_run_dir,
             "source_suite_name": _clean_optional_text(source_suite_name),
             "source_run_label": _clean_optional_text(source_run_label),
             "updated_at": str(updated_at or utc_cache_timestamp()),
         }
+        if not record["offset_weight_overrides"]:
+            record.pop("offset_weight_overrides", None)
         self.training_reuse[str(record["cache_key"])] = record
         return dict(record)
 
@@ -398,7 +503,7 @@ class ExperimentSharedCache:
     ) -> dict[str, object]:
         normalized_offsets = tuple(int(value) for value in offsets)
         normalized_bundle_dir = str(bundle_dir).strip()
-        normalized_training_run_label = str(training_run_label).strip()
+        normalized_training_run_label = _partition_label(training_run_label)
         record = {
             "cache_key": bundle_cache_key(
                 market=market,
@@ -412,7 +517,7 @@ class ExperimentSharedCache:
             "target": str(target).strip(),
             "offsets": normalized_offsets,
             "training_run_label": normalized_training_run_label,
-            "bundle_label": str(bundle_label or Path(normalized_bundle_dir).name).strip(),
+            "bundle_label": _partition_label(bundle_label or normalized_bundle_dir),
             "bundle_dir": normalized_bundle_dir,
             "source_suite_name": _clean_optional_text(source_suite_name),
             "source_run_label": _clean_optional_text(source_run_label),
@@ -466,6 +571,14 @@ class ExperimentSharedCache:
                     window_label=window_label,
                     offsets=offsets,
                     run_dir=training_run_dir,
+                    weight_variant_label=_clean_optional_text(row.get("weight_variant_label")) or "default",
+                    balance_classes=_clean_optional_bool(row.get("balance_classes")),
+                    weight_by_vol=_clean_optional_bool(row.get("weight_by_vol")),
+                    inverse_vol=_clean_optional_bool(row.get("inverse_vol")),
+                    contrarian_weight=_clean_optional_float(row.get("contrarian_weight")),
+                    contrarian_quantile=_clean_optional_float(row.get("contrarian_quantile")),
+                    contrarian_return_col=_clean_optional_text(row.get("contrarian_return_col")),
+                    offset_weight_overrides=_parse_offset_weight_overrides_json(row.get("offset_weight_overrides_json")),
                     source_suite_name=source_suite_name,
                     source_run_label=source_run_label,
                 )
@@ -537,8 +650,17 @@ class ExperimentSharedCache:
     def _training_reuse_frame(self) -> pd.DataFrame:
         rows: list[dict[str, object]] = []
         for record in self.training_reuse.values():
-            row = {column: record.get(column) for column in _TRAINING_REUSE_COLUMNS if column != "offsets_json"}
+            row = {
+                column: record.get(column)
+                for column in _TRAINING_REUSE_COLUMNS
+                if column not in {"offsets_json", "offset_weight_overrides_json"}
+            }
             row["offsets_json"] = json.dumps([int(value) for value in record.get("offsets", ())], ensure_ascii=False)
+            row["offset_weight_overrides_json"] = json.dumps(
+                offset_weight_overrides_payload(record.get("offset_weight_overrides")),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
             rows.append(row)
         return _frame_from_records(rows, columns=_TRAINING_REUSE_COLUMNS)
 
@@ -633,7 +755,7 @@ def _training_reuse_from_frame(frame: pd.DataFrame) -> dict[str, dict[str, objec
         run_dir = _clean_optional_text(row.get("run_dir")) or ""
         if not cache_key or not run_dir:
             continue
-        records[cache_key] = {
+        record = {
             "cache_key": cache_key,
             "market": _clean_optional_text(row.get("market")) or "",
             "profile": _clean_optional_text(row.get("profile")) or "",
@@ -643,12 +765,23 @@ def _training_reuse_from_frame(frame: pd.DataFrame) -> dict[str, dict[str, objec
             "target": _clean_optional_text(row.get("target")) or "",
             "window": _clean_optional_text(row.get("window")) or "",
             "offsets": _parse_offsets_json(row.get("offsets_json")),
-            "run_label": _clean_optional_text(row.get("run_label")) or Path(run_dir).name,
+            "weight_variant_label": _clean_optional_text(row.get("weight_variant_label")) or "default",
+            "balance_classes": _clean_optional_bool(row.get("balance_classes")),
+            "weight_by_vol": _clean_optional_bool(row.get("weight_by_vol")),
+            "inverse_vol": _clean_optional_bool(row.get("inverse_vol")),
+            "contrarian_weight": _clean_optional_float(row.get("contrarian_weight")),
+            "contrarian_quantile": _clean_optional_float(row.get("contrarian_quantile")),
+            "contrarian_return_col": _clean_optional_text(row.get("contrarian_return_col")),
+            "offset_weight_overrides": _parse_offset_weight_overrides_json(row.get("offset_weight_overrides_json")),
+            "run_label": _partition_label(_clean_optional_text(row.get("run_label")) or run_dir),
             "run_dir": run_dir,
             "source_suite_name": _clean_optional_text(row.get("source_suite_name")),
             "source_run_label": _clean_optional_text(row.get("source_run_label")),
             "updated_at": _clean_optional_text(row.get("updated_at")) or "",
         }
+        if not record["offset_weight_overrides"]:
+            record.pop("offset_weight_overrides", None)
+        records[cache_key] = record
     return records
 
 
@@ -665,8 +798,8 @@ def _bundle_reuse_from_frame(frame: pd.DataFrame) -> dict[str, dict[str, object]
             "profile": _clean_optional_text(row.get("profile")) or "",
             "target": _clean_optional_text(row.get("target")) or "",
             "offsets": _parse_offsets_json(row.get("offsets_json")),
-            "training_run_label": _clean_optional_text(row.get("training_run_label")) or "",
-            "bundle_label": _clean_optional_text(row.get("bundle_label")) or Path(bundle_dir).name,
+            "training_run_label": _partition_label(_clean_optional_text(row.get("training_run_label")) or ""),
+            "bundle_label": _partition_label(_clean_optional_text(row.get("bundle_label")) or bundle_dir),
             "bundle_dir": bundle_dir,
             "source_suite_name": _clean_optional_text(row.get("source_suite_name")),
             "source_run_label": _clean_optional_text(row.get("source_run_label")),
@@ -684,6 +817,20 @@ def _parse_offsets_json(raw: object) -> tuple[int, ...]:
     except Exception:
         return ()
     return normalize_offsets(payload)
+
+
+def _parse_offset_weight_overrides_json(raw: object) -> dict[int, dict[str, object]]:
+    token = _clean_optional_text(raw) or ""
+    if not token:
+        return {}
+    try:
+        payload = json.loads(token)
+    except Exception:
+        return {}
+    try:
+        return normalize_offset_weight_overrides(payload)
+    except Exception:
+        return {}
 
 
 def _is_missing(value: object) -> bool:

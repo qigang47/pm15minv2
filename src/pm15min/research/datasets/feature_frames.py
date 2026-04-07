@@ -49,6 +49,7 @@ def build_feature_frame_dataset(
         oracle_prices=oracle_prices,
         btc_klines=btc_klines,
         cycle=cfg.cycle,
+        root=str(cfg.layout.storage.rewrite_root),
     )
 
     data_path = cfg.layout.feature_frame_path(cfg.feature_set, source_surface=cfg.source_surface)
@@ -63,8 +64,8 @@ def build_feature_frame_dataset(
         spec={
             "feature_set": cfg.feature_set,
             "source_surface": cfg.source_surface,
-            "feature_columns": list(feature_set_columns(cfg.feature_set)),
-            "feature_schema": feature_schema(cfg.feature_set),
+            "feature_columns": list(feature_set_columns(cfg.feature_set, root=cfg.layout.storage.rewrite_root)),
+            "feature_schema": feature_schema(cfg.feature_set, root=cfg.layout.storage.rewrite_root),
         },
         inputs=[
             {"path": str(data_cfg.layout.binance_klines_path()), "kind": "binance_klines_1m"},

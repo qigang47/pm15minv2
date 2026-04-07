@@ -30,6 +30,7 @@ def build_feature_frame(
     oracle_prices: pd.DataFrame,
     btc_klines: pd.DataFrame | None = None,
     cycle: str = "15m",
+    root: str | None = None,
     requested_columns: set[str] | None = None,
 ) -> pd.DataFrame:
     build_started = time.perf_counter()
@@ -37,6 +38,7 @@ def build_feature_frame(
     base["decision_ts"] = decision_reference_ts(base)
     required_columns = _resolve_required_feature_columns(
         feature_set=feature_set,
+        root=root,
         requested_columns=requested_columns,
     )
     required_groups = {feature_group(column) for column in required_columns}
@@ -81,9 +83,10 @@ def build_feature_frame(
     return out
 
 
-def resolve_live_required_feature_columns(*, feature_set: str) -> set[str]:
+def resolve_live_required_feature_columns(*, feature_set: str, root: str | None = None) -> set[str]:
     return _resolve_required_feature_columns(
         feature_set=feature_set,
+        root=root,
         requested_columns={
             "ret_15m",
             "ret_30m",
@@ -98,9 +101,10 @@ def resolve_live_required_feature_columns(*, feature_set: str) -> set[str]:
 def _resolve_required_feature_columns(
     *,
     feature_set: str,
+    root: str | None,
     requested_columns: set[str] | None,
 ) -> set[str]:
-    required = {str(column) for column in feature_set_columns(feature_set)}
+    required = {str(column) for column in feature_set_columns(feature_set, root=root)}
     if requested_columns is not None:
         required.update(str(column) for column in requested_columns)
     # Keep upstream dependencies explicit so selective builders can still

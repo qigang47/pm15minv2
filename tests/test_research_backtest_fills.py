@@ -604,6 +604,86 @@ def test_build_canonical_fills_accumulates_partial_raw_depth_candidates(tmp_path
     assert row["stake"] == pytest.approx(1.0)
 
 
+def test_build_canonical_fills_uses_side_snapshot_ts_when_raw_depth_record_is_compacted(tmp_path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    accepted = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:08:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "quote_captured_ts_ms_up": int(pd.Timestamp("2026-03-01T00:08:30Z").timestamp() * 1000),
+                "quote_up_ask": 0.22,
+                "quote_up_bid": 0.19,
+                "quote_up_ask_size_1": 10.0,
+                "p_up": 0.95,
+                "p_down": 0.05,
+                "predicted_side": "UP",
+                "predicted_prob": 0.95,
+                "winner_side": "UP",
+                "stake": 1.0,
+            }
+        ]
+    )
+    expected_snapshot_ts_ms = int(pd.Timestamp("2026-03-01T00:08:20Z").timestamp() * 1000)
+    depth_replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:08:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "depth_snapshot_rank": 1,
+                "depth_source_path": str(data_cfg.layout.orderbook_depth_path("2026-03-01")),
+                "depth_up_record": {
+                    "asks": [[0.20, 5.0], [0.201, 5.0]],
+                },
+                "depth_up_snapshot_ts_ms": expected_snapshot_ts_ms,
+                "depth_down_record": None,
+            },
+        ]
+    )
+    profile_spec = replace(
+        resolve_backtest_profile_spec(profile="deep_otm"),
+        orderbook_min_fill_ratio=0.9,
+        orderbook_max_slippage_bps=150.0,
+    )
+
+    fills, rejects = build_canonical_fills(
+        accepted,
+        data_cfg=data_cfg,
+        config=BacktestFillConfig(
+            base_stake=1.0,
+            max_stake=1.0,
+            fee_bps=0.0,
+            high_conf_threshold=0.99,
+            high_conf_multiplier=1.0,
+            raw_depth_fak_refresh_enabled=False,
+            profile_spec=profile_spec,
+        ),
+        profile_spec=profile_spec,
+        depth_replay=depth_replay,
+    )
+
+    assert rejects.empty
+    assert len(fills) == 1
+    row = fills.iloc[0]
+    assert row["fill_model"] == "canonical_depth"
+    assert row["depth_status"] == "ok"
+    assert row["depth_reason"] == ""
+    assert row["depth_snapshot_ts_ms"] == expected_snapshot_ts_ms
+    assert row["depth_snapshot_age_ms"] == (
+        int(pd.Timestamp("2026-03-01T00:08:00Z").timestamp() * 1000) - expected_snapshot_ts_ms
+    )
+    assert row["depth_fill_ratio"] == pytest.approx(1.0)
+
+
 def test_build_canonical_fills_does_not_reuse_unchanged_raw_depth_queue(tmp_path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)

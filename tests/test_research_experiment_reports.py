@@ -266,6 +266,35 @@ def test_run_experiment_suite_writes_compare_and_report_outputs(monkeypatch, tmp
     assert "loose" in report_text
 
 
+def test_render_experiment_report_falls_back_without_tabulate(monkeypatch) -> None:
+    leaderboard = build_leaderboard(_sample_compare_frame())
+    compare_frame = _sample_compare_frame()
+    summary_payload = build_experiment_summary(
+        suite_name="demo_suite",
+        run_label="demo_run",
+        training_runs=pd.DataFrame(),
+        backtest_runs=compare_frame,
+        leaderboard=leaderboard,
+        compare_frame=compare_frame,
+        failed_cases=pd.DataFrame(),
+    )
+
+    def _raise_import_error(self, *args, **kwargs):
+        raise ImportError("Missing optional dependency 'tabulate'")
+
+    monkeypatch.setattr(pd.DataFrame, "to_markdown", _raise_import_error)
+
+    report = render_experiment_report(
+        summary_payload,
+        leaderboard=leaderboard,
+        compare_frame=compare_frame,
+        failed_cases=pd.DataFrame(),
+    )
+
+    assert "# Experiment Summary" in report
+    assert "| market |" in report
+
+
 def test_report_builders_produce_group_run_and_focus_views() -> None:
     compare_frame = _sample_compare_frame()
     leaderboard = build_leaderboard(compare_frame.loc[compare_frame["status"].eq("completed")].copy())

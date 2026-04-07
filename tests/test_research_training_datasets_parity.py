@@ -219,6 +219,110 @@ def test_build_label_frame_truth_backfills_missing_cycles_from_oracle_prices() -
     assert frame.iloc[1]["winner_side"] == "DOWN"
 
 
+def test_build_label_frame_truth_preserves_multiple_contracts_per_cycle() -> None:
+    truth = pd.DataFrame(
+        [
+            {
+                "asset": "btc",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+                "winner_side": "UP",
+                "label_updown": "UP",
+                "resolved": True,
+                "truth_source": "settlement_truth",
+                "full_truth": True,
+            },
+            {
+                "asset": "btc",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "market_id": "m-2",
+                "condition_id": "c-2",
+                "winner_side": "DOWN",
+                "label_updown": "DOWN",
+                "resolved": True,
+                "truth_source": "settlement_truth",
+                "full_truth": True,
+            },
+        ]
+    )
+
+    frame = build_label_frame(label_set="truth", truth_table=truth, oracle_prices_table=pd.DataFrame())
+
+    assert len(frame) == 2
+    assert set(frame["market_id"].tolist()) == {"m-1", "m-2"}
+
+
+def test_merge_feature_and_label_frames_recomputes_strike_features_per_contract() -> None:
+    features = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:07:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "close": 110.0,
+                "ret_from_cycle_open": 0.1,
+                "rv_30": 0.05,
+                "basis_bp": 0.0,
+                "has_oracle_strike": 0,
+                "has_cl_strike": 0,
+                "ret_from_strike": 999.0,
+                "move_z_strike": 999.0,
+                "strike_abs_z": 999.0,
+                "strike_flip_count_cycle": 999.0,
+                "q_bs_up_strike": 0.5,
+                "q_bs_up_strike_centered": 0.0,
+            }
+        ]
+    )
+    labels = pd.DataFrame(
+        [
+            {
+                "asset": "btc",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+                "label_set": "truth",
+                "settlement_source": "settlement_truth",
+                "label_source": "settlement_truth",
+                "resolved": True,
+                "price_to_beat": 100.0,
+                "final_price": 101.0,
+                "winner_side": "UP",
+                "direction_up": 1.0,
+                "full_truth": True,
+            },
+            {
+                "asset": "btc",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "market_id": "m-2",
+                "condition_id": "c-2",
+                "label_set": "truth",
+                "settlement_source": "settlement_truth",
+                "label_source": "settlement_truth",
+                "resolved": True,
+                "price_to_beat": 120.0,
+                "final_price": 99.0,
+                "winner_side": "DOWN",
+                "direction_up": 0.0,
+                "full_truth": True,
+            },
+        ]
+    )
+
+    merged, summary = merge_feature_and_label_frames(features, labels)
+
+    assert len(merged) == 2
+    assert summary["aligned_rows"] == 2
+    assert set(merged["market_id"].tolist()) == {"m-1", "m-2"}
+    assert set(round(float(value), 6) for value in merged["ret_from_strike"].tolist()) == {0.1, -0.083333}
+
+
 def test_load_label_frame_uses_truth_for_settlement_truth_alias(tmp_path) -> None:
     root = tmp_path / "v2"
     cfg = ResearchConfig.build(

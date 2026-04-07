@@ -346,6 +346,39 @@ def test_backtest_summary_surfaces_truth_source_diagnostics() -> None:
     assert "chainlink_datafeeds" in report
 
 
+def test_render_backtest_report_falls_back_without_tabulate(monkeypatch) -> None:
+    summary = build_backtest_summary(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        spec_name="baseline_truth",
+        target="direction",
+        bundle_dir="/tmp/bundle",
+        feature_set="deep_otm_v1",
+        label_set="truth",
+        available_offsets=[7],
+        trades=pd.DataFrame(),
+        rejects=pd.DataFrame([{"decision_source": "primary", "reason": "policy_low_confidence"}]),
+    )
+    reject_summary = build_reject_summary_frame(pd.DataFrame([{"decision_source": "primary", "reason": "policy_low_confidence"}]))
+
+    def _raise_import_error(self, *args, **kwargs):
+        raise ImportError("Missing optional dependency 'tabulate'")
+
+    monkeypatch.setattr(pd.DataFrame, "to_markdown", _raise_import_error)
+
+    report = render_backtest_report(
+        summary,
+        reject_summary=reject_summary,
+        policy_breakdown=pd.DataFrame([{"decision_source": "primary", "policy_action": "skip", "policy_reason": "policy_low_confidence", "count": 1}]),
+        market_summary=pd.DataFrame([{"market_id": "m-1", "trades": 0, "wins": 0, "pnl_sum": 0.0}]),
+    )
+
+    assert "# Backtest Summary" in report
+    assert "| decision_source | reason | count |" in report
+    assert "| market_id | trades | wins | pnl_sum |" in report
+
+
 def test_backtest_summary_normalizes_legacy_truth_runtime_keys() -> None:
     summary = build_backtest_summary(
         market="sol",

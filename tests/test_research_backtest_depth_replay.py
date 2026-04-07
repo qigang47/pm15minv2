@@ -376,8 +376,10 @@ def test_build_raw_depth_replay_frame_matches_legacy_raw_decision_ts_backshift(t
     assert row["depth_snapshot_status"] == "ok"
     assert row["depth_match_strategy"] == "decision_key"
     assert row["depth_candidate_total_count"] == 1
-    assert row["depth_up_record"]["decision_ts"] == "2026-03-01T00:07:00Z"
-    assert row["depth_down_record"]["decision_ts"] == "2026-03-01T00:07:00Z"
+    assert row["depth_up_record"] == {"asks": [[0.41, 10.0]]}
+    assert row["depth_down_record"] == {"asks": [[0.59, 9.0]]}
+    assert row["depth_up_snapshot_ts_ms"] == int(pd.Timestamp("2026-03-01T00:07:00.310000+00:00").timestamp() * 1000)
+    assert row["depth_down_snapshot_ts_ms"] == int(pd.Timestamp("2026-03-01T00:07:00.320000+00:00").timestamp() * 1000)
     assert summary.raw_record_matches == 2
     assert summary.snapshot_rows == 1
     assert summary.replay_rows_with_snapshots == 1
@@ -550,6 +552,127 @@ def test_build_raw_depth_replay_frame_backfills_blank_market_id_from_cycle_catal
     assert row["depth_snapshot_status"] == "ok"
     assert row["depth_match_strategy"] == "token_window"
     assert summary.replay_rows_with_snapshots == 1
+
+
+def test_build_raw_depth_replay_frame_does_not_copy_unrelated_replay_columns_into_each_snapshot(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    append_ndjson_zst(
+        data_cfg.layout.orderbook_depth_path("2026-03-01"),
+        [
+            {
+                "logged_at": "2026-03-01T00:05:20.000000+00:00",
+                "market_id": "m-1",
+                "token_id": "tok-up",
+                "side": "up",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "asks": [[0.30, 10.0]],
+                "bids": [[0.29, 5.0]],
+            },
+            {
+                "logged_at": "2026-03-01T00:05:20.000000+00:00",
+                "market_id": "m-1",
+                "token_id": "tok-down",
+                "side": "down",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "asks": [[0.70, 8.0]],
+                "bids": [[0.69, 3.0]],
+            },
+        ],
+    )
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-1",
+                "token_up": "tok-up",
+                "token_down": "tok-down",
+                "ret_1m": 0.123,
+                "ret_5m": 0.456,
+                "p_up": 0.78,
+                "p_down": 0.22,
+                "quote_up_ask": 0.30,
+                "quote_down_ask": 0.70,
+                "some_large_feature_blob": "x" * 500,
+            }
+        ]
+    )
+
+    out, summary = build_raw_depth_replay_frame(
+        replay=replay,
+        data_cfg=data_cfg,
+        snapshot_tolerance_ms=60_000,
+    )
+
+    assert len(out) == 1
+    assert summary.replay_rows_with_snapshots == 1
+    assert "ret_1m" not in out.columns
+    assert "ret_5m" not in out.columns
+    assert "p_up" not in out.columns
+    assert "p_down" not in out.columns
+    assert "quote_up_ask" not in out.columns
+    assert "quote_down_ask" not in out.columns
+    assert "some_large_feature_blob" not in out.columns
+    assert out["offset"].tolist() == [7]
+
+
+def test_build_raw_depth_replay_frame_compacts_snapshot_records_to_asks_only(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    append_ndjson_zst(
+        data_cfg.layout.orderbook_depth_path("2026-03-01"),
+        [
+            {
+                "logged_at": "2026-03-01T00:05:20.000000+00:00",
+                "orderbook_ts": "2026-03-01T00:05:20.050000+00:00",
+                "market_id": "m-1",
+                "token_id": "tok-up",
+                "side": "up",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "asks": [[0.30, 10.0]],
+                "bids": [[0.29, 5.0]],
+            },
+            {
+                "logged_at": "2026-03-01T00:05:20.000000+00:00",
+                "orderbook_ts": "2026-03-01T00:05:20.060000+00:00",
+                "market_id": "m-1",
+                "token_id": "tok-down",
+                "side": "down",
+                "offset": 7,
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "asks": [[0.70, 8.0]],
+                "bids": [[0.69, 3.0]],
+            },
+        ],
+    )
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-1",
+                "token_up": "tok-up",
+                "token_down": "tok-down",
+            }
+        ]
+    )
+
+    out, _summary = build_raw_depth_replay_frame(
+        replay=replay,
+        data_cfg=data_cfg,
+        snapshot_tolerance_ms=60_000,
+    )
+
+    assert out.iloc[0]["depth_up_record"] == {"asks": [[0.30, 10.0]]}
+    assert out.iloc[0]["depth_down_record"] == {"asks": [[0.70, 8.0]]}
 
 
 def test_build_raw_depth_replay_frame_prefers_market_id_catalog_match_before_cycle_fallback(tmp_path: Path) -> None:

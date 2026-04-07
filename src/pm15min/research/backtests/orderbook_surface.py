@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from pm15min.core.orderbook_index import load_orderbook_index_frame, resolve_orderbook_row
@@ -74,7 +75,7 @@ def attach_canonical_quote_surface(
 
     market_table = _prepare_market_table(load_market_catalog_with_fallback(data_cfg))
     frame = _attach_market_metadata(replay.copy(), market_table)
-    orderbook_cache: dict[str, tuple[str, pd.DataFrame, dict[tuple[str, str, str], pd.DataFrame], dict[tuple[str, str], pd.DataFrame]]] = {}
+    orderbook_cache: dict[str, tuple[str, pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]] = {}
     total_rows = len(frame)
     if heartbeat is not None:
         heartbeat(f"Attaching quote surface: 0/{total_rows:,} rows")
@@ -126,27 +127,40 @@ def _attach_market_metadata(replay: pd.DataFrame, market_table: pd.DataFrame) ->
                 replay[column] = pd.Series(index=replay.index, dtype="object")
         return replay
 
+    out = replay.copy()
     metadata_columns = [column for column in ("market_id", "condition_id", "token_up", "token_down", "question") if column in market_table.columns]
-    join_columns = [column for column in ("cycle_start_ts", "cycle_end_ts") if column in replay.columns and column in market_table.columns]
-    if len(join_columns) == 2:
-        selected_columns = [*join_columns, *[column for column in metadata_columns if column not in join_columns]]
-        merged = replay.merge(
-            market_table[selected_columns].drop_duplicates(subset=join_columns, keep="last"),
-            on=join_columns,
-            how="left",
-            suffixes=("", "_catalog"),
-        )
-        return _coalesce_catalog_columns(merged)
-
-    if "market_id" in replay.columns and "market_id" in metadata_columns:
-        merged = replay.merge(
+    if "market_id" in out.columns and "market_id" in metadata_columns:
+        merged = out.merge(
             market_table[metadata_columns].drop_duplicates(subset=["market_id"], keep="last"),
             on="market_id",
             how="left",
             suffixes=("", "_catalog"),
         )
-        return _coalesce_catalog_columns(merged)
-    return replay
+        out = _coalesce_catalog_columns(merged)
+
+    join_columns = [column for column in ("cycle_start_ts", "cycle_end_ts") if column in out.columns and column in market_table.columns]
+    if len(join_columns) != 2:
+        return out
+    fallback_mask = pd.Series(True, index=out.index)
+    if "market_id" in out.columns:
+        fallback_mask = out["market_id"].astype("string").fillna("").eq("")
+    if not bool(fallback_mask.any()):
+        return out
+    selected_columns = [*join_columns, *[column for column in metadata_columns if column not in join_columns]]
+    fallback_rows = out.loc[fallback_mask].copy()
+    fallback_rows["_row_idx"] = fallback_rows.index
+    merged = fallback_rows.merge(
+        market_table[selected_columns].drop_duplicates(subset=join_columns, keep="last"),
+        on=join_columns,
+        how="left",
+        suffixes=("", "_catalog"),
+    )
+    merged = _coalesce_catalog_columns(merged).set_index("_row_idx")
+    for column in merged.columns:
+        if column not in out.columns:
+            out[column] = pd.Series(index=out.index, dtype="object")
+        out.loc[merged.index, column] = merged[column]
+    return out
 
 
 def _coalesce_catalog_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -167,7 +181,7 @@ def _build_quote_surface_row(
     row: pd.Series,
     *,
     data_cfg: DataConfig,
-    orderbook_cache: dict[str, tuple[str, pd.DataFrame, dict[tuple[str, str, str], pd.DataFrame], dict[tuple[str, str], pd.DataFrame]]],
+    orderbook_cache: dict[str, tuple[str, pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]],
 ) -> dict[str, object]:
     decision_ts = pd.to_datetime(row.get("decision_ts"), utc=True, errors="coerce")
     market_id = str(row.get("market_id") or "").strip()
@@ -245,44 +259,50 @@ def _load_orderbook_cache_entry(
     *,
     data_cfg: DataConfig,
     date_str: str,
-    orderbook_cache: dict[str, tuple[str, pd.DataFrame, dict[tuple[str, str, str], pd.DataFrame], dict[tuple[str, str], pd.DataFrame]]],
-) -> tuple[str, pd.DataFrame, dict[tuple[str, str, str], pd.DataFrame], dict[tuple[str, str], pd.DataFrame]]:
+    orderbook_cache: dict[str, tuple[str, pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]],
+) -> tuple[str, pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]:
     cached = orderbook_cache.get(date_str)
     if cached is not None:
         return cached
     index_path = ensure_orderbook_index_path(data_cfg, date_str)
     index_frame = load_orderbook_index_frame(index_path=index_path)
-    token_lookup, market_side_lookup = _prepare_orderbook_lookup(index_frame)
-    payload = (str(index_path), index_frame, token_lookup, market_side_lookup)
+    prepared_frame, token_lookup, market_side_lookup = _prepare_orderbook_lookup(index_frame)
+    payload = (str(index_path), prepared_frame, token_lookup, market_side_lookup)
     orderbook_cache[date_str] = payload
     return payload
 
 
 def _prepare_orderbook_lookup(
     frame: pd.DataFrame,
-) -> tuple[dict[tuple[str, str, str], pd.DataFrame], dict[tuple[str, str], pd.DataFrame]]:
+) -> tuple[pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]:
     if frame.empty:
-        return {}, {}
+        return frame, {}, {}
     df = frame.copy()
     df["captured_ts_ms"] = pd.to_numeric(df["captured_ts_ms"], errors="coerce")
     df = df.dropna(subset=["captured_ts_ms"]).copy()
     if df.empty:
-        return {}, {}
+        return df, {}, {}
     df["captured_ts_ms"] = df["captured_ts_ms"].astype("int64")
     df["market_id"] = df["market_id"].astype(str)
     df["token_id"] = df["token_id"].astype(str)
     df["side"] = df["side"].astype(str).str.lower()
     df = df.sort_values("captured_ts_ms").reset_index(drop=True)
 
-    token_lookup = {
-        key: group.reset_index(drop=True)
-        for key, group in df.groupby(["market_id", "token_id", "side"], dropna=False, sort=False)
-    }
-    market_side_lookup = {
-        key: group.reset_index(drop=True)
-        for key, group in df.groupby(["market_id", "side"], dropna=False, sort=False)
-    }
-    return token_lookup, market_side_lookup
+    token_lookup = _group_row_positions(df, columns=("market_id", "token_id", "side"))
+    market_side_lookup = _group_row_positions(df, columns=("market_id", "side"))
+    return df, token_lookup, market_side_lookup
+
+
+def _group_row_positions(
+    frame: pd.DataFrame,
+    *,
+    columns: tuple[str, ...],
+) -> dict[tuple[str, ...], tuple[int, ...]]:
+    grouped: dict[tuple[str, ...], list[int]] = {}
+    values = frame.loc[:, list(columns)].itertuples(index=False, name=None)
+    for row_idx, key in enumerate(values):
+        grouped.setdefault(tuple(str(value) for value in key), []).append(row_idx)
+    return {key: tuple(indices) for key, indices in grouped.items()}
 
 
 def _resolve_side_row(
@@ -292,15 +312,15 @@ def _resolve_side_row(
     token_id: str,
     side: str,
     decision_ts_ms: int,
-    token_lookup: dict[tuple[str, str, str], pd.DataFrame] | None = None,
-    market_side_lookup: dict[tuple[str, str], pd.DataFrame] | None = None,
+    token_lookup: dict[tuple[str, str, str], tuple[int, ...]] | None = None,
+    market_side_lookup: dict[tuple[str, str], tuple[int, ...]] | None = None,
 ) -> dict[str, object] | None:
     normalized_side = str(side).lower()
     if token_id:
-        lookup_frame = None if token_lookup is None else token_lookup.get((str(market_id), str(token_id), normalized_side))
+        row_positions = None if token_lookup is None else token_lookup.get((str(market_id), str(token_id), normalized_side))
         row = (
-            _resolve_cached_orderbook_row(lookup_frame, decision_ts_ms=decision_ts_ms)
-            if lookup_frame is not None
+            _resolve_cached_orderbook_row(frame, row_positions=row_positions, decision_ts_ms=decision_ts_ms)
+            if row_positions is not None
             else resolve_orderbook_row(
                 frame,
                 market_id=market_id,
@@ -312,9 +332,9 @@ def _resolve_side_row(
         if row is not None:
             return row
 
-    fallback_frame = None if market_side_lookup is None else market_side_lookup.get((str(market_id), normalized_side))
-    if fallback_frame is not None:
-        return _resolve_cached_orderbook_row(fallback_frame, decision_ts_ms=decision_ts_ms)
+    fallback_positions = None if market_side_lookup is None else market_side_lookup.get((str(market_id), normalized_side))
+    if fallback_positions is not None:
+        return _resolve_cached_orderbook_row(frame, row_positions=fallback_positions, decision_ts_ms=decision_ts_ms)
 
     df = frame.copy()
     df = df[
@@ -327,9 +347,26 @@ def _resolve_side_row(
 def _resolve_cached_orderbook_row(
     frame: pd.DataFrame | None,
     *,
+    row_positions: tuple[int, ...] | None = None,
     decision_ts_ms: int,
 ) -> dict[str, object] | None:
     if frame is None or frame.empty:
+        return None
+    if row_positions is not None:
+        if not row_positions:
+            return None
+        captured_values = frame["captured_ts_ms"].to_numpy(copy=False)
+        group_values = captured_values[list(row_positions)]
+        valid_mask = ~pd.isna(group_values)
+        if not bool(valid_mask.any()):
+            return None
+        valid_positions = np.asarray(row_positions, dtype=int)[valid_mask]
+        valid_values = group_values[valid_mask].astype("int64", copy=False)
+        insert_at = int(np.searchsorted(valid_values, int(decision_ts_ms), side="right") - 1)
+        if insert_at >= 0:
+            return frame.iloc[int(valid_positions[insert_at])].to_dict()
+        if len(valid_positions) > 0:
+            return frame.iloc[int(valid_positions[0])].to_dict()
         return None
     df = frame
     if "captured_ts_ms" not in df.columns:

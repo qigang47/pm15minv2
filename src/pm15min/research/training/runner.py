@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pandas as pd
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import TrainingRunSpec, TrainingSetSpec
+from pm15min.research._contracts_training import offset_weight_overrides_payload
 from pm15min.research.datasets.training_sets import build_training_set_dataset
 from pm15min.research.freshness import prepare_research_artifacts
 from pm15min.research.manifests import build_manifest, write_manifest
@@ -60,7 +62,24 @@ def train_research_run(
 
     summaries: list[dict[str, object]] = []
     offset_metrics: dict[int, dict[str, object]] = {}
-    trainer_cfg = TrainerConfig(parallel_workers=max(1, int(spec.parallel_workers or 1)))
+    base_trainer_cfg = TrainerConfig(
+        parallel_workers=max(1, int(spec.parallel_workers or 1)),
+        balance_classes=TrainerConfig.balance_classes if spec.balance_classes is None else bool(spec.balance_classes),
+        weight_by_vol=TrainerConfig.weight_by_vol if spec.weight_by_vol is None else bool(spec.weight_by_vol),
+        inverse_vol=TrainerConfig.inverse_vol if spec.inverse_vol is None else bool(spec.inverse_vol),
+        contrarian_weight=(
+            TrainerConfig.contrarian_weight if spec.contrarian_weight is None else float(spec.contrarian_weight)
+        ),
+        contrarian_quantile=(
+            TrainerConfig.contrarian_quantile if spec.contrarian_quantile is None else float(spec.contrarian_quantile)
+        ),
+        contrarian_return_col=(
+            TrainerConfig.contrarian_return_col
+            if spec.contrarian_return_col in {None, ""}
+            else str(spec.contrarian_return_col)
+        ),
+        feature_set_root=cfg.layout.storage.rewrite_root,
+    )
     input_paths: list[dict[str, str]] = []
     total_offsets = len(spec.offsets)
     parallel_workers = max(1, int(spec.parallel_workers or 1))
@@ -87,7 +106,7 @@ def train_research_run(
                 spec=spec,
                 offset=offset,
                 run_dir=run_dir,
-                trainer_cfg=trainer_cfg,
+                trainer_cfg=base_trainer_cfg,
                 reporter=_offset_reporter(
                     reporter,
                     offset=offset,
@@ -142,7 +161,7 @@ def train_research_run(
                     spec=spec,
                     offset=offset,
                     run_dir=run_dir,
-                    trainer_cfg=trainer_cfg,
+                    trainer_cfg=base_trainer_cfg,
                     reporter=_offset_reporter(
                         reporter,
                         offset=offset,
@@ -199,6 +218,14 @@ def train_research_run(
         "window": spec.window.label,
         "run_label": spec.run_label,
         "offsets": list(spec.offsets),
+        "weight_variant_label": spec.weight_variant_label,
+        "balance_classes": base_trainer_cfg.balance_classes,
+        "weight_by_vol": base_trainer_cfg.weight_by_vol,
+        "inverse_vol": base_trainer_cfg.inverse_vol,
+        "contrarian_weight": base_trainer_cfg.contrarian_weight,
+        "contrarian_quantile": base_trainer_cfg.contrarian_quantile,
+        "contrarian_return_col": base_trainer_cfg.contrarian_return_col,
+        "offset_weight_overrides": offset_weight_overrides_payload(spec.offset_weight_overrides),
         "offset_summaries": summary_df.to_dict(orient="records"),
     }
     (run_dir / "summary.json").write_text(
@@ -240,6 +267,14 @@ def train_research_run(
         "run_label": spec.run_label,
         "offsets": list(spec.offsets),
         "parallel_workers": spec.parallel_workers,
+        "weight_variant_label": spec.weight_variant_label,
+        "balance_classes": base_trainer_cfg.balance_classes,
+        "weight_by_vol": base_trainer_cfg.weight_by_vol,
+        "inverse_vol": base_trainer_cfg.inverse_vol,
+        "contrarian_weight": base_trainer_cfg.contrarian_weight,
+        "contrarian_quantile": base_trainer_cfg.contrarian_quantile,
+        "contrarian_return_col": base_trainer_cfg.contrarian_return_col,
+        "offset_weight_overrides": offset_weight_overrides_payload(spec.offset_weight_overrides),
         "run_dir": str(run_dir),
         "summary_path": str(run_dir / "summary.json"),
         "report_path": str(report_path),
@@ -255,6 +290,7 @@ def _train_single_offset(
     trainer_cfg: TrainerConfig,
     market: str,
     feature_set: str,
+    weight_variant_label: str,
     reporter: TrainingProgressReporter | None = None,
 ) -> dict[str, object]:
     X, y, pruning_plan = prepare_training_matrix(
@@ -410,6 +446,13 @@ def _train_single_offset(
         "max_weight": float(sample_weight.max()) if len(sample_weight) else None,
         "mean_weight": float(sample_weight.mean()) if len(sample_weight) else None,
         "sum_weight": float(sample_weight.sum()) if len(sample_weight) else None,
+        "weight_variant_label": str(weight_variant_label),
+        "balance_classes": bool(trainer_cfg.balance_classes),
+        "weight_by_vol": bool(trainer_cfg.weight_by_vol),
+        "inverse_vol": bool(trainer_cfg.inverse_vol),
+        "contrarian_weight": float(trainer_cfg.contrarian_weight),
+        "contrarian_quantile": float(trainer_cfg.contrarian_quantile),
+        "contrarian_return_col": str(trainer_cfg.contrarian_return_col),
     }
     split_summary = {
         "folds_requested": int(min(int(trainer_cfg.n_splits), max(2, len(X) // 4))),
@@ -431,6 +474,7 @@ def _train_single_offset(
         "feature_count": int(X.shape[1]),
         "feature_set": str(feature_set),
         "market": str(market),
+        "weight_variant_label": str(weight_variant_label),
         "metrics": metrics,
         "pruning": pruning_plan.to_dict(),
         "weight_summary": weight_summary,
@@ -497,6 +541,7 @@ def _execute_training_offset(
     trainer_cfg: TrainerConfig,
     reporter: TrainingProgressReporter | None,
 ) -> tuple[Path, dict[str, object]]:
+    trainer_cfg = _trainer_cfg_for_offset(base_cfg=trainer_cfg, spec=spec, offset=offset)
     training_set_spec = TrainingSetSpec(
         feature_set=spec.feature_set,
         label_set=spec.label_set,
@@ -520,6 +565,7 @@ def _execute_training_offset(
         trainer_cfg=trainer_cfg,
         market=cfg.asset.slug,
         feature_set=spec.feature_set,
+        weight_variant_label=spec.weight_variant_label,
         reporter=reporter,
     )
     return training_set_path, result
@@ -539,6 +585,36 @@ def _training_summary_row(*, offset: int, result: dict[str, object]) -> dict[str
         "auc_blend": result["metrics"]["blend"]["auc"],
         "explainability": result["explainability"],
     }
+
+
+def _trainer_cfg_for_offset(
+    *,
+    base_cfg: TrainerConfig,
+    spec: TrainingRunSpec,
+    offset: int,
+) -> TrainerConfig:
+    override = dict((spec.offset_weight_overrides or {}).get(int(offset), {}))
+    if not override:
+        return base_cfg
+    return replace(
+        base_cfg,
+        balance_classes=base_cfg.balance_classes if override.get("balance_classes") is None else bool(override["balance_classes"]),
+        weight_by_vol=base_cfg.weight_by_vol if override.get("weight_by_vol") is None else bool(override["weight_by_vol"]),
+        inverse_vol=base_cfg.inverse_vol if override.get("inverse_vol") is None else bool(override["inverse_vol"]),
+        contrarian_weight=(
+            base_cfg.contrarian_weight if override.get("contrarian_weight") is None else float(override["contrarian_weight"])
+        ),
+        contrarian_quantile=(
+            base_cfg.contrarian_quantile
+            if override.get("contrarian_quantile") is None
+            else float(override["contrarian_quantile"])
+        ),
+        contrarian_return_col=(
+            base_cfg.contrarian_return_col
+            if override.get("contrarian_return_col") in {None, ""}
+            else str(override["contrarian_return_col"])
+        ),
+    )
 
 
 def _progress_pct(current: int, total: int) -> int:

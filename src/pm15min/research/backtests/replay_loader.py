@@ -8,8 +8,10 @@ from pm15min.research.labels.alignment import merge_feature_and_label_frames
 
 
 REPLAY_KEY_COLUMNS = ["decision_ts", "cycle_start_ts", "cycle_end_ts", "offset"]
+REPLAY_ENTITY_COLUMNS = ["market_id", "condition_id"]
 REPLAY_SCORE_COLUMNS = [
     *REPLAY_KEY_COLUMNS,
+    *REPLAY_ENTITY_COLUMNS,
     "window_start_ts",
     "window_end_ts",
     "window_duration_seconds",
@@ -67,12 +69,15 @@ def build_score_frame(score_frames: list[pd.DataFrame]) -> pd.DataFrame:
         frame["window_duration_seconds"] = pd.to_numeric(frame["window_duration_seconds"], errors="coerce")
     else:
         frame["window_duration_seconds"] = pd.Series(pd.NA, index=frame.index, dtype="Float64")
+    for column in REPLAY_ENTITY_COLUMNS:
+        frame[column] = _string_series(frame, column)
     frame["score_valid"] = _bool_series(frame, "score_valid")
     frame["score_reason"] = _string_series(frame, "score_reason")
+    dedupe_columns = _score_key_columns(frame)
     return (
         frame.reindex(columns=REPLAY_SCORE_COLUMNS)
-        .drop_duplicates(subset=REPLAY_KEY_COLUMNS, keep="last")
-        .sort_values(REPLAY_KEY_COLUMNS)
+        .drop_duplicates(subset=dedupe_columns, keep="last")
+        .sort_values(dedupe_columns)
         .reset_index(drop=True)
     )
 
@@ -88,7 +93,7 @@ def build_replay_frame(
     scoped_feature_frame = _scope_frame_to_offsets(features, scoped_offsets)
     merged, alignment_metadata = merge_feature_and_label_frames(scoped_feature_frame, labels)
     score_frame = _scope_frame_to_offsets(build_score_frame(score_frames), scoped_offsets)
-    replay = merged.merge(score_frame, on=REPLAY_KEY_COLUMNS, how="left")
+    replay = merged.merge(score_frame, on=_replay_merge_columns(merged, score_frame), how="left")
     replay["bundle_offset_available"] = pd.to_numeric(replay["offset"], errors="coerce").isin(
         [int(offset) for offset in available_offsets]
     )
@@ -119,7 +124,8 @@ def build_replay_frame(
         bundle_offset_missing_rows=int((~replay["bundle_offset_available"]).sum()),
         ready_rows=int(ready_mask.sum()),
     )
-    return replay.sort_values(REPLAY_KEY_COLUMNS).reset_index(drop=True), summary
+    sort_columns = [column for column in [*REPLAY_KEY_COLUMNS, *REPLAY_ENTITY_COLUMNS] if column in replay.columns]
+    return replay.sort_values(sort_columns).reset_index(drop=True), summary
 
 
 def _append_replay_window_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -154,6 +160,22 @@ def _scope_frame_to_offsets(frame: pd.DataFrame, scoped_offsets: list[int] | Non
     allowed_offsets = {int(value) for value in scoped_offsets}
     offset_values = pd.to_numeric(frame["offset"], errors="coerce")
     return frame.loc[offset_values.isin(allowed_offsets)].copy()
+
+
+def _score_key_columns(frame: pd.DataFrame) -> list[str]:
+    columns = list(REPLAY_KEY_COLUMNS)
+    for column in REPLAY_ENTITY_COLUMNS:
+        if column in frame.columns and _string_series(frame, column).ne("").any():
+            columns.append(column)
+    return columns
+
+
+def _replay_merge_columns(replay: pd.DataFrame, score_frame: pd.DataFrame) -> list[str]:
+    columns = list(REPLAY_KEY_COLUMNS)
+    for column in REPLAY_ENTITY_COLUMNS:
+        if column in replay.columns and column in score_frame.columns and _string_series(score_frame, column).ne("").any():
+            columns.append(column)
+    return columns
 
 
 def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:

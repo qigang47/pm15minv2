@@ -326,24 +326,24 @@ def render_backtest_report(
         "",
     ]
     if reject_summary is not None and not reject_summary.empty:
-        lines.append(reject_summary.to_markdown(index=False))
+        lines.append(_render_markdown_table(reject_summary))
     else:
         reject_counts = summary.get("reject_reason_counts", {})
         if isinstance(reject_counts, dict) and reject_counts:
             frame = pd.DataFrame(
                 [{"reason": str(reason), "count": int(count)} for reason, count in reject_counts.items()]
             ).sort_values(["count", "reason"], ascending=[False, True])
-            lines.append(frame.to_markdown(index=False))
+            lines.append(_render_markdown_table(frame))
         else:
             lines.append("No rejects.")
     lines.extend(["", "## Policy Breakdown", ""])
     if policy_breakdown is not None and not policy_breakdown.empty:
-        lines.append(policy_breakdown.to_markdown(index=False))
+        lines.append(_render_markdown_table(policy_breakdown))
     else:
         lines.append("No policy breakdown available.")
     lines.extend(["", "## Markets", ""])
     if market_summary is not None and not market_summary.empty:
-        lines.append(market_summary.to_markdown(index=False))
+        lines.append(_render_markdown_table(market_summary))
     else:
         lines.append("No market summary available.")
     lines.append("")
@@ -712,3 +712,29 @@ def _numeric_series(frame: pd.DataFrame, column: str) -> pd.Series:
 def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
     values = frame[column] if column in frame.columns else pd.Series(False, index=frame.index, dtype="boolean")
     return values.astype("boolean").fillna(False).astype(bool)
+
+
+def _render_markdown_table(frame: pd.DataFrame) -> str:
+    rendered = frame.astype("object").where(frame.notna(), "")
+    try:
+        return rendered.to_markdown(index=False)
+    except ImportError:
+        return _render_markdown_table_fallback(rendered)
+
+
+def _render_markdown_table_fallback(frame: pd.DataFrame) -> str:
+    columns = [str(column) for column in frame.columns.tolist()]
+    if not columns:
+        return ""
+    header = "| " + " | ".join(_markdown_cell(column) for column in columns) + " |"
+    divider = "| " + " | ".join("---" for _ in columns) + " |"
+    rows = [
+        "| " + " | ".join(_markdown_cell(value) for value in row) + " |"
+        for row in frame.itertuples(index=False, name=None)
+    ]
+    return "\n".join([header, divider, *rows])
+
+
+def _markdown_cell(value: object) -> str:
+    text = "" if value is None else str(value)
+    return text.replace("\n", "<br>").replace("|", "\\|")

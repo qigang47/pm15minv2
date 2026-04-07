@@ -497,7 +497,7 @@ def render_experiment_report(
             for column in ("market", "group_name", "run_name", "variant_label", "failure_stage", "error_type", "error_message")
             if column in failed_cases.columns
         ]
-        lines.append(failed_cases.loc[:, fail_cols].fillna("").to_markdown(index=False))
+        lines.append(_render_markdown_table(failed_cases.loc[:, fail_cols].fillna(""), fail_cols))
     else:
         lines.append("No failed cases.")
     lines.append("")
@@ -747,7 +747,11 @@ def _matrix_source_frame(source: pd.DataFrame) -> pd.DataFrame:
 def _render_markdown_table(frame: pd.DataFrame, columns: list[str]) -> str:
     selected = [column for column in columns if column in frame.columns]
     table = frame.loc[:, selected].copy()
-    return table.astype("object").where(table.notna(), "").to_markdown(index=False)
+    rendered = table.astype("object").where(table.notna(), "")
+    try:
+        return rendered.to_markdown(index=False)
+    except ImportError:
+        return _render_markdown_table_fallback(rendered)
 
 
 def _reused_case_mask(frame: pd.DataFrame) -> pd.Series:
@@ -790,6 +794,24 @@ def _sorted_numeric_values(values: pd.Series) -> list[float]:
 def _bool_coalesce(frame: pd.DataFrame, column: str) -> pd.Series:
     values = frame.get(column, pd.Series(False, index=frame.index, dtype="boolean"))
     return values.astype("boolean").fillna(False).astype(bool)
+
+
+def _render_markdown_table_fallback(frame: pd.DataFrame) -> str:
+    columns = [str(column) for column in frame.columns.tolist()]
+    if not columns:
+        return ""
+    header = "| " + " | ".join(_markdown_cell(column) for column in columns) + " |"
+    divider = "| " + " | ".join("---" for _ in columns) + " |"
+    rows = [
+        "| " + " | ".join(_markdown_cell(value) for value in row) + " |"
+        for row in frame.itertuples(index=False, name=None)
+    ]
+    return "\n".join([header, divider, *rows])
+
+
+def _markdown_cell(value: object) -> str:
+    text = "" if value is None else str(value)
+    return text.replace("\n", "<br>").replace("|", "\\|")
 
 
 def _bool_or(frame: pd.DataFrame, *columns: str) -> pd.Series:
