@@ -206,6 +206,54 @@ def test_sync_settlement_truth_from_rpc_writes_source_table(tmp_path: Path, monk
     assert bool(df.iloc[0]["full_truth"]) is True
 
 
+def test_sync_settlement_truth_from_rpc_supports_5m(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("pm15min.data.pipelines.direct_sync.ChainlinkRpcSource", _FakeChainlinkSource)
+    cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "eth",
+                    "cycle": "5m",
+                    "cycle_start_ts": 1766031900,
+                    "cycle_end_ts": 1766032200,
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "slug": "eth-updown-5m-1766031900",
+                    "question": "Ethereum Up or Down",
+                    "resolution_source": "https://data.chain.link/streams/eth-usd",
+                }
+            ]
+        ),
+        cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "asset": "eth",
+                    "tx_hash": "0xabc",
+                    "observation_ts": 1766032200,
+                    "extra_ts": 1766032200,
+                    "benchmark_price_raw": 1.1e21,
+                    "price": 1100.0,
+                    "perform_idx": 0,
+                    "value_idx": 0,
+                    "source_file": "rpc",
+                    "ingested_at": "2026-03-28T10:00:00Z",
+                }
+            ]
+        ),
+        cfg.layout.streams_partition_path(2026, 3),
+    )
+
+    summary = sync_settlement_truth_from_rpc(cfg, rpc=_FakeRpc())
+
+    assert summary["rows_imported"] == 1
+
+
 def test_sync_settlement_truth_from_gamma_writes_source_table(tmp_path: Path) -> None:
     cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
 

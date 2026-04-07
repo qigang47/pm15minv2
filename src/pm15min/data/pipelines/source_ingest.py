@@ -286,9 +286,6 @@ def import_legacy_settlement_truth(
     *,
     source_path: Path | None = None,
 ) -> dict[str, object]:
-    if cfg.cycle != "15m":
-        raise ValueError("Settlement truth import is currently only implemented for cycle=15m.")
-
     source_path = source_path or discover_legacy_settlement_truth_csv()
     if source_path is None or not source_path.exists():
         raise FileNotFoundError("Could not locate legacy settlement-truth CSV.")

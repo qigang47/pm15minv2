@@ -153,9 +153,6 @@ def sync_binance_klines_1m(
     batch_limit: int = 1000,
 ) -> dict[str, object]:
     resolved_symbol = str(symbol or cfg.asset.binance_symbol).strip().upper()
-    if cfg.cycle != "15m":
-        raise ValueError("Binance 1m sync currently assumes feature inputs for cycle=15m runtime.")
-
     now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     client = client or BinanceSpotKlinesClient(timeout_sec=max(2.0, cfg.orderbook_timeout_sec * 4.0))
     target_path = cfg.layout.binance_klines_path(symbol=resolved_symbol)

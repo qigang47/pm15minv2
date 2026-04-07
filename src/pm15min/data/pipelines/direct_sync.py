@@ -192,8 +192,6 @@ def sync_settlement_truth_from_rpc(
     chunk_blocks: int = 3000,
     sleep_sec: float = 0.01,
 ) -> dict[str, object]:
-    if cfg.cycle != "15m":
-        raise ValueError("settlement-truth-rpc currently requires cycle=15m.")
     markets = load_market_catalog(cfg)
     if markets.empty:
         raise FileNotFoundError(

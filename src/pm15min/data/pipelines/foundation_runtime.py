@@ -612,8 +612,6 @@ def run_live_data_foundation(
 ) -> dict[str, object]:
     if cfg.surface != "live":
         raise ValueError("live foundation runtime currently requires surface=live.")
-    if cfg.cycle != "15m":
-        raise ValueError("live foundation runtime currently requires cycle=15m.")
 
     requested_iterations = int(iterations)
     run_forever = loop and requested_iterations <= 0
@@ -893,8 +891,6 @@ def run_live_data_foundation_shared(
     for cfg in cfgs:
         if cfg.surface != "live":
             raise ValueError("shared live foundation currently requires surface=live.")
-        if cfg.cycle != "15m":
-            raise ValueError("shared live foundation currently requires cycle=15m.")
 
     requested_iterations = int(iterations)
     run_forever = loop and requested_iterations <= 0

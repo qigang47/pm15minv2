@@ -247,6 +247,19 @@ def test_run_live_data_foundation_allows_oracle_fail_open_with_existing_table(tm
     ]
 
 
+def test_run_live_data_foundation_accepts_5m(tmp_path: Path, monkeypatch) -> None:
+    cfg = DataConfig.build(market="sol", cycle="5m", surface="live", root=tmp_path / "v2")
+    monkeypatch.setattr(
+        "pm15min.data.pipelines.foundation_runtime._build_foundation_task_specs",
+        lambda *args, **kwargs: [],
+    )
+
+    summary = run_live_data_foundation(cfg, iterations=1, loop=False)
+
+    assert summary["status"] == "ok"
+    assert summary["cycle"] == "5m"
+
+
 def test_run_live_data_foundation_persists_error_metadata_before_raise(tmp_path: Path, monkeypatch) -> None:
     cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
 
