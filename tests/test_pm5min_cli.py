@@ -39,3 +39,21 @@ def test_rewrite_pm5min_argv_injects_5m_defaults() -> None:
         "--cycle-minutes",
         "5",
     ]
+
+
+def test_rewrite_pm5min_argv_does_not_inject_cycle_for_console_or_data() -> None:
+    assert rewrite_pm5min_argv(["console", "show-home"]) == [
+        "console",
+        "show-home",
+    ]
+    assert rewrite_pm5min_argv(
+        ["data", "sync", "streams-rpc", "--market", "sol", "--surface", "live"]
+    ) == [
+        "data",
+        "sync",
+        "streams-rpc",
+        "--market",
+        "sol",
+        "--surface",
+        "live",
+    ]

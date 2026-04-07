@@ -11,7 +11,7 @@ def rewrite_pm5min_argv(argv: list[str]) -> list[str]:
     if not out:
         return out
     domain = out[0]
-    if domain in {"layout", "data", "research", "console"} and "--cycle" not in out:
+    if domain in {"layout", "research"} and "--cycle" not in out:
         out.extend(["--cycle", DEFAULT_CYCLE])
     if domain == "live":
         if "--cycle-minutes" not in out:
