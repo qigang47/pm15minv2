@@ -527,6 +527,26 @@ def test_next_foundation_task_due_at_prefers_boundary_then_fallback(tmp_path: Pa
     assert pd.Timestamp(due_fallback, unit="s", tz="UTC") == pd.Timestamp("2026-03-20T00:15:00Z")
 
 
+def test_next_foundation_task_due_at_uses_5m_cycle_defaults_when_boundary_env_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = DataConfig.build(market="sol", cycle="5m", surface="live", root=tmp_path / "v2")
+    monkeypatch.delenv("PM15MIN_LIVE_FOUNDATION_BINANCE_BOUNDARY_OFFSETS", raising=False)
+    monkeypatch.setenv("PM15MIN_LIVE_FOUNDATION_BINANCE_BOUNDARY_DELAY_SEC", "0")
+    monkeypatch.setenv("PM15MIN_LIVE_FOUNDATION_BINANCE_FALLBACK_REFRESH_SEC", "300")
+
+    near_boundary = datetime(2026, 3, 20, 0, 1, 1, tzinfo=timezone.utc)
+    due_near = foundation_runtime_module._next_foundation_task_due_at(
+        cfg=cfg,
+        task_name="binance",
+        now=near_boundary,
+        interval_sec=60.0,
+    )
+
+    assert pd.Timestamp(due_near, unit="s", tz="UTC") == pd.Timestamp("2026-03-20T00:02:00Z")
+
+
 def test_next_foundation_task_due_at_retries_when_closed_bar_not_ready(tmp_path: Path, monkeypatch) -> None:
     cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
     monkeypatch.setenv("PM15MIN_LIVE_FOUNDATION_BINANCE_BOUNDARY_OFFSETS", "7,8,9")

@@ -7,6 +7,8 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from pm15min.core.cycle_contracts import resolve_cycle_contract
+
 from ..config import DataConfig
 from ..io.json_files import append_jsonl, write_json_atomic
 from .binance_klines import sync_binance_klines_1m
@@ -252,11 +254,12 @@ def _run_orderbook_step(
 
 
 def _binance_boundary_offsets(*, cycle_minutes: int) -> tuple[int, ...]:
+    default_offsets = resolve_cycle_contract(cycle_minutes).entry_offsets
     valid = tuple(
         offset
         for offset in _env_int_list(
             "PM15MIN_LIVE_FOUNDATION_BINANCE_BOUNDARY_OFFSETS",
-            default=(7, 8, 9),
+            default=default_offsets,
         )
         if 0 <= int(offset) < max(1, int(cycle_minutes))
     )

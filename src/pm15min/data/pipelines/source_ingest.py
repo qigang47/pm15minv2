@@ -86,10 +86,11 @@ def _latest_path(paths: list[Path]) -> Path | None:
     return max(paths, key=lambda path: path.stat().st_mtime_ns)
 
 
-def _infer_legacy_settlement_truth_cycle(source_path: Path, df: pd.DataFrame) -> str | None:
+def _detect_legacy_settlement_truth_cycles(source_path: Path, df: pd.DataFrame) -> set[str]:
+    detected: set[str] = set()
     match = LEGACY_SETTLEMENT_TRUTH_CYCLE_RE.search(source_path.name)
     if match:
-        return str(match.group(1)).strip().lower()
+        detected.add(str(match.group(1)).strip().lower())
 
     if "cycle" in df.columns:
         values = {
@@ -97,8 +98,7 @@ def _infer_legacy_settlement_truth_cycle(source_path: Path, df: pd.DataFrame) ->
             for value in df["cycle"].dropna().tolist()
             if str(value).strip()
         }
-        if len(values) == 1:
-            return next(iter(values))
+        detected.update(values)
 
     if "slug" in df.columns:
         values: set[str] = set()
@@ -109,10 +109,9 @@ def _infer_legacy_settlement_truth_cycle(source_path: Path, df: pd.DataFrame) ->
             for token in re.split(r"[^0-9a-z]+", text):
                 if re.fullmatch(r"\d+m", token):
                     values.add(token)
-        if len(values) == 1:
-            return next(iter(values))
+        detected.update(values)
 
-    return None
+    return detected
 
 
 def discover_legacy_streams_csv() -> Path | None:
@@ -326,7 +325,13 @@ def import_legacy_settlement_truth(
         raise FileNotFoundError("Could not locate legacy settlement-truth CSV.")
 
     df = pd.read_csv(source_path, low_memory=False)
-    source_cycle = _infer_legacy_settlement_truth_cycle(source_path, df)
+    detected_source_cycles = _detect_legacy_settlement_truth_cycles(source_path, df)
+    if len(detected_source_cycles) > 1:
+        raise ValueError(
+            f"Legacy settlement truth source {source_path} has conflicting cycle hints: "
+            f"{sorted(detected_source_cycles)}."
+        )
+    source_cycle = next(iter(detected_source_cycles)) if detected_source_cycles else None
     if source_cycle is not None and source_cycle != cfg.cycle:
         raise ValueError(
             f"Legacy settlement truth source {source_path} is not compatible with cycle={cfg.cycle}; "
