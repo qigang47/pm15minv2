@@ -57,3 +57,34 @@ def test_rewrite_pm5min_argv_does_not_inject_cycle_for_console_or_data() -> None
         "--surface",
         "live",
     ]
+
+
+def test_rewrite_pm5min_argv_respects_equals_form_values() -> None:
+    assert rewrite_pm5min_argv(["layout", "--market", "sol", "--cycle=15m"]) == [
+        "layout",
+        "--market",
+        "sol",
+        "--cycle=15m",
+    ]
+    assert rewrite_pm5min_argv(
+        ["live", "show-config", "--market", "sol", "--profile=custom_5m"]
+    ) == [
+        "live",
+        "show-config",
+        "--market",
+        "sol",
+        "--profile=custom_5m",
+        "--cycle-minutes",
+        "5",
+    ]
+
+
+def test_rewrite_pm5min_argv_skips_cycle_minutes_for_live_show_layout() -> None:
+    assert rewrite_pm5min_argv(["live", "show-layout", "--market", "sol"]) == [
+        "live",
+        "show-layout",
+        "--market",
+        "sol",
+        "--profile",
+        "deep_otm_5m",
+    ]
