@@ -117,6 +117,7 @@ def decide_live_latest(
     load_live_account_context_fn,
     build_decision_snapshot_fn=build_decision_snapshot,
     persist_decision_snapshot_fn=persist_decision_snapshot,
+    persist_live_signal_snapshot_fn=None,
 ) -> dict[str, object]:
     signal_started = time.perf_counter()
     signal, signal_cache_hit = _resolve_live_signal_payload(
@@ -128,6 +129,13 @@ def decide_live_latest(
         marker_source="decision",
         score_live_latest_fn=score_live_latest_fn,
     )
+    if persist:
+        _ensure_signal_payload_persisted(
+            cfg=cfg,
+            signal_payload=signal,
+            target=target,
+            persist_live_signal_snapshot_fn=persist_live_signal_snapshot_fn,
+        )
     signal_elapsed_ms = _elapsed_ms(signal_started)
     quote_started = time.perf_counter()
     quote = build_quote_snapshot_fn(
@@ -420,6 +428,11 @@ def _load_cached_signal_payload(
     if now_utc >= valid_until_ts:
         cache.pop(cache_key, None)
         return None
+    dependency_signatures = raw.get("dependency_signatures")
+    current_dependency_signatures = _signal_cache_dependency_signatures(payload=payload)
+    if not isinstance(dependency_signatures, dict) or dependency_signatures != current_dependency_signatures:
+        cache.pop(cache_key, None)
+        return None
     return payload
 
 
@@ -438,6 +451,7 @@ def _store_cached_signal_payload(
     cache[cache_key] = {
         "valid_until_ts": valid_until_ts.isoformat(),
         "payload": payload,
+        "dependency_signatures": _signal_cache_dependency_signatures(payload=payload),
     }
 
 
@@ -473,6 +487,79 @@ def _resolve_signal_cache_valid_until(
     if not transitions:
         return None
     return min(transitions)
+
+
+def _ensure_signal_payload_persisted(
+    *,
+    cfg,
+    signal_payload: dict[str, object],
+    target: str,
+    persist_live_signal_snapshot_fn,
+) -> None:
+    if not callable(persist_live_signal_snapshot_fn):
+        return
+    snapshot_ts = signal_payload.get("snapshot_ts")
+    if snapshot_ts in (None, ""):
+        return
+    latest_path = _existing_path(signal_payload.get("latest_signal_path"))
+    snapshot_path = _existing_path(signal_payload.get("snapshot_path"))
+    if latest_path is not None and snapshot_path is not None:
+        return
+    paths = persist_live_signal_snapshot_fn(
+        cfg,
+        target=str(signal_payload.get("target") or target or "direction"),
+        snapshot_ts=snapshot_ts,
+        payload=signal_payload,
+    )
+    if isinstance(paths, dict):
+        latest = paths.get("latest")
+        snapshot = paths.get("snapshot")
+        if latest is not None:
+            signal_payload["latest_signal_path"] = str(latest)
+        if snapshot is not None:
+            signal_payload["snapshot_path"] = str(snapshot)
+
+
+def _existing_path(raw: object) -> Path | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    path = Path(text)
+    return path if path.exists() else None
+
+
+def _signal_cache_dependency_signatures(
+    *,
+    payload: dict[str, object],
+) -> dict[str, tuple[int | None, int | None]]:
+    signatures: dict[str, tuple[int | None, int | None]] = {}
+    selection_path = _path_from_payload(payload.get("active_bundle_selection_path"))
+    if selection_path is not None:
+        signatures["active_bundle_selection_path"] = _path_signature(selection_path)
+    liquidity_path = _path_from_payload(payload.get("latest_liquidity_path"))
+    if liquidity_path is not None:
+        signatures["latest_liquidity_path"] = _path_signature(liquidity_path)
+    bundle_dir = _path_from_payload(payload.get("bundle_dir"))
+    if bundle_dir is not None:
+        signatures["bundle_manifest_path"] = _path_signature(bundle_dir / "manifest.json")
+    return signatures
+
+
+def _path_from_payload(raw: object) -> Path | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    return Path(text)
+
+
+def _path_signature(path: Path) -> tuple[int | None, int | None]:
+    try:
+        stat = path.stat()
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+    except FileNotFoundError:
+        return (None, None)
+    except Exception:
+        return (None, None)
 
 
 def _append_signal_refresh_marker(

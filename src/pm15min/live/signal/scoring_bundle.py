@@ -36,7 +36,10 @@ class LiveFeatureContext:
     timings_ms: dict[str, float]
 
 
-_BUNDLE_RESOLUTION_CACHE: dict[tuple[str, str, int, str, str | None], tuple[float, BundleResolution]] = {}
+_BUNDLE_RESOLUTION_CACHE: dict[
+    tuple[str, str, int, str, str | None],
+    tuple[float, BundleResolution, dict[str, tuple[int | None, int | None]]],
+] = {}
 _BUNDLE_RESOLUTION_CACHE_LOCK = threading.Lock()
 
 
@@ -207,8 +210,14 @@ def _load_cached_bundle_resolution(
         cached = _BUNDLE_RESOLUTION_CACHE.get(cache_key)
         if cached is None:
             return None
-        expires_at, resolution = cached
+        expires_at, resolution, dependency_signatures = cached
         if now_monotonic >= float(expires_at):
+            _BUNDLE_RESOLUTION_CACHE.pop(cache_key, None)
+            return None
+        if dependency_signatures != _bundle_resolution_dependency_signatures(
+            active_payload=resolution.active_payload,
+            bundle_dir=resolution.bundle_dir,
+        ):
             _BUNDLE_RESOLUTION_CACHE.pop(cache_key, None)
             return None
         return resolution
@@ -224,6 +233,10 @@ def _store_cached_bundle_resolution(
         _BUNDLE_RESOLUTION_CACHE[cache_key] = (
             time.monotonic() + max(0.0, float(cache_ttl_seconds)),
             resolution,
+            _bundle_resolution_dependency_signatures(
+                active_payload=resolution.active_payload,
+                bundle_dir=resolution.bundle_dir,
+            ),
         )
 
 
@@ -239,3 +252,33 @@ def _env_float(name: str, *, default: float) -> float:
 
 def _elapsed_ms(started_at: float) -> float:
     return round(max(0.0, (time.perf_counter() - float(started_at)) * 1000.0), 3)
+
+
+def _bundle_resolution_dependency_signatures(
+    *,
+    active_payload: dict[str, object],
+    bundle_dir: Path,
+) -> dict[str, tuple[int | None, int | None]]:
+    signatures: dict[str, tuple[int | None, int | None]] = {}
+    selection_path = _path_from_payload(active_payload.get("selection_path"))
+    if selection_path is not None:
+        signatures["selection_path"] = _path_signature(selection_path)
+    signatures["bundle_manifest_path"] = _path_signature(bundle_dir / "manifest.json")
+    return signatures
+
+
+def _path_from_payload(raw: object) -> Path | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    return Path(text)
+
+
+def _path_signature(path: Path) -> tuple[int | None, int | None]:
+    try:
+        stat = path.stat()
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+    except FileNotFoundError:
+        return (None, None)
+    except Exception:
+        return (None, None)

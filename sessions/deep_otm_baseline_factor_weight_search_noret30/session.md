@@ -166,6 +166,15 @@
   - Confirmed the latest SOL follow-up failed and used the next single-cycle slot on XRP's unresolved near-40 replacement-family search.
   - Ran the previously unused XRP 38band quick-screen against the existing 40_v4 control and summarized it with the standard experiment summary tool.
   - XRP 38_v4 only tied the old 40_v4 control on backed winners while still producing zero trades, so XRP remains blocked from formal promotion.
+
+- `033`
+  - Re-read program.md plus the freshly completed cycle 031 and 032 artifacts before finalizing this cycle, because those single-coin slots were claimed concurrently during the same window.
+  - Completed the new BTC ETH SOL 38band quick-screen reads and synthesized them with the already-recorded XRP 38band result instead of treating cycle 032's XRP label as a distinct new launch here.
+  - ETH 38_v3 is now the only fresh near-40 candidate that improves both trade rows and traded-winner coverage; BTC stays thin and SOL/XRP remain blocked at zero trades.
+
+- `034`
+  - Attempted ETH 38band as the next single formal 1 USD / max3 validation from the near-40 line because cycle 033 identified ETH 38_v3 as the only fresh promotable candidate.
+  - The launch built fresh training and model-bundle artifacts, but the formal runner was terminated before completion, leaving no surviving experiment run directory or formal summary.
 ## What's been tried
 
 - Round-1 reversal focus-width quick-screen selected BTC 30/34, ETH 30/34, SOL 34/30, XRP 34/30 as current best starting sets.
@@ -252,6 +261,9 @@
 - BTC 40bridge formal is now complete: swap_macd_z_for_strike_flip_count_cycle beats the BTC 40_v2 control on real evidence, but only on a single trade.
 
 - Completed the unused XRP 38band quick screen: 38_v4 tied the old 40_v4 control on 1 backed winner in band but still had 0 trades, while 38_v3 was weaker.
+- Completed the near-40 38band comparison across current controls plus 38_v3 and 38_v4 alternatives; ETH 38_v3 improved to 15 trade rows and 4 traded winners in band.
+- BTC 38_v4 raised raw trade rows to 3 but still had 0 traded winners, while SOL 38_v3 and XRP 38_v4 still remained at 0 trade rows.
+- Attempted ETH 38band 1 USD / max3 formal validation under auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407; training and bundle artifacts were built, but the formal runner was terminated before any formal backtest outputs or summary survived.
 ## Open issues
 - Need continuous Codex background loop to monitor active quick-screen runs, summarize completed runs, and launch the next one-factor follow-up automatically.
 
@@ -335,3 +347,7 @@
 - Because the new SOL near-40 bridges failed to improve tradeability, the next cycle should not open SOL formal validation; it should spend the single-cycle slot on XRP's unresolved near-40 replacement-family search unless the user explicitly asks for another SOL retry.
 
 - XRP still stays at zero trades across the current near-40 40family, 40bridge, and 38band lines, so it should not be promoted until a more substantive replacement idea exists.
+- ETH 38_v3 is now the clearest next formal 1 USD / max3 candidate and should still be tested against the ETH 40_v2 control once a clean formal run completes.
+- BTC still only has thin one-trade bridge evidence, so it should stay secondary until ETH 38_v3 gets real validation.
+- SOL and XRP remain blocked by zero-trade quick-screen outcomes and need a more substantive near-40 replacement idea before any promotion.
+- ETH 38band formal launch was terminated before any formal backtest outputs were persisted; the next cycle should relaunch or recover the same label from the surviving training and bundle artifacts instead of opening a different formal market.

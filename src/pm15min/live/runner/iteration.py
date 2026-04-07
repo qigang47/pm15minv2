@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import os
 import time
 from typing import Any
@@ -85,6 +86,7 @@ def build_runner_iteration(
         except Exception as exc:
             liquidity_state_payload = build_side_effect_error_payload_fn(stage="build_liquidity_state_snapshot", exc=exc)
         _store_liquidity_payload(session_state=session_state, payload=liquidity_state_payload)
+        _clear_live_signal_cache(session_state=session_state)
         phase_timings_ms["liquidity_cache_hit"] = False
     else:
         liquidity_state_payload = _load_cached_liquidity_payload(session_state=session_state)
@@ -97,6 +99,7 @@ def build_runner_iteration(
             except Exception as exc:
                 liquidity_state_payload = build_side_effect_error_payload_fn(stage="build_liquidity_state_snapshot", exc=exc)
             _store_liquidity_payload(session_state=session_state, payload=liquidity_state_payload)
+            _clear_live_signal_cache(session_state=session_state)
             phase_timings_ms["liquidity_cache_hit"] = False
         else:
             phase_timings_ms["liquidity_cache_hit"] = True
@@ -485,7 +488,12 @@ def _load_cached_liquidity_payload(session_state: dict[str, Any] | None) -> dict
     if not isinstance(session_state, dict):
         return None
     raw = session_state.get("liquidity_state_cache")
-    return dict(raw) if isinstance(raw, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    if _liquidity_payload_is_stale(raw):
+        session_state.pop("liquidity_state_cache", None)
+        return None
+    return dict(raw)
 
 
 def _store_liquidity_payload(
@@ -496,6 +504,12 @@ def _store_liquidity_payload(
     if not isinstance(session_state, dict) or not isinstance(payload, dict):
         return
     session_state["liquidity_state_cache"] = dict(payload)
+
+
+def _clear_live_signal_cache(*, session_state: dict[str, Any] | None) -> None:
+    if not isinstance(session_state, dict):
+        return
+    session_state.pop("live_signal_cache", None)
 
 
 def _side_effect_state_payload(session_state: dict[str, Any] | None) -> dict[str, object]:
@@ -958,3 +972,27 @@ def int_or_none(value) -> int | None:
         return int(value)
     except Exception:
         return None
+
+
+def _liquidity_payload_is_stale(payload: dict[str, Any]) -> bool:
+    refresh_seconds = _float_or_none(payload.get("refresh_seconds"))
+    if refresh_seconds is None or refresh_seconds <= 0.0:
+        return False
+    checked_at_epoch = _iso_to_epoch_seconds(payload.get("checked_at"))
+    if checked_at_epoch is None:
+        return False
+    return max(0.0, time.time() - checked_at_epoch) >= float(refresh_seconds)
+
+
+def _iso_to_epoch_seconds(value: object) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        parsed = datetime.fromisoformat(normalized)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return float(parsed.timestamp())

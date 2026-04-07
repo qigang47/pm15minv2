@@ -64,10 +64,16 @@ def signal_check_wiring(*, score_live_latest_fn: object, supports_feature_set_fn
     }
 
 
-def decision_wiring(*, score_live_latest_fn: object, load_live_account_context_fn: object) -> dict[str, object]:
+def decision_wiring(
+    *,
+    score_live_latest_fn: object,
+    load_live_account_context_fn: object,
+    persist_live_signal_snapshot_fn: object,
+) -> dict[str, object]:
     return {
         "score_live_latest_fn": score_live_latest_fn,
         "load_live_account_context_fn": load_live_account_context_fn,
+        "persist_live_signal_snapshot_fn": persist_live_signal_snapshot_fn,
     }
 
 

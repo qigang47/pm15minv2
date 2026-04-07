@@ -100,6 +100,7 @@ def build_decision_wiring(namespace: _Namespace) -> dict[str, object]:
             {
                 "score_live_latest_fn": "score_live_latest",
                 "load_live_account_context_fn": "_load_live_account_context",
+                "persist_live_signal_snapshot_fn": "_persist_live_signal_snapshot",
             },
         )
     )

@@ -296,6 +296,155 @@ def test_prewarm_finalize_bypasses_unexpired_signal_cache(tmp_path: Path, monkey
     assert marker["cache_hit"] is False
 
 
+def test_decide_live_latest_refreshes_when_cached_signal_liquidity_dependency_changes(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_WINDOW_SIGNAL_CACHE", "1")
+    session_state: dict[str, object] = {}
+    calls = {"score": 0}
+    liquidity_path = root / "var" / "live" / "state" / "liquidity" / "latest.json"
+    selection_path = root / "selection.json"
+    bundle_dir = root / "bundles" / "bundle=cached"
+    liquidity_path.parent.mkdir(parents=True, exist_ok=True)
+    liquidity_path.write_text("liquidity-v1", encoding="utf-8")
+    selection_path.write_text("bundle-a", encoding="utf-8")
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    def _score(*args, **kwargs):
+        calls["score"] += 1
+        return {
+            "market": "sol",
+            "profile": "deep_otm",
+            "cycle": "15m",
+            "target": "direction",
+            "snapshot_ts": "2026-03-27T14-00-00Z",
+            "latest_liquidity_path": str(liquidity_path),
+            "active_bundle_selection_path": str(selection_path),
+            "bundle_dir": str(bundle_dir),
+            "liquidity_state": {"status": "ok", "blocked": False},
+            "regime_state": {"status": "ok"},
+            "offset_signals": [
+                {
+                    "offset": 7,
+                    "decision_ts": "2026-03-27T14:07:00+00:00",
+                    "window_start_ts": "2099-03-27T14:07:00+00:00",
+                    "window_end_ts": "2099-03-27T14:08:00+00:00",
+                    "cycle_end_ts": "2099-03-27T14:15:00+00:00",
+                    "recommended_side": "UP",
+                    "confidence": 0.8,
+                    "edge": 0.3,
+                    "score_valid": True,
+                    "coverage": {"effective_missing_feature_count": 0, "not_allowed_blacklist_count": 0},
+                }
+            ],
+        }
+
+    prewarm_live_signal_cache_impl(
+        cfg,
+        persist=False,
+        session_state=session_state,
+        score_live_latest_fn=_score,
+    )
+    liquidity_path.write_text("liquidity-v2-updated", encoding="utf-8")
+
+    decide_live_latest_impl(
+        cfg,
+        persist=False,
+        session_state=session_state,
+        score_live_latest_fn=_score,
+        build_quote_snapshot_fn=lambda **kwargs: {"snapshot_ts": "2026-03-27T14-00-01Z", "quote_rows": []},
+        load_live_account_context_fn=lambda *_args, **_kwargs: {},
+        build_decision_snapshot_fn=lambda signal, quote, account_state, **kwargs: {
+            "snapshot_ts": "2026-03-27T14-00-02Z",
+            "decision": {"status": "reject", "selected_offset": None},
+            "signal_snapshot_ts": signal.get("snapshot_ts"),
+        },
+        persist_decision_snapshot_fn=lambda **kwargs: {},
+    )
+
+    assert calls["score"] == 2
+
+
+def test_decide_live_latest_persists_cached_signal_when_decision_requests_persistence(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_WINDOW_SIGNAL_CACHE", "1")
+    session_state: dict[str, object] = {}
+    calls = {"score": 0}
+    persisted: list[tuple[str, str]] = []
+    selection_path = root / "selection.json"
+    bundle_dir = root / "bundles" / "bundle=cached"
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text("bundle-a", encoding="utf-8")
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    def _score(*args, **kwargs):
+        calls["score"] += 1
+        return {
+            "market": "sol",
+            "profile": "deep_otm",
+            "cycle": "15m",
+            "target": "direction",
+            "snapshot_ts": "2026-03-27T14-00-00Z",
+            "active_bundle_selection_path": str(selection_path),
+            "bundle_dir": str(bundle_dir),
+            "offset_signals": [
+                {
+                    "offset": 7,
+                    "decision_ts": "2026-03-27T14:07:00+00:00",
+                    "window_start_ts": "2099-03-27T14:07:00+00:00",
+                    "window_end_ts": "2099-03-27T14:08:00+00:00",
+                    "cycle_end_ts": "2099-03-27T14:15:00+00:00",
+                    "recommended_side": "UP",
+                    "confidence": 0.8,
+                    "edge": 0.3,
+                    "score_valid": True,
+                    "coverage": {"effective_missing_feature_count": 0, "not_allowed_blacklist_count": 0},
+                }
+            ],
+        }
+
+    prewarm_live_signal_cache_impl(
+        cfg,
+        persist=False,
+        session_state=session_state,
+        score_live_latest_fn=_score,
+    )
+
+    payload = decide_live_latest_impl(
+        cfg,
+        persist=True,
+        session_state=session_state,
+        score_live_latest_fn=_score,
+        build_quote_snapshot_fn=lambda **kwargs: {"snapshot_ts": "2026-03-27T14-00-01Z", "quote_rows": []},
+        load_live_account_context_fn=lambda *_args, **_kwargs: {},
+        build_decision_snapshot_fn=lambda signal, quote, account_state, **kwargs: {
+            "snapshot_ts": "2026-03-27T14-00-02Z",
+            "decision": {"status": "reject", "selected_offset": None},
+            "signal_snapshot_path": signal.get("snapshot_path"),
+            "latest_signal_path": signal.get("latest_signal_path"),
+        },
+        persist_decision_snapshot_fn=lambda **kwargs: {
+            "latest": root / "var" / "live" / "state" / "decision" / "latest.json",
+            "snapshot": root / "var" / "live" / "state" / "decision" / "snapshots" / "decision.json",
+        },
+        persist_live_signal_snapshot_fn=lambda cfg, target, snapshot_ts, payload: (
+            persisted.append((str(target), str(snapshot_ts)))
+            or {
+                "latest": root / "var" / "live" / "state" / "signal" / "latest.json",
+                "snapshot": root / "var" / "live" / "state" / "signal" / "snapshots" / "signal.json",
+            }
+        ),
+    )
+
+    assert calls["score"] == 1
+    assert persisted == [("direction", "2026-03-27T14-00-00Z")]
+    assert payload["signal_snapshot_path"] == str(root / "var" / "live" / "state" / "signal" / "snapshots" / "signal.json")
+    assert payload["latest_signal_path"] == str(root / "var" / "live" / "state" / "signal" / "latest.json")
+
+
 def test_prewarm_live_signal_inputs_writes_prepare_marker(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
@@ -1858,6 +2007,71 @@ def test_decide_live_latest_reuses_cached_signal_until_next_transition(tmp_path:
     assert calls["score"] == 1
 
 
+def test_decide_live_latest_refreshes_when_cached_signal_bundle_selection_changes(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_WINDOW_SIGNAL_CACHE", "1")
+    session_state: dict[str, object] = {}
+    calls = {"score": 0}
+    selection_path = root / "selection.json"
+    bundle_dir = root / "bundles" / "bundle=cached"
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text("bundle-a", encoding="utf-8")
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    def _score(*args, **kwargs):
+        calls["score"] += 1
+        return {
+            "market": "sol",
+            "profile": "deep_otm",
+            "cycle": "15m",
+            "target": "direction",
+            "snapshot_ts": "2026-03-27T14-00-00Z",
+            "active_bundle_selection_path": str(selection_path),
+            "bundle_dir": str(bundle_dir),
+            "offset_signals": [
+                {
+                    "offset": 7,
+                    "decision_ts": "2026-03-27T14:07:00+00:00",
+                    "window_start_ts": "2099-03-27T14:07:00+00:00",
+                    "window_end_ts": "2099-03-27T14:08:00+00:00",
+                    "cycle_end_ts": "2099-03-27T14:15:00+00:00",
+                    "recommended_side": "UP",
+                    "confidence": 0.8,
+                    "edge": 0.3,
+                    "score_valid": True,
+                    "coverage": {"effective_missing_feature_count": 0, "not_allowed_blacklist_count": 0},
+                }
+            ],
+        }
+
+    prewarm_live_signal_cache_impl(
+        cfg,
+        persist=False,
+        session_state=session_state,
+        score_live_latest_fn=_score,
+    )
+    selection_path.write_text("bundle-b-updated", encoding="utf-8")
+
+    decide_live_latest_impl(
+        cfg,
+        persist=False,
+        session_state=session_state,
+        score_live_latest_fn=_score,
+        build_quote_snapshot_fn=lambda **kwargs: {"snapshot_ts": "2026-03-27T14-00-01Z", "quote_rows": []},
+        load_live_account_context_fn=lambda *_args, **_kwargs: {},
+        build_decision_snapshot_fn=lambda signal, quote, account_state, **kwargs: {
+            "snapshot_ts": "2026-03-27T14-00-02Z",
+            "decision": {"status": "reject", "selected_offset": None},
+            "signal_snapshot_ts": signal.get("snapshot_ts"),
+        },
+        persist_decision_snapshot_fn=lambda **kwargs: {},
+    )
+
+    assert calls["score"] == 2
+
+
 def test_resolve_signal_cache_valid_until_skips_active_unresolved_window() -> None:
     now_utc = pd.Timestamp("2026-03-27T14:07:10Z")
     payload = {
@@ -1932,6 +2146,65 @@ def test_decide_live_latest_refreshes_when_cached_signal_is_expired(tmp_path: Pa
     )
 
     assert calls["score"] == 1
+
+
+def test_resolve_bundle_resolution_refreshes_when_selection_file_changes(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    monkeypatch.setenv("PM15MIN_LIVE_BUNDLE_CACHE_SEC", "60")
+    scoring_bundle_module._BUNDLE_RESOLUTION_CACHE.clear()
+    selection_path = root / "selection.json"
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text("bundle-a", encoding="utf-8")
+    (root / "bundle=bundle-a").mkdir(parents=True, exist_ok=True)
+    (root / "bundle=bundle-b").mkdir(parents=True, exist_ok=True)
+    calls = {"selection": 0, "manifest": 0}
+
+    def _get_active_bundle_selection(*args, **kwargs):
+        calls["selection"] += 1
+        return {
+            "selection": {"bundle_label": selection_path.read_text(encoding="utf-8").strip()},
+            "selection_path": str(selection_path),
+        }
+
+    def _read_model_bundle_manifest(bundle_dir: Path):
+        calls["manifest"] += 1
+        return SimpleNamespace(
+            spec={
+                "feature_set": "v6_user_core",
+                "bundle_label": bundle_dir.name.split("=", 1)[1],
+            }
+        )
+
+    first = resolve_bundle_resolution(
+        cfg,
+        target="direction",
+        feature_set="v6_user_core",
+        resolve_live_profile_spec_fn=lambda profile: SimpleNamespace(default_feature_set="v6_user_core"),
+        get_active_bundle_selection_fn=_get_active_bundle_selection,
+        resolve_model_bundle_dir_fn=lambda *args, **kwargs: root / f"bundle={kwargs['bundle_label']}",
+        read_model_bundle_manifest_fn=_read_model_bundle_manifest,
+        supports_feature_set_fn=lambda feature_set: True,
+    )
+
+    selection_path.write_text("bundle-b", encoding="utf-8")
+
+    second = resolve_bundle_resolution(
+        cfg,
+        target="direction",
+        feature_set="v6_user_core",
+        resolve_live_profile_spec_fn=lambda profile: SimpleNamespace(default_feature_set="v6_user_core"),
+        get_active_bundle_selection_fn=_get_active_bundle_selection,
+        resolve_model_bundle_dir_fn=lambda *args, **kwargs: root / f"bundle={kwargs['bundle_label']}",
+        read_model_bundle_manifest_fn=_read_model_bundle_manifest,
+        supports_feature_set_fn=lambda feature_set: True,
+    )
+
+    assert first.bundle_dir == root / "bundle=bundle-a"
+    assert second.bundle_dir == root / "bundle=bundle-b"
+    assert calls["selection"] == 2
+    assert calls["manifest"] == 2
 
 
 def test_check_live_trading_gateway_reports_injected_gateway(tmp_path: Path, monkeypatch) -> None:

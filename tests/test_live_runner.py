@@ -1558,3 +1558,99 @@ def test_maybe_prewarm_signal_cache_prepare_and_finalize_use_separate_bucket_gua
     assert third["status"] == "skipped"
     assert third["reason"] == "signal_prewarm_prepare_already_attempted_for_bucket"
     assert calls == ["prewarm_finalize", "prewarm_prepare_inputs"]
+
+
+def test_build_runner_iteration_clears_signal_cache_after_liquidity_refresh(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
+    session_state: dict[str, object] = {
+        "live_signal_cache": {
+            "sol|deep_otm|15|direction|": {
+                "valid_until_ts": "2099-01-01T00:00:00+00:00",
+                "payload": {"snapshot_ts": "old-signal"},
+            }
+        }
+    }
+    seen: dict[str, object] = {}
+
+    def _decide(*args, **kwargs):
+        seen["cache_before_decide"] = dict((kwargs.get("session_state") or {}).get("live_signal_cache") or {})
+        return {
+            "snapshot_ts": "2026-03-20T00-00-00Z",
+            "decision": {"status": "reject", "selected_offset": None},
+            "timings_ms": {},
+            "regime_state": {"state": "normal"},
+        }
+
+    payload = runner_iteration_module.build_runner_iteration(
+        cfg,
+        target="direction",
+        feature_set=None,
+        persist_decision=False,
+        persist_execution=False,
+        run_foundation=False,
+        foundation_include_direct_oracle=True,
+        foundation_include_orderbooks=True,
+        apply_side_effects=False,
+        side_effect_dry_run=False,
+        gateway=None,
+        session_state=session_state,
+        orderbook_provider=None,
+        run_live_data_foundation_fn=lambda *args, **kwargs: {"status": "ok"},
+        build_liquidity_state_snapshot_fn=lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-00Z",
+            "checked_at": "2026-03-20T00:00:00+00:00",
+            "refresh_seconds": 30.0,
+            "status": "ok",
+            "blocked": False,
+            "reason": "ok",
+        },
+        decide_live_latest_fn=_decide,
+        prewarm_live_signal_inputs_fn=lambda *args, **kwargs: {"status": "skipped"},
+        prewarm_live_signal_cache_fn=lambda *args, **kwargs: {"status": "skipped", "triggered": False},
+        build_execution_snapshot_fn=lambda *args, **kwargs: {
+            "snapshot_ts": "2026-03-20T00-00-01Z",
+            "execution": {"status": "no_action", "reason": "decision_reject"},
+            "timings_ms": {},
+        },
+        persist_execution_snapshot_fn=lambda **kwargs: {},
+        submit_execution_payload_fn=lambda **kwargs: {},
+        build_account_state_snapshot_fn=lambda *args, **kwargs: {},
+        apply_cancel_policy_fn=lambda *args, **kwargs: {},
+        apply_redeem_policy_fn=lambda *args, **kwargs: {},
+        utc_snapshot_label_fn=lambda: "2026-03-20T00-00-02Z",
+        build_runner_risk_summary_fn=lambda **kwargs: {
+            "decision": {"status": "reject"},
+            "execution": {"status": "no_action"},
+        },
+        build_runner_health_summary_fn=lambda **kwargs: {
+            "overall_status": "ok",
+            "primary_blocker": None,
+            "blocking_issue_count": 0,
+            "warning_issue_count": 0,
+        },
+        build_runner_risk_alerts_fn=lambda **kwargs: [],
+        summarize_runner_risk_alerts_fn=lambda **kwargs: {"has_critical": False},
+        build_side_effect_error_payload_fn=lambda **kwargs: {"status": "error", "reason": "side_effect_error"},
+        build_account_state_error_payload_fn=lambda **kwargs: {"status": "error", "reason": "account_state_error"},
+    )
+
+    assert seen["cache_before_decide"] == {}
+    assert payload["timings_ms"]["liquidity_cache_hit"] is False
+
+
+def test_load_cached_liquidity_payload_returns_none_when_payload_is_stale() -> None:
+    session_state = {
+        "liquidity_state_cache": {
+            "snapshot_ts": "2000-01-01T00:00:00Z",
+            "checked_at": "2000-01-01T00:00:00+00:00",
+            "refresh_seconds": 30.0,
+            "status": "ok",
+            "blocked": False,
+        }
+    }
+
+    payload = runner_iteration_module._load_cached_liquidity_payload(session_state=session_state)
+
+    assert payload is None
