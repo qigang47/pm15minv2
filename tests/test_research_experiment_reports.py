@@ -14,12 +14,41 @@ from pm15min.research.experiments.reports import (
     build_best_by_run_frame,
     build_experiment_compare_frame,
     build_experiment_summary,
+    build_factor_signal_summary,
     build_group_summary_frame,
     build_matrix_summary_frame,
     build_run_summary_frame,
     render_experiment_report,
 )
 from pm15min.research.experiments.runner import run_experiment_suite
+
+
+def _write_training_offset_summary(
+    run_dir: Path,
+    *,
+    offset: int,
+    positive: list[tuple[str, float]],
+    negative: list[tuple[str, float]],
+) -> None:
+    offset_dir = run_dir / "offsets" / f"offset={offset}"
+    offset_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "offset": int(offset),
+        "explainability": {
+            "top_positive_factors": [
+                {"feature": feature, "direction_score": score}
+                for feature, score in positive
+            ],
+            "top_negative_factors": [
+                {"feature": feature, "direction_score": score}
+                for feature, score in negative
+            ],
+        },
+    }
+    (offset_dir / "summary.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def _sample_compare_frame() -> pd.DataFrame:
@@ -384,6 +413,208 @@ def test_render_experiment_report_renders_new_summary_sections() -> None:
     assert "No notable runtime flags." not in report_text
     assert "tight" in report_text
     assert "boom" in report_text
+
+
+def test_build_experiment_summary_aggregates_factor_signals_from_profitable_traded_cases(tmp_path: Path) -> None:
+    winner_train_dir = tmp_path / "winner-train"
+    loser_train_dir = tmp_path / "loser-train"
+    idle_train_dir = tmp_path / "idle-train"
+    _write_training_offset_summary(
+        winner_train_dir,
+        offset=7,
+        positive=[("q_bs_up_strike", 0.60), ("ret_from_cycle_open", 0.48)],
+        negative=[("volume_z_3", -0.02)],
+    )
+    _write_training_offset_summary(
+        winner_train_dir,
+        offset=8,
+        positive=[("q_bs_up_strike", 0.58), ("bb_pos_20", 0.44)],
+        negative=[("atr_14", -0.01)],
+    )
+    _write_training_offset_summary(
+        loser_train_dir,
+        offset=7,
+        positive=[("noise_feature", 0.90)],
+        negative=[("bad_feature", -0.90)],
+    )
+    _write_training_offset_summary(
+        idle_train_dir,
+        offset=7,
+        positive=[("idle_feature", 0.50)],
+        negative=[("idle_negative", -0.50)],
+    )
+
+    compare_frame = pd.DataFrame(
+        [
+            {
+                "case_key": "eth:core:good:default",
+                "market": "eth",
+                "group_name": "core",
+                "run_name": "good",
+                "feature_set": "bs_q_replace_direction",
+                "variant_label": "default",
+                "target": "direction",
+                "status": "completed",
+                "training_run_dir": str(winner_train_dir),
+                "trades": 6,
+                "pnl_sum": 1.2,
+                "roi_pct": 120.0,
+            },
+            {
+                "case_key": "eth:core:bad:default",
+                "market": "eth",
+                "group_name": "core",
+                "run_name": "bad",
+                "feature_set": "bs_q_replace_direction",
+                "variant_label": "default",
+                "target": "direction",
+                "status": "completed",
+                "training_run_dir": str(loser_train_dir),
+                "trades": 4,
+                "pnl_sum": -0.4,
+                "roi_pct": -40.0,
+            },
+            {
+                "case_key": "eth:core:idle:default",
+                "market": "eth",
+                "group_name": "core",
+                "run_name": "idle",
+                "feature_set": "bs_q_replace_direction",
+                "variant_label": "default",
+                "target": "direction",
+                "status": "completed",
+                "training_run_dir": str(idle_train_dir),
+                "trades": 0,
+                "pnl_sum": 0.0,
+                "roi_pct": 0.0,
+            },
+        ]
+    )
+    leaderboard = build_leaderboard(compare_frame)
+
+    summary = build_experiment_summary(
+        suite_name="factor_suite",
+        run_label="factor_run",
+        training_runs=pd.DataFrame(),
+        backtest_runs=compare_frame,
+        leaderboard=leaderboard,
+        compare_frame=compare_frame,
+        failed_cases=pd.DataFrame(),
+    )
+
+    factor_signal_summary = summary["factor_signal_summary"]
+    assert factor_signal_summary["selection_mode"] == "profitable_traded"
+    assert factor_signal_summary["selected_case_count"] == 1
+    assert factor_signal_summary["selected_cases"][0]["case_key"] == "eth:core:good:default"
+    assert factor_signal_summary["positive_factors"][0]["feature"] == "q_bs_up_strike"
+    assert factor_signal_summary["positive_factors"][0]["hits"] == 2
+    assert factor_signal_summary["positive_factors"][0]["offsets"] == [7, 8]
+    assert factor_signal_summary["negative_factors"][0]["feature"] == "volume_z_3"
+    positive_names = [row["feature"] for row in factor_signal_summary["positive_factors"]]
+    negative_names = [row["feature"] for row in factor_signal_summary["negative_factors"]]
+    assert "noise_feature" not in positive_names
+    assert "bad_feature" not in negative_names
+    assert "idle_feature" not in positive_names
+
+
+def test_render_experiment_report_includes_factor_signal_section(tmp_path: Path) -> None:
+    winner_train_dir = tmp_path / "winner-train"
+    _write_training_offset_summary(
+        winner_train_dir,
+        offset=7,
+        positive=[("q_bs_up_strike", 0.60), ("ret_from_cycle_open", 0.48)],
+        negative=[("volume_z_3", -0.02)],
+    )
+
+    compare_frame = pd.DataFrame(
+        [
+            {
+                "case_key": "eth:core:good:default",
+                "market": "eth",
+                "group_name": "core",
+                "run_name": "good",
+                "feature_set": "bs_q_replace_direction",
+                "variant_label": "default",
+                "target": "direction",
+                "status": "completed",
+                "training_run_dir": str(winner_train_dir),
+                "trades": 6,
+                "pnl_sum": 1.2,
+                "roi_pct": 120.0,
+            }
+        ]
+    )
+    leaderboard = build_leaderboard(compare_frame)
+    summary = build_experiment_summary(
+        suite_name="factor_suite",
+        run_label="factor_run",
+        training_runs=pd.DataFrame(),
+        backtest_runs=compare_frame,
+        leaderboard=leaderboard,
+        compare_frame=compare_frame,
+        failed_cases=pd.DataFrame(),
+    )
+
+    report_text = render_experiment_report(
+        summary,
+        leaderboard=leaderboard,
+        compare_frame=compare_frame,
+        failed_cases=pd.DataFrame(),
+    )
+
+    assert "## Factor Signals From Good Cases" in report_text
+    assert "q_bs_up_strike" in report_text
+    assert "volume_z_3" in report_text
+
+
+def test_build_factor_signal_summary_skips_cases_with_missing_training_run_dir(tmp_path: Path) -> None:
+    winner_train_dir = tmp_path / "winner-train"
+    _write_training_offset_summary(
+        winner_train_dir,
+        offset=7,
+        positive=[("q_bs_up_strike", 0.60)],
+        negative=[("volume_z_3", -0.02)],
+    )
+
+    compare_frame = pd.DataFrame(
+        [
+            {
+                "case_key": "eth:core:good:default",
+                "market": "eth",
+                "group_name": "core",
+                "run_name": "good",
+                "feature_set": "bs_q_replace_direction",
+                "variant_label": "default",
+                "target": "direction",
+                "status": "completed",
+                "training_run_dir": str(winner_train_dir),
+                "trades": 6,
+                "pnl_sum": 1.2,
+                "roi_pct": 120.0,
+            },
+            {
+                "case_key": "eth:core:legacy:default",
+                "market": "eth",
+                "group_name": "core",
+                "run_name": "legacy",
+                "feature_set": "bs_q_replace_direction",
+                "variant_label": "default",
+                "target": "direction",
+                "status": "completed",
+                "training_run_dir": pd.NA,
+                "trades": 5,
+                "pnl_sum": 0.8,
+                "roi_pct": 80.0,
+            },
+        ]
+    )
+
+    summary = build_factor_signal_summary(compare_frame)
+
+    assert summary["selection_mode"] == "profitable_traded"
+    assert summary["selected_case_count"] == 2
+    assert summary["positive_factors"][0]["feature"] == "q_bs_up_strike"
+    assert summary["negative_factors"][0]["feature"] == "volume_z_3"
 
 
 def test_summary_builders_normalize_missing_group_and_run_keys() -> None:

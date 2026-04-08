@@ -83,12 +83,7 @@ def apply_initial_snapshot_decision_parity(
                 reason="orderbook_limit_reject",
             )
 
-    summary = InitialSnapshotDecisionSummary(
-        raw_depth_rows=int(_bool_series(out, "decision_quote_has_raw_depth", default=False).sum()) if not out.empty else 0,
-        repriced_rows=int(_bool_series(out, "decision_quote_any_repriced", default=False).sum()) if not out.empty else 0,
-        limit_reject_rows=int(_bool_series(out, "decision_quote_limit_reject", default=False).sum()) if not out.empty else 0,
-        orderbook_missing_rows=int(_bool_series(out, "decision_quote_orderbook_missing", default=False).sum()) if not out.empty else 0,
-    )
+    summary = summarize_initial_snapshot_decision_surface(out)
     return out, summary
 
 
@@ -234,6 +229,17 @@ def build_empty_initial_snapshot_decision_summary() -> InitialSnapshotDecisionSu
         repriced_rows=0,
         limit_reject_rows=0,
         orderbook_missing_rows=0,
+    )
+
+
+def summarize_initial_snapshot_decision_surface(frame: pd.DataFrame) -> InitialSnapshotDecisionSummary:
+    if frame.empty:
+        return build_empty_initial_snapshot_decision_summary()
+    return InitialSnapshotDecisionSummary(
+        raw_depth_rows=int(_bool_series(frame, "decision_quote_has_raw_depth", default=False).sum()),
+        repriced_rows=int(_bool_series(frame, "decision_quote_any_repriced", default=False).sum()),
+        limit_reject_rows=int(_bool_series(frame, "decision_quote_limit_reject", default=False).sum()),
+        orderbook_missing_rows=int(_bool_series(frame, "decision_quote_orderbook_missing", default=False).sum()),
     )
 
 

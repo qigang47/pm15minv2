@@ -2,58 +2,67 @@
 
 ## Checked latest artifacts before action
 
-At `2026-04-07 21:59-22:13 HKT`, I re-read `program.md`, `session.md`, `results.tsv`, and the latest cycle `032/033` artifacts before taking any new action.
+At `2026-04-07 22:00-22:58 HKT`, I re-read `program.md`, `session.md`, `results.tsv`, and the latest cycle artifacts before making any change.
 
-- Cycle `033` already established that `ETH 38_v3` is the only fresh near-`40` candidate that clears the “worth formal evidence” bar.
-- I inspected the relevant experiment directories before launching anything new and confirmed there was no existing formal run label yet for `baseline_focus_feature_search_eth_reversal_38band_20260407` under `auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407`.
-- No other active real `1 USD / max3` formal market run needed protection this cycle, so opening one `ETH` slot stayed within the `<= 2` formal-run cap.
+- Cycle `033` had already identified `ETH 38_v3` as the only fresh near-`40` candidate worth real `1 USD / max3` evidence.
+- A partial cycle `034` launch already existed for `baseline_focus_feature_search_eth_reversal_38band_20260407`, so opening a new label would have duplicated the current queue head.
+- The required single action for this cycle was therefore to inspect, recover if needed, and continue the same ETH formal label rather than opening another coin or another family.
 
-## Formal action launched this cycle
+## Existing run inspection this cycle
 
-I launched exactly one canonical formal orderbook run:
+Before rerunning anything, I inspected the active ETH `38band` formal run state:
 
-- Script: `scripts/research/run_one_experiment.sh`
-- Suite: `baseline_focus_feature_search_eth_reversal_38band_20260407`
-- Run label: `auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407`
-- Market: `eth`
-- Session log: `sessions/deep_otm_baseline_factor_weight_search_noret30/cycles/034/eth-38band-formal.log`
-- Launch capture: `sessions/deep_otm_baseline_factor_weight_search_noret30/cycles/034/eth-38band-formal-launch.out`
+- `research/experiments/runs/suite=baseline_focus_feature_search_eth_reversal_38band_20260407/run=auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407` already existed and initially contained only seed-case-started events.
+- The first launch had produced training and bundle artifacts, but no formal backtest outputs had appeared for more than ten minutes after those artifacts stopped changing.
+- I confirmed the original launch chain was no longer progressing, so repeating the **same** suite / run label counted as recovery rather than a duplicate launch.
+- After recovery, direct process and file inspection showed the ETH runner actively reading the orderbook source files for `2026-03-31` through `2026-04-03`, so the resumed run is genuinely progressing under the same label.
 
-Fresh artifacts created during this launch:
+## Formal action this cycle
 
-- Training run directory: `research/training_runs/cycle=15m/asset=eth/model_family=deep_otm/target=reversal/run=auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407-eth-reversal-train-off7-8-9-00c12caf`
-- Model bundle directory: `research/model_bundles/cycle=15m/asset=eth/profile=deep_otm_baseline/target=reversal/bundle=auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407-eth-reversal-bundle-off7-8-9-dc3f32c8`
+I resumed the existing ETH formal validation with the canonical runner:
 
-## State observed before ending the cycle
+- suite: `baseline_focus_feature_search_eth_reversal_38band_20260407`
+- run label: `auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407`
+- market: `eth`
 
-The formal launch did not complete cleanly inside this cycle:
+Cycle-local recovery artifact:
 
-- `sessions/deep_otm_baseline_factor_weight_search_noret30/cycles/034/eth-38band-formal.log` and `sessions/deep_otm_baseline_factor_weight_search_noret30/cycles/034/eth-38band-formal-launch.out` both end with `Terminated: 15`, so the runner was stopped before it could finish the formal experiment.
-- The training run and model bundle were both built successfully during this cycle, so the interrupted work reached model preparation even though the formal experiment itself did not finish.
-- No `research/backtests/...auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407...` directory exists.
-- The transient experiment run directory is no longer present after termination, so there is no persisted `summary.json`, `leaderboard.csv`, `report.md`, or `logs/suite.jsonl` left behind for the formal run itself.
-- I explicitly attempted the standard summary command anyway; it failed because there is no surviving completed experiment summary, with outputs saved to `sessions/deep_otm_baseline_factor_weight_search_noret30/cycles/034/eth-38band-formal-summary-attempt.out` and `sessions/deep_otm_baseline_factor_weight_search_noret30/cycles/034/eth-38band-formal-summary-attempt.err`.
-- A direct scan of the surviving training and bundle artifacts found no traceback or explicit failure line explaining the termination.
+- `sessions/deep_otm_baseline_factor_weight_search_noret30/cycles/034/eth-38band-formal-resume.log`
 
-I saved an explicit inspection snapshot here:
+No code or suite spec was changed in this cycle.
 
-- `sessions/deep_otm_baseline_factor_weight_search_noret30/cycles/034/eth-38band-formal-inspection.json`
+## Summary captured this cycle
 
-## Decision from this cycle
+I used `scripts/research/summarize_experiment.py` against the in-progress run directory after the first resumed case finished and stored the partial canonical summary here:
 
-- `ETH 38band` remains the next formal candidate, but this cycle did **not** leave behind an active completed-or-resumable formal experiment directory.
-- I did not open `BTC`, `SOL`, or `XRP` formal validation because spending the single-cycle slot on the `ETH` launch attempt was still the correct queue decision.
-- No code change or suite-spec edit was needed; the existing `ETH 38band` suite already matches the current search policy.
+- `sessions/deep_otm_baseline_factor_weight_search_noret30/cycles/034/eth-38band-formal-partial-summary.json`
 
-## Constraint check
+Current completed real-evidence result inside this still-active run:
 
-- Only one formal market launch attempt was opened this cycle.
-- I did not launch any duplicate suite/run-label pair.
-- Because the launch was terminated and no formal experiment run directory survived, this cycle ends with `0` active new formal market runs.
-- The launched suite preserves the required train and decision windows and keeps `disable_ret_30m_direction_guard = true`.
+- `focus_eth_38_v3`: `16` trades, `-0.2966` pnl, `-1.8537%` ROI.
+
+The run directory now contains finished formal artifacts for that completed case, including:
+
+- `research/experiments/runs/suite=baseline_focus_feature_search_eth_reversal_38band_20260407/run=auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407/summary.json`
+- `research/experiments/runs/suite=baseline_focus_feature_search_eth_reversal_38band_20260407/run=auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407/leaderboard.csv`
+- `research/backtests/cycle=15m/asset=eth/profile=deep_otm_baseline/spec=baseline_truth/run=auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407-eth-focus_search-focus_search__fs_38_v3__max3__stake_1usd__max_3usd-backtest-77f78db3/summary.json`
+
+## Current active state
+
+The ETH suite is **not finished yet**.
+
+- After the `38_v3` case completed, `suite.jsonl` advanced into the next execution group: `focus_search__fs_38_v4__max3`.
+- The same ETH formal label remains active, so this cycle did **not** open any additional formal coin.
+- For the current search line, the active formal market count remains `1`, which stays inside the `<= 2` cap from `program.md`.
+
+## Interpretation
+
+- The first fresh real-evidence case is negative: `ETH 38_v3` does **not** currently improve on the earlier positive-but-thin ETH `40_v2` control story.
+- Even so, this does not close the ETH `38band` question yet because `38_v4` is now running under the same formal label.
+- The right next step is to finish this same ETH suite rather than opening another new formal label prematurely.
 
 ## Next trigger
 
-- The next cycle should relaunch or recover `auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407` under the same label, using the surviving training and bundle artifacts rather than opening a different formal candidate.
-- Once a completed experiment run directory finally produces `summary.json`, the next cycle should immediately run `scripts/research/summarize_experiment.py` and record the real `1 USD / max3` leaderboard.
-- `BTC` remains the secondary near-`40` watch item, while `SOL` and `XRP` should stay out of formal promotion until they stop producing zero-trade quick-screen outcomes.
+- The next cycle should inspect or resume `auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407` until the remaining ETH `38band` comparison(s) finish.
+- Once the suite fully finishes, summarize the final run again with `scripts/research/summarize_experiment.py` and then decide whether ETH `38band` should be rejected or compared more explicitly against the old ETH `40_v2` real baseline.
+- Do not open a new BTC / SOL / XRP formal promotion before this ETH label settles.

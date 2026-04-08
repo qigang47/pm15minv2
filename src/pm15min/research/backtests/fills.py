@@ -438,6 +438,14 @@ def _resolve_probability_edge(
     return edge
 
 
+def _is_synthetic_entry_price_source(entry_price_source: str | None) -> bool:
+    return str(entry_price_source or "").strip() in {"p_up", "p_down"}
+
+
+def _allows_synthetic_entry_price(config: BacktestFillConfig) -> bool:
+    return str(config.fill_model).strip() == "probability_cap_proxy"
+
+
 def _predicted_side_series(frame: pd.DataFrame) -> pd.Series:
     existing = frame.get("predicted_side", pd.Series("", index=frame.index, dtype="string")).astype("string").fillna("")
     normalized = existing.astype(str).str.upper()
@@ -502,10 +510,66 @@ def _materialize_fill_row(
     entry_price = _float_or_none(row.get("entry_price"))
     price_cap = _float_or_none(row.get("price_cap"))
     entry_price_source = str(row.get("entry_price_source") or "")
+    fill_reason = str(row.get("fill_reason") or "")
     fee_rate = float(config.fee_bps) / 10_000.0
 
     _apply_depth_diagnostics(out, None, None)
-    if not bool(row.get("fill_valid", False)):
+    can_attempt_depth = (
+        data_cfg is not None
+        and bool(config.prefer_depth)
+        and raw_depth_candidates is not None
+        and bool(raw_depth_candidates)
+    )
+    allow_synthetic_entry_price = data_cfg is None or _allows_synthetic_entry_price(config)
+    synthetic_entry_price = _is_synthetic_entry_price_source(entry_price_source)
+    requires_real_entry_price = synthetic_entry_price and not allow_synthetic_entry_price
+    enforce_price_cap_on_entry = entry_price is not None and (not synthetic_entry_price or not allow_synthetic_entry_price)
+    needs_depth_first = can_attempt_depth and (
+        (not bool(row.get("fill_valid", False)) and fill_reason in {"quote_missing", "quote_invalid"})
+        or requires_real_entry_price
+        or entry_price is None
+        or entry_price <= 0.0
+        or (
+            price_cap is not None
+            and price_cap > 0.0
+            and enforce_price_cap_on_entry
+            and entry_price > price_cap
+        )
+    )
+    if not bool(row.get("fill_valid", False)) and not needs_depth_first:
+        out["fill_model"] = str(config.fill_model)
+        return out
+    if needs_depth_first:
+        depth_fill, depth_reason = _resolve_depth_fill(
+            row=row,
+            data_cfg=data_cfg,
+            config=config,
+            raw_depth_candidates=raw_depth_candidates,
+        )
+        _apply_depth_diagnostics(out, depth_fill, depth_reason)
+        if isinstance(depth_fill, dict) and str(depth_fill.get("status") or "") == "ok":
+            reprice_guard_reason = _resolve_raw_depth_reprice_guard_reason(
+                row=row,
+                depth_fill=depth_fill,
+                config=config,
+                raw_depth_candidates=raw_depth_candidates,
+            )
+            if reprice_guard_reason:
+                out["fill_valid"] = False
+                out["fill_reason"] = reprice_guard_reason
+                out["fill_model"] = "canonical_depth"
+                return out
+            out.update(
+                _build_depth_fill_values(
+                    depth_fill=depth_fill,
+                    entry_price=entry_price,
+                    fee_rate=fee_rate,
+                    use_conservative_price=bool(raw_depth_candidates and config.raw_depth_fak_refresh_enabled),
+                )
+            )
+            return out
+        out["fill_valid"] = False
+        out["fill_reason"] = str(depth_reason or fill_reason or "depth_fill_unavailable")
         out["fill_model"] = str(config.fill_model)
         return out
     if entry_price is None or entry_price <= 0.0:
@@ -513,11 +577,16 @@ def _materialize_fill_row(
         out["fill_reason"] = "quote_invalid"
         out["fill_model"] = str(config.fill_model)
         return out
+    if requires_real_entry_price:
+        out["fill_valid"] = False
+        out["fill_reason"] = "quote_missing"
+        out["fill_model"] = str(config.fill_model)
+        return out
     if (
         price_cap is not None
         and price_cap > 0.0
+        and enforce_price_cap_on_entry
         and entry_price > price_cap
-        and entry_price_source not in {"p_up", "p_down"}
     ):
         out["fill_valid"] = False
         out["fill_reason"] = "quote_above_price_cap"
@@ -564,6 +633,7 @@ def _materialize_fill_row(
                 fee_rate=fee_rate,
                 config=config,
                 min_fill_ratio_override=0.0,
+                allow_synthetic_entry_price=allow_synthetic_entry_price,
             )
             if bool(quote_completion.get("fill_valid")):
                 out.update(
@@ -577,7 +647,13 @@ def _materialize_fill_row(
                 )
         return out
 
-    quote_fill = _resolve_quote_fill(row=row, requested_notional=requested_notional, fee_rate=fee_rate, config=config)
+    quote_fill = _resolve_quote_fill(
+        row=row,
+        requested_notional=requested_notional,
+        fee_rate=fee_rate,
+        config=config,
+        allow_synthetic_entry_price=allow_synthetic_entry_price,
+    )
     out.update(quote_fill)
     return out
 
@@ -664,10 +740,18 @@ def _resolve_quote_fill(
     fee_rate: float,
     config: BacktestFillConfig,
     min_fill_ratio_override: float | None = None,
+    allow_synthetic_entry_price: bool = False,
 ) -> dict[str, object]:
     entry_price = _float_or_none(row.get("entry_price"))
     price_cap = _float_or_none(row.get("price_cap"))
     entry_price_source = str(row.get("entry_price_source") or "")
+    synthetic_entry_price = _is_synthetic_entry_price_source(entry_price_source)
+    if _is_synthetic_entry_price_source(entry_price_source) and not allow_synthetic_entry_price:
+        return {
+            "fill_valid": False,
+            "fill_reason": "quote_missing",
+            "fill_model": "canonical_quote",
+        }
     if entry_price is None or entry_price <= 0.0:
         return {
             "fill_valid": False,
@@ -677,8 +761,8 @@ def _resolve_quote_fill(
     if (
         price_cap is not None
         and price_cap > 0.0
+        and (not synthetic_entry_price or not allow_synthetic_entry_price)
         and entry_price > price_cap
-        and entry_price_source not in {"p_up", "p_down"}
     ):
         return {
             "fill_valid": False,

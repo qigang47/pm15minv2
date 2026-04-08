@@ -503,6 +503,118 @@ def test_build_canonical_fills_consumes_multi_snapshot_raw_depth_candidates(tmp_
     assert float(fills.loc[0, "depth_fill_ratio"]) == 1.0
 
 
+def test_build_canonical_fills_rejects_synthetic_probability_entry_without_real_quote(tmp_path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    profile_spec = resolve_backtest_profile_spec(profile="deep_otm")
+    accepted = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:08:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "p_up": 0.95,
+                "p_down": 0.05,
+                "predicted_side": "UP",
+                "predicted_prob": 0.95,
+                "winner_side": "UP",
+            }
+        ]
+    )
+
+    fills, rejects = build_canonical_fills(
+        accepted,
+        data_cfg=data_cfg,
+        config=BacktestFillConfig(
+            base_stake=1.0,
+            max_stake=1.0,
+            fee_bps=50.0,
+            high_conf_threshold=0.99,
+            high_conf_multiplier=1.0,
+            profile_spec=profile_spec,
+        ),
+        profile_spec=profile_spec,
+        depth_replay=pd.DataFrame(),
+    )
+
+    assert fills.empty
+    assert rejects["reason"].tolist() == ["quote_missing"]
+
+
+def test_build_canonical_fills_recovers_synthetic_probability_entry_with_raw_depth(tmp_path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    profile_spec = replace(
+        resolve_backtest_profile_spec(profile="deep_otm"),
+        orderbook_min_fill_ratio=0.9,
+        orderbook_max_slippage_bps=150.0,
+    )
+    accepted = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:08:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "quote_captured_ts_ms_up": int(pd.Timestamp("2026-03-01T00:08:10Z").timestamp() * 1000),
+                "p_up": 0.95,
+                "p_down": 0.05,
+                "predicted_side": "UP",
+                "predicted_prob": 0.95,
+                "winner_side": "UP",
+            }
+        ]
+    )
+    depth_replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:08:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "depth_snapshot_rank": 1,
+                "depth_source_path": str(data_cfg.layout.orderbook_depth_path("2026-03-01")),
+                "depth_up_record": {
+                    "logged_at": "2026-03-01T00:08:10Z",
+                    "asks": [[0.20, 10.0]],
+                    "bids": [[0.19, 1.0]],
+                },
+                "depth_up_snapshot_ts_ms": int(pd.Timestamp("2026-03-01T00:08:10Z").timestamp() * 1000),
+                "depth_down_record": None,
+            }
+        ]
+    )
+
+    fills, rejects = build_canonical_fills(
+        accepted,
+        data_cfg=data_cfg,
+        config=BacktestFillConfig(
+            base_stake=1.0,
+            max_stake=1.0,
+            fee_bps=50.0,
+            high_conf_threshold=0.99,
+            high_conf_multiplier=1.0,
+            profile_spec=profile_spec,
+        ),
+        profile_spec=profile_spec,
+        depth_replay=depth_replay,
+    )
+
+    assert rejects.empty
+    assert len(fills) == 1
+    assert fills.loc[0, "fill_model"] == "canonical_depth"
+    assert fills.loc[0, "entry_price"] == pytest.approx(0.20)
+
+
 def test_build_canonical_fills_accumulates_partial_raw_depth_candidates(tmp_path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
@@ -1688,6 +1800,139 @@ def test_build_canonical_fills_legacy_fak_refresh_rejects_repriced_entry_price_m
 
     assert fills.empty
     assert rejects["reason"].tolist() == ["repriced_entry_price_max"]
+
+
+def test_materialize_fill_row_prefers_raw_depth_before_quote_price_cap_reject(tmp_path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    profile_spec = replace(
+        resolve_backtest_profile_spec(profile="deep_otm"),
+        entry_price_max=0.30,
+        orderbook_min_fill_ratio=0.9,
+        orderbook_max_slippage_bps=150.0,
+    )
+    row = {
+        "decision_ts": "2026-03-01T00:08:00Z",
+        "cycle_start_ts": "2026-03-01T00:00:00Z",
+        "cycle_end_ts": "2026-03-01T00:15:00Z",
+        "offset": 7,
+        "market_id": "market-1",
+        "condition_id": "cond-1",
+        "token_up": "token-up",
+        "token_down": "token-down",
+        "quote_up_ask": 0.40,
+        "quote_up_bid": 0.39,
+        "quote_up_ask_size_1": 10.0,
+        "p_up": 0.95,
+        "p_down": 0.05,
+        "predicted_side": "UP",
+        "predicted_prob": 0.95,
+        "winner_side": "UP",
+        "stake": 1.0,
+        "entry_price": 0.40,
+        "entry_price_source": "quote_up_ask",
+        "price_cap": 0.30,
+        "fill_valid": True,
+        "fill_reason": "",
+    }
+    raw_depth_candidates = [
+        {
+            "depth_source_path": str(data_cfg.layout.orderbook_depth_path("2026-03-01")),
+            "depth_up_record": {
+                "logged_at": "2026-03-01T00:08:10Z",
+                "asks": [[0.20, 10.0]],
+                "bids": [[0.19, 1.0]],
+            },
+            "depth_up_snapshot_ts_ms": int(pd.Timestamp("2026-03-01T00:08:10Z").timestamp() * 1000),
+            "depth_down_record": None,
+        }
+    ]
+
+    out = fills_module._materialize_fill_row(
+        row,
+        data_cfg=data_cfg,
+        config=BacktestFillConfig(
+            base_stake=1.0,
+            max_stake=1.0,
+            fee_bps=0.0,
+            high_conf_threshold=0.99,
+            high_conf_multiplier=1.0,
+            raw_depth_fak_refresh_enabled=True,
+            profile_spec=profile_spec,
+        ),
+        raw_depth_candidates=raw_depth_candidates,
+    )
+
+    assert bool(out["fill_valid"]) is True
+    assert out["fill_model"] == "canonical_depth"
+    assert out["fill_reason"] == ""
+    assert float(out["entry_price"]) == pytest.approx(0.20)
+
+
+def test_materialize_fill_row_recovers_quote_missing_with_raw_depth_candidates(tmp_path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    profile_spec = replace(
+        resolve_backtest_profile_spec(profile="deep_otm"),
+        orderbook_min_fill_ratio=0.9,
+        orderbook_max_slippage_bps=150.0,
+    )
+    row = {
+        "decision_ts": "2026-03-01T00:08:00Z",
+        "cycle_start_ts": "2026-03-01T00:00:00Z",
+        "cycle_end_ts": "2026-03-01T00:15:00Z",
+        "offset": 7,
+        "market_id": "market-1",
+        "condition_id": "cond-1",
+        "token_up": "token-up",
+        "token_down": "token-down",
+        "quote_up_ask": None,
+        "quote_up_bid": None,
+        "quote_up_ask_size_1": None,
+        "p_up": 0.95,
+        "p_down": 0.05,
+        "predicted_side": "UP",
+        "predicted_prob": 0.95,
+        "winner_side": "UP",
+        "stake": 1.0,
+        "entry_price": None,
+        "entry_price_source": "",
+        "price_cap": 0.30,
+        "fill_valid": False,
+        "fill_reason": "quote_missing",
+    }
+    raw_depth_candidates = [
+        {
+            "depth_source_path": str(data_cfg.layout.orderbook_depth_path("2026-03-01")),
+            "depth_up_record": {
+                "logged_at": "2026-03-01T00:08:10Z",
+                "asks": [[0.20, 10.0]],
+                "bids": [[0.19, 1.0]],
+            },
+            "depth_up_snapshot_ts_ms": int(pd.Timestamp("2026-03-01T00:08:10Z").timestamp() * 1000),
+            "depth_down_record": None,
+        }
+    ]
+
+    out = fills_module._materialize_fill_row(
+        row,
+        data_cfg=data_cfg,
+        config=BacktestFillConfig(
+            base_stake=1.0,
+            max_stake=1.0,
+            fee_bps=0.0,
+            high_conf_threshold=0.99,
+            high_conf_multiplier=1.0,
+            raw_depth_fak_refresh_enabled=True,
+            profile_spec=profile_spec,
+        ),
+        raw_depth_candidates=raw_depth_candidates,
+    )
+
+    assert bool(out["fill_valid"]) is True
+    assert out["fill_model"] == "canonical_depth"
+    assert out["fill_reason"] == ""
+    assert float(out["entry_price"]) == pytest.approx(0.20)
 
 
 def test_build_canonical_fills_legacy_fak_refresh_rejects_repriced_net_edge_below_threshold(tmp_path) -> None:

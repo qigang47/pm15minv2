@@ -8,16 +8,19 @@ from typing import Protocol
 
 import joblib
 import pandas as pd
+import numpy as np
 
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.data.queries.loaders import load_binance_klines_1m
+from pm15min.live.execution.utils import resolve_probability_interval_view
 from pm15min.research.backtests.build_signature import backtest_build_signature
 from pm15min.research.backtests.decision_quote_surface import (
     InitialSnapshotDecisionSummary,
     attach_initial_snapshot_decision_surface,
     apply_initial_snapshot_decision_parity,
     build_empty_initial_snapshot_decision_summary,
+    summarize_initial_snapshot_decision_surface,
 )
 from pm15min.research.backtests.decision_engine_parity import (
     DECISION_ENGINE_PARITY_COLUMNS,
@@ -1253,66 +1256,22 @@ def _attach_decision_engine_surface(
             market=market,
             profile_spec=profile_spec,
         )
-        if depth_replay is None or depth_replay.empty:
-            if _frame_has_decision_quote_fallback_prices(frame):
-                frame = attach_initial_snapshot_decision_surface(
-                    frame,
-                    depth_replay=None,
-                    profile_spec=profile_spec,
-                    fill_config=fill_config,
-                )
-                out = apply_decision_engine_parity(
-                    frame,
-                    config=decision_config,
-                    up_price_columns=("quote_up_ask", "quote_prob_up", "p_up"),
-                    down_price_columns=("quote_down_ask", "quote_prob_down", "p_down"),
-                    min_dir_prob_boost_column="decision_engine_min_dir_prob_boost",
-                )
-                out = attach_pre_submit_orderbook_retry_contract(
-                    out,
-                    spec=profile_spec,
-                )
-                return out, build_empty_initial_snapshot_decision_summary()
-            out = attach_pre_submit_orderbook_retry_contract(
-                frame,
-                spec=profile_spec,
-            )
-            return out, build_empty_initial_snapshot_decision_summary()
-        out, summary = apply_initial_snapshot_decision_parity(
+        frame = attach_initial_snapshot_decision_surface(
             frame,
             depth_replay=depth_replay,
             profile_spec=profile_spec,
             fill_config=fill_config,
-            decision_config=decision_config,
+        )
+        summary = summarize_initial_snapshot_decision_surface(frame)
+        out = _apply_probability_only_decision_surface(
+            frame,
+            config=decision_config,
             min_dir_prob_boost_column="decision_engine_min_dir_prob_boost",
         )
         out = attach_pre_submit_orderbook_retry_contract(
             out,
             spec=profile_spec,
         )
-        missing_depth_mask = _decision_quote_missing_depth_mask(out)
-        if missing_depth_mask.any():
-            fallback = apply_decision_engine_parity(
-                frame.loc[missing_depth_mask].copy(),
-                config=decision_config,
-                up_price_columns=("quote_up_ask", "quote_prob_up", "p_up"),
-                down_price_columns=("quote_down_ask", "quote_prob_down", "p_down"),
-                min_dir_prob_boost_column="decision_engine_min_dir_prob_boost",
-            )
-            for column in DECISION_ENGINE_PARITY_COLUMNS:
-                out.loc[missing_depth_mask, column] = fallback[column].to_numpy()
-            fallback_retry = attach_pre_submit_orderbook_retry_contract(
-                out.loc[missing_depth_mask].copy(),
-                spec=profile_spec,
-            )
-            for column in (
-                "pre_submit_orderbook_retry_armed",
-                "pre_submit_orderbook_retry_reason",
-                "pre_submit_orderbook_retry_interval_sec",
-                "pre_submit_orderbook_retry_max",
-                "pre_submit_orderbook_retry_state_key",
-            ):
-                out.loc[missing_depth_mask, column] = fallback_retry[column].to_numpy()
         return out, summary
     out = apply_decision_engine_parity(
         frame,
@@ -1404,6 +1363,108 @@ def _decision_engine_min_dir_prob_boost(value: object) -> float:
 def _decision_quote_missing_depth_mask(frame: pd.DataFrame) -> pd.Series:
     values = frame.get("decision_quote_has_raw_depth", pd.Series(False, index=frame.index, dtype="boolean"))
     return ~values.astype("boolean").fillna(False).astype(bool)
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        parsed = float(value)
+    except Exception:
+        return None
+    if np.isnan(parsed):
+        return None
+    return parsed
+
+
+def _resolve_probability_only_trade_signal(
+    *,
+    row: pd.Series,
+    threshold: float,
+) -> tuple[str | None, float | None, float | None, str]:
+    view = resolve_probability_interval_view(selected_row=row.to_dict())
+    if view is None:
+        return None, None, None, "input_missing"
+    raw_up = float(view["p_up_raw"])
+    up_lcb = float(view["p_up_lcb"])
+    up_ucb = float(view["p_up_ucb"])
+    eff_up = float(view["p_eff_up"])
+    eff_down = float(view["p_eff_down"])
+    upper_threshold = max(0.0, 1.0 - float(threshold))
+    if raw_up > 0.5:
+        if up_lcb > float(threshold):
+            return "UP", up_lcb, eff_up, "trade"
+        return None, up_lcb, eff_up, "direction_prob"
+    if raw_up < 0.5:
+        if up_ucb < float(upper_threshold):
+            return "DOWN", up_ucb, eff_down, "trade"
+        return None, up_ucb, eff_down, "direction_prob"
+    return None, raw_up, max(eff_up, eff_down), "direction_prob"
+
+
+def _apply_probability_only_decision_surface(
+    frame: pd.DataFrame,
+    *,
+    config: DecisionEngineParityConfig,
+    min_dir_prob_boost_column: str | None = None,
+) -> pd.DataFrame:
+    out = frame.copy()
+    p_up = pd.to_numeric(out.get("p_up"), errors="coerce")
+    p_down = pd.to_numeric(out.get("p_down"), errors="coerce")
+    offsets = pd.to_numeric(out.get("offset"), errors="coerce")
+    boosts = (
+        pd.to_numeric(out.get(min_dir_prob_boost_column), errors="coerce")
+        if min_dir_prob_boost_column and min_dir_prob_boost_column in out.columns
+        else pd.Series(0.0, index=out.index, dtype=float)
+    )
+    gap = (p_up - p_down).abs()
+    preferred_side = pd.Series(pd.NA, index=out.index, dtype="string")
+    preferred_side.loc[p_up >= p_down] = "UP"
+    preferred_side.loc[p_down > p_up] = "DOWN"
+    preferred_prob = pd.concat([p_up, p_down], axis=1).max(axis=1)
+
+    for column in DECISION_ENGINE_PARITY_COLUMNS:
+        if column not in out.columns:
+            out[column] = pd.NA
+    out["decision_engine_action"] = "reject"
+    out["decision_engine_reason"] = "input_missing"
+    out["decision_engine_side"] = pd.Series(pd.NA, index=out.index, dtype="string")
+    out["decision_engine_rationale"] = ""
+    out["decision_engine_entry_price"] = pd.Series(np.nan, index=out.index, dtype=float)
+    out["decision_engine_prob"] = preferred_prob
+    out["decision_engine_probability_gap"] = gap
+    out["decision_engine_edge"] = pd.Series(np.nan, index=out.index, dtype=float)
+    out["decision_engine_roi"] = pd.Series(np.nan, index=out.index, dtype=float)
+    out["decision_engine_roi_net"] = pd.Series(np.nan, index=out.index, dtype=float)
+
+    valid_mask = offsets.notna() & preferred_prob.notna() & preferred_side.notna()
+    if not bool(valid_mask.any()):
+        return out
+
+    for idx in out.index[valid_mask]:
+        offset_value = int(offsets.loc[idx])
+        boost = 0.0 if pd.isna(boosts.loc[idx]) else float(boosts.loc[idx])
+        threshold = config.min_dir_prob_for(offset=offset_value, boost=boost)
+        if threshold is None:
+            out.loc[idx, "decision_engine_reason"] = "offset_unsupported"
+            continue
+        side, trigger_prob, selected_prob, reason = _resolve_probability_only_trade_signal(
+            row=out.loc[idx],
+            threshold=float(threshold),
+        )
+        if selected_prob is not None:
+            out.loc[idx, "decision_engine_prob"] = float(selected_prob)
+        out.loc[idx, "decision_engine_probability_gap"] = float(gap.loc[idx])
+        if reason == "trade" and side is not None:
+            out.loc[idx, "decision_engine_action"] = "trade"
+            out.loc[idx, "decision_engine_reason"] = "trade"
+            out.loc[idx, "decision_engine_side"] = side
+            out.loc[idx, "decision_engine_rationale"] = (
+                f"threshold_only:{side.lower()}_raw={float(trigger_prob or 0.0):.4f}>min_dir_prob={float(threshold):.4f}"
+            )
+        else:
+            out.loc[idx, "decision_engine_reason"] = reason
+    return out
 
 
 def _frame_has_decision_quote_fallback_prices(frame: pd.DataFrame) -> bool:

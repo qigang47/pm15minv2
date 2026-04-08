@@ -57,14 +57,18 @@ class ReplayLoadSummary:
 
 def build_score_frame(score_frames: list[pd.DataFrame]) -> pd.DataFrame:
     if not score_frames:
-        return pd.DataFrame(columns=REPLAY_SCORE_COLUMNS)
-    frame = pd.concat(score_frames, ignore_index=True, sort=False)
+        frame = pd.DataFrame(index=pd.RangeIndex(0))
+    else:
+        frame = pd.concat(score_frames, ignore_index=True, sort=False)
     for column in ("decision_ts", "cycle_start_ts", "cycle_end_ts", "window_start_ts", "window_end_ts"):
         if column in frame.columns:
             frame[column] = pd.to_datetime(frame[column], utc=True, errors="coerce")
         else:
             frame[column] = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns, UTC]")
-    frame["offset"] = pd.to_numeric(frame["offset"], errors="coerce").astype("Int64")
+    if "offset" in frame.columns:
+        frame["offset"] = pd.to_numeric(frame["offset"], errors="coerce").astype("Int64")
+    else:
+        frame["offset"] = pd.Series(pd.NA, index=frame.index, dtype="Int64")
     if "window_duration_seconds" in frame.columns:
         frame["window_duration_seconds"] = pd.to_numeric(frame["window_duration_seconds"], errors="coerce")
     else:

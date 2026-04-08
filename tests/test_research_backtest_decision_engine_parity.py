@@ -251,8 +251,8 @@ def test_apply_initial_snapshot_decision_parity_rejects_partial_first_snapshot_w
     }
 
 
-def test_attach_decision_engine_surface_uses_initial_snapshot_parity_only_when_legacy_mode_enabled() -> None:
-    rows = _decision_replay_rows(p_up=0.80, p_down=0.20)
+def test_attach_decision_engine_surface_uses_probability_threshold_only_when_window_scan_mode_enabled() -> None:
+    rows = _decision_replay_rows(p_up=0.82, p_down=0.18, quote_up_ask=0.81, quote_down_ask=0.19)
     depth_replay = pd.DataFrame(
         [
             _depth_snapshot_candidate(
@@ -278,14 +278,19 @@ def test_attach_decision_engine_surface_uses_initial_snapshot_parity_only_when_l
         fill_config=_decision_fill_config(raw_depth_fak_refresh_enabled=False),
     )
 
-    assert legacy_out.loc[0, "decision_engine_action"] == "reject"
-    assert legacy_out.loc[0, "decision_engine_reason"] == "direction_prob"
+    assert legacy_out.loc[0, "decision_engine_action"] == "trade"
+    assert legacy_out.loc[0, "decision_engine_reason"] == "trade"
+    assert legacy_out.loc[0, "decision_engine_side"] == "UP"
+    assert bool(legacy_out.loc[0, "decision_quote_limit_reject"]) is False
+    assert bool(legacy_out.loc[0, "pre_submit_orderbook_retry_armed"]) is False
     assert legacy_summary.to_dict() == {
         "raw_depth_rows": 1,
         "repriced_rows": 1,
         "limit_reject_rows": 0,
         "orderbook_missing_rows": 0,
     }
+    assert research_out.loc[0, "decision_engine_action"] == "trade"
+    assert research_out.loc[0, "decision_engine_reason"] == "trade"
     assert research_out.loc[0, "decision_engine_side"] == "UP"
     assert research_summary.to_dict() == {
         "raw_depth_rows": 0,
@@ -295,7 +300,7 @@ def test_attach_decision_engine_surface_uses_initial_snapshot_parity_only_when_l
     }
 
 
-def test_attach_decision_engine_surface_arms_pre_submit_orderbook_retry_on_limit_reject() -> None:
+def test_attach_decision_engine_surface_does_not_arm_pre_submit_retry_for_initial_snapshot_limit_reject() -> None:
     rows = _decision_replay_rows(p_up=0.58, p_down=0.42)
     depth_replay = pd.DataFrame(
         [
@@ -315,13 +320,15 @@ def test_attach_decision_engine_surface_arms_pre_submit_orderbook_retry_on_limit
         fill_config=_decision_fill_config(raw_depth_fak_refresh_enabled=True),
     )
 
-    assert out.loc[0, "decision_engine_reason"] == "orderbook_limit_reject"
-    assert bool(out.loc[0, "pre_submit_orderbook_retry_armed"]) is True
-    assert out.loc[0, "pre_submit_orderbook_retry_reason"] == "orderbook_limit_reject"
-    assert out.loc[0, "pre_submit_orderbook_retry_state_key"] == "orderbook_retry_count"
+    assert out.loc[0, "decision_engine_action"] == "reject"
+    assert out.loc[0, "decision_engine_reason"] == "direction_prob"
+    assert bool(out.loc[0, "decision_quote_limit_reject"]) is True
+    assert bool(out.loc[0, "pre_submit_orderbook_retry_armed"]) is False
+    assert out.loc[0, "pre_submit_orderbook_retry_reason"] == ""
+    assert out.loc[0, "pre_submit_orderbook_retry_state_key"] == ""
 
 
-def test_attach_decision_engine_surface_missing_depth_fallback_keeps_profile_entry_band() -> None:
+def test_attach_decision_engine_surface_missing_depth_fallback_uses_probability_threshold_only() -> None:
     rows = _decision_replay_rows(p_up=0.82, p_down=0.18, quote_up_ask=0.81, quote_down_ask=0.19)
 
     out, summary = _attach_decision_engine_surface(
@@ -332,16 +339,129 @@ def test_attach_decision_engine_surface_missing_depth_fallback_keeps_profile_ent
         fill_config=_decision_fill_config(raw_depth_fak_refresh_enabled=True),
     )
 
-    assert out.loc[0, "decision_engine_action"] == "reject"
-    assert out.loc[0, "decision_engine_reason"] in {"entry_price_max", "direction_prob"}
-    assert pd.isna(out.loc[0, "decision_engine_side"])
+    assert out.loc[0, "decision_engine_action"] == "trade"
+    assert out.loc[0, "decision_engine_reason"] == "trade"
+    assert out.loc[0, "decision_engine_side"] == "UP"
     assert bool(out.loc[0, "decision_quote_has_raw_depth"]) is False
+    assert bool(out.loc[0, "pre_submit_orderbook_retry_armed"]) is False
     assert summary.to_dict() == {
         "raw_depth_rows": 0,
         "repriced_rows": 0,
         "limit_reject_rows": 0,
         "orderbook_missing_rows": 0,
     }
+
+
+def test_attach_decision_engine_surface_probability_only_keeps_up_side_when_up_interval_passes_even_if_down_is_cheaper() -> None:
+    rows = _decision_replay_rows(
+        signal_target="direction",
+        p_up=0.65,
+        p_down=0.30,
+        p_up_raw=0.70,
+        p_down_raw=0.30,
+        p_eff_up=0.65,
+        p_eff_down=0.30,
+        p_up_lcb=0.65,
+        p_up_ucb=0.70,
+        quote_up_ask=0.29,
+        quote_down_ask=0.05,
+    )
+
+    out, _summary = _attach_decision_engine_surface(
+        rows,
+        market="eth",
+        profile_spec=resolve_backtest_profile_spec(market="eth", profile="deep_otm_baseline"),
+        depth_replay=None,
+        fill_config=_decision_fill_config(raw_depth_fak_refresh_enabled=True),
+    )
+
+    assert out.loc[0, "decision_engine_action"] == "trade"
+    assert out.loc[0, "decision_engine_reason"] == "trade"
+    assert out.loc[0, "decision_engine_side"] == "UP"
+
+
+def test_attach_decision_engine_surface_probability_only_rejects_up_when_lcb_is_not_above_threshold() -> None:
+    rows = _decision_replay_rows(
+        signal_target="direction",
+        p_up=0.60,
+        p_down=0.32,
+        p_up_raw=0.68,
+        p_down_raw=0.32,
+        p_eff_up=0.60,
+        p_eff_down=0.32,
+        p_up_lcb=0.60,
+        p_up_ucb=0.68,
+        quote_up_ask=0.29,
+        quote_down_ask=0.05,
+    )
+
+    out, _summary = _attach_decision_engine_surface(
+        rows,
+        market="eth",
+        profile_spec=resolve_backtest_profile_spec(market="eth", profile="deep_otm_baseline"),
+        depth_replay=None,
+        fill_config=_decision_fill_config(raw_depth_fak_refresh_enabled=True),
+    )
+
+    assert out.loc[0, "decision_engine_action"] == "reject"
+    assert out.loc[0, "decision_engine_reason"] == "direction_prob"
+    assert pd.isna(out.loc[0, "decision_engine_side"])
+
+
+def test_attach_decision_engine_surface_probability_only_trades_down_when_down_interval_passes() -> None:
+    rows = _decision_replay_rows(
+        signal_target="direction",
+        p_up=0.28,
+        p_down=0.72,
+        p_up_raw=0.28,
+        p_down_raw=0.72,
+        p_eff_up=0.28,
+        p_eff_down=0.72,
+        p_up_lcb=0.28,
+        p_up_ucb=0.28,
+        quote_up_ask=0.74,
+        quote_down_ask=0.05,
+    )
+
+    out, _summary = _attach_decision_engine_surface(
+        rows,
+        market="eth",
+        profile_spec=resolve_backtest_profile_spec(market="eth", profile="deep_otm_baseline"),
+        depth_replay=None,
+        fill_config=_decision_fill_config(raw_depth_fak_refresh_enabled=True),
+    )
+
+    assert out.loc[0, "decision_engine_action"] == "trade"
+    assert out.loc[0, "decision_engine_reason"] == "trade"
+    assert out.loc[0, "decision_engine_side"] == "DOWN"
+
+
+def test_attach_decision_engine_surface_probability_only_rejects_down_when_ucb_is_not_below_threshold() -> None:
+    rows = _decision_replay_rows(
+        signal_target="direction",
+        p_up=0.41,
+        p_down=0.59,
+        p_up_raw=0.41,
+        p_down_raw=0.59,
+        p_eff_up=0.41,
+        p_eff_down=0.59,
+        p_up_lcb=0.41,
+        p_up_ucb=0.41,
+        quote_up_ask=0.20,
+        quote_down_ask=0.29,
+    )
+
+    out, _summary = _attach_decision_engine_surface(
+        rows,
+        market="eth",
+        profile_spec=resolve_backtest_profile_spec(market="eth", profile="deep_otm_baseline"),
+        depth_replay=None,
+        fill_config=_decision_fill_config(raw_depth_fak_refresh_enabled=True),
+    )
+
+    assert out.loc[0, "decision_engine_action"] == "reject"
+    assert out.loc[0, "decision_engine_reason"] == "direction_prob"
+    assert pd.isna(out.loc[0, "decision_engine_side"])
 
 
 def _decision_replay_rows(**overrides: object) -> pd.DataFrame:

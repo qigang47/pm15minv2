@@ -222,3 +222,37 @@ def test_build_replay_frame_preserves_contract_specific_scores() -> None:
     out = replay.sort_values("market_id").reset_index(drop=True)
     assert out["market_id"].tolist() == ["m-1", "m-2"]
     assert out["p_up"].tolist() == [0.74, 0.21]
+
+
+def test_build_replay_frame_handles_empty_window_without_dtype_merge_errors() -> None:
+    features = pd.DataFrame(
+        {
+            "decision_ts": pd.Series(dtype="datetime64[ns, UTC]"),
+            "cycle_start_ts": pd.Series(dtype="datetime64[ns, UTC]"),
+            "cycle_end_ts": pd.Series(dtype="datetime64[ns, UTC]"),
+            "offset": pd.Series(dtype="Int64"),
+            "ret_1m": pd.Series(dtype="float64"),
+        }
+    )
+    labels = pd.DataFrame(
+        {
+            "cycle_start_ts": pd.Series(dtype="int64"),
+            "cycle_end_ts": pd.Series(dtype="int64"),
+            "label_set": pd.Series(dtype="string"),
+            "resolved": pd.Series(dtype="boolean"),
+            "winner_side": pd.Series(dtype="string"),
+        }
+    )
+
+    replay, summary = build_replay_frame(
+        features=features,
+        labels=labels,
+        score_frames=[],
+        available_offsets=[7, 8, 9],
+    )
+
+    assert replay.empty
+    assert str(replay["decision_ts"].dtype) == "datetime64[ns, UTC]"
+    assert summary.feature_rows == 0
+    assert summary.score_rows == 0
+    assert summary.ready_rows == 0

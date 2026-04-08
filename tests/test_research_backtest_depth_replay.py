@@ -3,10 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from pm15min.data.config import DataConfig
 from pm15min.data.io.ndjson_zst import append_ndjson_zst
 from pm15min.data.io.parquet import write_parquet_atomic
+from pm15min.research.backtests import depth_replay as depth_replay_module
 from pm15min.research.backtests.depth_replay import build_raw_depth_replay_frame
 
 
@@ -752,4 +754,82 @@ def test_build_raw_depth_replay_frame_prefers_market_id_catalog_match_before_cyc
     assert row["token_down"] == "tok-down-good"
     assert row["question"] == "SOL good?"
     assert row["depth_snapshot_status"] == "ok"
+    assert summary.replay_rows_with_snapshots == 1
+
+
+def test_build_raw_depth_replay_frame_falls_back_to_orderbook_index_when_raw_depth_is_corrupt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    depth_path = data_cfg.layout.orderbook_depth_path("2026-03-01")
+    depth_path.parent.mkdir(parents=True, exist_ok=True)
+    depth_path.write_bytes(b"corrupt")
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "captured_ts_ms": int(pd.Timestamp("2026-03-01T00:05:20Z").timestamp() * 1000),
+                    "market_id": "m-idx",
+                    "token_id": "tok-up-idx",
+                    "side": "up",
+                    "best_ask": 0.31,
+                    "best_bid": 0.30,
+                    "ask_size_1": 9.0,
+                    "bid_size_1": 4.0,
+                    "spread": 0.01,
+                },
+                {
+                    "captured_ts_ms": int(pd.Timestamp("2026-03-01T00:05:20Z").timestamp() * 1000),
+                    "market_id": "m-idx",
+                    "token_id": "tok-down-idx",
+                    "side": "down",
+                    "best_ask": 0.69,
+                    "best_bid": 0.68,
+                    "ask_size_1": 8.0,
+                    "bid_size_1": 3.0,
+                    "spread": 0.01,
+                },
+            ]
+        ),
+        data_cfg.layout.orderbook_index_path("2026-03-01"),
+    )
+
+    original_iter = depth_replay_module.iter_ndjson_zst
+
+    def _corrupting_iter(path: Path):
+        if path == depth_path:
+            raise RuntimeError("synthetic zstd corruption")
+        yield from original_iter(path)
+
+    monkeypatch.setattr(depth_replay_module, "iter_ndjson_zst", _corrupting_iter)
+
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "window_start_ts": "2026-03-01T00:05:00Z",
+                "window_end_ts": "2026-03-01T00:06:00Z",
+                "offset": 7,
+                "market_id": "m-idx",
+                "token_up": "tok-up-idx",
+                "token_down": "tok-down-idx",
+            }
+        ]
+    )
+
+    out, summary = build_raw_depth_replay_frame(
+        replay=replay,
+        data_cfg=data_cfg,
+        snapshot_tolerance_ms=60_000,
+    )
+
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert row["depth_match_strategy"] == "token_window"
+    assert row["depth_source_path"] == str(data_cfg.layout.orderbook_index_path("2026-03-01"))
+    assert row["depth_up_record"] == {"asks": [[0.31, 9.0]]}
+    assert row["depth_down_record"] == {"asks": [[0.69, 8.0]]}
+    assert summary.raw_records_scanned == 2
+    assert summary.snapshot_rows == 1
     assert summary.replay_rows_with_snapshots == 1

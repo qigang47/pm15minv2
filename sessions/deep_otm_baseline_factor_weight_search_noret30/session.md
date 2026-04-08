@@ -175,6 +175,20 @@
 - `034`
   - Attempted ETH 38band as the next single formal 1 USD / max3 validation from the near-40 line because cycle 033 identified ETH 38_v3 as the only fresh promotable candidate.
   - The launch built fresh training and model-bundle artifacts, but the formal runner was terminated before completion, leaving no surviving experiment run directory or formal summary.
+
+  - Recovered the stalled ETH 38band formal label instead of launching a duplicate run.
+  - Confirmed the resumed ETH run is actively progressing through real orderbook files and completed the 38_v3 formal case.
+
+- `035`
+  - Resumed the interrupted ETH 38band formal run under the same label instead of launching a duplicate.
+  - Captured the first persisted ETH 38_v3 real-orderbook result: 16 trades, 4 wins, 12 losses, -1.8537% ROI, pnl -0.296592.
+  - The same suite log has already advanced to eth/focus_search__fs_38_v4__max3__stake_1usd__max_3usd, so the formal run remains partially active beyond the first completed case.
+  - Saved a partial summarize_experiment snapshot plus a manual inspection JSON for this in-progress run.
+
+- `036`
+  - Re-read program.md plus the latest session artifacts, then inspected the current ETH 38band formal run so this cycle would not open a duplicate label.
+  - Resumed baseline_focus_feature_search_eth_reversal_38band_20260407 under auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407 with scripts/research/run_one_experiment.sh and kept the cycle within the one-coin formal cap.
+  - Ran scripts/research/summarize_experiment.py after the recovery attempt and confirmed the run summary still only reflects the persisted 38_v3 case while the suite log again ends at the 38_v4 seed-case start.
 ## What's been tried
 
 - Round-1 reversal focus-width quick-screen selected BTC 30/34, ETH 30/34, SOL 34/30, XRP 34/30 as current best starting sets.
@@ -264,6 +278,13 @@
 - Completed the near-40 38band comparison across current controls plus 38_v3 and 38_v4 alternatives; ETH 38_v3 improved to 15 trade rows and 4 traded winners in band.
 - BTC 38_v4 raised raw trade rows to 3 but still had 0 traded winners, while SOL 38_v3 and XRP 38_v4 still remained at 0 trade rows.
 - Attempted ETH 38band 1 USD / max3 formal validation under auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407; training and bundle artifacts were built, but the formal runner was terminated before any formal backtest outputs or summary survived.
+
+- Recovered and resumed the ETH 38band 1 USD / max3 formal validation under the same run label.
+- Captured a partial standardized summary after the first completed 38_v3 case posted -1.85% ROI on 16 trades.
+
+- ETH 38band formal recovery under the existing label now has a persisted 38_v3 result at -1.8537% ROI across 16 trades, but the full three-case suite is not finished yet.
+
+- ETH 38band formal recovery was attempted again under the same label, but the run still exposes only the 38_v3 result at -1.8537% ROI across 16 trades with no 38_v4 completion yet.
 ## Open issues
 - Need continuous Codex background loop to monitor active quick-screen runs, summarize completed runs, and launch the next one-factor follow-up automatically.
 
@@ -351,3 +372,14 @@
 - BTC still only has thin one-trade bridge evidence, so it should stay secondary until ETH 38_v3 gets real validation.
 - SOL and XRP remain blocked by zero-trade quick-screen outcomes and need a more substantive near-40 replacement idea before any promotion.
 - ETH 38band formal launch was terminated before any formal backtest outputs were persisted; the next cycle should relaunch or recover the same label from the surviving training and bundle artifacts instead of opening a different formal market.
+
+- The ETH 38band suite is still active in the 38_v4 execution group and must be resumed or summarized only under the same label.
+- Do not open a new BTC / SOL / XRP formal line before the active ETH 38band label settles.
+
+- ETH 38band formal is still in progress under auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407; resume or monitor the same label instead of launching a duplicate.
+- For this run label, summary.json now appears before the full suite finishes, so the next cycle must read the suite log before treating the run as complete.
+- Background autorun still reports other incomplete experiment runs, so do not add a new formal market until active workload is checked against the program cap.
+
+- ETH 38band formal remains incomplete under auto_focus_feature_search_eth_reversal_38band_formal1usd_r1_20260407; inspect the same label again before launching any new formal market.
+- A second consecutive recovery attempt still leaves the suite log stranded at the 38_v4 seed-case start, so the next single-cycle action may need targeted runner debugging instead of another blind resume.
+- Do not treat summary.json presence alone as full-suite completion for this label.

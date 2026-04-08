@@ -14,6 +14,7 @@ from pm15min.research.backtests.replay_loader import REPLAY_KEY_COLUMNS
 from pm15min.research.backtests.data_surface_fallback import (
     load_market_catalog_with_fallback,
     resolve_orderbook_depth_path,
+    resolve_orderbook_index_path,
 )
 
 
@@ -121,77 +122,68 @@ def build_raw_depth_replay_frame(
         snapshot_tolerance_ms=tolerance_ms,
     )
     buckets: dict[tuple[int, int], dict[str, Any]] = {}
-    seen_bucket_keys: set[tuple[int, int]] = set()
     row_candidate_total_counts: dict[int, int] = {}
     row_stored_candidate_counts: dict[int, int] = {}
     raw_records_scanned = 0
     raw_record_matches = 0
     source_files_scanned = 0
 
-    depth_sources = [
-        (date_str, resolve_orderbook_depth_path(data_cfg, date_str))
+    available_dates = [
+        date_str
         for date_str in sorted(date_lookups)
+        if resolve_orderbook_depth_path(data_cfg, date_str).exists() or resolve_orderbook_index_path(data_cfg, date_str).exists()
     ]
-    existing_sources = [(date_str, depth_path) for date_str, depth_path in depth_sources if depth_path.exists()]
 
-    for source_idx, (date_str, depth_path) in enumerate(existing_sources, start=1):
+    for source_idx, date_str in enumerate(available_dates, start=1):
+        depth_path = resolve_orderbook_depth_path(data_cfg, date_str)
+        index_path = resolve_orderbook_index_path(data_cfg, date_str)
+        source_path = depth_path if depth_path.exists() else index_path
+        if not source_path.exists():
+            continue
         source_files_scanned += 1
         if heartbeat is not None:
-            heartbeat(f"Scanning depth replay file {source_idx}/{len(existing_sources)}: {date_str}")
+            heartbeat(f"Scanning depth replay file {source_idx}/{len(available_dates)}: {date_str}")
         date_lookup = date_lookups[date_str]
-        for raw in iter_ndjson_zst(depth_path):
-            raw_records_scanned += 1
-            if heartbeat is not None and raw_records_scanned % DEPTH_REPLAY_HEARTBEAT_INTERVAL_RECORDS == 0:
-                heartbeat(
-                    f"Scanning depth replay file {source_idx}/{len(existing_sources)}: "
-                    f"{raw_records_scanned:,} raw records"
-                )
-            market_id = str(raw.get("market_id") or "").strip()
-            if not market_id or market_id not in date_lookup["market_ids"]:
-                continue
-            raw_offset = _int_or_none(raw.get("offset"))
-            if raw_offset is not None and date_lookup["offsets"] and raw_offset not in date_lookup["offsets"]:
-                continue
-            matched_rows, strategy = _match_replay_rows(
-                raw,
-                decision_lookup=date_lookup["decision_lookup"],
-                token_lookup=date_lookup["token_lookup"],
+        try:
+            local_buckets, local_row_candidate_totals, local_records_scanned, local_record_matches = _scan_depth_replay_records(
+                records=iter_ndjson_zst(depth_path),
+                source_path=depth_path,
+                date_lookup=date_lookup,
                 snapshot_tolerance_ms=tolerance_ms,
                 allow_token_window_fallback=allow_token_window_fallback,
+                source_idx=source_idx,
+                source_total=len(available_dates),
+                heartbeat=heartbeat,
             )
-            if not matched_rows:
-                continue
-            side = str(raw.get("side") or "").strip().lower()
-            if side not in {"up", "down"}:
-                continue
-            bucket_ts_ms = _replay_snapshot_ts_ms(raw)
-            if bucket_ts_ms is None:
-                continue
-            record_ts_ms = _record_snapshot_ts_ms(raw)
-            raw_record_matches += len(matched_rows)
-            for row_idx in matched_rows:
-                bucket_key = (row_idx, bucket_ts_ms)
-                if bucket_key not in seen_bucket_keys:
-                    seen_bucket_keys.add(bucket_key)
-                    row_candidate_total_counts[int(row_idx)] = row_candidate_total_counts.get(int(row_idx), 0) + 1
-                    stored_count = row_stored_candidate_counts.get(int(row_idx), 0)
-                    if snapshot_cap is not None and stored_count >= snapshot_cap:
-                        continue
-                    row_stored_candidate_counts[int(row_idx)] = stored_count + 1
-                    buckets[bucket_key] = {
-                        "source_path": str(depth_path),
-                        "up": None,
-                        "down": None,
-                        "match_strategies": set(),
-                        "up_snapshot_ts_ms": None,
-                        "down_snapshot_ts_ms": None,
-                    }
-                bucket = buckets.get(bucket_key)
-                if bucket is None:
+        except Exception:
+            if not index_path.exists():
+                raise
+            if heartbeat is not None:
+                heartbeat(f"Depth replay falling back to orderbook index for {date_str}")
+            local_buckets, local_row_candidate_totals, local_records_scanned, local_record_matches = _scan_depth_replay_records(
+                records=_iter_orderbook_index_records(index_path),
+                source_path=index_path,
+                date_lookup=date_lookup,
+                snapshot_tolerance_ms=tolerance_ms,
+                allow_token_window_fallback=allow_token_window_fallback,
+                source_idx=source_idx,
+                source_total=len(available_dates),
+                heartbeat=heartbeat,
+            )
+        raw_records_scanned += int(local_records_scanned)
+        raw_record_matches += int(local_record_matches)
+        for row_idx, count in local_row_candidate_totals.items():
+            row_candidate_total_counts[int(row_idx)] = row_candidate_total_counts.get(int(row_idx), 0) + int(count)
+        for bucket_key in sorted(local_buckets):
+            row_idx = int(bucket_key[0])
+            if bucket_key not in buckets:
+                stored_count = row_stored_candidate_counts.get(row_idx, 0)
+                if snapshot_cap is not None and stored_count >= snapshot_cap:
                     continue
-                bucket[side] = _compact_depth_snapshot_record(raw)
-                bucket[f"{side}_snapshot_ts_ms"] = record_ts_ms
-                bucket["match_strategies"].add(strategy)
+                row_stored_candidate_counts[row_idx] = stored_count + 1
+                buckets[bucket_key] = local_buckets[bucket_key]
+                continue
+            _merge_depth_bucket(buckets[bucket_key], local_buckets[bucket_key])
 
     out = _build_depth_replay_output(
         prepared=prepared,
@@ -226,6 +218,110 @@ def build_raw_depth_replay_frame(
     if "_replay_row_idx" in out.columns:
         out = out.drop(columns=["_replay_row_idx"])
     return out, summary
+
+
+def _scan_depth_replay_records(
+    *,
+    records: Any,
+    source_path: Path,
+    date_lookup: dict[str, Any],
+    snapshot_tolerance_ms: int,
+    allow_token_window_fallback: bool,
+    source_idx: int,
+    source_total: int,
+    heartbeat: Callable[[str], None] | None,
+) -> tuple[dict[tuple[int, int], dict[str, Any]], dict[int, int], int, int]:
+    buckets: dict[tuple[int, int], dict[str, Any]] = {}
+    seen_bucket_keys: set[tuple[int, int]] = set()
+    row_candidate_total_counts: dict[int, int] = {}
+    raw_records_scanned = 0
+    raw_record_matches = 0
+    for raw in records:
+        raw_records_scanned += 1
+        if heartbeat is not None and raw_records_scanned % DEPTH_REPLAY_HEARTBEAT_INTERVAL_RECORDS == 0:
+            heartbeat(
+                f"Scanning depth replay file {source_idx}/{source_total}: "
+                f"{raw_records_scanned:,} raw records"
+            )
+        market_id = str(raw.get("market_id") or "").strip()
+        if not market_id or market_id not in date_lookup["market_ids"]:
+            continue
+        raw_offset = _int_or_none(raw.get("offset"))
+        if raw_offset is not None and date_lookup["offsets"] and raw_offset not in date_lookup["offsets"]:
+            continue
+        matched_rows, strategy = _match_replay_rows(
+            raw,
+            decision_lookup=date_lookup["decision_lookup"],
+            token_lookup=date_lookup["token_lookup"],
+            snapshot_tolerance_ms=snapshot_tolerance_ms,
+            allow_token_window_fallback=allow_token_window_fallback,
+        )
+        if not matched_rows:
+            continue
+        side = str(raw.get("side") or "").strip().lower()
+        if side not in {"up", "down"}:
+            continue
+        bucket_ts_ms = _replay_snapshot_ts_ms(raw)
+        if bucket_ts_ms is None:
+            continue
+        record_ts_ms = _record_snapshot_ts_ms(raw)
+        raw_record_matches += len(matched_rows)
+        for row_idx in matched_rows:
+            bucket_key = (int(row_idx), int(bucket_ts_ms))
+            if bucket_key not in seen_bucket_keys:
+                seen_bucket_keys.add(bucket_key)
+                row_candidate_total_counts[int(row_idx)] = row_candidate_total_counts.get(int(row_idx), 0) + 1
+                buckets[bucket_key] = {
+                    "source_path": str(source_path),
+                    "up": None,
+                    "down": None,
+                    "match_strategies": set(),
+                    "up_snapshot_ts_ms": None,
+                    "down_snapshot_ts_ms": None,
+                }
+            bucket = buckets[bucket_key]
+            bucket[side] = _compact_depth_snapshot_record(raw)
+            bucket[f"{side}_snapshot_ts_ms"] = record_ts_ms
+            bucket["match_strategies"].add(strategy)
+    return buckets, row_candidate_total_counts, raw_records_scanned, raw_record_matches
+
+
+def _merge_depth_bucket(target: dict[str, Any], incoming: dict[str, Any]) -> None:
+    if not str(target.get("source_path") or "") and str(incoming.get("source_path") or ""):
+        target["source_path"] = str(incoming.get("source_path") or "")
+    for side in ("up", "down"):
+        if target.get(side) is None and incoming.get(side) is not None:
+            target[side] = incoming.get(side)
+        ts_key = f"{side}_snapshot_ts_ms"
+        if target.get(ts_key) is None and incoming.get(ts_key) is not None:
+            target[ts_key] = incoming.get(ts_key)
+    target.setdefault("match_strategies", set())
+    target["match_strategies"].update(set(incoming.get("match_strategies") or set()))
+
+
+def _iter_orderbook_index_records(index_path: Path) -> Any:
+    columns = [
+        "captured_ts_ms",
+        "market_id",
+        "token_id",
+        "side",
+        "best_ask",
+        "ask_size_1",
+    ]
+    frame = pd.read_parquet(index_path, columns=columns)
+    for row in frame.itertuples(index=False):
+        best_ask = _float_or_none(getattr(row, "best_ask", None))
+        ask_size_1 = _float_or_none(getattr(row, "ask_size_1", None))
+        asks: list[list[float]] = []
+        if best_ask is not None and best_ask > 0.0 and ask_size_1 is not None and ask_size_1 > 0.0:
+            asks = [[float(best_ask), float(ask_size_1)]]
+        yield {
+            "captured_ts_ms": _int_or_none(getattr(row, "captured_ts_ms", None)),
+            "market_id": str(getattr(row, "market_id", "") or "").strip(),
+            "token_id": str(getattr(row, "token_id", "") or "").strip(),
+            "side": str(getattr(row, "side", "") or "").strip().lower(),
+            "asks": asks,
+        }
 
 
 def _empty_depth_replay_frame(replay: pd.DataFrame) -> pd.DataFrame:
@@ -590,6 +686,15 @@ def _int_or_none(value: object) -> int | None:
         if value is None or pd.isna(value):
             return None
         return int(value)
+    except Exception:
+        return None
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
     except Exception:
         return None
 

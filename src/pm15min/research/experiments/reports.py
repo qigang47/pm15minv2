@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pandas as pd
 
 from .leaderboard import build_leaderboard_cut
@@ -107,6 +110,30 @@ RUNTIME_NOTE_COLUMNS = [
     "secondary_training_reused",
     "secondary_bundle_reused",
     "resumed_from_existing",
+]
+
+FACTOR_SIGNAL_CASE_COLUMNS = [
+    "rank",
+    "case_key",
+    "market",
+    "group_name",
+    "run_name",
+    "feature_set",
+    "variant_label",
+    "target",
+    "trades",
+    "pnl_sum",
+    "roi_pct",
+]
+
+FACTOR_SIGNAL_COLUMNS = [
+    "feature",
+    "hits",
+    "case_hits",
+    "offsets",
+    "avg_direction_score",
+    "avg_case_roi_pct",
+    "avg_case_pnl_sum",
 ]
 
 
@@ -330,6 +357,7 @@ def build_experiment_summary(
     group_summary = build_group_summary_frame(compare_frame)
     matrix_summary = build_matrix_summary_frame(compare_frame)
     run_summary = build_run_summary_frame(compare_frame)
+    factor_signal_summary = build_factor_signal_summary(compare_frame)
     return {
         "suite_name": suite_name,
         "run_label": run_label,
@@ -350,6 +378,7 @@ def build_experiment_summary(
         "top_roi_pct": None if leaderboard.empty else float(pd.to_numeric(leaderboard["roi_pct"], errors="coerce").fillna(0.0).iloc[0]),
         "training_rows": int(len(training_runs)),
         "backtest_rows": int(len(backtest_runs)),
+        "factor_signal_summary": factor_signal_summary,
     }
 
 
@@ -369,6 +398,7 @@ def render_experiment_report(
     best_by_matrix = build_best_by_matrix_frame(leaderboard if leaderboard is not None and not leaderboard.empty else compare_frame)
     best_by_run = build_best_by_run_frame(leaderboard if leaderboard is not None and not leaderboard.empty else compare_frame)
     runtime_notes = build_runtime_notes_frame(compare_frame)
+    factor_signal_summary = summary.get("factor_signal_summary") if isinstance(summary.get("factor_signal_summary"), dict) else {}
     lines = [
         "# Experiment Summary",
         "",
@@ -394,6 +424,31 @@ def render_experiment_report(
         lines.append(_render_markdown_table(top_cases, FOCUS_CASE_COLUMNS))
     else:
         lines.append("No top cases available.")
+    lines.extend(["", "## Factor Signals From Good Cases", ""])
+    if int(factor_signal_summary.get("selected_case_count") or 0) > 0:
+        lines.append(f"- selection_mode: `{factor_signal_summary.get('selection_mode')}`")
+        lines.append(f"- selected_case_count: `{factor_signal_summary.get('selected_case_count')}`")
+        lines.extend(["", "### Source Cases", ""])
+        lines.append(
+            _render_markdown_table(
+                pd.DataFrame(list(factor_signal_summary.get("selected_cases") or [])),
+                FACTOR_SIGNAL_CASE_COLUMNS,
+            )
+        )
+        lines.extend(["", "### Positive Factors", ""])
+        positive_factors = pd.DataFrame(list(factor_signal_summary.get("positive_factors") or []))
+        if not positive_factors.empty:
+            lines.append(_render_markdown_table(positive_factors, FACTOR_SIGNAL_COLUMNS))
+        else:
+            lines.append("No positive factors collected.")
+        lines.extend(["", "### Negative Factors", ""])
+        negative_factors = pd.DataFrame(list(factor_signal_summary.get("negative_factors") or []))
+        if not negative_factors.empty:
+            lines.append(_render_markdown_table(negative_factors, FACTOR_SIGNAL_COLUMNS))
+        else:
+            lines.append("No negative factors collected.")
+    else:
+        lines.append("No factor signal summary available.")
     lines.extend(["", "## Group Summary", ""])
     if not group_summary.empty:
         lines.append(
@@ -667,6 +722,71 @@ def build_runtime_notes_frame(compare_frame: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def build_factor_signal_summary(compare_frame: pd.DataFrame, *, limit: int = 5) -> dict[str, object]:
+    empty = {
+        "selection_mode": "none",
+        "selected_case_count": 0,
+        "selected_cases": [],
+        "positive_factors": [],
+        "negative_factors": [],
+    }
+    if compare_frame is None or compare_frame.empty:
+        return empty
+    source = _focus_source_frame(compare_frame)
+    if source.empty:
+        return empty
+
+    source = source.copy()
+    source["trades"] = pd.to_numeric(source.get("trades", pd.Series(0, index=source.index)), errors="coerce").fillna(0).astype(int)
+    source["pnl_sum"] = pd.to_numeric(source.get("pnl_sum", pd.Series(0.0, index=source.index)), errors="coerce").fillna(0.0)
+    source["roi_pct"] = pd.to_numeric(source.get("roi_pct", pd.Series(0.0, index=source.index)), errors="coerce").fillna(0.0)
+
+    profitable_traded = source.loc[source["trades"].gt(0) & source["pnl_sum"].gt(0.0)].copy()
+    if not profitable_traded.empty:
+        selection_mode = "profitable_traded"
+        selected_source = profitable_traded
+    else:
+        traded = source.loc[source["trades"].gt(0)].copy()
+        if not traded.empty:
+            selection_mode = "traded"
+            selected_source = traded
+        else:
+            selection_mode = "completed"
+            selected_source = source
+
+    selected_cases = build_top_cases_frame(selected_source, limit=limit)
+    if selected_cases.empty:
+        return {**empty, "selection_mode": selection_mode}
+
+    selected_case_rows: list[dict[str, object]] = []
+    positive = _aggregate_case_factor_rows(selected_cases, row_key="top_positive_factors")
+    negative = _aggregate_case_factor_rows(selected_cases, row_key="top_negative_factors")
+    for row in selected_cases.reset_index(drop=True).itertuples(index=False):
+        selected_case_rows.append(
+            {
+                "rank": int(len(selected_case_rows) + 1),
+                "case_key": _optional_text(getattr(row, "case_key", "")),
+                "market": _optional_text(getattr(row, "market", "")),
+                "group_name": _optional_text(getattr(row, "group_name", "")),
+                "run_name": _optional_text(getattr(row, "run_name", "")),
+                "feature_set": _optional_text(getattr(row, "feature_set", "")),
+                "variant_label": _optional_text(getattr(row, "variant_label", "")),
+                "target": _optional_text(getattr(row, "target", "")),
+                "trades": _optional_int(getattr(row, "trades", 0)),
+                "pnl_sum": _optional_float(getattr(row, "pnl_sum", 0.0)),
+                "roi_pct": _optional_float(getattr(row, "roi_pct", 0.0)),
+            }
+        )
+
+    return {
+        "selection_mode": selection_mode,
+        "selected_case_count": int(len(selected_case_rows)),
+        "selected_cases": selected_case_rows,
+        "positive_factors": positive,
+        "negative_factors": negative,
+    }
+
+
 def _build_summary_frame(
     compare_frame: pd.DataFrame,
     *,
@@ -742,6 +862,96 @@ def _matrix_source_frame(source: pd.DataFrame) -> pd.DataFrame:
     frame = source.copy()
     values = frame.get("matrix_parent_run_name", pd.Series("", index=frame.index, dtype="string")).astype("string").fillna("")
     return frame.loc[values.ne("")].copy()
+
+
+def _aggregate_case_factor_rows(source: pd.DataFrame, *, row_key: str, limit: int = 10) -> list[dict[str, object]]:
+    stats_by_feature: dict[str, dict[str, object]] = {}
+    for row in source.itertuples(index=False):
+        training_run_dir = _optional_text(getattr(row, "training_run_dir", ""))
+        if not training_run_dir:
+            continue
+        case_key = _optional_text(getattr(row, "case_key", ""))
+        case_roi_pct = _optional_float(getattr(row, "roi_pct", 0.0))
+        case_pnl_sum = _optional_float(getattr(row, "pnl_sum", 0.0))
+        for offset_value, factor_rows in _read_case_factor_rows(Path(training_run_dir), row_key=row_key):
+            for factor_row in factor_rows:
+                feature = str((factor_row or {}).get("feature") or "").strip()
+                if not feature:
+                    continue
+                score = float((factor_row or {}).get("direction_score", 0.0) or 0.0)
+                stat = stats_by_feature.setdefault(
+                    feature,
+                    {
+                        "feature": feature,
+                        "hits": 0,
+                        "case_keys": set(),
+                        "offsets": set(),
+                        "direction_score_sum": 0.0,
+                        "case_roi_pct_sum": 0.0,
+                        "case_pnl_sum": 0.0,
+                    },
+                )
+                stat["hits"] = int(stat["hits"]) + 1
+                stat["case_keys"].add(case_key)
+                stat["offsets"].add(int(offset_value))
+                stat["direction_score_sum"] = float(stat["direction_score_sum"]) + score
+                stat["case_roi_pct_sum"] = float(stat["case_roi_pct_sum"]) + case_roi_pct
+                stat["case_pnl_sum"] = float(stat["case_pnl_sum"]) + case_pnl_sum
+
+    rows: list[dict[str, object]] = []
+    for stat in stats_by_feature.values():
+        hits = max(1, int(stat["hits"]))
+        rows.append(
+            {
+                "feature": str(stat["feature"]),
+                "hits": hits,
+                "case_hits": int(len(stat["case_keys"])),
+                "offsets": sorted(int(value) for value in stat["offsets"]),
+                "avg_direction_score": float(stat["direction_score_sum"]) / hits,
+                "avg_case_roi_pct": float(stat["case_roi_pct_sum"]) / hits,
+                "avg_case_pnl_sum": float(stat["case_pnl_sum"]) / hits,
+            }
+        )
+    rows.sort(
+        key=lambda item: (
+            -int(item["hits"]),
+            -int(item["case_hits"]),
+            -abs(float(item["avg_direction_score"])),
+            -float(item["avg_case_roi_pct"]),
+            str(item["feature"]),
+        )
+    )
+    return rows[: max(0, int(limit))]
+
+
+def _read_case_factor_rows(training_run_dir: Path, *, row_key: str) -> list[tuple[int, list[dict[str, object]]]]:
+    rows: list[tuple[int, list[dict[str, object]]]] = []
+    offsets_dir = training_run_dir / "offsets"
+    if not offsets_dir.exists():
+        return rows
+    for offset_dir in sorted(offsets_dir.glob("offset=*")):
+        try:
+            offset_value = int(str(offset_dir.name).split("=", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        payload = _read_factor_summary_payload(offset_dir)
+        explainability = payload.get("explainability") if isinstance(payload.get("explainability"), dict) else payload
+        factor_rows = list(explainability.get(row_key) or []) if isinstance(explainability, dict) else []
+        rows.append((offset_value, [dict(item) for item in factor_rows if isinstance(item, dict)]))
+    return rows
+
+
+def _read_factor_summary_payload(offset_dir: Path) -> dict[str, object]:
+    for candidate in (offset_dir / "summary.json", offset_dir / "factor_direction_summary.json"):
+        if not candidate.exists():
+            continue
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
 
 
 def _render_markdown_table(frame: pd.DataFrame, columns: list[str]) -> str:
@@ -826,3 +1036,35 @@ def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
     if frame.empty or column not in frame.columns:
         return pd.Series(dtype=bool)
     return frame[column].astype("boolean").fillna(False).astype(bool)
+
+
+def _optional_text(value: object) -> str:
+    if _is_missing_scalar(value):
+        return ""
+    return str(value).strip()
+
+
+def _optional_float(value: object, default: float = 0.0) -> float:
+    if _is_missing_scalar(value):
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _optional_int(value: object, default: int = 0) -> int:
+    if _is_missing_scalar(value):
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _is_missing_scalar(value: object) -> bool:
+    if value is None:
+        return True
+    if not pd.api.types.is_scalar(value):
+        return False
+    return bool(pd.isna(value))
