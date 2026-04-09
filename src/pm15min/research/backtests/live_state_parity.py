@@ -4,13 +4,16 @@ from collections.abc import Callable
 from collections import Counter
 from dataclasses import dataclass
 import math
+import re
 from typing import Any
 
 import pandas as pd
 
+from pm15min.core.cycle_contracts import resolve_cycle_contract
 from pm15min.live.liquidity.policy import apply_temporal_filter
 from pm15min.live.profiles.spec import LiveProfileSpec
 from pm15min.live.profiles import resolve_live_profile_spec
+from pm15min.live.regime.controller import infer_regime_cycle
 from pm15min.research.backtests.regime_parity import (
     build_backtest_regime_liquidity_proxy,
     build_backtest_regime_state,
@@ -109,6 +112,7 @@ def attach_live_state_parity(
         raw_klines=raw_klines,
         mode=proxy_mode,
     )
+    cycle = infer_regime_cycle(features=replay, offsets=spec.offsets)
     close_series = _prepare_close_series(raw_klines)
     frame = replay.copy()
     frame["_live_state_order"] = pd.RangeIndex(len(frame))
@@ -132,10 +136,16 @@ def attach_live_state_parity(
         if liquidity_state is not None:
             previous_liquidity_state = liquidity_state
 
-        features = _single_row_features(row, checked_at=checked_at, close_series=close_series)
+        features = _single_row_features(
+            row,
+            checked_at=checked_at,
+            close_series=close_series,
+            cycle=cycle,
+        )
         regime_state = build_backtest_regime_state(
             market=market,
             profile=spec,
+            cycle=cycle,
             features=features,
             liquidity_state=liquidity_state,
             previous_state=previous_regime_state,
@@ -294,19 +304,27 @@ def _single_row_features(
     *,
     checked_at: pd.Timestamp | None,
     close_series: pd.Series | None,
+    cycle: str | int,
 ) -> pd.DataFrame:
+    short_col, long_col = resolve_cycle_contract(cycle).regime_return_columns
     payload = {
         "decision_ts": checked_at,
-        "ret_15m": _float_or_none(_row_value(row, "ret_15m")),
-        "ret_30m": _float_or_none(_row_value(row, "ret_30m")),
+        short_col: _float_or_none(_row_value(row, short_col)),
+        long_col: _float_or_none(_row_value(row, long_col)),
     }
     if checked_at is not None:
         payload["decision_ts"] = checked_at
-    if _float_or_none(payload.get("ret_15m")) is None:
-        payload["ret_15m"] = _log_return_over_minutes(close_series, checked_at, 15)
-    if _float_or_none(payload.get("ret_30m")) is None:
-        payload["ret_30m"] = _log_return_over_minutes(close_series, checked_at, 30)
+    for column in (short_col, long_col):
+        if _float_or_none(payload.get(column)) is None:
+            payload[column] = _log_return_over_minutes(close_series, checked_at, _regime_return_minutes(column))
     return pd.DataFrame([payload])
+
+
+def _regime_return_minutes(column: str) -> int:
+    match = re.fullmatch(r"ret_(\d+)m", str(column).strip().lower())
+    if not match:
+        return 0
+    return int(match.group(1))
 
 
 def _log_return_over_minutes(

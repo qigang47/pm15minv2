@@ -112,3 +112,42 @@ def test_build_regime_state_snapshot_enters_defense_after_confirmations(tmp_path
     assert second["state"] == "DEFENSE"
     assert second["pressure"] == "down"
     assert second["guard_hints"]["defense_force_with_pressure"] is True
+
+
+def test_build_regime_state_snapshot_uses_5m_regime_return_columns(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    _patch_regime_snapshot_labels(monkeypatch, ["2026-03-20T00-03-00Z"])
+    cfg = LiveConfig.build(market="sol", profile="deep_otm_5m", cycle_minutes=5)
+
+    payload = build_regime_state_snapshot(
+        cfg,
+        features=pd.DataFrame(
+            [
+                {
+                    "decision_ts": "2026-03-20T00:03:00+00:00",
+                    "offset": 2,
+                    "ret_5m": 0.0020,
+                    "ret_15m": 0.0030,
+                }
+            ]
+        ),
+        liquidity_payload={
+            "snapshot_ts": "2026-03-20T00-02-59Z",
+            "status": "ok",
+            "reason": "ok",
+            "blocked": False,
+            "reason_codes": ["ok"],
+            "metrics": {
+                "spot_quote_ratio": 1.0,
+                "perp_quote_ratio": 1.0,
+                "spot_trades_ratio": 1.0,
+                "perp_trades_ratio": 1.0,
+                "soft_fail_count": 0,
+                "hard_fail_count": 0,
+            },
+        },
+        persist=False,
+    )
+
+    assert payload["pressure"] == "up"

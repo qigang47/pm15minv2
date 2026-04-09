@@ -93,7 +93,7 @@ def build_regime_state_snapshot(
         payload["reason_codes"] = ["disabled"]
         return persist_regime_state_snapshot(rewrite_root=cfg.layout.rewrite.root, payload=payload) if persist else payload
 
-    ret_15m, ret_30m = latest_regime_returns(features)
+    ret_15m, ret_30m = latest_regime_returns(features, cycle=cycle)
     controller = RegimeController(
         caution_min_liquidity_ratio=float(spec.regime_caution_min_liquidity_ratio),
         defense_min_liquidity_ratio=float(spec.regime_defense_min_liquidity_ratio),
