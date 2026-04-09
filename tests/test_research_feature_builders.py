@@ -126,6 +126,31 @@ def test_build_feature_frame_emits_new_low_cost_feature_columns() -> None:
         assert features[column].notna().any()
 
 
+def test_build_feature_frame_uses_5m_first_half_anchor() -> None:
+    features = build_feature_frame(
+        _raw_klines(rows=15),
+        feature_set="deep_otm_v1",
+        oracle_prices=pd.DataFrame(
+            [
+                {
+                    "cycle_start_ts": int(pd.Timestamp("2026-03-20T00:00:00Z").timestamp()),
+                    "cycle_end_ts": int(pd.Timestamp("2026-03-20T00:05:00Z").timestamp()),
+                    "price_to_beat": 100.0,
+                    "final_price": 101.0,
+                }
+            ]
+        ),
+        cycle="5m",
+        requested_columns={"ret_from_cycle_open", "first_half_ret", "second_half_ret_proxy"},
+    )
+
+    anchor_row = features.loc[features["offset"].eq(2)].iloc[0]
+    late_row = features.loc[features["offset"].eq(4)].iloc[0]
+
+    assert anchor_row["first_half_ret"] == anchor_row["ret_from_cycle_open"]
+    assert late_row["second_half_ret_proxy"] > 0.0
+
+
 def test_build_feature_frame_counts_strike_side_flips_within_cycle() -> None:
     features = build_feature_frame(
         _oscillating_klines(),
