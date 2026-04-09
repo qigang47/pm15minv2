@@ -181,12 +181,14 @@ def _write_sample_copula_returns(path: Path) -> Path:
     return path
 
 
-def test_top_level_layout_command(capsys) -> None:
+def test_top_level_layout_command(capsys, monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
     rc = main(["layout", "--market", "sol", "--cycle", "15m", "--json"])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["market"] == "sol"
-    assert "v2" in Path(payload["rewrite_root"]).parts
+    assert Path(payload["rewrite_root"]) == root
     assert payload["surface"] == "backtest"
 
 
