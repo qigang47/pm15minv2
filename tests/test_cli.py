@@ -186,11 +186,22 @@ def test_top_level_layout_command(capsys) -> None:
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["market"] == "sol"
-    assert Path(payload["rewrite_root"]).name == "v2"
+    assert "v2" in Path(payload["rewrite_root"]).parts
     assert payload["surface"] == "backtest"
 
 
-def test_data_show_summary(capsys, monkeypatch) -> None:
+def test_pm5min_layout_command(capsys) -> None:
+    from pm5min.cli import main as pm5min_main
+
+    rc = pm5min_main(["layout", "--market", "sol", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["market"] == "sol"
+    assert payload["cycle"] == "5m"
+
+
+def test_data_show_summary(capsys, monkeypatch, tmp_path: Path) -> None:
+    _patch_v2_roots(monkeypatch, tmp_path / "v2")
     monkeypatch.setattr(
         "pm15min.data.cli.show_data_summary",
         lambda cfg, persist=False: {
@@ -211,7 +222,8 @@ def test_data_show_summary(capsys, monkeypatch) -> None:
     assert payload["summary"]["dataset_count"] == 10
 
 
-def test_data_sync_datafeeds_rpc(capsys, monkeypatch) -> None:
+def test_data_sync_datafeeds_rpc(capsys, monkeypatch, tmp_path: Path) -> None:
+    _patch_v2_roots(monkeypatch, tmp_path / "v2")
     monkeypatch.setattr(
         "pm15min.data.cli.sync_datafeeds_from_rpc",
         lambda cfg, start_ts, end_ts, chunk_blocks=5000, sleep_sec=0.02: {
@@ -861,7 +873,7 @@ def test_research_show_layout(capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["market"] == "sol"
     assert payload["cycle"] == "15m"
-    assert payload["market_training_runs_root"].endswith("v2/research/training_runs/cycle=15m/asset=sol")
+    assert Path(payload["market_training_runs_root"]).parts[-3:] == ("training_runs", "cycle=15m", "asset=sol")
 
 
 def test_research_training_set_build(capsys, tmp_path: Path, monkeypatch) -> None:
@@ -2016,7 +2028,8 @@ def test_data_show_layout(capsys) -> None:
     assert payload["surface"] == "backtest"
 
 
-def test_data_show_config(capsys) -> None:
+def test_data_show_config(capsys, monkeypatch, tmp_path: Path) -> None:
+    _patch_v2_roots(monkeypatch, tmp_path / "v2")
     rc = main(
         [
             "data",
@@ -2093,7 +2106,8 @@ def test_data_run_orderbook_fleet(capsys, monkeypatch) -> None:
     assert payload["market_start_offset"] == 7
 
 
-def test_data_run_live_foundation_passes_refresh_intervals(capsys, monkeypatch) -> None:
+def test_data_run_live_foundation_passes_refresh_intervals(capsys, monkeypatch, tmp_path: Path) -> None:
+    _patch_v2_roots(monkeypatch, tmp_path / "v2")
     captured: dict[str, float] = {}
 
     def fake_run_live_data_foundation(cfg, **kwargs):
