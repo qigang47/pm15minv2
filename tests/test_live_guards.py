@@ -1183,6 +1183,66 @@ def test_decision_rejects_when_depth_fill_ratio_blocks_trade(tmp_path: Path, mon
     assert out["rejected_offsets"][0]["quote_metrics"]["depth_plan"]["status"] == "blocked"
 
 
+def test_decision_depth_enforced_defaults_on_when_env_missing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("PM15MIN_LIVE_DECISION_DEPTH_ENFORCED", raising=False)
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="xrp", cycle="15m", surface="live", root=root)
+    captured_ts_ms = int(pd.Timestamp("2026-03-20T00:08:30Z").timestamp() * 1000)
+    append_ndjson_zst(
+        data_cfg.layout.orderbook_depth_path("2026-03-20"),
+        [
+            {
+                "market_id": "market-1",
+                "token_id": "token-down",
+                "side": "down",
+                "logged_at": "2026-03-20T00:08:30+00:00",
+                "asks": [[0.20, 1.0], [0.31, 10.0]],
+                "bids": [[0.19, 2.0]],
+            }
+        ],
+    )
+    row = _base_signal_row()
+    row["offset"] = 8
+    row["decision_ts"] = "2026-03-20T00:08:00+00:00"
+    row["p_down"] = 0.80
+    payload = {
+        "market": "xrp",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-20T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-20T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 8,
+                "status": "ok",
+                "market_id": "market-1",
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.20,
+                "quote_up_bid": 0.19,
+                "quote_down_bid": 0.19,
+                "quote_down_ask_size_1": 1.0,
+                "quote_captured_ts_ms_down": captured_ts_ms,
+                "reasons": [],
+            }
+        ],
+    }
+
+    out = build_decision_snapshot(payload, quote_payload, rewrite_root=root)
+
+    assert out["decision"]["status"] == "reject"
+    assert "depth_fill_ratio_below_threshold" in out["rejected_offsets"][0]["guard_reasons"]
+    assert out["rejected_offsets"][0]["quote_metrics"]["depth_enforced"] is True
+    assert out["rejected_offsets"][0]["quote_metrics"]["depth_plan"]["status"] == "blocked"
+
+
 def test_resolve_live_profile_spec_applies_cash_stop_env_override(monkeypatch) -> None:
     monkeypatch.setenv("PM15MIN_STOP_TRADING_BELOW_CASH_USD", "100")
     spec = resolve_live_profile_spec("deep_otm")

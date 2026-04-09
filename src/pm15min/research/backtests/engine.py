@@ -660,7 +660,6 @@ def _build_decision_depth_runtime(
     depth_replay, summary = build_raw_depth_replay_frame(
         replay=replay,
         data_cfg=data_cfg,
-        max_snapshots_per_replay_row=1,
         heartbeat=heartbeat,
     )
     return depth_replay, summary, build_depth_candidate_lookup(depth_replay)
@@ -1262,12 +1261,12 @@ def _attach_decision_engine_surface(
             profile_spec=profile_spec,
             fill_config=fill_config,
         )
-        summary = summarize_initial_snapshot_decision_surface(frame)
         out = _apply_probability_only_decision_surface(
             frame,
             config=decision_config,
             min_dir_prob_boost_column="decision_engine_min_dir_prob_boost",
         )
+        summary = summarize_initial_snapshot_decision_surface(out)
         out = attach_pre_submit_orderbook_retry_contract(
             out,
             spec=profile_spec,
@@ -1377,11 +1376,40 @@ def _float_or_none(value: object) -> float | None:
     return parsed
 
 
+def _resolve_reversal_current_up(row: pd.Series) -> float | None:
+    current_up = _float_or_none(row.get("current_up"))
+    if current_up in {0.0, 1.0}:
+        return current_up
+    for column in ("ret_from_strike", "ret_from_cycle_open"):
+        current_ret = _float_or_none(row.get(column))
+        if current_ret is None or current_ret == 0.0:
+            continue
+        return 1.0 if current_ret > 0.0 else 0.0
+    return None
+
+
 def _resolve_probability_only_trade_signal(
     *,
     row: pd.Series,
     threshold: float,
 ) -> tuple[str | None, float | None, float | None, str]:
+    signal_target = str(row.get("signal_target") or "direction").strip().lower()
+    if signal_target == "reversal":
+        reversal_raw = _float_or_none(row.get("p_signal"))
+        current_up = _resolve_reversal_current_up(row)
+        p_up = _float_or_none(row.get("p_up"))
+        p_down = _float_or_none(row.get("p_down"))
+        if reversal_raw is None:
+            return None, None, None, "input_missing"
+        if current_up is None:
+            return None, reversal_raw, None, "missing_reversal_anchor"
+        if reversal_raw <= float(threshold):
+            selected_prob = p_down if current_up == 1.0 else p_up
+            return None, reversal_raw, selected_prob, "direction_prob"
+        if current_up == 1.0:
+            return "DOWN", reversal_raw, p_down, "trade"
+        return "UP", reversal_raw, p_up, "trade"
+
     view = resolve_probability_interval_view(selected_row=row.to_dict())
     if view is None:
         return None, None, None, "input_missing"
@@ -1436,6 +1464,8 @@ def _apply_probability_only_decision_surface(
     out["decision_engine_edge"] = pd.Series(np.nan, index=out.index, dtype=float)
     out["decision_engine_roi"] = pd.Series(np.nan, index=out.index, dtype=float)
     out["decision_engine_roi_net"] = pd.Series(np.nan, index=out.index, dtype=float)
+    out["decision_engine_signal_side"] = pd.Series(pd.NA, index=out.index, dtype="string")
+    out["decision_engine_signal_triggered"] = False
 
     valid_mask = offsets.notna() & preferred_prob.notna() & preferred_side.notna()
     if not bool(valid_mask.any()):
@@ -1456,15 +1486,75 @@ def _apply_probability_only_decision_surface(
             out.loc[idx, "decision_engine_prob"] = float(selected_prob)
         out.loc[idx, "decision_engine_probability_gap"] = float(gap.loc[idx])
         if reason == "trade" and side is not None:
+            out.loc[idx, "decision_engine_signal_side"] = side
+            out.loc[idx, "decision_engine_signal_triggered"] = True
+            chosen_price, chosen_status = _resolve_probability_only_selected_price(
+                row=out.loc[idx],
+                side=side,
+            )
+            if chosen_status == "orderbook_missing":
+                out.loc[idx, "decision_engine_reason"] = "orderbook_missing"
+                continue
+            if chosen_status == "orderbook_limit_reject":
+                out.loc[idx, "decision_engine_reason"] = "orderbook_limit_reject"
+                continue
+            if chosen_price is None or chosen_price <= 0.0:
+                out.loc[idx, "decision_engine_reason"] = "entry_price_missing"
+                continue
+            if config.entry_price_min is not None and chosen_price < float(config.entry_price_min):
+                out.loc[idx, "decision_engine_reason"] = "entry_price_min"
+                continue
+            if config.entry_price_max is not None and chosen_price > float(config.entry_price_max):
+                out.loc[idx, "decision_engine_reason"] = "entry_price_max"
+                continue
             out.loc[idx, "decision_engine_action"] = "trade"
             out.loc[idx, "decision_engine_reason"] = "trade"
             out.loc[idx, "decision_engine_side"] = side
+            out.loc[idx, "decision_engine_entry_price"] = float(chosen_price)
             out.loc[idx, "decision_engine_rationale"] = (
                 f"threshold_only:{side.lower()}_raw={float(trigger_prob or 0.0):.4f}>min_dir_prob={float(threshold):.4f}"
             )
         else:
             out.loc[idx, "decision_engine_reason"] = reason
     return out
+
+
+def _resolve_probability_only_selected_price(
+    *,
+    row: pd.Series,
+    side: str,
+) -> tuple[float | None, str | None]:
+    normalized_side = str(side or "").strip().upper()
+    if normalized_side == "UP":
+        status = _normalized_optional_string(row.get("decision_quote_up_status"))
+        candidates = (
+            row.get("decision_quote_up_ask"),
+            row.get("quote_up_ask"),
+            row.get("quote_prob_up"),
+            row.get("p_up"),
+        )
+    elif normalized_side == "DOWN":
+        status = _normalized_optional_string(row.get("decision_quote_down_status"))
+        candidates = (
+            row.get("decision_quote_down_ask"),
+            row.get("quote_down_ask"),
+            row.get("quote_prob_down"),
+            row.get("p_down"),
+        )
+    else:
+        return None, None
+    for candidate in candidates:
+        price = _float_or_none(candidate)
+        if price is not None:
+            return float(price), status
+    return None, status
+
+
+def _normalized_optional_string(value: object) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _frame_has_decision_quote_fallback_prices(frame: pd.DataFrame) -> bool:

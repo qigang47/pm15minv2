@@ -283,14 +283,8 @@ def test_build_canonical_fills_keeps_depth_diagnostics_when_depth_blocks_then_qu
         profile_spec=profile_spec,
     )
 
-    assert rejects.empty
-    assert len(fills) == 1
-    assert fills.loc[0, "fill_model"] == "canonical_quote"
-    assert fills.loc[0, "depth_status"] == "blocked"
-    assert fills.loc[0, "depth_reason"] == "depth_fill_ratio_below_threshold"
-    assert fills.loc[0, "depth_source_path"].endswith("depth.ndjson.zst")
-    assert float(fills.loc[0, "depth_fill_ratio"]) == 0.2
-    assert float(fills.loc[0, "stake"]) == 1.0
+    assert fills.empty
+    assert rejects["reason"].tolist() == ["depth_fill_ratio_below_threshold"]
 
 
 def test_build_canonical_fills_uses_precomputed_depth_miss_without_rescanning_raw_depth(monkeypatch, tmp_path) -> None:
@@ -335,12 +329,8 @@ def test_build_canonical_fills_uses_precomputed_depth_miss_without_rescanning_ra
         depth_replay=pd.DataFrame(),
     )
 
-    assert rejects.empty
-    assert len(fills) == 1
-    assert fills.loc[0, "fill_model"] == "canonical_quote"
-    assert fills.loc[0, "depth_status"] == "missing"
-    assert fills.loc[0, "depth_reason"] == "depth_snapshot_missing"
-    assert fills.loc[0, "depth_chain_mode"] == "precomputed_missing"
+    assert fills.empty
+    assert rejects["reason"].tolist() == ["depth_snapshot_missing"]
 
 
 def test_build_canonical_fills_uses_profile_depth_slippage_for_partial_depth_fill(tmp_path) -> None:
@@ -1705,13 +1695,8 @@ def test_build_canonical_fills_legacy_retry_stops_when_snapshot_marker_is_unchan
         depth_replay=depth_replay,
     )
 
-    assert rejects.empty
-    row = fills.iloc[0]
-    assert row["fill_model"] == "canonical_quote"
-    assert row["depth_retry_stage"] == "pre_submit_orderbook_recheck"
-    assert row["depth_retry_exit_reason"] == "orderbook_snapshot_unchanged"
-    assert row["depth_retry_snapshot_unchanged_count"] == 1
-    assert row["depth_retry_refresh_count"] == 0
+    assert fills.empty
+    assert rejects["reason"].tolist() == ["orderbook_snapshot_unchanged"]
 
 
 def test_build_canonical_fills_legacy_fak_refresh_rejects_repriced_entry_price_max(tmp_path) -> None:
@@ -2115,11 +2100,8 @@ def test_build_canonical_fills_legacy_fak_refresh_blocks_depth_when_reprice_exce
         depth_replay=depth_replay,
     )
 
-    assert rejects.empty
-    assert len(fills) == 1
-    assert fills.loc[0, "fill_model"] == "canonical_quote"
-    assert fills.loc[0, "depth_status"] == "blocked"
-    assert fills.loc[0, "depth_reason"] == "depth_fill_unavailable"
+    assert fills.empty
+    assert rejects["reason"].tolist() == ["depth_fill_unavailable"]
 
 
 def test_build_canonical_fills_legacy_fak_refresh_keeps_partial_fill_without_quote_completion(tmp_path) -> None:

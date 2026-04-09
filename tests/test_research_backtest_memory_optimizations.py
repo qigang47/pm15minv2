@@ -317,7 +317,7 @@ def test_prepare_orderbook_lookup_uses_row_positions_without_group_dataframe_cop
     assert float(row["best_ask"]) == 0.41
 
 
-def test_build_decision_depth_runtime_caps_snapshots_per_row_when_refresh_enabled(monkeypatch) -> None:
+def test_build_decision_depth_runtime_preserves_full_snapshot_window_when_refresh_enabled(monkeypatch) -> None:
     replay = pd.DataFrame(
         [
             {
@@ -363,7 +363,7 @@ def test_build_decision_depth_runtime_caps_snapshots_per_row_when_refresh_enable
         fill_config=fills_module.BacktestFillConfig(raw_depth_fak_refresh_enabled=True),
     )
 
-    assert seen == {"rows": 2, "cap": 1}
+    assert seen == {"rows": 2, "cap": None}
     assert summary.replay_rows == 2
     assert len(lookup) == 0
 

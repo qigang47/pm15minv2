@@ -446,7 +446,7 @@ def _build_decision_quote_metrics(
 def _decision_depth_enforced() -> bool:
     raw = os.getenv("PM15MIN_LIVE_DECISION_DEPTH_ENFORCED")
     if raw in (None, ""):
-        return False
+        return True
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 

@@ -595,7 +595,9 @@ def _materialize_fill_row(
 
     depth_fill = None
     depth_reason = None
+    depth_attempted = False
     if data_cfg is not None and bool(config.prefer_depth):
+        depth_attempted = True
         depth_fill, depth_reason = _resolve_depth_fill(
             row=row,
             data_cfg=data_cfg,
@@ -645,6 +647,11 @@ def _materialize_fill_row(
                         fallback_entry_price=entry_price,
                     )
                 )
+        return out
+    if depth_attempted:
+        out["fill_valid"] = False
+        out["fill_reason"] = str(depth_reason or fill_reason or "depth_fill_unavailable")
+        out["fill_model"] = "canonical_depth"
         return out
 
     quote_fill = _resolve_quote_fill(
