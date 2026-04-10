@@ -24,6 +24,7 @@ class GuardParitySummary:
 
 
 _FEATURE_SNAPSHOT_COLUMNS = (
+    "ret_5m",
     "ret_15m",
     "ret_30m",
     "ret_from_strike",
@@ -38,6 +39,7 @@ GUARD_PARITY_HEARTBEAT_INTERVAL_ROWS = 1_000
 def apply_live_guard_parity(
     *,
     market: str,
+    cycle: str = "15m",
     profile: str,
     decisions: pd.DataFrame,
     profile_spec: LiveProfileSpec | None = None,
@@ -59,12 +61,14 @@ def apply_live_guard_parity(
     for row_index, row in enumerate(out.itertuples(index=False, name="GuardParityRow"), start=1):
         quote_row = _build_quote_row(row)
         signal_row = _build_signal_row(row)
+        row_cycle = str(_row_value(row, "cycle") or cycle)
         if quote_row is None:
             reasons: list[str] = []
             quote_metrics: dict[str, Any] = {}
             account_context: dict[str, Any] = {}
         else:
             reasons, quote_metrics, account_context = evaluate_signal_guard_reasons(
+                cycle=row_cycle,
                 market=market,
                 profile_spec=spec,
                 signal_row=signal_row,
