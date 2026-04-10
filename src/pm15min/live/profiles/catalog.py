@@ -247,8 +247,52 @@ DEEP_OTM_BASELINE_LIVE_PROFILE_SPEC = LiveProfileSpec(
     )
 )
 
+DEEP_OTM_5M_LIVE_PROFILE_SPEC = LiveProfileSpec(
+    **(
+        DEEP_OTM_LIVE_PROFILE_SPEC.to_dict()
+        | {
+            "profile": "deep_otm_5m",
+            "offsets": (2, 3, 4),
+            "min_dir_prob_by_offset": {
+                "sol": {2: 0.62},
+                "xrp": {},
+            },
+            "min_net_edge_by_offset": {2: 0.012, 3: 0.015, 4: 0.018},
+            "tail_space_max_move_z_by_offset": {2: 1.85, 3: 2.05, 4: 2.30},
+        }
+    )
+)
+
+DEEP_OTM_5M_BASELINE_LIVE_PROFILE_SPEC = LiveProfileSpec(
+    **(
+        DEEP_OTM_5M_LIVE_PROFILE_SPEC.to_dict()
+        | {
+            "profile": "deep_otm_5m_baseline",
+            "min_net_edge_default": 0.0,
+            "min_net_edge_by_offset": {2: 0.0, 3: 0.0, 4: 0.0},
+            "min_net_edge_entry_price_le_0p10_bonus": 0.0,
+            "min_net_edge_entry_price_le_0p05_bonus": 0.0,
+            "tail_space_guard_enabled": False,
+            "ret_30m_up_floor_by_asset": {
+                "btc": 0.0020,
+                "eth": 0.0015,
+                "sol": -0.04,
+                "xrp": -0.04,
+            },
+            "ret_30m_down_ceiling_by_asset": {
+                "btc": 0.0,
+                "eth": 0.0,
+                "sol": 0.002,
+                "xrp": 0.009,
+            },
+        }
+    )
+)
+
 LIVE_PROFILE_SPECS = {
     "default": DEFAULT_LIVE_PROFILE_SPEC,
     "deep_otm": DEEP_OTM_LIVE_PROFILE_SPEC,
     "deep_otm_baseline": DEEP_OTM_BASELINE_LIVE_PROFILE_SPEC,
+    "deep_otm_5m": DEEP_OTM_5M_LIVE_PROFILE_SPEC,
+    "deep_otm_5m_baseline": DEEP_OTM_5M_BASELINE_LIVE_PROFILE_SPEC,
 }

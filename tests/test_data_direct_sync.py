@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
@@ -12,6 +13,7 @@ from pm15min.data.pipelines.direct_sync import (
     sync_settlement_truth_from_rpc,
     sync_streams_from_rpc,
 )
+from pm15min.data.pipelines.source_ingest import import_legacy_settlement_truth
 
 
 class _FakeRpc:
@@ -204,6 +206,185 @@ def test_sync_settlement_truth_from_rpc_writes_source_table(tmp_path: Path, monk
     df = pd.read_parquet(cfg.layout.settlement_truth_source_path)
     assert df.iloc[0]["winner_side"] == "UP"
     assert bool(df.iloc[0]["full_truth"]) is True
+
+
+def test_sync_settlement_truth_from_rpc_supports_5m(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("pm15min.data.pipelines.direct_sync.ChainlinkRpcSource", _FakeChainlinkSource)
+    cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "eth",
+                    "cycle": "5m",
+                    "cycle_start_ts": 1766031900,
+                    "cycle_end_ts": 1766032200,
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "slug": "eth-updown-5m-1766031900",
+                    "question": "Ethereum Up or Down",
+                    "resolution_source": "https://data.chain.link/streams/eth-usd",
+                }
+            ]
+        ),
+        cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "asset": "eth",
+                    "tx_hash": "0xabc",
+                    "observation_ts": 1766032200,
+                    "extra_ts": 1766032200,
+                    "benchmark_price_raw": 1.1e21,
+                    "price": 1100.0,
+                    "perform_idx": 0,
+                    "value_idx": 0,
+                    "source_file": "rpc",
+                    "ingested_at": "2026-03-28T10:00:00Z",
+                }
+            ]
+        ),
+        cfg.layout.streams_partition_path(2026, 3),
+    )
+
+    summary = sync_settlement_truth_from_rpc(cfg, rpc=_FakeRpc())
+
+    assert summary["rows_imported"] == 1
+    df = pd.read_parquet(cfg.layout.settlement_truth_source_path)
+    assert df.iloc[0]["cycle"] == "5m"
+    assert int(df.iloc[0]["cycle_start_ts"]) == 1766031900
+    assert df.iloc[0]["winner_side"] == "UP"
+    assert bool(df.iloc[0]["full_truth"]) is True
+
+
+def test_import_legacy_settlement_truth_discovers_default_5m_source(tmp_path: Path, monkeypatch) -> None:
+    cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
+    shared_root = tmp_path / "data" / "markets" / "_shared" / "oracle"
+    shared_root.mkdir(parents=True, exist_ok=True)
+    discovered = shared_root / "polymarket_5m_settlement_truth.csv"
+    pd.DataFrame(
+        [
+            {
+                "asset": "eth",
+                "end_ts": 1766032200,
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "slug": "eth-updown-5m-1766031900",
+                "question": "Ethereum Up or Down",
+                "resolution_source": "legacy-5m",
+                "winner_side": "UP",
+                "label_updown": "UP",
+                "onchain_resolved": True,
+                "stream_match_exact": True,
+                "full_truth": True,
+                "stream_price": 2042.5,
+                "stream_extra_ts": 1766032200,
+            }
+        ]
+    ).to_csv(discovered, index=False)
+    monkeypatch.setattr("pm15min.data.pipelines.source_ingest.workspace_root", lambda: tmp_path)
+
+    summary = import_legacy_settlement_truth(cfg)
+
+    assert summary["rows_imported"] == 1
+    df = pd.read_parquet(cfg.layout.settlement_truth_source_path)
+    assert df.iloc[0]["cycle"] == "5m"
+    assert int(df.iloc[0]["cycle_start_ts"]) == 1766031900
+    assert df.iloc[0]["source_file"] == str(discovered)
+
+
+def test_import_legacy_settlement_truth_supports_5m_with_explicit_source(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
+    source_path = tmp_path / "polymarket_5m_settlement_truth.csv"
+    pd.DataFrame(
+        [
+            {
+                "asset": "eth",
+                "end_ts": 1766032200,
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "slug": "eth-updown-5m-1766031900",
+                "question": "Ethereum Up or Down",
+                "resolution_source": "legacy-5m",
+                "winner_side": "DOWN",
+                "label_updown": "DOWN",
+                "onchain_resolved": True,
+                "stream_match_exact": True,
+                "full_truth": True,
+                "stream_price": 2042.5,
+                "stream_extra_ts": 1766032200,
+            }
+        ]
+    ).to_csv(source_path, index=False)
+
+    summary = import_legacy_settlement_truth(cfg, source_path=source_path)
+
+    assert summary["rows_imported"] == 1
+    df = pd.read_parquet(cfg.layout.settlement_truth_source_path)
+    assert df.iloc[0]["cycle"] == "5m"
+    assert int(df.iloc[0]["cycle_start_ts"]) == 1766031900
+    assert df.iloc[0]["source_file"] == str(source_path)
+
+
+def test_import_legacy_settlement_truth_rejects_explicit_15m_source_for_5m(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
+    source_path = tmp_path / "polymarket_15m_settlement_truth.csv"
+    pd.DataFrame(
+        [
+            {
+                "asset": "eth",
+                "end_ts": 1766032200,
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "slug": "eth-updown-15m-1766031300",
+                "question": "Ethereum Up or Down",
+                "resolution_source": "legacy-15m",
+                "winner_side": "DOWN",
+                "label_updown": "DOWN",
+                "onchain_resolved": True,
+                "stream_match_exact": True,
+                "full_truth": True,
+                "stream_price": 2042.5,
+                "stream_extra_ts": 1766032200,
+            }
+        ]
+    ).to_csv(source_path, index=False)
+
+    with pytest.raises(ValueError, match="compatible with cycle=5m"):
+        import_legacy_settlement_truth(cfg, source_path=source_path)
+
+
+def test_import_legacy_settlement_truth_rejects_conflicting_explicit_5m_source_for_5m(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
+    source_path = tmp_path / "polymarket_5m_settlement_truth.csv"
+    pd.DataFrame(
+        [
+            {
+                "asset": "eth",
+                "cycle": "15m",
+                "end_ts": 1766032200,
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "slug": "eth-updown-15m-1766031300",
+                "question": "Ethereum Up or Down",
+                "resolution_source": "legacy-15m",
+                "winner_side": "DOWN",
+                "label_updown": "DOWN",
+                "onchain_resolved": True,
+                "stream_match_exact": True,
+                "full_truth": True,
+                "stream_price": 2042.5,
+                "stream_extra_ts": 1766032200,
+            }
+        ]
+    ).to_csv(source_path, index=False)
+
+    with pytest.raises(ValueError, match="conflicting cycle hints"):
+        import_legacy_settlement_truth(cfg, source_path=source_path)
 
 
 def test_sync_settlement_truth_from_gamma_writes_source_table(tmp_path: Path) -> None:

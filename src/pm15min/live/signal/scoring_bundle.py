@@ -150,7 +150,10 @@ def prepare_live_features_and_states(
     build_live_feature_frame_fn,
     allow_preview_open_bar: bool = False,
 ) -> LiveFeatureContext:
-    required_feature_columns = resolve_live_required_feature_columns(feature_set=builder_feature_set)
+    required_feature_columns = resolve_live_required_feature_columns(
+        feature_set=builder_feature_set,
+        cycle=f"{int(cfg.cycle_minutes)}m",
+    )
     feature_started = time.perf_counter()
     base_features = build_live_feature_frame_fn(
         cfg,

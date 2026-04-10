@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from pm15min.core.cycle_contracts import resolve_cycle_contract
 from pm15min.research.features.base import decision_reference_ts
 
 
@@ -46,6 +47,8 @@ def append_cycle_features(
 
     decision_ts = decision_reference_ts(out)
     freq = _pandas_cycle_freq(cycle)
+    contract = resolve_cycle_contract(cycle)
+    anchor_offset = contract.first_half_anchor_offset
     cycle_start = decision_ts.dt.floor(freq)
     cycle_end = cycle_start + pd.Timedelta(freq)
     offset_seconds = (decision_ts - cycle_start).dt.total_seconds()
@@ -94,10 +97,10 @@ def append_cycle_features(
     if needs("move_z"):
         out["move_z"] = out["ret_from_cycle_open"] / pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
     if needs("first_half_ret", "second_half_ret_proxy"):
-        first_half_close = close.where(minute_in_cycle.eq(7)).groupby(cycle_start).ffill().fillna(close)
+        first_half_close = close.where(minute_in_cycle.eq(anchor_offset)).groupby(cycle_start).ffill().fillna(close)
         if needs("first_half_ret"):
             out["first_half_ret"] = first_half_close / cycle_open - 1.0
         if needs("second_half_ret_proxy"):
-            second_half_anchor = first_half_close.where(minute_in_cycle.ge(7), close)
+            second_half_anchor = first_half_close.where(minute_in_cycle.ge(anchor_offset), close)
             out["second_half_ret_proxy"] = close / second_half_anchor - 1.0
     return out

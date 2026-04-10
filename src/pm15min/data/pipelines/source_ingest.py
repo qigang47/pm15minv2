@@ -56,6 +56,7 @@ SETTLEMENT_SOURCE_COLUMNS = [
 
 LEGACY_ORDERBOOK_DEPTH_RE = re.compile(r"orderbook_depth_(\d{8})\.ndjson\.zst$")
 LEGACY_MARKET_SNAPSHOT_RE = re.compile(r"_(\d{8}_\d{6})\.(?:csv|json)$")
+LEGACY_SETTLEMENT_TRUTH_CYCLE_RE = re.compile(r"polymarket_(\d+m)_settlement_truth\.csv$", re.IGNORECASE)
 
 
 def _utc_now_label() -> str:
@@ -85,17 +86,45 @@ def _latest_path(paths: list[Path]) -> Path | None:
     return max(paths, key=lambda path: path.stat().st_mtime_ns)
 
 
+def _detect_legacy_settlement_truth_cycles(source_path: Path, df: pd.DataFrame) -> set[str]:
+    detected: set[str] = set()
+    match = LEGACY_SETTLEMENT_TRUTH_CYCLE_RE.search(source_path.name)
+    if match:
+        detected.add(str(match.group(1)).strip().lower())
+
+    if "cycle" in df.columns:
+        values = {
+            str(value).strip().lower()
+            for value in df["cycle"].dropna().tolist()
+            if str(value).strip()
+        }
+        detected.update(values)
+
+    if "slug" in df.columns:
+        values: set[str] = set()
+        for value in df["slug"].dropna().tolist():
+            text = str(value).strip().lower()
+            if not text:
+                continue
+            for token in re.split(r"[^0-9a-z]+", text):
+                if re.fullmatch(r"\d+m", token):
+                    values.add(token)
+        detected.update(values)
+
+    return detected
+
+
 def discover_legacy_streams_csv() -> Path | None:
     root = workspace_root() / "data" / "markets" / "_shared" / "oracle"
     paths = sorted(root.glob("streams_reports_registry_all_*.csv"))
     return _latest_path(paths)
 
 
-def discover_legacy_settlement_truth_csv() -> Path | None:
+def discover_legacy_settlement_truth_csv(cycle: str = "15m") -> Path | None:
     root = workspace_root() / "data" / "markets" / "_shared" / "oracle"
     paths = [
         path
-        for path in root.rglob("polymarket_15m_settlement_truth.csv")
+        for path in root.rglob(f"polymarket_{cycle}_settlement_truth.csv")
         if "parts" not in {part.lower() for part in path.parts}
     ]
     return _latest_path(paths)
@@ -286,14 +315,28 @@ def import_legacy_settlement_truth(
     *,
     source_path: Path | None = None,
 ) -> dict[str, object]:
-    if cfg.cycle != "15m":
-        raise ValueError("Settlement truth import is currently only implemented for cycle=15m.")
-
-    source_path = source_path or discover_legacy_settlement_truth_csv()
+    source_path = source_path or discover_legacy_settlement_truth_csv(cfg.cycle)
     if source_path is None or not source_path.exists():
         raise FileNotFoundError("Could not locate legacy settlement-truth CSV.")
 
     df = pd.read_csv(source_path, low_memory=False)
+    detected_source_cycles = _detect_legacy_settlement_truth_cycles(source_path, df)
+    if len(detected_source_cycles) > 1:
+        raise ValueError(
+            f"Legacy settlement truth source {source_path} has conflicting cycle hints: "
+            f"{sorted(detected_source_cycles)}."
+        )
+    source_cycle = next(iter(detected_source_cycles)) if detected_source_cycles else None
+    if source_cycle is not None and source_cycle != cfg.cycle:
+        raise ValueError(
+            f"Legacy settlement truth source {source_path} is not compatible with cycle={cfg.cycle}; "
+            f"detected cycle={source_cycle}."
+        )
+    if cfg.cycle != "15m" and source_cycle is None:
+        raise ValueError(
+            f"Legacy settlement truth source {source_path} is not compatible with cycle={cfg.cycle}; "
+            "unable to validate source cycle."
+        )
     required = {"asset", "end_ts", "market_id", "winner_side", "label_updown"}
     missing = sorted(required - set(df.columns))
     if missing:

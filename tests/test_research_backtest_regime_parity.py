@@ -367,3 +367,38 @@ def test_apply_live_guard_parity_keeps_tail_space_guard_from_row_features() -> N
     assert summary.blocked_rows == 1
     assert out.loc[0, "policy_action"] == "reject"
     assert out.loc[0, "guard_primary_reason"] == "tail_space_too_far"
+
+
+def test_apply_live_guard_parity_uses_5m_long_return_guard() -> None:
+    decisions = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "offset": 2,
+                "p_up": 0.20,
+                "p_down": 0.80,
+                "score_valid": True,
+                "score_reason": "",
+                "policy_action": "trade",
+                "policy_reason": "trade",
+                "trade_decision": True,
+                "quote_status": "ok",
+                "quote_up_ask": 0.71,
+                "quote_down_ask": 0.29,
+                "quote_up_bid": 0.70,
+                "quote_down_bid": 0.28,
+                "ret_5m": 0.001,
+                "ret_15m": 0.02,
+            }
+        ]
+    )
+
+    out, summary = apply_live_guard_parity(
+        market="xrp",
+        profile="deep_otm_5m",
+        decisions=decisions,
+    )
+
+    assert summary.blocked_rows == 1
+    assert out.loc[0, "policy_action"] == "reject"
+    assert out.loc[0, "guard_primary_reason"] == "ret30m_down_ceiling"

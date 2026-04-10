@@ -25,6 +25,7 @@ from ..session_state import normalize_trade_side
 
 def evaluate_signal_guard_reasons(
     *,
+    cycle: str,
     market: str,
     profile_spec: LiveProfileSpec,
     signal_row: dict[str, Any],
@@ -111,6 +112,7 @@ def evaluate_signal_guard_reasons(
     feature_snapshot = signal_row.get("feature_snapshot") or {}
     reasons.extend(
         directional_return_guard_reasons(
+            cycle=cycle,
             market=market,
             profile_spec=profile_spec,
             signal_row=signal_row,

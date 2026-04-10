@@ -77,17 +77,22 @@ def live_active_direction_bundle(cfg: LiveConfig) -> dict[str, object]:
 def canonical_live_scope(*, cfg: LiveConfig, target: str) -> dict[str, object]:
     market = str(cfg.asset.slug)
     profile = str(cfg.profile)
+    cycle = f"{int(cfg.cycle_minutes)}m"
     normalized_target = str(target or CANONICAL_LIVE_TARGET).strip().lower()
+    cycle_in_scope = cycle == CANONICAL_LIVE_CYCLE
     return {
         "market": market,
         "profile": profile,
+        "cycle": cycle,
         "target": normalized_target,
         "market_in_scope": market in CANONICAL_LIVE_MARKETS,
         "profile_in_scope": profile == CANONICAL_LIVE_PROFILE,
+        "cycle_in_scope": cycle_in_scope,
         "target_in_scope": normalized_target == CANONICAL_LIVE_TARGET,
         "ok": (
             market in CANONICAL_LIVE_MARKETS
             and profile == CANONICAL_LIVE_PROFILE
+            and cycle_in_scope
             and normalized_target == CANONICAL_LIVE_TARGET
         ),
     }
@@ -141,7 +146,7 @@ def describe_live_cli_boundary(
         ),
     ]
     if requested_scope_classification == "non_canonical_scope":
-        notes.append("requested market/profile falls outside canonical live scope")
+        notes.append("requested market/profile/cycle falls outside canonical live scope")
     if str(profile_resolution.get("status") or "") == "compatibility_fallback":
         notes.append(
             "requested profile is outside the live profile registry and currently resolves through a fallback profile_spec"

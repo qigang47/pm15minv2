@@ -4,6 +4,8 @@ from typing import Any
 
 import pandas as pd
 
+from pm15min.core.cycle_contracts import resolve_cycle_contract
+
 
 PRESSURE_NEUTRAL = "neutral"
 REGIME_NORMAL = "NORMAL"
@@ -172,17 +174,37 @@ def resolve_checked_at(*, features: pd.DataFrame | None, now: pd.Timestamp | Non
     return pd.Timestamp.now(tz="UTC")
 
 
-def latest_regime_returns(features: pd.DataFrame | None) -> tuple[float | None, float | None]:
+def infer_regime_cycle(
+    *,
+    cycle: str | int | None = None,
+    features: pd.DataFrame | None = None,
+    offsets: tuple[int, ...] | None = None,
+) -> str:
+    if cycle is not None:
+        return resolve_cycle_contract(cycle).cycle
+    if isinstance(features, pd.DataFrame) and "ret_5m" in features.columns:
+        return "5m"
+    if offsets:
+        try:
+            if max(int(value) for value in offsets) <= 4:
+                return "5m"
+        except ValueError:
+            pass
+    return "15m"
+
+
+def latest_regime_returns(features: pd.DataFrame | None, *, cycle: str | int) -> tuple[float | None, float | None]:
     if not isinstance(features, pd.DataFrame) or features.empty:
         return None, None
+    short_col, long_col = resolve_cycle_contract(cycle).regime_return_columns
     rows = features.copy()
     if "decision_ts" in rows.columns:
         rows = rows.sort_values("decision_ts")
     row = rows.tail(1)
     if row.empty:
         return None, None
-    return float_or_none(row.get("ret_15m").iloc[-1] if "ret_15m" in row.columns else None), float_or_none(
-        row.get("ret_30m").iloc[-1] if "ret_30m" in row.columns else None
+    return float_or_none(row.get(short_col).iloc[-1] if short_col in row.columns else None), float_or_none(
+        row.get(long_col).iloc[-1] if long_col in row.columns else None
     )
 
 

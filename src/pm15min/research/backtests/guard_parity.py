@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 
 from pm15min.live.guards import evaluate_signal_guard_reasons
+from pm15min.live.regime.controller import infer_regime_cycle
 from pm15min.live.profiles.spec import LiveProfileSpec
 from pm15min.live.profiles import resolve_live_profile_spec
 
@@ -24,6 +25,7 @@ class GuardParitySummary:
 
 
 _FEATURE_SNAPSHOT_COLUMNS = (
+    "ret_5m",
     "ret_15m",
     "ret_30m",
     "ret_from_strike",
@@ -38,6 +40,7 @@ GUARD_PARITY_HEARTBEAT_INTERVAL_ROWS = 1_000
 def apply_live_guard_parity(
     *,
     market: str,
+    cycle: str | None = None,
     profile: str,
     decisions: pd.DataFrame,
     profile_spec: LiveProfileSpec | None = None,
@@ -47,6 +50,7 @@ def apply_live_guard_parity(
         return decisions.copy(), GuardParitySummary(evaluated_rows=0, blocked_rows=0)
 
     spec = profile_spec or resolve_live_profile_spec(profile)
+    resolved_cycle = infer_regime_cycle(cycle=cycle, features=decisions, offsets=spec.offsets)
     out = decisions.copy()
     guard_reasons_list: list[list[str]] = []
     quote_metrics_list: list[dict[str, Any]] = []
@@ -59,12 +63,14 @@ def apply_live_guard_parity(
     for row_index, row in enumerate(out.itertuples(index=False, name="GuardParityRow"), start=1):
         quote_row = _build_quote_row(row)
         signal_row = _build_signal_row(row)
+        row_cycle = str(_row_value(row, "cycle") or resolved_cycle)
         if quote_row is None:
             reasons: list[str] = []
             quote_metrics: dict[str, Any] = {}
             account_context: dict[str, Any] = {}
         else:
             reasons, quote_metrics, account_context = evaluate_signal_guard_reasons(
+                cycle=row_cycle,
                 market=market,
                 profile_spec=spec,
                 signal_row=signal_row,

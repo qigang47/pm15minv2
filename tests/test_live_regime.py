@@ -6,6 +6,7 @@ import pandas as pd
 
 from pm15min.core.config import LiveConfig
 from pm15min.live.regime import build_regime_state_snapshot
+from pm15min.live.signal.scoring_bundle import prepare_live_features_and_states
 
 
 def _patch_v2_roots(monkeypatch, root: Path) -> None:
@@ -112,3 +113,93 @@ def test_build_regime_state_snapshot_enters_defense_after_confirmations(tmp_path
     assert second["state"] == "DEFENSE"
     assert second["pressure"] == "down"
     assert second["guard_hints"]["defense_force_with_pressure"] is True
+
+
+def test_build_regime_state_snapshot_uses_5m_regime_return_columns(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    _patch_regime_snapshot_labels(monkeypatch, ["2026-03-20T00-03-00Z"])
+    cfg = LiveConfig.build(market="sol", profile="deep_otm_5m", cycle_minutes=5)
+
+    payload = build_regime_state_snapshot(
+        cfg,
+        features=pd.DataFrame(
+            [
+                {
+                    "decision_ts": "2026-03-20T00:03:00+00:00",
+                    "offset": 2,
+                    "ret_5m": 0.0020,
+                    "ret_15m": 0.0030,
+                }
+            ]
+        ),
+        liquidity_payload={
+            "snapshot_ts": "2026-03-20T00-02-59Z",
+            "status": "ok",
+            "reason": "ok",
+            "blocked": False,
+            "reason_codes": ["ok"],
+            "metrics": {
+                "spot_quote_ratio": 1.0,
+                "perp_quote_ratio": 1.0,
+                "spot_trades_ratio": 1.0,
+                "perp_trades_ratio": 1.0,
+                "soft_fail_count": 0,
+                "hard_fail_count": 0,
+            },
+        },
+        persist=False,
+    )
+
+    assert payload["pressure"] == "up"
+
+
+def test_prepare_live_features_and_states_requests_5m_regime_return_columns(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="sol", profile="deep_otm_5m", cycle_minutes=5)
+    captured: dict[str, object] = {}
+
+    def fake_build_live_feature_frame_fn(
+        _cfg,
+        *,
+        feature_set,
+        retain_offsets,
+        allow_preview_open_bar,
+        required_feature_columns,
+    ):
+        captured["required_feature_columns"] = set(required_feature_columns)
+        return pd.DataFrame(
+            [
+                {
+                    "decision_ts": "2026-03-20T00:03:00+00:00",
+                    "ret_5m": 0.0020,
+                    "ret_15m": 0.0030,
+                }
+            ]
+        )
+
+    monkeypatch.setattr("pm15min.live.signal.scoring_bundle.load_latest_liquidity_state_snapshot", lambda **kwargs: None)
+    monkeypatch.setattr("pm15min.live.signal.scoring_bundle.summarize_liquidity_state", lambda payload: {})
+    monkeypatch.setattr(
+        "pm15min.live.signal.scoring_bundle.build_regime_state_snapshot",
+        lambda *args, **kwargs: {"status": "ok"},
+    )
+    monkeypatch.setattr(
+        "pm15min.live.signal.scoring_bundle.summarize_regime_state",
+        lambda payload: {"state": "NORMAL"},
+    )
+
+    prepare_live_features_and_states(
+        cfg,
+        builder_feature_set="v6_user_core",
+        persist=False,
+        build_live_feature_frame_fn=fake_build_live_feature_frame_fn,
+    )
+
+    required_feature_columns = captured["required_feature_columns"]
+    assert "ret_5m" in required_feature_columns
+    assert "ret_15m" in required_feature_columns

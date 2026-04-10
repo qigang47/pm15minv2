@@ -6,12 +6,14 @@ from typing import Any
 
 import pandas as pd
 
+from pm15min.core.cycle_contracts import resolve_cycle_contract
 from pm15min.live.profiles.spec import LiveProfileSpec
 from pm15min.live.profiles import resolve_live_profile_spec
 from pm15min.live.regime.controller import (
     PRESSURE_NEUTRAL,
     REGIME_NORMAL,
     RegimeController,
+    infer_regime_cycle,
     latest_regime_returns,
     resolve_checked_at,
     seed_regime_controller,
@@ -207,6 +209,7 @@ def attach_backtest_regime_parity(
         raw_klines=raw_klines,
         mode=proxy_mode,
     )
+    cycle = infer_regime_cycle(features=decisions, offsets=profile_spec.offsets)
     out = decisions.copy()
     previous_state: dict[str, Any] | None = None
 
@@ -220,7 +223,8 @@ def attach_backtest_regime_parity(
         regime_payload = build_backtest_regime_state(
             market=market,
             profile=profile_spec,
-            features=_row_feature_frame(row=row, checked_at=checked_at),
+            cycle=cycle,
+            features=_row_feature_frame(row=row, checked_at=checked_at, cycle=cycle),
             liquidity_state=liquidity_payload,
             previous_state=previous_state,
             now=checked_at,
@@ -307,6 +311,7 @@ def build_backtest_regime_state(
     *,
     market: str,
     profile: str | LiveProfileSpec,
+    cycle: str | int | None = None,
     features: pd.DataFrame | None = None,
     liquidity_state: BacktestLiquidityStatus | Mapping[str, Any] | None = None,
     previous_state: Mapping[str, Any] | None = None,
@@ -314,6 +319,7 @@ def build_backtest_regime_state(
 ) -> dict[str, Any]:
     market_token = str(market or "").strip().lower()
     profile_name, spec = _resolve_profile_spec(profile)
+    resolved_cycle = infer_regime_cycle(cycle=cycle, features=features, offsets=spec.offsets)
     checked_at = resolve_checked_at(features=features, now=now)
     liquidity_summary = summarize_backtest_liquidity_state(liquidity_state)
     guard_hints = _guard_hints(spec=spec, regime_state=REGIME_NORMAL)
@@ -353,7 +359,7 @@ def build_backtest_regime_state(
         payload["reason_codes"] = ["disabled"]
         return payload
 
-    ret_15m, ret_30m = latest_regime_returns(features)
+    ret_15m, ret_30m = latest_regime_returns(features, cycle=resolved_cycle)
     controller = _build_regime_controller(spec)
     seed_regime_controller(
         controller=controller,
@@ -460,13 +466,14 @@ def _row_checked_at(row: pd.Series) -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
 
 
-def _row_feature_frame(*, row: pd.Series, checked_at: pd.Timestamp) -> pd.DataFrame:
+def _row_feature_frame(*, row: pd.Series, checked_at: pd.Timestamp, cycle: str | int) -> pd.DataFrame:
+    short_col, long_col = resolve_cycle_contract(cycle).regime_return_columns
     return pd.DataFrame(
         [
             {
                 "decision_ts": checked_at,
-                "ret_15m": row.get("ret_15m"),
-                "ret_30m": row.get("ret_30m"),
+                short_col: row.get(short_col),
+                long_col: row.get(long_col),
             }
         ]
     )

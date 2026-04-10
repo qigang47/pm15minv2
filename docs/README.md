@@ -24,6 +24,13 @@ Repo 内自动化入口：
 - `scripts/research/README.md`
   - `codex_background_loop.sh`、`status_autorun.sh`、`run_one_experiment.sh` 等控制面脚本的使用说明。
 
+入口包：
+
+- `pm5min/`
+  - 5 分钟入口包。
+  - 复用共享的 `pm15min` 实现，不是整套代码再分叉一份。
+  - 只把周期敏感的默认值和 5 分钟 profile 单独分离出来。
+
 清理规则：
 
 - 长期规范和 runbook 留在 `docs/`

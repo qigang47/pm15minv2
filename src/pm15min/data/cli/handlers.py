@@ -143,7 +143,7 @@ def _handle_sync_binance_klines(args: argparse.Namespace, deps: DataCliDeps) -> 
 def _handle_sync_settlement_truth_rpc(args: argparse.Namespace, deps: DataCliDeps) -> dict[str, Any]:
     start_ts = int(parse_utc_datetime(args.start_date).timestamp()) if args.start_date else None
     end_ts = int(parse_utc_datetime(args.end_date).timestamp()) if args.end_date else None
-    cfg = _build_data_cfg(args, deps, cycle="15m")
+    cfg = _build_data_cfg(args, deps)
     return deps.sync_settlement_truth_from_rpc(
         cfg,
         start_ts=start_ts,
@@ -191,7 +191,7 @@ def _handle_sync_legacy_orderbook_depth(args: argparse.Namespace, deps: DataCliD
 
 
 def _handle_sync_legacy_settlement_truth(args: argparse.Namespace, deps: DataCliDeps) -> dict[str, Any]:
-    cfg = _build_data_cfg(args, deps, cycle="15m")
+    cfg = _build_data_cfg(args, deps)
     return deps.import_legacy_settlement_truth(cfg, source_path=Path(args.source_path) if args.source_path else None)
 
 
