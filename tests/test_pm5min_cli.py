@@ -1,8 +1,15 @@
 import json
+from pathlib import Path
 
 from pm15min.core.config import LiveConfig
 from pm15min.live.runtime import canonical_live_scope
 from pm5min.cli import main, rewrite_pm5min_argv
+
+
+def _patch_v2_roots(monkeypatch, root: Path) -> None:
+    monkeypatch.setattr("pm15min.core.layout.rewrite_root", lambda: root)
+    monkeypatch.setattr("pm15min.data.layout.rewrite_root", lambda: root)
+    monkeypatch.setattr("pm15min.research.layout.rewrite_root", lambda: root)
 
 
 def test_rewrite_pm5min_argv_injects_5m_defaults() -> None:
@@ -17,6 +24,77 @@ def test_rewrite_pm5min_argv_injects_5m_defaults() -> None:
         "research",
         "show-layout",
         "--market",
+        "sol",
+        "--cycle",
+        "5m",
+    ]
+    assert rewrite_pm5min_argv(["data", "show-layout", "--market", "sol"]) == [
+        "data",
+        "show-layout",
+        "--market",
+        "sol",
+        "--cycle",
+        "5m",
+    ]
+    assert rewrite_pm5min_argv(["data", "run", "live-foundation", "--market", "sol"]) == [
+        "data",
+        "run",
+        "live-foundation",
+        "--market",
+        "sol",
+        "--cycle",
+        "5m",
+    ]
+    assert rewrite_pm5min_argv(["data", "sync", "settlement-truth-rpc", "--market", "sol"]) == [
+        "data",
+        "sync",
+        "settlement-truth-rpc",
+        "--market",
+        "sol",
+        "--cycle",
+        "5m",
+    ]
+    assert rewrite_pm5min_argv(["data", "sync", "legacy-settlement-truth", "--market", "sol"]) == [
+        "data",
+        "sync",
+        "legacy-settlement-truth",
+        "--market",
+        "sol",
+        "--cycle",
+        "5m",
+    ]
+    assert rewrite_pm5min_argv(["data", "build", "truth-15m", "--market", "sol"]) == [
+        "data",
+        "build",
+        "truth-15m",
+        "--market",
+        "sol",
+        "--cycle",
+        "5m",
+    ]
+    assert rewrite_pm5min_argv(["data", "export", "truth-15m", "--market", "sol"]) == [
+        "data",
+        "export",
+        "truth-15m",
+        "--market",
+        "sol",
+        "--cycle",
+        "5m",
+    ]
+    assert rewrite_pm5min_argv(["data", "run", "backfill-direct-oracle", "--market", "sol"]) == [
+        "data",
+        "run",
+        "backfill-direct-oracle",
+        "--market",
+        "sol",
+        "--cycle",
+        "5m",
+    ]
+    assert rewrite_pm5min_argv(["data", "run", "backfill-cycle-labels-gamma", "--markets", "sol"]) == [
+        "data",
+        "run",
+        "backfill-cycle-labels-gamma",
+        "--markets",
         "sol",
         "--cycle",
         "5m",
@@ -45,7 +123,7 @@ def test_rewrite_pm5min_argv_injects_5m_defaults() -> None:
     ]
 
 
-def test_rewrite_pm5min_argv_does_not_inject_cycle_for_console_or_data() -> None:
+def test_rewrite_pm5min_argv_does_not_inject_cycle_for_console_or_cycleless_data_commands() -> None:
     assert rewrite_pm5min_argv(["console", "show-home"]) == [
         "console",
         "show-home",
@@ -109,6 +187,83 @@ def test_pm5min_live_show_layout_uses_5m_profile_and_cycle(capsys) -> None:
     assert payload["cli_boundary"]["requested_scope_classification"] == "non_canonical_scope"
     assert payload["cli_boundary"]["canonical_live_contract"]["cycle"] == "15m"
     assert payload["profile_spec_resolution"]["status"] == "exact_match"
+
+
+def test_pm5min_data_show_layout_uses_5m_cycle(capsys, monkeypatch, tmp_path: Path) -> None:
+    _patch_v2_roots(monkeypatch, tmp_path / "v2")
+
+    rc = main(["data", "show-layout", "--market", "sol"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cycle"] == "5m"
+
+
+def test_pm5min_data_live_foundation_uses_5m_cycle(capsys, monkeypatch, tmp_path: Path) -> None:
+    _patch_v2_roots(monkeypatch, tmp_path / "v2")
+    monkeypatch.setattr(
+        "pm15min.data.cli.run_live_data_foundation",
+        lambda cfg, **kwargs: {
+            "dataset": "live_foundation",
+            "market": cfg.asset.slug,
+            "cycle": cfg.cycle,
+            "status": "ok",
+        },
+    )
+
+    rc = main(["data", "run", "live-foundation", "--market", "sol"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cycle"] == "5m"
+
+
+def test_pm5min_settlement_truth_rpc_is_reachable_for_5m(capsys, monkeypatch, tmp_path: Path) -> None:
+    _patch_v2_roots(monkeypatch, tmp_path / "v2")
+    monkeypatch.setattr(
+        "pm15min.data.cli.sync_settlement_truth_from_rpc",
+        lambda cfg, **kwargs: {
+            "dataset": "settlement_truth_rpc",
+            "market": cfg.asset.slug,
+            "cycle": cfg.cycle,
+            "rows_imported": 0,
+        },
+    )
+
+    rc = main(["data", "sync", "settlement-truth-rpc", "--market", "sol"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cycle"] == "5m"
+
+
+def test_pm5min_legacy_settlement_truth_is_reachable_for_5m(capsys, monkeypatch, tmp_path: Path) -> None:
+    _patch_v2_roots(monkeypatch, tmp_path / "v2")
+    monkeypatch.setattr(
+        "pm15min.data.cli.import_legacy_settlement_truth",
+        lambda cfg, source_path=None: {
+            "dataset": "settlement_truth",
+            "market": cfg.asset.slug,
+            "cycle": cfg.cycle,
+            "source_file": None if source_path is None else str(source_path),
+        },
+    )
+
+    rc = main(
+        [
+            "data",
+            "sync",
+            "legacy-settlement-truth",
+            "--market",
+            "sol",
+            "--source-path",
+            str(tmp_path / "settlement.csv"),
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cycle"] == "5m"
 
 
 def test_canonical_live_scope_rejects_non_canonical_cycle_with_canonical_market_and_profile() -> None:

@@ -85,8 +85,7 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
         "settlement-truth-rpc",
         help="Fetch settlement truth directly from Polygon RPC and store it in v2 source storage.",
     )
-    add_market_arg(settlement_rpc)
-    add_surface_arg(settlement_rpc)
+    add_market_cycle_surface_args(settlement_rpc)
     settlement_rpc.add_argument("--start-date", default=None, help="Optional UTC start date override.")
     settlement_rpc.add_argument("--end-date", default=None, help="Optional UTC end date override.")
     settlement_rpc.add_argument("--chunk-blocks", type=int, default=3000)
@@ -134,8 +133,7 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
         "legacy-settlement-truth",
         help="Import the latest legacy settlement-truth CSV into v2 source storage.",
     )
-    add_market_arg(legacy_settlement)
-    add_surface_arg(legacy_settlement)
+    add_market_cycle_surface_args(legacy_settlement)
     legacy_settlement.add_argument("--source-path", default=None)
 
     build = data_sub.add_parser("build", help="Build canonical tables from v2 sources.")

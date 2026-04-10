@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import time
 
+from pm15min.core.cycle_contracts import resolve_cycle_contract
 from pm15min.research.features.base import decision_reference_ts, normalize_feature_frame, prepare_klines
 from pm15min.research.features.cross_asset import append_cross_asset_features
 from pm15min.research.features.cycle import append_decision_cycle_metadata
@@ -83,13 +84,19 @@ def build_feature_frame(
     return out
 
 
-def resolve_live_required_feature_columns(*, feature_set: str, root: str | None = None) -> set[str]:
+def resolve_live_required_feature_columns(
+    *,
+    feature_set: str,
+    cycle: str = "15m",
+    root: str | None = None,
+) -> set[str]:
+    short_return, long_return = resolve_cycle_contract(cycle).regime_return_columns
     return _resolve_required_feature_columns(
         feature_set=feature_set,
         root=root,
         requested_columns={
-            "ret_15m",
-            "ret_30m",
+            short_return,
+            long_return,
             "ret_from_cycle_open",
             "ret_from_strike",
             "move_z",
