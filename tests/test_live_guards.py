@@ -107,6 +107,30 @@ def test_decision_rejects_when_ret_30m_guard_fails() -> None:
     assert out["rejected_offsets"][0]["guard_reasons"] == ["ret30m_down_ceiling"]
 
 
+def test_decision_rejects_when_5m_long_return_guard_fails() -> None:
+    row = _base_signal_row()
+    row["offset"] = 2
+    row["feature_snapshot"] = {
+        "ret_5m": 0.001,
+        "ret_15m": 0.02,
+        "ret_from_strike": -0.002,
+        "move_z": 1.0,
+    }
+    payload = {
+        "market": "xrp",
+        "profile": "deep_otm_5m",
+        "cycle": "5m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    out = build_decision_snapshot(payload)
+    assert out["decision"]["status"] == "reject"
+    assert out["rejected_offsets"][0]["guard_reasons"] == ["ret30m_down_ceiling"]
+
+
 def test_deep_otm_baseline_ret30_thresholds_match_tightened_btc_eth_policy() -> None:
     spec = resolve_live_profile_spec("deep_otm_baseline")
 

@@ -66,6 +66,7 @@ def build_decision_snapshot(
                 orderbook_provider=orderbook_provider,
             )
             reasons, quote_metrics, account_context = evaluate_signal_guard_reasons(
+                cycle=cycle,
                 market=market,
                 profile_spec=spec,
                 signal_row=candidate,

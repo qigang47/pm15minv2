@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from pm15min.core.cycle_contracts import resolve_cycle_contract
+
 from ..profiles import LiveProfileSpec
 
 
 def directional_return_guard_reasons(
     *,
+    cycle: str,
     market: str,
     profile_spec: LiveProfileSpec,
     signal_row: dict[str, Any],
@@ -14,16 +17,17 @@ def directional_return_guard_reasons(
 ) -> list[str]:
     reasons: list[str] = []
     side = str(signal_row.get("recommended_side") or "").upper()
-    ret_30m = float_or_none(feature_snapshot.get("ret_30m"))
-    if ret_30m is None:
+    _, long_return_column = resolve_cycle_contract(cycle).regime_return_columns
+    long_return = float_or_none(feature_snapshot.get(long_return_column))
+    if long_return is None:
         return reasons
 
     up_floor = profile_spec.ret_30m_up_floor_for(market)
-    if side == "UP" and up_floor is not None and ret_30m < float(up_floor):
+    if side == "UP" and up_floor is not None and long_return < float(up_floor):
         reasons.append("ret30m_up_floor")
 
     down_ceiling = profile_spec.ret_30m_down_ceiling_for(market)
-    if side == "DOWN" and down_ceiling is not None and ret_30m > float(down_ceiling):
+    if side == "DOWN" and down_ceiling is not None and long_return > float(down_ceiling):
         reasons.append("ret30m_down_ceiling")
     return reasons
 

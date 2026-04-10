@@ -1,6 +1,8 @@
+import argparse
 import json
 from pathlib import Path
 
+from pm15min.cli import build_parser as build_pm15min_parser
 from pm15min.core.config import LiveConfig
 from pm15min.live.runtime import canonical_live_scope
 from pm5min.cli import main, rewrite_pm5min_argv
@@ -10,6 +12,34 @@ def _patch_v2_roots(monkeypatch, root: Path) -> None:
     monkeypatch.setattr("pm15min.core.layout.rewrite_root", lambda: root)
     monkeypatch.setattr("pm15min.data.layout.rewrite_root", lambda: root)
     monkeypatch.setattr("pm15min.research.layout.rewrite_root", lambda: root)
+
+
+def _data_cycle_capable_command_paths() -> set[tuple[str, ...]]:
+    parser = build_pm15min_parser()
+    paths: set[tuple[str, ...]] = set()
+
+    def find_subparsers(target: argparse.ArgumentParser) -> argparse._SubParsersAction | None:
+        for action in target._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                return action
+        return None
+
+    root_subparsers = find_subparsers(parser)
+    assert root_subparsers is not None
+    data_parser = root_subparsers.choices["data"]
+
+    def visit(target: argparse.ArgumentParser, path: tuple[str, ...]) -> None:
+        option_strings = {option for action in target._actions for option in action.option_strings}
+        if "--cycle" in option_strings and path:
+            paths.add(path)
+        child_subparsers = find_subparsers(target)
+        if child_subparsers is None:
+            return
+        for token, child in child_subparsers.choices.items():
+            visit(child, path + (token,))
+
+    visit(data_parser, ())
+    return paths
 
 
 def test_rewrite_pm5min_argv_injects_5m_defaults() -> None:
@@ -139,6 +169,12 @@ def test_rewrite_pm5min_argv_does_not_inject_cycle_for_console_or_cycleless_data
         "--surface",
         "live",
     ]
+
+
+def test_rewrite_pm5min_argv_covers_every_cycle_capable_data_command() -> None:
+    for path in sorted(_data_cycle_capable_command_paths()):
+        rewritten = rewrite_pm5min_argv(["data", *path])
+        assert "--cycle" in rewritten, path
 
 
 def test_rewrite_pm5min_argv_respects_equals_form_values() -> None:
