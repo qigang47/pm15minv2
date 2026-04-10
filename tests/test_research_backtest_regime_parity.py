@@ -374,7 +374,6 @@ def test_apply_live_guard_parity_uses_5m_long_return_guard() -> None:
         [
             {
                 "decision_ts": "2026-03-01T00:05:00Z",
-                "cycle": "5m",
                 "offset": 2,
                 "p_up": 0.20,
                 "p_down": 0.80,
@@ -384,10 +383,10 @@ def test_apply_live_guard_parity_uses_5m_long_return_guard() -> None:
                 "policy_reason": "trade",
                 "trade_decision": True,
                 "quote_status": "ok",
-                "quote_up_ask": 0.20,
-                "quote_down_ask": 0.80,
-                "quote_up_bid": 0.19,
-                "quote_down_bid": 0.79,
+                "quote_up_ask": 0.71,
+                "quote_down_ask": 0.29,
+                "quote_up_bid": 0.70,
+                "quote_down_bid": 0.28,
                 "ret_5m": 0.001,
                 "ret_15m": 0.02,
             }
@@ -396,7 +395,6 @@ def test_apply_live_guard_parity_uses_5m_long_return_guard() -> None:
 
     out, summary = apply_live_guard_parity(
         market="xrp",
-        cycle="5m",
         profile="deep_otm_5m",
         decisions=decisions,
     )

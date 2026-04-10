@@ -261,9 +261,11 @@ def test_sync_settlement_truth_from_rpc_supports_5m(tmp_path: Path, monkeypatch)
     assert bool(df.iloc[0]["full_truth"]) is True
 
 
-def test_import_legacy_settlement_truth_requires_explicit_source_for_5m(tmp_path: Path, monkeypatch) -> None:
+def test_import_legacy_settlement_truth_discovers_default_5m_source(tmp_path: Path, monkeypatch) -> None:
     cfg = DataConfig.build(market="eth", cycle="5m", root=tmp_path / "v2")
-    discovered = tmp_path / "polymarket_15m_settlement_truth.csv"
+    shared_root = tmp_path / "data" / "markets" / "_shared" / "oracle"
+    shared_root.mkdir(parents=True, exist_ok=True)
+    discovered = shared_root / "polymarket_5m_settlement_truth.csv"
     pd.DataFrame(
         [
             {
@@ -271,9 +273,9 @@ def test_import_legacy_settlement_truth_requires_explicit_source_for_5m(tmp_path
                 "end_ts": 1766032200,
                 "market_id": "market-1",
                 "condition_id": "cond-1",
-                "slug": "eth-updown-15m-1766031300",
+                "slug": "eth-updown-5m-1766031900",
                 "question": "Ethereum Up or Down",
-                "resolution_source": "legacy-15m",
+                "resolution_source": "legacy-5m",
                 "winner_side": "UP",
                 "label_updown": "UP",
                 "onchain_resolved": True,
@@ -284,13 +286,15 @@ def test_import_legacy_settlement_truth_requires_explicit_source_for_5m(tmp_path
             }
         ]
     ).to_csv(discovered, index=False)
-    monkeypatch.setattr(
-        "pm15min.data.pipelines.source_ingest.discover_legacy_settlement_truth_csv",
-        lambda: discovered,
-    )
+    monkeypatch.setattr("pm15min.data.pipelines.source_ingest.workspace_root", lambda: tmp_path)
 
-    with pytest.raises(ValueError, match="explicit source_path"):
-        import_legacy_settlement_truth(cfg)
+    summary = import_legacy_settlement_truth(cfg)
+
+    assert summary["rows_imported"] == 1
+    df = pd.read_parquet(cfg.layout.settlement_truth_source_path)
+    assert df.iloc[0]["cycle"] == "5m"
+    assert int(df.iloc[0]["cycle_start_ts"]) == 1766031900
+    assert df.iloc[0]["source_file"] == str(discovered)
 
 
 def test_import_legacy_settlement_truth_supports_5m_with_explicit_source(tmp_path: Path) -> None:

@@ -120,11 +120,11 @@ def discover_legacy_streams_csv() -> Path | None:
     return _latest_path(paths)
 
 
-def discover_legacy_settlement_truth_csv() -> Path | None:
+def discover_legacy_settlement_truth_csv(cycle: str = "15m") -> Path | None:
     root = workspace_root() / "data" / "markets" / "_shared" / "oracle"
     paths = [
         path
-        for path in root.rglob("polymarket_15m_settlement_truth.csv")
+        for path in root.rglob(f"polymarket_{cycle}_settlement_truth.csv")
         if "parts" not in {part.lower() for part in path.parts}
     ]
     return _latest_path(paths)
@@ -315,12 +315,7 @@ def import_legacy_settlement_truth(
     *,
     source_path: Path | None = None,
 ) -> dict[str, object]:
-    if source_path is None and cfg.cycle != "15m":
-        raise ValueError(
-            f"Legacy settlement truth import for cycle={cfg.cycle} requires explicit source_path; "
-            "default discovery only supports legacy 15m CSV."
-        )
-    source_path = source_path or discover_legacy_settlement_truth_csv()
+    source_path = source_path or discover_legacy_settlement_truth_csv(cfg.cycle)
     if source_path is None or not source_path.exists():
         raise FileNotFoundError("Could not locate legacy settlement-truth CSV.")
 
