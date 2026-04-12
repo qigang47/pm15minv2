@@ -20,17 +20,22 @@ _CODEX_HOME_COPY_FILES = (
 _CODEX_PROVIDER_SECTION_RE = re.compile(
     r"(?ms)^\[model_providers\.codex\]\n.*?(?=^\[|\Z)",
 )
+_MODEL_PROVIDER_LINE_RE = re.compile(r'(?m)^model_provider\s*=\s*"[^"]+"\s*$')
 _ACTIVE_SESSION_LINE_RE = re.compile(
     r"(?im)^\s*-\s*(?:active session|new active session)\s*:\s*`?([^`\n]+/(?:session\.md|results\.tsv))`?\s*$"
 )
 _SESSION_REF_RE = re.compile(r"(sessions/[^\s`]+/(?:session\.md|results\.tsv))")
 _TRANSIENT_PROVIDER_FAILURE_MARKERS = (
     "503 service unavailable",
+    "429 too many requests",
+    "exceeded retry limit",
     "service temporarily unavailable",
     "error sending request for url",
     "stream disconnected before completion",
     "unexpected status 503",
     "error decoding response body",
+    "failed to connect to websocket",
+    "http error: 500 internal server error",
 )
 
 
@@ -174,6 +179,12 @@ def apply_codex_auth_override(
     config_path = target_codex_dir / "config.toml"
     config_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     updated_config = _CODEX_PROVIDER_SECTION_RE.sub("", config_text).rstrip()
+    if _MODEL_PROVIDER_LINE_RE.search(updated_config):
+        updated_config = _MODEL_PROVIDER_LINE_RE.sub('model_provider = "openai"', updated_config)
+    elif updated_config:
+        updated_config = f'{updated_config}\nmodel_provider = "openai"'
+    else:
+        updated_config = 'model_provider = "openai"'
     if updated_config:
         updated_config = f"{updated_config}\n"
     config_path.write_text(updated_config, encoding="utf-8")

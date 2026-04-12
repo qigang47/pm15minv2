@@ -39,6 +39,8 @@ def _normalize_oracle_source_label(value: object) -> str:
         return "streams"
     if "datafeed" in token:
         return "datafeeds"
+    if "chainlink" in token or "candlestick" in token:
+        return "streams"
     if "oracle_prices" in token or "direct_api" in token:
         return "oracle_prices"
     return "oracle_prices"

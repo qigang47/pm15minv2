@@ -519,6 +519,7 @@ def test_apply_codex_auth_override_replaces_auth_and_clears_provider_override(tm
     assert payload["codex_dir"] == str(isolated_codex_dir)
     config_text = (isolated_codex_dir / "config.toml").read_text(encoding="utf-8")
     assert "[model_providers.codex]" not in config_text
+    assert 'model_provider = "openai"' in config_text
     auth_payload = json.loads((isolated_codex_dir / "auth.json").read_text(encoding="utf-8"))
     assert auth_payload["auth_mode"] == "chatgpt"
     assert auth_payload["tokens"]["access_token"] == "demo-token"
@@ -528,6 +529,21 @@ def test_is_transient_codex_provider_failure_matches_service_unavailable_retry_l
     output = """
     ERROR codex_api::endpoint::responses: error=http 503 Service Unavailable
     Reconnecting... 3/5 (unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://nimabo.cn/v1/responses)
+    """
+    assert is_transient_codex_provider_failure(output) is True
+
+
+def test_is_transient_codex_provider_failure_matches_websocket_internal_error() -> None:
+    output = """
+    ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 500 Internal Server Error, url: wss://api.openai.com/v1/responses
+    ERROR: Reconnecting... 2/5
+    """
+    assert is_transient_codex_provider_failure(output) is True
+
+
+def test_is_transient_codex_provider_failure_matches_rate_limit_retry_log() -> None:
+    output = """
+    ERROR: exceeded retry limit, last status: 429 Too Many Requests
     """
     assert is_transient_codex_provider_failure(output) is True
 
