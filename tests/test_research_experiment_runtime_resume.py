@@ -304,6 +304,44 @@ def test_run_experiment_suite_reports_progress(monkeypatch, tmp_path: Path) -> N
     assert events[-1]["progress_pct"] == 100
 
 
+def test_run_experiment_suite_releases_backtest_memory_after_each_group(monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    cfg = _build_cfg(root)
+    suite = _Suite(
+        suite_name="memory_release_suite",
+        cycle="15m",
+        markets=(
+            _MarketSpec(market="sol", group_name="core", run_name="run-a", variant_label="baseline"),
+            _MarketSpec(market="eth", group_name="core", run_name="run-b", variant_label="alt"),
+        ),
+    )
+    monkeypatch.setattr("pm15min.research.experiments.runner.load_suite_definition", lambda path: suite)
+    monkeypatch.setattr("pm15min.research.experiments.runner._resolve_suite_spec_path", lambda cfg, suite_name: root / "suite.json")
+
+    counters = {"feature": 0, "label": 0, "train": 0, "bundle": 0, "backtest": 0}
+    backtest_trace: list[dict[str, object]] = []
+    _install_runtime_fakes(
+        monkeypatch,
+        root=root,
+        counters=counters,
+        backtest_trace=backtest_trace,
+    )
+
+    release_trace: list[str] = []
+    monkeypatch.setattr(
+        "pm15min.research.experiments.runner.clear_process_backtest_runtime_cache",
+        lambda: release_trace.append("clear"),
+    )
+    monkeypatch.setattr(
+        "pm15min.research.experiments.runner.gc.collect",
+        lambda: release_trace.append("gc") or 0,
+    )
+
+    run_experiment_suite(cfg=cfg, suite_name="memory_release_suite", run_label="memory-release-exp")
+
+    assert release_trace == ["clear", "gc", "clear", "gc"]
+
+
 def test_build_execution_groups_groups_stake_matrix_cases_by_parent_run_name_and_stake() -> None:
     groups = build_execution_groups(
         (

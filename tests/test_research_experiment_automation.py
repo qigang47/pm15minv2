@@ -5,12 +5,19 @@ import json
 from pathlib import Path
 
 from pm15min.research.automation import (
+    apply_codex_auth_override,
+    apply_codex_provider_override,
+    build_codex_exec_command,
+    build_codex_exec_extra_args,
     build_codex_cycle_prompt,
     build_autorun_status_report,
     find_incomplete_experiment_runs,
+    is_transient_codex_provider_failure,
     next_autorun_failure_state,
     prepare_codex_home,
     record_session_update,
+    resolve_autorun_session_dir,
+    resolve_codex_exec_binary,
     summarize_experiment_run,
 )
 
@@ -143,6 +150,84 @@ def test_summarize_experiment_run_reads_quick_screen_summary_and_top_case(tmp_pa
     }
 
 
+def test_summarize_experiment_run_reads_incomplete_formal_run_from_logs_and_suite_spec(tmp_path: Path) -> None:
+    suite_name = "demo_suite"
+    run_label = "demo_run"
+    suite_spec_dir = tmp_path / "research" / "experiments" / "suite_specs"
+    suite_spec_dir.mkdir(parents=True, exist_ok=True)
+    (suite_spec_dir / f"{suite_name}.json").write_text(
+        json.dumps(
+            {
+                "suite_name": suite_name,
+                "stakes": [2.0],
+                "max_trades_per_market_values": [5],
+                "markets": {
+                    "xrp": {
+                        "groups": {
+                            "focus_search": {
+                                "runs": [
+                                    {
+                                        "run_name": "focus_search",
+                                        "feature_set_variants": [
+                                            {"label": "38_v3", "feature_set": "focus_xrp_38_v3"},
+                                            {"label": "38_v4", "feature_set": "focus_xrp_38_v4"},
+                                        ],
+                                        "weight_variants": [
+                                            {"label": "current_default"},
+                                            {"label": "offset_reversal_mild"},
+                                            {"label": "offset_reversal_strong"},
+                                        ],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "research" / "experiments" / "runs" / f"suite={suite_name}" / f"run={run_label}"
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "suite.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event": "execution_group_started",
+                        "group_label": "xrp/focus_search/focus_search__fs_38_v3__w_current_default__max5",
+                        "cases": 1,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "market_cache_resolved",
+                        "market": "xrp",
+                        "run_name": "focus_search__fs_38_v3__w_current_default__max5__stake_2usd__max_10usd",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    payload = summarize_experiment_run(run_dir)
+
+    assert payload["suite_name"] == suite_name
+    assert payload["run_label"] == run_label
+    assert payload["cases"] == 6
+    assert payload["completed_cases"] == 0
+    assert payload["failed_cases"] == 0
+    assert payload["leaderboard_rows"] == 0
+    assert payload["markets"] == ["xrp"]
+    assert payload["top_case"] is None
+    assert payload["raw_summary"]["state"] == "stuck_seed_case"
+    assert payload["raw_summary"]["last_event"] == "market_cache_resolved"
+    assert payload["raw_summary"]["summary_exists"] is False
+
+
 def test_record_session_update_appends_results_and_session_sections(tmp_path: Path) -> None:
     session_dir = tmp_path / "sessions" / "demo"
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -191,13 +276,142 @@ def test_record_session_update_appends_results_and_session_sections(tmp_path: Pa
 def test_build_codex_cycle_prompt_references_program_and_session(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     session_dir = root / "sessions" / "demo"
-    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    program_path = root / "program_custom.md"
+    program_path.write_text("# demo program\n", encoding="utf-8")
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir, program_path=program_path)
 
     assert str(root) in prompt
     assert str(session_dir) in prompt
-    assert "program.md" in prompt
+    assert str(program_path) in prompt
+    assert "read program_custom.md and the latest session artifacts before making changes." in prompt.lower()
     assert "one completed cycle only" in prompt.lower()
     assert "two simultaneous formal market runs" in prompt
+    assert "do not scan the entire repository" in prompt.lower()
+    assert "prefer resuming or launching one formal experiment" in prompt.lower()
+    assert "if `rg` is unavailable" in prompt.lower()
+
+
+def test_build_codex_cycle_prompt_includes_existing_autorun_snapshot(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    autorun_dir = root / "var" / "research" / "autorun"
+    autorun_dir.mkdir(parents=True, exist_ok=True)
+    (autorun_dir / "codex-background.status.json").write_text(
+        json.dumps(
+            {
+                "state": "idle",
+                "iteration": 3,
+                "pid": None,
+                "last_started_at": "2026-04-12T00:00:00Z",
+                "last_finished_at": "2026-04-12T00:10:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_dir = root / "research" / "experiments" / "runs" / "suite=test_suite" / "run=test_run"
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+    (run_dir / "logs" / "suite.jsonl").write_text(
+        json.dumps({"event": "market_cache_resolved"}) + "\n",
+        encoding="utf-8",
+    )
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
+
+    assert "current autorun snapshot already collected for you:" in prompt.lower()
+    assert "autorun state: idle" in prompt.lower()
+    assert "test_suite / test_run / state=stuck_seed_case" in prompt
+
+
+def test_build_codex_exec_extra_args_adds_skip_git_repo_check_once() -> None:
+    assert build_codex_exec_extra_args() == ("--skip-git-repo-check",)
+    assert build_codex_exec_extra_args("--model gpt-5.4") == (
+        "--model",
+        "gpt-5.4",
+        "--skip-git-repo-check",
+    )
+    assert build_codex_exec_extra_args("--skip-git-repo-check --model gpt-5.4") == (
+        "--skip-git-repo-check",
+        "--model",
+        "gpt-5.4",
+    )
+
+
+def test_build_codex_exec_command_places_skip_git_check_before_stdin_prompt(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    output_path = root / "last-output.txt"
+
+    command = build_codex_exec_command(
+        project_root=root,
+        output_path=output_path,
+        sandbox_mode="danger-full-access",
+        model="gpt-5.4",
+        extra_args=None,
+    )
+
+    assert Path(command[0]).name == "codex"
+    assert command[1] == "exec"
+    assert "--skip-git-repo-check" in command
+    assert command[-1] == "-"
+    assert command.index("--skip-git-repo-check") < len(command) - 1
+    assert command[2:8] == (
+        "--cd",
+        str(root.resolve()),
+        "--output-last-message",
+        str(output_path.resolve()),
+        "--sandbox",
+        "danger-full-access",
+    )
+
+
+def test_resolve_autorun_session_dir_prefers_explicit_value(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir(parents=True, exist_ok=True)
+    explicit = root / "sessions" / "manual"
+
+    resolved = resolve_autorun_session_dir(
+        root,
+        explicit_session_dir=explicit,
+        program_path=root / "program.md",
+    )
+
+    assert resolved == explicit.resolve()
+
+
+def test_resolve_autorun_session_dir_reads_active_session_from_program(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir(parents=True, exist_ok=True)
+    program_path = root / "program.md"
+    program_path.write_text(
+        "\n".join(
+            [
+                "# Demo Program",
+                "",
+                "## Canonical References",
+                "",
+                "- Active session: `sessions/deep_otm_baseline_retrain_autoresearch/session.md`",
+                "- Archived session: `sessions/old_line/session.md`",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_autorun_session_dir(root, program_path=program_path)
+
+    assert resolved == (root / "sessions" / "deep_otm_baseline_retrain_autoresearch").resolve()
+
+
+def test_resolve_codex_exec_binary_falls_back_to_local_bin(tmp_path: Path) -> None:
+    home_root = tmp_path / "home"
+    local_bin = home_root / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+    codex_path = local_bin / "codex"
+    codex_path.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    resolved = resolve_codex_exec_binary(home_root=home_root, env_path="/usr/bin:/bin")
+
+    assert resolved == str(codex_path.resolve())
 
 
 def test_prepare_codex_home_copies_minimal_runtime_files_without_skills(tmp_path: Path) -> None:
@@ -225,6 +439,107 @@ def test_prepare_codex_home_copies_minimal_runtime_files_without_skills(tmp_path
     assert (isolated_codex_dir / "AGENTS.md").read_text(encoding="utf-8") == "# local guidance"
     assert (isolated_codex_dir / "version.json").read_text(encoding="utf-8") == '{"version":"1"}'
     assert not (isolated_codex_dir / "skills").exists()
+
+
+def test_apply_codex_provider_override_updates_only_isolated_home(tmp_path: Path) -> None:
+    source_home = tmp_path / "source-home"
+    source_codex_dir = source_home / ".codex"
+    source_codex_dir.mkdir(parents=True, exist_ok=True)
+    (source_codex_dir / "auth.json").write_text('{"OPENAI_API_KEY":"primary-key"}', encoding="utf-8")
+    (source_codex_dir / "config.toml").write_text(
+        '\n'.join(
+            [
+                'model = "gpt-5.4"',
+                'model_provider = "codex"',
+                "",
+                "[model_providers.codex]",
+                'name = "codex"',
+                'base_url = "https://nimabo.cn/v1"',
+                'wire_api = "responses"',
+                "requires_openai_auth = true",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    isolated_home = tmp_path / "isolated-home"
+    prepare_codex_home(isolated_home, source_home=source_home)
+    payload = apply_codex_provider_override(
+        isolated_home,
+        base_url="https://ai.changyou.club/v1",
+        api_key="fallback-key",
+    )
+
+    isolated_codex_dir = isolated_home / ".codex"
+    assert payload["codex_dir"] == str(isolated_codex_dir)
+    config_text = (isolated_codex_dir / "config.toml").read_text(encoding="utf-8")
+    assert 'base_url = "https://ai.changyou.club/v1"' in config_text
+    auth_payload = json.loads((isolated_codex_dir / "auth.json").read_text(encoding="utf-8"))
+    assert auth_payload["OPENAI_API_KEY"] == "fallback-key"
+    source_auth_payload = json.loads((source_codex_dir / "auth.json").read_text(encoding="utf-8"))
+    assert source_auth_payload["OPENAI_API_KEY"] == "primary-key"
+
+
+def test_apply_codex_auth_override_replaces_auth_and_clears_provider_override(tmp_path: Path) -> None:
+    source_home = tmp_path / "source-home"
+    source_codex_dir = source_home / ".codex"
+    source_codex_dir.mkdir(parents=True, exist_ok=True)
+    (source_codex_dir / "auth.json").write_text('{"OPENAI_API_KEY":"primary-key"}', encoding="utf-8")
+    (source_codex_dir / "config.toml").write_text(
+        '\n'.join(
+            [
+                'model = "gpt-5.4"',
+                'model_provider = "codex"',
+                "",
+                "[model_providers.codex]",
+                'name = "codex"',
+                'base_url = "https://nimabo.cn/v1"',
+                'wire_api = "responses"',
+                "requires_openai_auth = true",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    isolated_home = tmp_path / "isolated-home"
+    prepare_codex_home(isolated_home, source_home=source_home)
+    payload = apply_codex_auth_override(
+        isolated_home,
+        auth_payload={
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "demo-token",
+            },
+        },
+    )
+
+    isolated_codex_dir = isolated_home / ".codex"
+    assert payload["codex_dir"] == str(isolated_codex_dir)
+    config_text = (isolated_codex_dir / "config.toml").read_text(encoding="utf-8")
+    assert "[model_providers.codex]" not in config_text
+    auth_payload = json.loads((isolated_codex_dir / "auth.json").read_text(encoding="utf-8"))
+    assert auth_payload["auth_mode"] == "chatgpt"
+    assert auth_payload["tokens"]["access_token"] == "demo-token"
+
+
+def test_is_transient_codex_provider_failure_matches_service_unavailable_retry_log() -> None:
+    output = """
+    ERROR codex_api::endpoint::responses: error=http 503 Service Unavailable
+    Reconnecting... 3/5 (unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://nimabo.cn/v1/responses)
+    """
+    assert is_transient_codex_provider_failure(output) is True
+
+
+def test_is_transient_codex_provider_failure_ignores_regular_traceback() -> None:
+    output = """
+    Traceback (most recent call last):
+      File "demo.py", line 1, in <module>
+        raise RuntimeError("boom")
+    RuntimeError: boom
+    """
+    assert is_transient_codex_provider_failure(output) is False
 
 
 def test_next_autorun_failure_state_stops_after_threshold() -> None:

@@ -1,21 +1,48 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import sys
 
-from pm15min.console.cli import attach_console_subcommands, run_console_command
 from pm15min.data.layout import DataLayout
-from pm15min.data.cli import attach_data_subcommands, run_data_command
-from pm15min.live.cli import attach_live_subcommands, run_live_command
-from pm15min.research.cli import attach_research_subcommands, run_research_command
+
+
+_DOMAIN_LOADERS = {
+    "console": ("pm15min.console.cli", "attach_console_subcommands", "run_console_command"),
+    "data": ("pm15min.data.cli", "attach_data_subcommands", "run_data_command"),
+    "live": ("pm15min.live.cli", "attach_live_subcommands", "run_live_command"),
+    "research": ("pm15min.research.cli", "attach_research_subcommands", "run_research_command"),
+}
+_DOMAIN_HELP = {
+    "console": "Console commands.",
+    "data": "Data commands.",
+    "live": "Live commands.",
+    "research": "Research commands.",
+}
 
 
 def _print_json(payload: dict[str, object]) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _load_domain_cli(domain: str) -> tuple[object, object]:
+    module_name, attach_name, run_name = _DOMAIN_LOADERS[domain]
+    module = importlib.import_module(module_name)
+    return getattr(module, attach_name), getattr(module, run_name)
+
+
+def _requested_domain(argv: list[str]) -> str | None:
+    for token in argv:
+        if token.startswith("-"):
+            continue
+        if token in _DOMAIN_LOADERS or token == "layout":
+            return token
+        break
+    return None
+
+
+def build_parser(requested_domain: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m pm15min",
         description="pm15min v2 clean-room CLI",
@@ -34,16 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print JSON instead of key/value lines.",
     )
 
-    attach_live_subcommands(subparsers)
-    attach_research_subcommands(subparsers)
-    attach_data_subcommands(subparsers)
-    attach_console_subcommands(subparsers)
+    for domain in ("live", "research", "data", "console"):
+        if requested_domain == domain:
+            attach_subcommands, _ = _load_domain_cli(domain)
+            attach_subcommands(subparsers)
+        else:
+            subparsers.add_parser(domain, help=_DOMAIN_HELP[domain])
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    parser = build_parser()
+    parser = build_parser(_requested_domain(argv))
     if not argv:
         parser.print_help()
         return 0
@@ -58,12 +87,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{key}: {value}")
         return 0
     if args.domain == "live":
+        _, run_live_command = _load_domain_cli("live")
         return run_live_command(args)
     if args.domain == "research":
+        _, run_research_command = _load_domain_cli("research")
         return run_research_command(args)
     if args.domain == "data":
+        _, run_data_command = _load_domain_cli("data")
         return run_data_command(args)
     if args.domain == "console":
+        _, run_console_command = _load_domain_cli("console")
         return run_console_command(args)
 
     parser.print_help()

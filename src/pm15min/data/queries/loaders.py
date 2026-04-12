@@ -19,9 +19,22 @@ def load_market_catalog(cfg: DataConfig) -> pd.DataFrame:
     return pd.read_parquet(path) if path.exists() else pd.DataFrame()
 
 
-def load_binance_klines_1m(cfg: DataConfig, symbol: str | None = None) -> pd.DataFrame:
+def load_binance_klines_1m(
+    cfg: DataConfig,
+    symbol: str | None = None,
+    *,
+    columns: list[str] | tuple[str, ...] | None = None,
+    filters: list[tuple[str, str, object]] | None = None,
+) -> pd.DataFrame:
     path = cfg.layout.binance_klines_path(symbol=symbol)
-    return pd.read_parquet(path) if path.exists() else pd.DataFrame()
+    if not path.exists():
+        return pd.DataFrame()
+    kwargs: dict[str, object] = {}
+    if columns is not None:
+        kwargs["columns"] = list(columns)
+    if filters:
+        kwargs["filters"] = filters
+    return pd.read_parquet(path, **kwargs)
 
 
 def load_streams_source(cfg: DataConfig) -> pd.DataFrame:

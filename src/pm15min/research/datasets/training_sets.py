@@ -38,6 +38,23 @@ TRAINING_SET_META_COLUMNS = [
     "full_truth",
 ]
 
+TRAINING_SET_LABEL_REQUIRED_COLUMNS = [
+    "asset",
+    "cycle_start_ts",
+    "cycle_end_ts",
+    "market_id",
+    "condition_id",
+    "label_set",
+    "settlement_source",
+    "label_source",
+    "resolved",
+    "price_to_beat",
+    "final_price",
+    "winner_side",
+    "direction_up",
+    "full_truth",
+]
+
 
 def build_training_set_dataset(
     cfg: ResearchConfig,
@@ -63,8 +80,17 @@ def build_training_set_dataset(
                 label_set=spec.label_set,
                 mode=dependency_mode,
             )
-    features = load_feature_frame(cfg, feature_set=spec.feature_set)
-    labels = load_label_frame(cfg, label_set=spec.label_set)
+    features = load_feature_frame(
+        cfg,
+        feature_set=spec.feature_set,
+        filters=_training_feature_frame_filters(spec),
+    )
+    labels = load_label_frame(
+        cfg,
+        label_set=spec.label_set,
+        columns=TRAINING_SET_LABEL_REQUIRED_COLUMNS,
+        filters=_training_label_frame_filters(spec),
+    )
 
     merged, alignment_metadata = merge_feature_and_label_frames(features, labels)
     filtered = _filter_training_window(merged, start=spec.window.start, end=spec.window.end, offset=spec.offset)
@@ -148,6 +174,30 @@ def _filter_training_window(frame: pd.DataFrame, *, start: str, end: str, offset
 def _window_bound_timestamp(value: str) -> pd.Timestamp:
     ts = pd.Timestamp(normalize_window_bound(value))
     return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def _training_feature_frame_filters(spec: TrainingSetSpec) -> list[tuple[str, str, object]]:
+    start_ts, end_bound = _training_window_bounds(spec)
+    return [
+        ("decision_ts", ">=", start_ts),
+        ("decision_ts", "<", end_bound),
+        ("offset", "==", int(spec.offset)),
+    ]
+
+
+def _training_label_frame_filters(spec: TrainingSetSpec) -> list[tuple[str, str, object]]:
+    start_ts, end_bound = _training_window_bounds(spec)
+    return [
+        ("cycle_end_ts", ">", int(start_ts.timestamp())),
+        ("cycle_start_ts", "<", int(end_bound.timestamp())),
+    ]
+
+
+def _training_window_bounds(spec: TrainingSetSpec) -> tuple[pd.Timestamp, pd.Timestamp]:
+    start_ts = _window_bound_timestamp(spec.window.start)
+    end_ts = _window_bound_timestamp(spec.window.end)
+    end_bound = end_ts + pd.Timedelta(days=1) if window_bound_is_date_only(spec.window.end) else end_ts
+    return start_ts, end_bound
 
 
 def _build_target_frame(frame: pd.DataFrame, *, target: str) -> tuple[pd.DataFrame, dict[str, object]]:

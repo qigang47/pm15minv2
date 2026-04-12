@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
+import time
 from typing import Any
 
 import pandas as pd
@@ -11,6 +12,7 @@ from ..io.parquet import read_parquet_if_exists, write_parquet_atomic
 
 
 DEFAULT_RECENT_ORDERBOOK_WINDOW_MINUTES = 15
+DEFAULT_RECENT_ORDERBOOK_PERSIST_INTERVAL_SECONDS = 0.0
 _RECENT_INDEX_STATE_LOCK = Lock()
 
 
@@ -18,6 +20,7 @@ _RECENT_INDEX_STATE_LOCK = Lock()
 class _RecentIndexState:
     loaded: bool = False
     rows_by_key: dict[tuple[int, str, str, str], dict[str, Any]] = field(default_factory=dict)
+    last_persist_monotonic: float = 0.0
 
 
 _RECENT_INDEX_STATE: dict[str, _RecentIndexState] = {}
@@ -79,6 +82,8 @@ def update_recent_orderbook_index(
     incoming: pd.DataFrame,
     now_ts_ms: int,
     window_minutes: int = DEFAULT_RECENT_ORDERBOOK_WINDOW_MINUTES,
+    persist_interval_seconds: float = DEFAULT_RECENT_ORDERBOOK_PERSIST_INTERVAL_SECONDS,
+    force_persist: bool = False,
 ) -> pd.DataFrame:
     state = _recent_state(path)
     _seed_recent_state_from_disk(state=state, path=path)
@@ -94,7 +99,17 @@ def update_recent_orderbook_index(
     }
 
     combined = _build_recent_frame(state=state)
-    write_parquet_atomic(combined, path)
+    interval_seconds = max(0.0, float(persist_interval_seconds))
+    should_persist = bool(force_persist or not path.exists())
+    now_monotonic = time.monotonic()
+    if not should_persist:
+        if interval_seconds <= 0.0:
+            should_persist = True
+        else:
+            should_persist = now_monotonic - float(state.last_persist_monotonic) >= interval_seconds
+    if should_persist:
+        write_parquet_atomic(combined, path)
+        state.last_persist_monotonic = now_monotonic
     return combined
 
 

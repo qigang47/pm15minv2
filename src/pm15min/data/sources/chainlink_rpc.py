@@ -329,9 +329,38 @@ class ChainlinkRpcSource:
                 block_ts = self.rpc.eth_block_timestamp(block_number, block_ts_cache)
             meta = tx_meta_by_hash[tx_hash]
 
-            if selector == TRANSMIT_SELECTOR:
-                rows = _decode_transmit_rows(input_hex)
-                for row in rows:
+            try:
+                if selector == TRANSMIT_SELECTOR:
+                    rows = _decode_transmit_rows(input_hex)
+                    for row in rows:
+                        report_feed_id = str(row.get("report_feed_id") or "").lower()
+                        if report_feed_id and report_feed_id != DEFAULT_FEEDS[asset].lower():
+                            continue
+                        decoded_rows.append(
+                            {
+                                "asset": asset,
+                                "tx_hash": tx_hash,
+                                "block_number": block_number,
+                                "block_timestamp": block_ts,
+                                "requester": meta["requester"],
+                                "feed_id_log": meta["feed_id_log"],
+                                "report_feed_id": report_feed_id,
+                                "perform_idx": row.get("perform_idx"),
+                                "value_idx": row.get("value_idx"),
+                                "extra_code": row.get("extra_code"),
+                                "extra_ts": row.get("extra_ts"),
+                                "valid_from_ts": row.get("valid_from_ts"),
+                                "observation_ts": row.get("observation_ts"),
+                                "expires_at_ts": row.get("expires_at_ts"),
+                                "benchmark_price_raw": row.get("benchmark_price_raw"),
+                                "bid_raw": row.get("bid_raw"),
+                                "ask_raw": row.get("ask_raw"),
+                                "path": "keeper_transmit",
+                            }
+                        )
+                else:
+                    payload, _parameter_payload = decode(["bytes", "bytes"], bytes.fromhex(input_hex[10:]))
+                    row = _decode_signed_report_payload(payload)
                     report_feed_id = str(row.get("report_feed_id") or "").lower()
                     if report_feed_id and report_feed_id != DEFAULT_FEEDS[asset].lower():
                         continue
@@ -344,47 +373,21 @@ class ChainlinkRpcSource:
                             "requester": meta["requester"],
                             "feed_id_log": meta["feed_id_log"],
                             "report_feed_id": report_feed_id,
-                            "perform_idx": row.get("perform_idx"),
-                            "value_idx": row.get("value_idx"),
-                            "extra_code": row.get("extra_code"),
-                            "extra_ts": row.get("extra_ts"),
+                            "perform_idx": 0,
+                            "value_idx": 0,
+                            "extra_code": None,
+                            "extra_ts": None,
                             "valid_from_ts": row.get("valid_from_ts"),
                             "observation_ts": row.get("observation_ts"),
                             "expires_at_ts": row.get("expires_at_ts"),
                             "benchmark_price_raw": row.get("benchmark_price_raw"),
                             "bid_raw": row.get("bid_raw"),
                             "ask_raw": row.get("ask_raw"),
-                            "path": "keeper_transmit",
+                            "path": "direct_verify",
                         }
                     )
-            else:
-                payload, _parameter_payload = decode(["bytes", "bytes"], bytes.fromhex(input_hex[10:]))
-                row = _decode_signed_report_payload(payload)
-                report_feed_id = str(row.get("report_feed_id") or "").lower()
-                if report_feed_id and report_feed_id != DEFAULT_FEEDS[asset].lower():
-                    continue
-                decoded_rows.append(
-                    {
-                        "asset": asset,
-                        "tx_hash": tx_hash,
-                        "block_number": block_number,
-                        "block_timestamp": block_ts,
-                        "requester": meta["requester"],
-                        "feed_id_log": meta["feed_id_log"],
-                        "report_feed_id": report_feed_id,
-                        "perform_idx": 0,
-                        "value_idx": 0,
-                        "extra_code": None,
-                        "extra_ts": None,
-                        "valid_from_ts": row.get("valid_from_ts"),
-                        "observation_ts": row.get("observation_ts"),
-                        "expires_at_ts": row.get("expires_at_ts"),
-                        "benchmark_price_raw": row.get("benchmark_price_raw"),
-                        "bid_raw": row.get("bid_raw"),
-                        "ask_raw": row.get("ask_raw"),
-                        "path": "direct_verify",
-                    }
-                )
+            except Exception:
+                continue
         return decoded_rows
 
     def scan_condition_resolutions(

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any
 
 import requests
+from dotenv import load_dotenv
 
 
 DEFAULT_RPC_URLS = [
@@ -12,16 +14,60 @@ DEFAULT_RPC_URLS = [
 ]
 
 
+def _load_dotenv_if_enabled() -> None:
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return
+    load_dotenv()
+
+
+def _split_rpc_list(raw: object) -> list[str]:
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    parts = [part.strip() for token in text.replace(";", ",").split(",") for part in token.split()]
+    return [part for part in parts if part]
+
+
+def _dedupe_keep_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _resolve_rpc_urls(urls: list[str] | None = None) -> list[str]:
+    _load_dotenv_if_enabled()
+    if urls is not None:
+        resolved = [url.strip() for url in urls if str(url).strip()]
+        if not resolved:
+            raise ValueError("No RPC URLs configured.")
+        return list(dict.fromkeys(resolved))
+
+    candidates: list[str] = []
+    for key in ("RPC_URL", "POLYGON_RPC", "POLYGON_RPC_URL", "WEB3_PROVIDER_URI"):
+        candidates.extend(_split_rpc_list(os.getenv(key)))
+    for key in ("RPC_URL_BACKUPS", "POLYGON_RPC_BACKUPS", "RPC_FALLBACKS", "POLYGON_RPC_FALLBACKS"):
+        candidates.extend(_split_rpc_list(os.getenv(key)))
+    candidates.extend(DEFAULT_RPC_URLS)
+    resolved = _dedupe_keep_order(candidates)
+    if not resolved:
+        raise ValueError("No RPC URLs configured.")
+    return resolved
+
+
 @dataclass
 class PolygonRpcClient:
     urls: list[str]
     timeout_sec: float = 25.0
 
     def __init__(self, urls: list[str] | None = None, timeout_sec: float = 25.0) -> None:
-        resolved = [url.strip() for url in (urls or DEFAULT_RPC_URLS) if str(url).strip()]
-        if not resolved:
-            raise ValueError("No RPC URLs configured.")
-        self.urls = list(dict.fromkeys(resolved))
+        self.urls = _resolve_rpc_urls(urls)
         self.timeout_sec = float(timeout_sec)
         self.primary_url = self.urls[0]
         self._session = requests.Session()

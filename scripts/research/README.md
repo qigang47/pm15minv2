@@ -17,6 +17,12 @@ Main entrypoints:
 - `scripts/research/status_autorun.sh`
   - inspect background status plus incomplete experiment runs
 
+Default session resolution:
+
+- `codex_background_loop.sh` now resolves the session directory from the active program file
+- if `SESSION_DIR` is unset, it reads the first `Active session:` reference in `program.md`
+- this keeps the background loop from mixing a new program with an old session log
+
 Default Codex home behavior:
 
 - `codex_background_loop.sh` now defaults to `CODEX_HOME_MODE=isolated`
@@ -31,6 +37,12 @@ Operator overrides:
   - use the operator's main `~/.codex/` directly
 - `CODEX_HOME_DIR=/custom/path`
   - choose a different isolated home root
+- `FALLBACK_ENV_PATH=/custom/path/codex-fallback.env`
+  - load background-only fallback provider settings from a local env file
+- `CODEX_FALLBACK_BASE_URL=...`
+  - backup responses endpoint used only when the primary background provider fails transiently
+- `CODEX_FALLBACK_API_KEY=...`
+  - matching API key for the backup endpoint
 - `MAX_CONSECUTIVE_FAILURES=5`
   - change the background stop threshold
 

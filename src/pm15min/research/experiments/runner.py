@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+import gc
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from pm15min.research._contracts_training import (
     offset_weight_overrides_payload,
 )
 from pm15min.research.backtests.engine import run_research_backtest
+from pm15min.research.backtests.runtime_cache import clear_process_backtest_runtime_cache
 from pm15min.research.bundles.builder import build_model_bundle
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import BacktestRunSpec, ModelBundleSpec, TrainingRunSpec
@@ -813,6 +815,7 @@ def run_experiment_suite(
                 "cases": len(execution_group.market_specs),
             },
         )
+        _release_execution_group_memory()
 
     outputs = _persist_runtime_state(
         cfg=cfg,
@@ -1260,6 +1263,11 @@ def _emit_experiment_progress(
         progress_pct=progress_pct,
         heartbeat=heartbeat,
     )
+
+
+def _release_execution_group_memory() -> None:
+    clear_process_backtest_runtime_cache()
+    gc.collect()
 
 
 def _suite_progress_pct(current: int, total: int) -> int:

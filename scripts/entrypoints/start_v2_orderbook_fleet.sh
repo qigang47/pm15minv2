@@ -20,6 +20,7 @@ Env overrides:
   V2_ORDERBOOK_FLEET_ITERATIONS       default: 0
   V2_ORDERBOOK_FLEET_SLEEP_SEC        default: same as poll interval
   V2_ORDERBOOK_FLEET_LOG_PATH         default: var/<surface>/logs/entrypoints/orderbook_fleet_<cycle>_<surface>.out
+  V2_ORDERBOOK_FLEET_STOP_MODE        default: scope (scope|global|none)
   PM15MIN_ORDERBOOK_FLEET_SCHEDULER_MODE default: process_per_market
   MALLOC_ARENA_MAX                    default: 2
 EOF
@@ -39,6 +40,32 @@ is_truthy() {
 orderbook_recorder_pattern() {
   local market="$1"
   printf '%s' "market='${market}', cycle='${CYCLE}', surface='${SURFACE}'"
+}
+
+all_orderbook_recorder_pids() {
+  pgrep -f -- "run_orderbook_recorder; cfg = DataConfig.build" || true
+}
+
+stop_all_orderbook_recorders() {
+  local pids=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(all_orderbook_recorder_pids)
+  if [[ ${#pids[@]} -eq 0 ]]; then
+    echo "No existing orderbook recorder processes found."
+    return 0
+  fi
+  echo "Stopping all existing orderbook recorder processes: ${pids[*]}"
+  kill "${pids[@]}" 2>/dev/null || true
+  sleep 1
+  local remaining=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && remaining+=("$pid")
+  done < <(all_orderbook_recorder_pids)
+  if [[ ${#remaining[@]} -gt 0 ]]; then
+    echo "Force stopping remaining orderbook recorder processes: ${remaining[*]}"
+    kill -9 "${remaining[@]}" 2>/dev/null || true
+  fi
 }
 
 orderbook_recorder_pids() {
@@ -142,6 +169,11 @@ SLEEP_SEC="${V2_ORDERBOOK_FLEET_SLEEP_SEC:-$POLL_SEC}"
 LOG_PATH="${V2_ORDERBOOK_FLEET_LOG_PATH:-$PROJECT_DIR/var/${SURFACE}/logs/entrypoints/orderbook_fleet_${CYCLE}_${SURFACE}.out}"
 ALLOCATOR_ARENAS="${MALLOC_ARENA_MAX:-2}"
 SCHEDULER_MODE="${PM15MIN_ORDERBOOK_FLEET_SCHEDULER_MODE:-process_per_market}"
+STOP_MODE="${V2_ORDERBOOK_FLEET_STOP_MODE:-scope}"
+
+export PM15MIN_ORDERBOOK_ASYNC_PERSIST="${PM15MIN_ORDERBOOK_ASYNC_PERSIST:-1}"
+export PM15MIN_ORDERBOOK_ASYNC_MAX_PENDING_BATCHES="${PM15MIN_ORDERBOOK_ASYNC_MAX_PENDING_BATCHES:-1}"
+export PM15MIN_ORDERBOOK_ASYNC_DROP_OLDEST_WHEN_FULL="${PM15MIN_ORDERBOOK_ASYNC_DROP_OLDEST_WHEN_FULL:-0}"
 
 export V2_ORDERBOOK_FLEET_MARKETS="$MARKETS_CSV"
 export V2_ORDERBOOK_FLEET_CYCLE="$CYCLE"
@@ -171,16 +203,34 @@ echo "Market Depth: $MARKET_DEPTH"
 echo "Market Start Offset: $MARKET_START_OFFSET"
 echo "Iterations: $ITERATIONS"
 echo "Scheduler Mode: $SCHEDULER_MODE"
+echo "Stop Mode: $STOP_MODE"
 echo "MALLOC_ARENA_MAX: $ALLOCATOR_ARENAS"
+echo "Async Persist: ${PM15MIN_ORDERBOOK_ASYNC_PERSIST}"
+echo "Max Pending Batches: ${PM15MIN_ORDERBOOK_ASYNC_MAX_PENDING_BATCHES}"
+echo "Drop Oldest When Full: ${PM15MIN_ORDERBOOK_ASYNC_DROP_OLDEST_WHEN_FULL}"
 echo "Wrapper Log: $LOG_PATH"
 echo "============================================="
 
 echo "Stopping previous v2 orderbook fleet processes..."
 pkill -f "pm15min data run orderbook-fleet" || true
 sleep 1
-for market in "${MARKETS_LIST[@]}"; do
-  stop_orderbook_recorder_for_market "$market"
-done
+case "$STOP_MODE" in
+  global)
+    stop_all_orderbook_recorders
+    ;;
+  scope)
+    for market in "${MARKETS_LIST[@]}"; do
+      stop_orderbook_recorder_for_market "$market"
+    done
+    ;;
+  none)
+    echo "Skip stopping existing recorder processes (stop mode: none)"
+    ;;
+  *)
+    echo "❌ Unsupported V2_ORDERBOOK_FLEET_STOP_MODE: $STOP_MODE"
+    exit 1
+    ;;
+esac
 
 cmd=(
   "$PYTHON_BIN" -c

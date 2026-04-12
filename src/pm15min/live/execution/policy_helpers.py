@@ -4,7 +4,6 @@ from pathlib import Path
 import math
 from typing import Any
 
-from ..account import load_latest_open_orders_snapshot, load_latest_positions_snapshot
 from .utils import (
     float_or_none,
     minutes_left_to_market_end,
@@ -25,6 +24,8 @@ def resolve_regime_stake_multiplier(*, spec, regime_state: dict[str, Any] | None
 
 
 def load_policy_state(*, rewrite_root: Path, market: str) -> dict[str, Any]:
+    from ..account import load_latest_open_orders_snapshot, load_latest_positions_snapshot
+
     return {
         "open_orders_snapshot": load_latest_open_orders_snapshot(rewrite_root=rewrite_root, market=market),
         "positions_snapshot": load_latest_positions_snapshot(rewrite_root=rewrite_root, market=market),

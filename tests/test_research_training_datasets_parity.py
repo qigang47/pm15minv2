@@ -525,3 +525,193 @@ def test_training_set_window_supports_precise_utc_start(tmp_path) -> None:
 
     assert summary["rows_written"] == 1
     assert out.iloc[0]["decision_ts"] == pd.Timestamp("2026-03-01T00:16:00Z")
+
+
+def test_build_training_set_dataset_passes_window_and_offset_filters_to_loaders(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        source_surface="backtest",
+        feature_set="deep_otm_v1",
+        label_set="truth",
+        target="direction",
+        root=root,
+    )
+    seen: dict[str, object] = {}
+
+    def _fake_load_feature_frame(_cfg, *, feature_set=None, columns=None, filters=None):
+        seen["feature_set"] = feature_set
+        seen["feature_columns"] = columns
+        seen["feature_filters"] = filters
+        return pd.DataFrame(
+            [
+                {
+                    "decision_ts": "2026-03-01T00:01:00Z",
+                    "cycle_start_ts": "2026-03-01T00:00:00Z",
+                    "cycle_end_ts": "2026-03-01T00:15:00Z",
+                    "offset": 7,
+                    "ret_1m": 0.1,
+                    "ret_from_strike": 0.05,
+                },
+                {
+                    "decision_ts": "2026-03-01T00:01:00Z",
+                    "cycle_start_ts": "2026-03-01T00:00:00Z",
+                    "cycle_end_ts": "2026-03-01T00:15:00Z",
+                    "offset": 8,
+                    "ret_1m": 0.2,
+                    "ret_from_strike": 0.06,
+                },
+            ]
+        )
+
+    def _fake_load_label_frame(_cfg, *, label_set=None, columns=None, filters=None):
+        seen["label_set"] = label_set
+        seen["label_columns"] = tuple(columns or ())
+        seen["label_filters"] = filters
+        return pd.DataFrame(
+            [
+                {
+                    "asset": "sol",
+                    "cycle_start_ts": int(pd.Timestamp("2026-03-01T00:00:00Z").timestamp()),
+                    "cycle_end_ts": int(pd.Timestamp("2026-03-01T00:15:00Z").timestamp()),
+                    "market_id": "m-1",
+                    "condition_id": "c-1",
+                    "label_set": "truth",
+                    "settlement_source": "settlement_truth",
+                    "label_source": "settlement_truth",
+                    "resolved": True,
+                    "price_to_beat": 120.0,
+                    "final_price": 121.0,
+                    "winner_side": "UP",
+                    "direction_up": 1.0,
+                    "full_truth": True,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(
+        "pm15min.research.datasets.training_sets.load_feature_frame",
+        _fake_load_feature_frame,
+    )
+    monkeypatch.setattr(
+        "pm15min.research.datasets.training_sets.load_label_frame",
+        _fake_load_label_frame,
+    )
+
+    summary = build_training_set_dataset(
+        cfg,
+        TrainingSetSpec(
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+            offset=7,
+        ),
+        skip_freshness=True,
+    )
+
+    assert summary["rows_written"] == 1
+    assert seen["feature_set"] == "deep_otm_v1"
+    assert seen["feature_filters"] == [
+        ("decision_ts", ">=", pd.Timestamp("2026-03-01T00:00:00Z")),
+        ("decision_ts", "<", pd.Timestamp("2026-03-02T00:00:00Z")),
+        ("offset", "==", 7),
+    ]
+    assert seen["label_set"] == "truth"
+    assert seen["label_filters"] == [
+        ("cycle_end_ts", ">", int(pd.Timestamp("2026-03-01T00:00:00Z").timestamp())),
+        ("cycle_start_ts", "<", int(pd.Timestamp("2026-03-02T00:00:00Z").timestamp())),
+    ]
+
+
+def test_build_training_set_dataset_precise_start_filters_label_cycles(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        source_surface="backtest",
+        feature_set="deep_otm_v1",
+        label_set="truth",
+        target="direction",
+        root=root,
+    )
+    seen: dict[str, object] = {}
+
+    def _fake_load_feature_frame(_cfg, *, feature_set=None, columns=None, filters=None):
+        seen["feature_filters"] = filters
+        return pd.DataFrame(
+            [
+                {
+                    "decision_ts": "2026-03-01T00:16:00Z",
+                    "cycle_start_ts": "2026-03-01T00:15:00Z",
+                    "cycle_end_ts": "2026-03-01T00:30:00Z",
+                    "offset": 7,
+                    "ret_1m": -0.1,
+                    "ret_from_strike": -0.05,
+                }
+            ]
+        )
+
+    def _fake_load_label_frame(_cfg, *, label_set=None, columns=None, filters=None):
+        seen["label_filters"] = filters
+        return pd.DataFrame(
+            [
+                {
+                    "asset": "sol",
+                    "cycle_start_ts": int(pd.Timestamp("2026-03-01T00:15:00Z").timestamp()),
+                    "cycle_end_ts": int(pd.Timestamp("2026-03-01T00:30:00Z").timestamp()),
+                    "market_id": "m-2",
+                    "condition_id": "c-2",
+                    "label_set": "truth",
+                    "settlement_source": "settlement_truth",
+                    "label_source": "settlement_truth",
+                    "resolved": True,
+                    "price_to_beat": 120.0,
+                    "final_price": 119.0,
+                    "winner_side": "DOWN",
+                    "direction_up": 0.0,
+                    "full_truth": True,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(
+        "pm15min.research.datasets.training_sets.load_feature_frame",
+        _fake_load_feature_frame,
+    )
+    monkeypatch.setattr(
+        "pm15min.research.datasets.training_sets.load_label_frame",
+        _fake_load_label_frame,
+    )
+
+    summary = build_training_set_dataset(
+        cfg,
+        TrainingSetSpec(
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01T00:16:00Z", "2026-03-01"),
+            offset=7,
+        ),
+        skip_freshness=True,
+    )
+
+    assert summary["rows_written"] == 1
+    assert seen["feature_filters"] == [
+        ("decision_ts", ">=", pd.Timestamp("2026-03-01T00:16:00Z")),
+        ("decision_ts", "<", pd.Timestamp("2026-03-02T00:00:00Z")),
+        ("offset", "==", 7),
+    ]
+    assert seen["label_filters"] == [
+        ("cycle_end_ts", ">", int(pd.Timestamp("2026-03-01T00:16:00Z").timestamp())),
+        ("cycle_start_ts", "<", int(pd.Timestamp("2026-03-02T00:00:00Z").timestamp())),
+    ]

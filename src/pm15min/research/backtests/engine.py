@@ -258,8 +258,8 @@ def run_research_backtest(
             label_set=label_set,
             scoped_features=features,
         )
-        raw_klines = _scope_backtest_klines(
-            load_binance_klines_1m(data_cfg),
+        raw_klines = _load_scoped_backtest_klines(
+            data_cfg=data_cfg,
             decision_start=spec.decision_start,
             decision_end=spec.decision_end,
             required_lookback_minutes=_required_backtest_klines_lookback_minutes(profile_spec),
@@ -423,14 +423,13 @@ def run_research_backtest(
     fills_stage_index, fills_stage_name = _start_stage("fills_materialization", "Materializing canonical fills")
     policy_rejects = build_policy_reject_frame(decisions)
     accepted = decisions.loc[decisions["policy_action"].eq("trade")].copy()
-    fill_depth_replay = depth_replay
-    fill_depth_candidate_lookup = depth_candidate_lookup
-    if bool(fill_config.raw_depth_fak_refresh_enabled) or depth_replay.empty:
-        fill_depth_replay, _fill_depth_replay_summary, fill_depth_candidate_lookup = _build_fill_depth_runtime(
-            accepted=accepted,
-            data_cfg=data_cfg,
-            heartbeat=progress.heartbeat(stage_index=fills_stage_index, stage_name=fills_stage_name),
-        )
+    fill_depth_replay, fill_depth_candidate_lookup = _resolve_fill_depth_runtime(
+        accepted=accepted,
+        decision_depth_replay=depth_replay,
+        decision_depth_candidate_lookup=depth_candidate_lookup,
+        data_cfg=data_cfg,
+        heartbeat=progress.heartbeat(stage_index=fills_stage_index, stage_name=fills_stage_name),
+    )
     fills, fill_rejects = build_canonical_fills(
         accepted,
         data_cfg=data_cfg,
@@ -679,6 +678,27 @@ def _build_fill_depth_runtime(
         heartbeat=heartbeat,
     )
     return depth_replay, summary, build_depth_candidate_lookup(depth_replay)
+
+
+def _resolve_fill_depth_runtime(
+    *,
+    accepted: pd.DataFrame,
+    decision_depth_replay: pd.DataFrame,
+    decision_depth_candidate_lookup: object,
+    data_cfg: DataConfig,
+    heartbeat: Callable[[str], None] | None = None,
+) -> tuple[pd.DataFrame, object]:
+    if accepted.empty:
+        empty_depth_replay, _summary, empty_lookup = _build_empty_depth_runtime()
+        return empty_depth_replay, empty_lookup
+    if decision_depth_replay is not None and not decision_depth_replay.empty:
+        return decision_depth_replay, decision_depth_candidate_lookup
+    fill_depth_replay, _summary, fill_depth_candidate_lookup = _build_fill_depth_runtime(
+        accepted=accepted,
+        data_cfg=data_cfg,
+        heartbeat=heartbeat,
+    )
+    return fill_depth_replay, fill_depth_candidate_lookup
 
 
 def _build_orderbook_preflight_summary(
@@ -930,6 +950,10 @@ def _load_scoped_backtest_feature_frame(
         cfg,
         feature_set=feature_set,
         columns=_required_backtest_feature_columns(bundle_dirs=bundle_dirs, targets=targets),
+        filters=_feature_frame_filters(
+            decision_start=decision_start,
+            decision_end=decision_end,
+        ),
     )
     return _scope_backtest_feature_frame(
         features,
@@ -974,10 +998,18 @@ def _load_scoped_backtest_label_frame(
     label_set: str,
     scoped_features: pd.DataFrame,
 ) -> pd.DataFrame:
+    if scoped_features.empty:
+        return pd.DataFrame(columns=_BACKTEST_LABEL_REQUIRED_COLUMNS)
+
+    label_filters = _label_frame_filters(scoped_features=scoped_features)
+    if not label_filters:
+        return pd.DataFrame(columns=_BACKTEST_LABEL_REQUIRED_COLUMNS)
+
     labels = load_label_frame(
         cfg,
         label_set=label_set,
         columns=_BACKTEST_LABEL_REQUIRED_COLUMNS,
+        filters=label_filters,
     )
     return _scope_backtest_label_frame(labels, scoped_features=scoped_features)
 
@@ -1021,6 +1053,29 @@ def _required_backtest_klines_lookback_minutes(profile_spec) -> int:
     return max(30, lookback + baseline)
 
 
+def _load_scoped_backtest_klines(
+    *,
+    data_cfg: DataConfig,
+    decision_start: str | None,
+    decision_end: str | None,
+    required_lookback_minutes: int,
+) -> pd.DataFrame:
+    raw_klines = load_binance_klines_1m(
+        data_cfg,
+        filters=_kline_filters(
+            decision_start=decision_start,
+            decision_end=decision_end,
+            required_lookback_minutes=required_lookback_minutes,
+        ),
+    )
+    return _scope_backtest_klines(
+        raw_klines,
+        decision_start=decision_start,
+        decision_end=decision_end,
+        required_lookback_minutes=required_lookback_minutes,
+    )
+
+
 def _scope_backtest_klines(
     raw_klines: pd.DataFrame,
     *,
@@ -1049,6 +1104,66 @@ def _scope_backtest_klines(
             mask &= open_time.le(end_bound)
 
     return raw_klines.loc[mask].reset_index(drop=True)
+
+
+def _feature_frame_filters(
+    *,
+    decision_start: str | None,
+    decision_end: str | None,
+) -> list[tuple[str, str, object]] | None:
+    filters: list[tuple[str, str, object]] = []
+    start_bound = _parse_window_bound(decision_start, is_end=False)
+    if start_bound is not None:
+        filters.append(("decision_ts", ">=", start_bound))
+
+    end_bound = _parse_window_bound(decision_end, is_end=True)
+    if end_bound is not None:
+        operator = "<" if _looks_like_date_only(decision_end) else "<="
+        filters.append(("decision_ts", operator, end_bound))
+
+    return filters or None
+
+
+def _label_frame_filters(
+    *,
+    scoped_features: pd.DataFrame,
+) -> list[tuple[str, str, object]] | None:
+    if scoped_features.empty:
+        return None
+
+    cycle_start = pd.to_datetime(scoped_features.get("cycle_start_ts"), utc=True, errors="coerce")
+    cycle_end = pd.to_datetime(scoped_features.get("cycle_end_ts"), utc=True, errors="coerce")
+    valid = cycle_start.notna() & cycle_end.notna()
+    if not bool(valid.any()):
+        return None
+
+    min_cycle_start = int(cycle_start.loc[valid].min().timestamp())
+    max_cycle_end = int(cycle_end.loc[valid].max().timestamp())
+    return [
+        ("cycle_start_ts", ">=", min_cycle_start),
+        ("cycle_end_ts", "<=", max_cycle_end),
+    ]
+
+
+def _kline_filters(
+    *,
+    decision_start: str | None,
+    decision_end: str | None,
+    required_lookback_minutes: int,
+) -> list[tuple[str, str, object]] | None:
+    filters: list[tuple[str, str, object]] = []
+
+    start_bound = _parse_window_bound(decision_start, is_end=False)
+    if start_bound is not None:
+        lower_bound = start_bound - pd.Timedelta(minutes=max(0, int(required_lookback_minutes)))
+        filters.append(("open_time", ">=", lower_bound))
+
+    end_bound = _parse_window_bound(decision_end, is_end=True)
+    if end_bound is not None:
+        operator = "<" if _looks_like_date_only(decision_end) else "<="
+        filters.append(("open_time", operator, end_bound))
+
+    return filters or None
 
 
 def _load_cached_primary_runtime(
@@ -1591,6 +1706,9 @@ def _build_backtest_fill_config(*, spec: BacktestRunSpec, profile_spec) -> Backt
         fill_max_stake = float(spec.stake_usd)
     else:
         fill_max_stake = 3.0
+    filled_trade_cap = spec.parity.regime_defense_max_trades_per_market
+    if filled_trade_cap is not None and int(filled_trade_cap) <= 0:
+        filled_trade_cap = None
     return BacktestFillConfig(
         base_stake=fill_base_stake,
         max_stake=fill_max_stake,
@@ -1600,6 +1718,7 @@ def _build_backtest_fill_config(*, spec: BacktestRunSpec, profile_spec) -> Backt
         ),
         fill_model="canonical_quote_depth",
         profile_spec=profile_spec,
+        max_filled_trades_per_offset=filled_trade_cap,
     )
 
 

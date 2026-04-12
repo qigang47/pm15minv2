@@ -33,6 +33,7 @@ class BacktestFillConfig:
     prefer_depth: bool = True
     fill_model: str = "canonical_quote_depth"
     profile_spec: LiveProfileSpec | None = None
+    max_filled_trades_per_offset: int | None = None
 
 
 FILLS_HEARTBEAT_INTERVAL_ROWS = 500
@@ -261,20 +262,34 @@ def _build_fills_impl(
         fill_model=cfg.fill_model,
         profile_spec=effective_profile_spec,
     )
-    if not planned.empty:
-        planned_records = planned.to_dict(orient="records")
-        planned_keys = [_replay_key_tuple(record) for record in planned_records]
-        materialized_rows: list[dict[str, object]] = []
-        total_rows = len(planned_records)
-        if heartbeat is not None:
-            heartbeat(f"Materializing canonical fills: 0/{total_rows:,} decisions")
-        for row_index, (record, replay_key) in enumerate(zip(planned_records, planned_keys, strict=False), start=1):
-            materialized_rows.append(
-                _materialize_fill_row(
-                    record,
-                    data_cfg=data_cfg,
-                    config=cfg,
-                    raw_depth_candidates=depth_candidates.get(replay_key, [] if depth_lookup_complete else None),
+    if planned.empty:
+        return planned.copy(), _empty_fill_reject_frame()
+
+    empty_filled = planned.iloc[0:0].copy()
+    filled_rows: list[dict[str, object]] = []
+    rejected_rows: list[dict[str, object]] = []
+    materialized_columns: list[object] = list(empty_filled.columns)
+    materialized_column_set = set(materialized_columns)
+    total_rows = len(planned)
+    max_filled_trades_per_offset = _resolve_max_filled_trades_per_offset(cfg)
+    filled_trade_counts_by_offset: dict[int, int] = {}
+    if heartbeat is not None:
+        heartbeat(f"Materializing canonical fills: 0/{total_rows:,} decisions")
+    for row_index, record in enumerate(_iter_frame_records(planned), start=1):
+        offset_value = _int_or_none(record.get("offset"))
+        if (
+            max_filled_trades_per_offset is not None
+            and offset_value is not None
+            and filled_trade_counts_by_offset.get(offset_value, 0) >= max_filled_trades_per_offset
+        ):
+            rejected_rows.append(
+                _build_fill_reject_row(
+                    {
+                        **record,
+                        "fill_valid": False,
+                        "fill_reason": "max_filled_trades_per_offset",
+                        "fill_model": str(cfg.fill_model),
+                    }
                 )
             )
             if heartbeat is not None and (
@@ -282,17 +297,38 @@ def _build_fills_impl(
                 or row_index % FILLS_HEARTBEAT_INTERVAL_ROWS == 0
             ):
                 heartbeat(f"Materializing canonical fills: {row_index:,}/{total_rows:,} decisions")
-        planned = pd.DataFrame.from_records(materialized_rows)
-    filled = planned.loc[planned["fill_valid"]].copy().reset_index(drop=True)
-    rejected = planned.loc[~planned["fill_valid"], [*REPLAY_KEY_COLUMNS, "fill_reason"]].copy()
-    source_rows = planned.loc[~planned["fill_valid"]].copy()
-    if "decision_source" in source_rows.columns:
-        rejected["decision_source"] = source_rows["decision_source"].astype(str)
-    elif "model_source" in source_rows.columns:
-        rejected["decision_source"] = source_rows["model_source"].astype(str)
-    else:
-        rejected["decision_source"] = pd.Series("primary", index=rejected.index, dtype="string").astype(str)
-    rejected = rejected.rename(columns={"fill_reason": "reason"}).reset_index(drop=True)
+            continue
+        replay_key = _replay_key_tuple(record)
+        materialized = _materialize_fill_row(
+            record,
+            data_cfg=data_cfg,
+            config=cfg,
+            raw_depth_candidates=depth_candidates.get(replay_key, [] if depth_lookup_complete else None),
+        )
+        for column in materialized:
+            if column not in materialized_column_set:
+                materialized_columns.append(column)
+                materialized_column_set.add(column)
+        if bool(materialized.get("fill_valid", False)):
+            filled_rows.append(materialized)
+            materialized_offset = _int_or_none(materialized.get("offset"))
+            if max_filled_trades_per_offset is not None and materialized_offset is not None:
+                filled_trade_counts_by_offset[materialized_offset] = filled_trade_counts_by_offset.get(materialized_offset, 0) + 1
+        else:
+            rejected_rows.append(_build_fill_reject_row(materialized))
+        if heartbeat is not None and (
+            row_index == total_rows
+            or row_index % FILLS_HEARTBEAT_INTERVAL_ROWS == 0
+        ):
+            heartbeat(f"Materializing canonical fills: {row_index:,}/{total_rows:,} decisions")
+    del planned
+    filled = pd.DataFrame.from_records(filled_rows, columns=materialized_columns).reset_index(drop=True)
+    if filled.empty:
+        filled = pd.DataFrame(columns=materialized_columns)
+    rejected = pd.DataFrame.from_records(
+        rejected_rows,
+        columns=[*REPLAY_KEY_COLUMNS, "reason", "decision_source"],
+    ).reset_index(drop=True)
     return filled, rejected
 
 
@@ -302,6 +338,43 @@ def summarize_fill_reasons(frame: pd.DataFrame) -> dict[str, int]:
     counts = frame["fill_reason"].astype("string").fillna("").value_counts().sort_index()
     counts = counts[counts.index != ""]
     return {str(reason): int(count) for reason, count in counts.items()}
+
+
+def _empty_fill_reject_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=[*REPLAY_KEY_COLUMNS, "reason", "decision_source"])
+
+
+def _iter_frame_records(frame: pd.DataFrame) -> Iterator[dict[str, object]]:
+    columns = tuple(frame.columns)
+    for values in frame.itertuples(index=False, name=None):
+        yield dict(zip(columns, values, strict=False))
+
+
+def _build_fill_reject_row(row: Mapping[str, object]) -> dict[str, object]:
+    out = {column: row.get(column) for column in REPLAY_KEY_COLUMNS}
+    out["reason"] = str(row.get("fill_reason") or "")
+    if "decision_source" in row:
+        out["decision_source"] = _stringify_scalar(row.get("decision_source"))
+    elif "model_source" in row:
+        out["decision_source"] = _stringify_scalar(row.get("model_source"))
+    else:
+        out["decision_source"] = "primary"
+    return out
+
+
+def _stringify_scalar(value: object) -> str:
+    return "" if value is None else str(value)
+
+
+def _resolve_max_filled_trades_per_offset(config: BacktestFillConfig) -> int | None:
+    value = config.max_filled_trades_per_offset
+    if value is None:
+        return None
+    try:
+        resolved = int(value)
+    except Exception:
+        return None
+    return resolved if resolved > 0 else None
 
 
 def max_price_for_target_roi(
@@ -1155,8 +1228,6 @@ def _resolve_raw_depth_reprice_guard_reason(
     raw_depth_candidates: list[dict[str, object]] | None,
 ) -> str | None:
     if not raw_depth_candidates or not bool(config.raw_depth_fak_refresh_enabled):
-        return None
-    if (_int_or_none(depth_fill.get("retry_refresh_count")) or 0) <= 0:
         return None
     profile_spec = config.profile_spec
     if profile_spec is None:

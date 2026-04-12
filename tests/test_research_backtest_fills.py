@@ -5,12 +5,14 @@ from dataclasses import replace
 import pandas as pd
 import pytest
 
+import pm15min.research.backtests.engine as backtest_engine
 import pm15min.research.backtests.fills as fills_module
 from pm15min.data.config import DataConfig
 from pm15min.data.io.ndjson_zst import append_ndjson_zst
 from pm15min.research._contracts_runs import BacktestParitySpec
 from pm15min.research.backtests.fills import BacktestFillConfig, build_canonical_fills, build_fill_plan_frame, summarize_fill_reasons
 from pm15min.research.backtests.regime_parity import resolve_backtest_profile_spec
+from pm15min.research.contracts import BacktestRunSpec
 from pm15min.research.backtests.settlement import build_equity_curve, settle_fill_frame, settlement_summary
 from pm15min.research.backtests.taxonomy import build_reject_frame, summarize_reject_reasons
 
@@ -224,6 +226,170 @@ def test_build_canonical_fills_materializes_mapping_rows(monkeypatch, tmp_path) 
     assert rejects.empty
     assert len(fills) == 1
     assert seen_row_types == [dict]
+
+
+def test_build_canonical_fills_caps_real_fills_per_offset_before_more_materialization(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    accepted = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:08:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "quote_up_ask": 0.20,
+                "quote_up_ask_size_1": 10.0,
+                "p_up": 0.80,
+                "p_down": 0.20,
+            },
+            {
+                "decision_ts": "2026-03-01T00:08:10Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "quote_up_ask": 0.21,
+                "quote_up_ask_size_1": 10.0,
+                "p_up": 0.81,
+                "p_down": 0.19,
+            },
+            {
+                "decision_ts": "2026-03-01T00:08:20Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "quote_up_ask": 0.22,
+                "quote_up_ask_size_1": 10.0,
+                "p_up": 0.82,
+                "p_down": 0.18,
+            },
+        ]
+    )
+    calls: list[str] = []
+
+    def _wrapped_materialize(row, **kwargs):
+        calls.append(str(row["decision_ts"]))
+        return {
+            **row,
+            "fill_valid": True,
+            "fill_reason": "",
+            "fill_model": "canonical_quote",
+            "stake": 1.0,
+            "shares": 5.0,
+            "fee_rate": 0.0,
+            "fee_paid": 0.0,
+            "fill_ratio": 1.0,
+        }
+
+    monkeypatch.setattr(fills_module, "_materialize_fill_row", _wrapped_materialize)
+
+    fills, rejects = build_canonical_fills(
+        accepted,
+        data_cfg=data_cfg,
+        config=BacktestFillConfig(
+            base_stake=1.0,
+            max_stake=1.0,
+            fee_bps=0.0,
+            high_conf_threshold=0.99,
+            high_conf_multiplier=1.0,
+            prefer_depth=False,
+            max_filled_trades_per_offset=1,
+        ),
+    )
+
+    assert len(calls) == 1
+    assert len(fills) == 1
+    assert rejects["reason"].tolist() == [
+        "max_filled_trades_per_offset",
+        "max_filled_trades_per_offset",
+    ]
+
+
+def test_build_canonical_fills_counts_only_valid_fills_toward_offset_cap(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    accepted = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:08:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "quote_up_ask": 0.20,
+                "quote_up_ask_size_1": 10.0,
+                "p_up": 0.80,
+                "p_down": 0.20,
+            },
+            {
+                "decision_ts": "2026-03-01T00:08:10Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "quote_up_ask": 0.21,
+                "quote_up_ask_size_1": 10.0,
+                "p_up": 0.81,
+                "p_down": 0.19,
+            },
+        ]
+    )
+    outcomes = iter(
+        [
+            {
+                "fill_valid": False,
+                "fill_reason": "quote_missing",
+                "fill_model": "canonical_quote",
+            },
+            {
+                "fill_valid": True,
+                "fill_reason": "",
+                "fill_model": "canonical_quote",
+                "stake": 1.0,
+                "shares": 5.0,
+                "fee_rate": 0.0,
+                "fee_paid": 0.0,
+                "fill_ratio": 1.0,
+            },
+        ]
+    )
+    calls: list[str] = []
+
+    def _wrapped_materialize(row, **kwargs):
+        calls.append(str(row["decision_ts"]))
+        return {**row, **next(outcomes)}
+
+    monkeypatch.setattr(fills_module, "_materialize_fill_row", _wrapped_materialize)
+
+    fills, rejects = build_canonical_fills(
+        accepted,
+        data_cfg=data_cfg,
+        config=BacktestFillConfig(
+            base_stake=1.0,
+            max_stake=1.0,
+            fee_bps=0.0,
+            high_conf_threshold=0.99,
+            high_conf_multiplier=1.0,
+            prefer_depth=False,
+            max_filled_trades_per_offset=1,
+        ),
+    )
+
+    assert len(calls) == 2
+    assert len(fills) == 1
+    assert rejects["reason"].tolist() == ["quote_missing"]
+
+
+def test_build_backtest_fill_config_maps_trade_cap_to_filled_trade_cap() -> None:
+    spec = BacktestRunSpec(
+        profile="deep_otm",
+        spec_name="baseline_truth",
+        run_label="cap-check",
+        parity={"regime_defense_max_trades_per_market": 5},
+    )
+    profile_spec = resolve_backtest_profile_spec(profile="deep_otm")
+
+    out = backtest_engine._build_backtest_fill_config(spec=spec, profile_spec=profile_spec)
+
+    assert out.max_filled_trades_per_offset == 5
 
 
 def test_build_canonical_fills_keeps_depth_diagnostics_when_depth_blocks_then_quote_fallbacks(tmp_path) -> None:
@@ -1785,6 +1951,72 @@ def test_build_canonical_fills_legacy_fak_refresh_rejects_repriced_entry_price_m
 
     assert fills.empty
     assert rejects["reason"].tolist() == ["repriced_entry_price_max"]
+
+
+def test_materialize_fill_row_rejects_initial_repriced_entry_price_max_without_refresh_retry(tmp_path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    profile_spec = replace(
+        resolve_backtest_profile_spec(profile="deep_otm"),
+        entry_price_max=0.30,
+        orderbook_min_fill_ratio=0.9,
+        orderbook_max_slippage_bps=150.0,
+    )
+    row = {
+        "decision_ts": "2026-03-01T00:08:00Z",
+        "cycle_start_ts": "2026-03-01T00:00:00Z",
+        "cycle_end_ts": "2026-03-01T00:15:00Z",
+        "offset": 7,
+        "market_id": "market-1",
+        "condition_id": "cond-1",
+        "token_up": "token-up",
+        "token_down": "token-down",
+        "quote_up_ask": 0.46,
+        "quote_up_bid": 0.45,
+        "quote_up_ask_size_1": 10.0,
+        "p_up": 0.70,
+        "p_down": 0.30,
+        "predicted_side": "UP",
+        "predicted_prob": 0.70,
+        "winner_side": "UP",
+        "stake": 2.0,
+        "entry_price": 0.27,
+        "entry_price_source": "decision_engine_entry_price",
+        "price_cap": 0.68,
+        "fill_valid": True,
+        "fill_reason": "",
+    }
+    raw_depth_candidates = [
+        {
+            "depth_source_path": str(data_cfg.layout.orderbook_depth_path("2026-03-01")),
+            "depth_up_record": {
+                "logged_at": "2026-03-01T00:08:10Z",
+                "asks": [[0.46, 10.0]],
+                "bids": [[0.45, 1.0]],
+            },
+            "depth_up_snapshot_ts_ms": int(pd.Timestamp("2026-03-01T00:08:10Z").timestamp() * 1000),
+            "depth_down_record": None,
+        }
+    ]
+
+    out = fills_module._materialize_fill_row(
+        row,
+        data_cfg=data_cfg,
+        config=BacktestFillConfig(
+            base_stake=2.0,
+            max_stake=2.0,
+            fee_bps=0.0,
+            high_conf_threshold=0.99,
+            high_conf_multiplier=1.0,
+            raw_depth_fak_refresh_enabled=True,
+            profile_spec=profile_spec,
+        ),
+        raw_depth_candidates=raw_depth_candidates,
+    )
+
+    assert bool(out["fill_valid"]) is False
+    assert out["fill_model"] == "canonical_depth"
+    assert out["fill_reason"] == "repriced_entry_price_max"
 
 
 def test_materialize_fill_row_prefers_raw_depth_before_quote_price_cap_reject(tmp_path) -> None:

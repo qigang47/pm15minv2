@@ -29,6 +29,10 @@ DEFAULT_LIVE_MARKET_CATALOG_LOOKBACK_HOURS = 24
 DEFAULT_LIVE_MARKET_CATALOG_LOOKAHEAD_HOURS = 24
 DEFAULT_ORDERBOOK_INDEX_COMPACT_SECONDS = 5.0
 DEFAULT_ORDERBOOK_INDEX_COMPACT_MAX_PENDING_ROWS = 128
+DEFAULT_LIVE_ORDERBOOK_DEPTH_ZSTD_LEVEL = 3
+DEFAULT_BACKTEST_ORDERBOOK_DEPTH_ZSTD_LEVEL = 7
+DEFAULT_LIVE_RECENT_ORDERBOOK_PERSIST_INTERVAL_SECONDS = 2.0
+DEFAULT_BACKTEST_RECENT_ORDERBOOK_PERSIST_INTERVAL_SECONDS = 0.0
 
 _ORDERBOOK_INDEX_COMPACT_STATE: dict[str, dict[str, float]] = {}
 
@@ -277,20 +281,30 @@ def _load_market_table(
     now_ts = int(captured_ts_ms // 1000)
     df = read_parquet_if_exists(target_path)
     requires_active_rows = _market_catalog_requires_active_rows(surface=cfg.surface)
-    if requires_active_rows and _live_market_catalog_refresh_reason(
-        target_path=target_path,
-        frame=df,
-        now_ts=now_ts,
-        now_utc=now,
-    ):
-        sync_market_catalog(
-            cfg,
-            start_ts=int((now - pd.Timedelta(hours=DEFAULT_LIVE_MARKET_CATALOG_LOOKBACK_HOURS)).timestamp()),
-            end_ts=int((now + pd.Timedelta(hours=DEFAULT_LIVE_MARKET_CATALOG_LOOKAHEAD_HOURS)).timestamp()),
-            client=gamma_client,
-            now=now,
+    refresh_reason = (
+        _live_market_catalog_refresh_reason(
+            target_path=target_path,
+            frame=df,
+            now_ts=now_ts,
+            now_utc=now,
         )
-        df = read_parquet_if_exists(target_path)
+        if requires_active_rows
+        else None
+    )
+    if refresh_reason:
+        try:
+            sync_market_catalog(
+                cfg,
+                start_ts=int((now - pd.Timedelta(hours=DEFAULT_LIVE_MARKET_CATALOG_LOOKBACK_HOURS)).timestamp()),
+                end_ts=int((now + pd.Timedelta(hours=DEFAULT_LIVE_MARKET_CATALOG_LOOKAHEAD_HOURS)).timestamp()),
+                client=gamma_client,
+                now=now,
+            )
+            df = read_parquet_if_exists(target_path)
+        except Exception:
+            can_reuse_existing = bool(df is not None and not df.empty and _has_active_or_future_rows(df, now_ts=now_ts))
+            if not can_reuse_existing:
+                raise
     if df is None or df.empty:
         raise FileNotFoundError(
             f"Missing canonical market catalog: {target_path}. "
@@ -378,6 +392,31 @@ def _parse_ts_ms(value: object) -> int | None:
         return int(dt.timestamp() * 1000)
     except Exception:
         return None
+
+
+def _orderbook_depth_zstd_level(cfg: DataConfig) -> int:
+    default_level = (
+        DEFAULT_LIVE_ORDERBOOK_DEPTH_ZSTD_LEVEL
+        if str(cfg.surface).strip().lower() == "live"
+        else DEFAULT_BACKTEST_ORDERBOOK_DEPTH_ZSTD_LEVEL
+    )
+    value = int(_env_float("PM15MIN_ORDERBOOK_DEPTH_ZSTD_LEVEL", default=float(default_level)))
+    return max(1, min(22, value))
+
+
+def _recent_orderbook_persist_interval_seconds(cfg: DataConfig) -> float:
+    default_interval = (
+        DEFAULT_LIVE_RECENT_ORDERBOOK_PERSIST_INTERVAL_SECONDS
+        if str(cfg.surface).strip().lower() == "live"
+        else DEFAULT_BACKTEST_RECENT_ORDERBOOK_PERSIST_INTERVAL_SECONDS
+    )
+    return max(
+        0.0,
+        _env_float(
+            "PM15MIN_ORDERBOOK_RECENT_PERSIST_INTERVAL_SECONDS",
+            default=float(default_interval),
+        ),
+    )
 
 
 def _normalize_levels(levels: object, *, reverse: bool) -> list[tuple[float, float]]:
@@ -559,7 +598,7 @@ def persist_captured_orderbooks_once(
     append_ndjson_zst(
         cfg.layout.orderbook_depth_path(batch.date_str),
         batch.snapshot_rows,
-        level=7,
+        level=_orderbook_depth_zstd_level(cfg),
     )
 
     index_path = cfg.layout.orderbook_index_path(batch.date_str)
@@ -570,6 +609,7 @@ def persist_captured_orderbooks_once(
         incoming=index_df,
         now_ts_ms=batch.captured_ts_ms,
         window_minutes=batch.recent_window_minutes,
+        persist_interval_seconds=_recent_orderbook_persist_interval_seconds(cfg),
     )
     latest_full_snapshot_payload = {
         "dataset": "orderbook_latest_full_snapshot",
