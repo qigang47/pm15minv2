@@ -5,14 +5,19 @@ import importlib
 import json
 import sys
 
+from pm5min.console.cli import attach_console_subcommands, run_console_command
+from pm5min.data.cli import attach_data_subcommands, run_data_command
+from pm5min.data.layout import DataLayout
 from pm5min.defaults import DEFAULT_CYCLE, DEFAULT_CYCLE_MINUTES, DEFAULT_LIVE_PROFILE
+from pm5min.live.cli import attach_live_subcommands, run_live_command
+from pm5min.research.cli import attach_research_subcommands, run_research_command
 
 
 _DOMAIN_LOADERS = {
-    "console": ("pm15min.console.cli", "attach_console_subcommands", "run_console_command"),
-    "data": ("pm15min.data.cli", "attach_data_subcommands", "run_data_command"),
-    "live": ("pm15min.live.cli", "attach_live_subcommands", "run_live_command"),
-    "research": ("pm15min.research.cli", "attach_research_subcommands", "run_research_command"),
+    "console": (attach_console_subcommands, run_console_command),
+    "data": (attach_data_subcommands, run_data_command),
+    "live": (attach_live_subcommands, run_live_command),
+    "research": (attach_research_subcommands, run_research_command),
 }
 
 
@@ -48,17 +53,12 @@ def _data_command_supports_cycle(argv: list[str]) -> bool:
         ("run", "backfill-cycle-labels-gamma"),
     }
 
-
-def _load_data_layout() -> object:
-    module = importlib.import_module("pm15min.data.layout")
-    return getattr(module, "DataLayout")
-
-
 def _load_domain_cli(domain: str) -> tuple[object, object]:
+    if domain in {"console", "data", "live", "research"}:
+        return _DOMAIN_LOADERS[domain]
     module_name, attach_name, run_name = _DOMAIN_LOADERS[domain]
     module = importlib.import_module(module_name)
     return getattr(module, attach_name), getattr(module, run_name)
-
 
 def _requested_domain(argv: list[str]) -> str | None:
     for token in argv:
@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(rewritten_argv)
     if args.domain == "layout":
-        payload = _load_data_layout().discover().for_market(args.market, args.cycle).to_dict()
+        payload = DataLayout.discover().for_market(args.market, args.cycle).to_dict()
         if args.json:
             _print_json(payload)
         else:

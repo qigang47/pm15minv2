@@ -45,7 +45,31 @@ def _data_cycle_capable_command_paths() -> set[tuple[str, ...]]:
 def test_pm5min_cli_does_not_delegate_to_pm15min_cli() -> None:
     text = (Path(__file__).resolve().parents[1] / "src" / "pm5min" / "cli.py").read_text(encoding="utf-8")
     assert "from pm15min.cli import main as pm15min_main" not in text
-    assert "pm15min." not in text
+    assert "pm15min.data.layout" not in text
+    assert "pm15min.data.cli" not in text
+    assert "pm15min.live.cli" not in text
+    assert "pm15min.research.cli" not in text
+    assert "pm15min.console.cli" not in text
+
+    data_cli_text = (Path(__file__).resolve().parents[1] / "src" / "pm5min" / "data" / "cli.py").read_text(
+        encoding="utf-8"
+    )
+    assert "pm15min.data.cli" not in data_cli_text
+
+    live_cli_text = (Path(__file__).resolve().parents[1] / "src" / "pm5min" / "live" / "cli.py").read_text(
+        encoding="utf-8"
+    )
+    assert "pm15min.live.cli" not in live_cli_text
+
+    research_cli_text = (
+        Path(__file__).resolve().parents[1] / "src" / "pm5min" / "research" / "cli.py"
+    ).read_text(encoding="utf-8")
+    assert "pm15min.research.cli" not in research_cli_text
+
+    console_cli_text = (
+        Path(__file__).resolve().parents[1] / "src" / "pm5min" / "console" / "cli.py"
+    ).read_text(encoding="utf-8")
+    assert "pm15min.console.cli" not in console_cli_text
 
 
 def test_rewrite_pm5min_argv_injects_5m_defaults() -> None:
@@ -231,6 +255,55 @@ def test_pm5min_live_show_layout_uses_5m_profile_and_cycle(capsys) -> None:
     assert payload["profile_spec_resolution"]["status"] == "exact_match"
 
 
+def test_pm5min_live_show_config_uses_pm5min_layout_root(capsys, monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    monkeypatch.setattr("pm5min.core.layout.rewrite_root", lambda: root)
+
+    rc = main(["live", "show-config", "--market", "sol"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cycle_minutes"] == 5
+    assert payload["profile"] == "deep_otm_5m"
+    assert Path(payload["layout"]["rewrite_root"]) == root
+
+
+def test_pm5min_research_show_layout_uses_5m_cycle(capsys, monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    monkeypatch.setattr("pm5min.core.layout.rewrite_root", lambda: root)
+    monkeypatch.setattr("pm5min.research.layout.rewrite_root", lambda: root)
+
+    rc = main(["research", "show-layout", "--market", "sol"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["market"] == "sol"
+    assert payload["cycle"] == "5m"
+    assert Path(payload["research_root"]).parent == root
+
+
+def test_pm5min_research_show_config_uses_pm5min_layout_root(capsys, monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    monkeypatch.setattr("pm5min.core.layout.rewrite_root", lambda: root)
+    monkeypatch.setattr("pm5min.research.layout.rewrite_root", lambda: root)
+
+    rc = main(["research", "show-config", "--market", "sol"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["market"] == "sol"
+    assert payload["cycle"] == "5m"
+    assert Path(payload["layout"]["rewrite_root"]) == root
+
+
+def test_pm5min_console_show_home_still_reachable(capsys) -> None:
+    rc = main(["console", "show-home"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, dict)
+
+
 def test_pm5min_data_show_layout_uses_5m_cycle(capsys, monkeypatch, tmp_path: Path) -> None:
     _patch_v2_roots(monkeypatch, tmp_path / "v2")
 
@@ -239,6 +312,19 @@ def test_pm5min_data_show_layout_uses_5m_cycle(capsys, monkeypatch, tmp_path: Pa
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["cycle"] == "5m"
+
+
+def test_pm5min_data_show_config_uses_pm5min_layout_root(capsys, monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    monkeypatch.setattr("pm5min.core.layout.rewrite_root", lambda: root)
+    monkeypatch.setattr("pm5min.data.layout.rewrite_root", lambda: root)
+
+    rc = main(["data", "show-config", "--market", "sol"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cycle"] == "5m"
+    assert Path(payload["layout"]["rewrite_root"]) == root
 
 
 def test_pm5min_data_live_foundation_uses_5m_cycle(capsys, monkeypatch, tmp_path: Path) -> None:
