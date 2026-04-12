@@ -47,6 +47,20 @@ def test_market_layout_splits_runtime_and_legacy_reference_paths() -> None:
     assert "artifacts_root" not in payload
 
 
+def test_pm15min_and_pm5min_do_not_import_each_other() -> None:
+    repo = Path(__file__).resolve().parents[1] / "src"
+    offending: list[str] = []
+    for root_name, forbidden in (("pm15min", "pm5min"), ("pm5min", "pm15min")):
+        for path in (repo / root_name).rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            import_lines = "\n".join(
+                line for line in text.splitlines() if line.lstrip().startswith(("import ", "from "))
+            )
+            if f"from {forbidden}" in import_lines or f"import {forbidden}" in import_lines:
+                offending.append(str(path))
+    assert offending == []
+
+
 def test_v2_legacy_imports_are_limited_to_explicit_boundaries() -> None:
     repo = Path(__file__).resolve().parents[1] / "src" / "pm15min"
     allow_live_trading = {

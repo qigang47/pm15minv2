@@ -192,6 +192,15 @@ def test_top_level_layout_command(capsys, monkeypatch, tmp_path: Path) -> None:
     assert payload["surface"] == "backtest"
 
 
+def test_pm15min_layout_defaults_to_15m(capsys, monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    rc = main(["layout", "--market", "sol", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cycle"] == "15m"
+
+
 def test_pm5min_layout_command(capsys) -> None:
     from pm5min.cli import main as pm5min_main
 

@@ -42,6 +42,12 @@ def _data_cycle_capable_command_paths() -> set[tuple[str, ...]]:
     return paths
 
 
+def test_pm5min_cli_does_not_delegate_to_pm15min_cli() -> None:
+    text = (Path(__file__).resolve().parents[1] / "src" / "pm5min" / "cli.py").read_text(encoding="utf-8")
+    assert "from pm15min.cli import main as pm15min_main" not in text
+    assert "pm15min." not in text
+
+
 def test_rewrite_pm5min_argv_injects_5m_defaults() -> None:
     assert rewrite_pm5min_argv(["layout", "--market", "sol"]) == [
         "layout",
