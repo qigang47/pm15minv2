@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -161,6 +162,131 @@ def _prepare_sol_research_inputs(root: Path) -> ResearchConfig:
         market="sol",
         cycle="15m",
         profile="deep_otm",
+        source_surface="backtest",
+        feature_set="deep_otm_v1",
+        label_set="truth",
+        root=root,
+    )
+
+
+def _prepare_sol_research_inputs_5m(root: Path):
+    from pm5min.research.config import ResearchConfig as Pm5minResearchConfig
+
+    data_cfg = DataConfig.build(market="sol", cycle="5m", surface="backtest", root=root)
+    btc_cfg = DataConfig.build(market="btc", cycle="5m", surface="backtest", root=root)
+    write_parquet_atomic(
+        _sample_klines("SOLUSDT", start="2026-03-01T00:00:00Z", periods=240, price_base=120.0),
+        data_cfg.layout.binance_klines_path(),
+    )
+    write_parquet_atomic(
+        _sample_klines("BTCUSDT", start="2026-03-01T00:00:00Z", periods=240, price_base=50000.0),
+        btc_cfg.layout.binance_klines_path(),
+    )
+
+    base_cycle_start_ts = 1_772_323_200
+    oracle_rows = []
+    truth_rows = []
+    market_catalog_rows = []
+    depth_rows = []
+    for idx in range(48):
+        cycle_start_ts = base_cycle_start_ts + idx * 300
+        cycle_end_ts = cycle_start_ts + 300
+        oracle_rows.append(
+            {
+                "asset": "sol",
+                "cycle_start_ts": cycle_start_ts,
+                "cycle_end_ts": cycle_end_ts,
+                "price_to_beat": 120.0 + idx,
+                "final_price": 120.5 + idx,
+                "source_price_to_beat": "direct_api",
+                "source_final_price": "streams_rpc",
+                "has_price_to_beat": True,
+                "has_final_price": True,
+                "has_both": True,
+            }
+        )
+        truth_rows.append(
+            {
+                "asset": "sol",
+                "cycle_start_ts": cycle_start_ts,
+                "cycle_end_ts": cycle_end_ts,
+                "market_id": f"market-{idx}",
+                "condition_id": f"cond-{idx}",
+                "winner_side": "UP" if idx % 2 == 0 else "DOWN",
+                "label_updown": "UP" if idx % 2 == 0 else "DOWN",
+                "resolved": True,
+                "truth_source": "settlement_truth",
+                "full_truth": True,
+            }
+        )
+        token_up = f"token-up-{idx}"
+        token_down = f"token-down-{idx}"
+        market_catalog_rows.append(
+            {
+                "market_id": f"market-{idx}",
+                "condition_id": f"cond-{idx}",
+                "asset": "sol",
+                "cycle": "5m",
+                "cycle_start_ts": cycle_start_ts,
+                "cycle_end_ts": cycle_end_ts,
+                "token_up": token_up,
+                "token_down": token_down,
+                "slug": f"sol-updown-5m-{cycle_start_ts}",
+                "question": f"SOL {idx}?",
+                "resolution_source": "https://data.chain.link/streams/sol-usd",
+                "event_id": f"event-{idx}",
+                "event_slug": f"event-{idx}",
+                "event_title": f"event-{idx}",
+                "series_slug": "sol-updown-5m",
+                "closed_ts": None,
+                "source_snapshot_ts": "2026-03-01T00-00-00Z",
+            }
+        )
+        orderbook_ts = pd.Timestamp(cycle_start_ts, unit="s", tz="UTC") + pd.Timedelta(minutes=2)
+        orderbook_ts_iso = orderbook_ts.isoformat()
+        depth_rows.extend(
+            [
+                {
+                    "logged_at": orderbook_ts_iso,
+                    "orderbook_ts": orderbook_ts_iso,
+                    "market_id": f"market-{idx}",
+                    "token_id": token_up,
+                    "side": "up",
+                    "asks": [[0.41, 10.0]],
+                    "bids": [[0.39, 8.0]],
+                },
+                {
+                    "logged_at": orderbook_ts_iso,
+                    "orderbook_ts": orderbook_ts_iso,
+                    "market_id": f"market-{idx}",
+                    "token_id": token_down,
+                    "side": "down",
+                    "asks": [[0.59, 9.0]],
+                    "bids": [[0.57, 7.0]],
+                },
+            ]
+        )
+
+    oracle_prices = pd.DataFrame(oracle_rows)
+    write_parquet_atomic(oracle_prices, data_cfg.layout.oracle_prices_table_path)
+    write_parquet_atomic(
+        oracle_prices.assign(
+            cycle="5m",
+            source="direct_api",
+            source_priority=3,
+            fetched_at="2026-03-01T00:00:00Z",
+        ),
+        data_cfg.layout.direct_oracle_source_path,
+    )
+    truth_frame = pd.DataFrame(truth_rows)
+    write_parquet_atomic(truth_frame, data_cfg.layout.truth_table_path)
+    write_parquet_atomic(truth_frame, data_cfg.layout.settlement_truth_source_path)
+    write_parquet_atomic(pd.DataFrame(market_catalog_rows), data_cfg.layout.market_catalog_table_path)
+    append_ndjson_zst(data_cfg.layout.orderbook_depth_path("2026-03-01"), depth_rows)
+    return Pm5minResearchConfig.build(
+        market="sol",
+        cycle="5m",
+        profile="deep_otm_5m",
         source_surface="backtest",
         feature_set="deep_otm_v1",
         label_set="truth",
@@ -618,6 +744,8 @@ def test_live_runner_loop_rejects_noncanonical_target(monkeypatch, capsys) -> No
 
 
 def test_live_score_latest(capsys, tmp_path: Path, monkeypatch) -> None:
+    if os.getenv("PM_RUN_NETWORK_TESTS") != "1":
+        pytest.skip("set PM_RUN_NETWORK_TESTS=1 to run live network smoke tests")
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     live_cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=root)
@@ -1303,6 +1431,106 @@ def test_research_backtest_run(capsys, tmp_path: Path, monkeypatch) -> None:
     assert payload["fallback_reasons"] == ["direction_prob", "policy_low_confidence"]
     assert payload["parity"] == {"regime_enabled": True}
     assert "backtests" in payload["run_dir"]
+
+
+def test_pm5min_research_backtest_run_cli_smoke(capsys, tmp_path: Path, monkeypatch) -> None:
+    from pm5min.cli import main as pm5min_main
+
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    monkeypatch.setattr("pm5min.core.layout.rewrite_root", lambda: root)
+    monkeypatch.setattr("pm5min.data.layout.rewrite_root", lambda: root)
+    monkeypatch.setattr("pm5min.research.layout.rewrite_root", lambda: root)
+    cfg = _prepare_sol_research_inputs_5m(root)
+
+    assert pm5min_main(["research", "build", "feature-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
+    capsys.readouterr()
+    assert pm5min_main(["research", "build", "label-frame", "--market", "sol", "--dependency-mode", "auto_repair"]) == 0
+    capsys.readouterr()
+    for offset in ("2", "3"):
+        assert (
+            pm5min_main(
+                [
+                    "research",
+                    "build",
+                    "training-set",
+                    "--market",
+                    "sol",
+                    "--window-start",
+                    "2026-03-01",
+                    "--window-end",
+                    "2026-03-01",
+                    "--offset",
+                    offset,
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+    assert (
+        pm5min_main(
+            [
+                "research",
+                "train",
+                "run",
+                "--market",
+                "sol",
+                "--window-start",
+                "2026-03-01",
+                    "--window-end",
+                    "2026-03-01",
+                    "--offsets",
+                    "2,3",
+                    "--run-label",
+                    "demo",
+                ]
+            )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        pm5min_main(
+            [
+                "research",
+                "bundle",
+                "build",
+                "--market",
+                "sol",
+                "--profile",
+                "deep_otm_5m",
+                "--offsets",
+                "2,3",
+                "--bundle-label",
+                "demo-bundle",
+                "--source-training-run",
+                "demo",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    rc = pm5min_main(
+        [
+            "research",
+            "backtest",
+            "run",
+            "--market",
+            "sol",
+            "--profile",
+            "deep_otm_5m",
+            "--spec",
+            "baseline_truth",
+            "--run-label",
+            "demo",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["market"] == cfg.asset.slug
+    assert payload["cycle"] == "5m"
+    assert payload["profile"] == "deep_otm_5m"
+    assert payload["run_label"] == "demo"
 
 
 def test_research_backtest_run_fail_fast_raises_on_missing_dependencies(

@@ -16,6 +16,7 @@ def _patch_v2_roots(monkeypatch, root: Path) -> None:
     monkeypatch.setattr("pm15min.core.layout.rewrite_root", lambda: root)
     monkeypatch.setattr("pm15min.data.layout.rewrite_root", lambda: root)
     monkeypatch.setattr("pm15min.research.layout.rewrite_root", lambda: root)
+    monkeypatch.setenv("PM15MIN_RUNNER_ENABLE_SIGNAL_PREWARM", "0")
 
 
 def test_runner_exports_distinct_prepare_and_preview_prewarm_callables() -> None:

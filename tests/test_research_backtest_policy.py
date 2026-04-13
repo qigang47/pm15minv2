@@ -405,7 +405,7 @@ def test_backtest_summary_normalizes_legacy_truth_runtime_keys() -> None:
     assert summary["truth_runtime_window_refresh_status"] == "fresh"
 
 
-def test_backtest_summary_tracks_depth_usage_and_fallbacks() -> None:
+def test_backtest_summary_tracks_depth_usage_without_quote_completion() -> None:
     trades = pd.DataFrame(
         [
             {
@@ -424,8 +424,8 @@ def test_backtest_summary_tracks_depth_usage_and_fallbacks() -> None:
             },
             {
                 "decision_source": "primary",
-                "fill_model": "canonical_quote",
-                "depth_status": "blocked",
+                "fill_model": "canonical_depth",
+                "depth_status": "partial",
                 "depth_reason": "depth_fill_ratio_below_threshold",
                 "depth_fill_ratio": 0.4,
                 "depth_candidate_count": 2,
@@ -433,12 +433,12 @@ def test_backtest_summary_tracks_depth_usage_and_fallbacks() -> None:
                 "depth_chain_mode": "single_snapshot",
                 "depth_queue_turnover_count": 0,
                 "win": False,
-                "stake": 1.0,
+                "stake": 0.4,
                 "pnl": -0.5,
             },
             {
                 "decision_source": "secondary",
-                "fill_model": "canonical_depth_quote",
+                "fill_model": "canonical_depth",
                 "depth_status": "partial",
                 "depth_reason": "queue_path_stalled",
                 "depth_fill_ratio": 0.8,
@@ -505,14 +505,12 @@ def test_backtest_summary_tracks_depth_usage_and_fallbacks() -> None:
     report = render_backtest_report(summary)
 
     assert summary["depth_fill_model_counts"] == {
-        "canonical_depth": 3,
-        "canonical_depth_quote": 1,
-        "canonical_quote": 1,
+        "canonical_depth": 5,
     }
-    assert summary["depth_canonical_depth_rows"] == 3
-    assert summary["depth_quote_fallback_rows"] == 1
-    assert summary["depth_quote_completion_rows"] == 1
-    assert summary["depth_partial_fill_rows"] == 1
+    assert summary["depth_canonical_depth_rows"] == 5
+    assert summary["depth_partial_fill_rows"] == 2
+    assert "depth_quote_fallback_rows" not in summary
+    assert "depth_quote_completion_rows" not in summary
     assert summary["depth_queue_growth_rows"] == 1
     assert summary["depth_price_path_rows"] == 0
     assert summary["depth_queue_turnover_rows"] == 1
@@ -537,7 +535,9 @@ def test_backtest_summary_tracks_depth_usage_and_fallbacks() -> None:
     }
     assert "Depth Usage" in report
     assert "canonical_depth" in report
-    assert "canonical_depth_quote" in report
+    assert "canonical_depth_quote" not in report
+    assert "depth_quote_fallback_rows" not in report
+    assert "depth_quote_completion_rows" not in report
     assert "depth_queue_turnover_rows" in report
     assert "depth_time_turnover_rows" in report
     assert "depth_retry_refresh_rows" in report

@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import argparse
 
-from .compat import attach_pm15min_console_subcommands, run_pm15min_console_command
+from .handlers import run_console_command as _run_console_command_impl
+from .parser import attach_console_subcommands as _attach_console_subcommands_impl
 
 
 def attach_console_subcommands(
     subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
-    attach_pm15min_console_subcommands(subparsers)
+    _attach_console_subcommands_impl(subparsers)
 
 
 def run_console_command(args: argparse.Namespace) -> int:
-    return run_pm15min_console_command(args)
+    return _run_console_command_impl(args)

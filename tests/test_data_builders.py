@@ -682,6 +682,137 @@ def test_sync_direct_oracle_overwrites_existing_incomplete_row_with_complete_can
     assert direct.iloc[0]["fetched_at"] != "2026-03-19T09:00:00Z"
 
 
+def test_sync_direct_oracle_fills_missing_close_from_chainlink_official(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="btc", cycle="15m", surface="backtest", root=tmp_path / "v2")
+    cycle_start_ts = 1700000000
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "btc",
+                    "cycle": "15m",
+                    "cycle_start_ts": cycle_start_ts,
+                    "cycle_end_ts": cycle_start_ts + 900,
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "slug": "btc-up-or-down-15m-1700000000",
+                    "question": "Btc Up or Down",
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "event_id": "event-1",
+                    "event_slug": "slug-1",
+                    "event_title": "title-1",
+                    "series_slug": "btc-up-or-down-15m",
+                    "closed_ts": None,
+                    "source_snapshot_ts": "2026-03-19T09-00-00Z",
+                }
+            ]
+        ),
+        cfg.layout.market_catalog_table_path,
+    )
+
+    class _FakePolymarketClient:
+        def fetch_past_results_batch(self, **kwargs):
+            return []
+
+        def fetch_crypto_price(self, **kwargs):
+            return {
+                "openPrice": 100.0,
+                "closePrice": None,
+                "completed": False,
+                "incomplete": True,
+                "cached": False,
+                "timestamp": 1700000000000,
+                "source": "polymarket_api_crypto_price",
+            }
+
+    class _FakeChainlinkClient:
+        def fetch_report(self, *, feed_id: str, timestamp: int):
+            if int(timestamp) == cycle_start_ts + 900:
+                return {
+                    "feed_id": feed_id,
+                    "valid_from_ts": cycle_start_ts + 840,
+                    "observation_ts": cycle_start_ts + 900,
+                    "price": 101.0,
+                    "source": "chainlink_data_streams_rest_api",
+                }
+            return None
+
+    summary = sync_polymarket_oracle_prices_direct(
+        cfg,
+        start_ts=cycle_start_ts,
+        end_ts=cycle_start_ts,
+        max_requests=0,
+        client=_FakePolymarketClient(),
+        chainlink_client=_FakeChainlinkClient(),
+    )
+    direct = pd.read_parquet(cfg.layout.direct_oracle_source_path)
+
+    assert summary["rows_imported"] == 1
+    assert len(direct) == 1
+    assert bool(direct.iloc[0]["has_both"]) is True
+    assert float(direct.iloc[0]["price_to_beat"]) == 100.0
+    assert float(direct.iloc[0]["final_price"]) == 101.0
+    assert direct.iloc[0]["source_price_to_beat"] == "polymarket_api_crypto_price"
+    assert direct.iloc[0]["source_final_price"] == "chainlink_data_streams_rest_api"
+
+
+def test_build_truth_recognizes_chainlink_official_direct_source(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="btc", cycle="15m", surface="backtest", root=tmp_path / "v2")
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "asset": "btc",
+                    "cycle": "15m",
+                    "cycle_start_ts": 1700000000,
+                    "cycle_end_ts": 1700000900,
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "slug": "btc-up-or-down-15m-1700000000",
+                    "question": "Btc Up or Down",
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "event_id": "event-1",
+                    "event_slug": "slug-1",
+                    "event_title": "title-1",
+                    "series_slug": "btc-up-or-down-15m",
+                    "closed_ts": None,
+                    "source_snapshot_ts": "2026-03-19T09-00-00Z",
+                }
+            ]
+        ),
+        cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "asset": "btc",
+                    "cycle_start_ts": 1700000000,
+                    "cycle_end_ts": 1700000900,
+                    "price_to_beat": 100.0,
+                    "final_price": 101.0,
+                    "source_price_to_beat": "chainlink_data_streams_rest_api",
+                    "source_final_price": "chainlink_data_streams_rest_api",
+                    "has_price_to_beat": True,
+                    "has_final_price": True,
+                    "has_both": True,
+                }
+            ]
+        ),
+        cfg.layout.oracle_prices_table_path,
+    )
+
+    truth_summary = build_truth_15m(cfg)
+    truth = pd.read_parquet(cfg.layout.truth_table_path)
+
+    assert truth_summary["rows_written"] == 1
+    assert truth.iloc[0]["truth_source"] == "streams"
+
+
 def test_import_legacy_market_catalog_builds_canonical_table(tmp_path: Path) -> None:
     source = tmp_path / "solana_updown_15m_markets_last3y_20260312_150335.csv"
     pd.DataFrame(

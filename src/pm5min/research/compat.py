@@ -13,15 +13,6 @@ def _load_research_cli_handlers_module() -> object:
     return importlib.import_module("pm15min.research.cli_handlers")
 
 
-def _load_research_cli_parser_module() -> object:
-    return importlib.import_module("pm15min.research.cli_parser")
-
-
-def attach_pm15min_research_subcommands(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    module = _load_research_cli_parser_module()
-    getattr(module, "attach_research_subcommands")(subparsers)
-
-
 def run_pm15min_research_command(args: argparse.Namespace, *, deps: object) -> int:
     module = _load_research_cli_handlers_module()
     return getattr(module, "run_research_command")(args, deps=deps)

@@ -204,6 +204,121 @@ def test_console_show_home_and_serve(capsys, monkeypatch) -> None:
     assert serve_calls == [{"host": "127.0.0.1", "port": 9001, "poll_interval": 0.1}]
 
 
+def test_pm5min_console_http_defaults_are_5m(monkeypatch) -> None:
+    from pm15min.console.http.app import route_console_http_request
+    from pm5min.console.http import build_pm5min_console_http_handlers
+
+    monkeypatch.setattr(
+        "pm5min.console.http.console_service.load_console_data_overview",
+        lambda **kwargs: {
+            "dataset": "console_data_overview",
+            "market": kwargs["market"],
+            "cycle": kwargs["cycle"],
+            "surface": kwargs["surface"],
+        },
+    )
+    monkeypatch.setattr(
+        "pm5min.console.http.console_service.load_console_bundle",
+        lambda **kwargs: {
+            "dataset": "console_bundle_detail",
+            "market": kwargs["market"],
+            "cycle": kwargs["cycle"],
+            "profile": kwargs["profile"],
+            "target": kwargs["target"],
+            "bundle_label": kwargs["bundle_label"],
+        },
+    )
+    monkeypatch.setattr(
+        "pm5min.console.http.console_service.list_console_bundles",
+        lambda **kwargs: {
+            "dataset": "console_bundle_list",
+            "market": kwargs["market"],
+            "cycle": kwargs["cycle"],
+            "profile": kwargs["profile"],
+            "target": kwargs["target"],
+        },
+    )
+    monkeypatch.setattr(
+        "pm5min.console.http.console_service.load_console_backtest",
+        lambda **kwargs: {
+            "dataset": "console_backtest_detail",
+            "market": kwargs["market"],
+            "cycle": kwargs["cycle"],
+            "profile": kwargs["profile"],
+            "spec_name": kwargs["spec_name"],
+            "run_label": kwargs["run_label"],
+        },
+    )
+    monkeypatch.setattr(
+        "pm5min.console.http.console_service.list_console_backtests",
+        lambda **kwargs: {
+            "dataset": "console_backtest_list",
+            "market": kwargs["market"],
+            "cycle": kwargs["cycle"],
+            "profile": kwargs["profile"],
+            "spec_name": kwargs["spec_name"],
+        },
+    )
+
+    handlers = build_pm5min_console_http_handlers()
+
+    overview_response = route_console_http_request(
+        method="GET",
+        target="/api/console/data-overview",
+        handlers=handlers,
+    )
+    overview_payload = json.loads(overview_response.body_bytes().decode("utf-8"))
+    assert overview_response.status_code == 200
+    assert overview_payload["cycle"] == "5m"
+    assert overview_payload["surface"] == "backtest"
+
+    bundle_list_response = route_console_http_request(
+        method="GET",
+        target="/api/console/bundles",
+        handlers=handlers,
+    )
+    bundle_list_payload = json.loads(bundle_list_response.body_bytes().decode("utf-8"))
+    assert bundle_list_response.status_code == 200
+    assert bundle_list_payload["cycle"] == "5m"
+    assert bundle_list_payload["profile"] is None
+    assert bundle_list_payload["target"] is None
+
+    bundles_response = route_console_http_request(
+        method="GET",
+        target="/api/console/bundles?bundle_label=demo",
+        handlers=handlers,
+    )
+    bundles_payload = json.loads(bundles_response.body_bytes().decode("utf-8"))
+    assert bundles_response.status_code == 200
+    assert bundles_payload["cycle"] == "5m"
+    assert bundles_payload["profile"] == "deep_otm_5m"
+    assert bundles_payload["target"] == "direction"
+    assert bundles_payload["bundle_label"] == "demo"
+
+    backtest_list_response = route_console_http_request(
+        method="GET",
+        target="/api/console/backtests",
+        handlers=handlers,
+    )
+    backtest_list_payload = json.loads(backtest_list_response.body_bytes().decode("utf-8"))
+    assert backtest_list_response.status_code == 200
+    assert backtest_list_payload["cycle"] == "5m"
+    assert backtest_list_payload["profile"] is None
+    assert backtest_list_payload["spec_name"] is None
+
+    backtests_response = route_console_http_request(
+        method="GET",
+        target="/api/console/backtests?run_label=demo",
+        handlers=handlers,
+    )
+    backtests_payload = json.loads(backtests_response.body_bytes().decode("utf-8"))
+    assert backtests_response.status_code == 200
+    assert backtests_payload["cycle"] == "5m"
+    assert backtests_payload["profile"] == "deep_otm_5m"
+    assert backtests_payload["spec_name"] == "baseline_truth"
+    assert backtests_payload["run_label"] == "demo"
+
+
 def test_console_show_training_run_and_bundle(capsys, monkeypatch, tmp_path: Path) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)

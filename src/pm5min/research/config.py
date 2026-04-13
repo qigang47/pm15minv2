@@ -34,7 +34,7 @@ class ResearchConfig:
         cls,
         *,
         market: str,
-        cycle: str | int = "15m",
+        cycle: str | int = "5m",
         profile: str = "default",
         source_surface: str = "backtest",
         feature_set: str = "deep_otm_v1",
@@ -58,7 +58,7 @@ class ResearchConfig:
             target=normalize_target(target),
             model_family=slug_token(model_family),
             run_prefix=slug_token(run_prefix) if run_prefix else None,
-            layout=storage.for_market(asset, cycle=cycle_slug),
+            layout=storage.for_market(asset, cycle=cycle_slug, target=target),
         )
 
     def to_dict(self) -> dict[str, object]:

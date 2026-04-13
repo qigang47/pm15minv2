@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from .compat import build_pm15min_data_deps, run_pm15min_data_command
+from .handlers import run_data_command as _run_data_command_impl
 from .parser import attach_data_subcommands as _attach_data_subcommands_impl
 
 
@@ -11,4 +11,4 @@ def attach_data_subcommands(subparsers: argparse._SubParsersAction[argparse.Argu
 
 
 def run_data_command(args: argparse.Namespace) -> int:
-    return run_pm15min_data_command(args, deps=build_pm15min_data_deps())
+    return _run_data_command_impl(args)

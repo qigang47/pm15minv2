@@ -453,6 +453,130 @@ def test_update_recent_orderbook_index_recovers_corrupt_existing_file(tmp_path: 
     assert len(list(path.parent.glob("recent.parquet.corrupt.*"))) == 1
 
 
+def test_update_recent_orderbook_index_can_defer_parquet_rewrite(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "recent.parquet"
+    writes: list[int] = []
+    monotonic_now = {"value": 100.0}
+
+    def _fake_monotonic() -> float:
+        return monotonic_now["value"]
+
+    original_write = update_recent_orderbook_index.__globals__["write_parquet_atomic"]
+
+    def _fake_write(df: pd.DataFrame, target: Path) -> Path:
+        writes.append(len(df))
+        return original_write(df, target)
+
+    monkeypatch.setattr("pm15min.data.pipelines.orderbook_recent.time.monotonic", _fake_monotonic)
+    monkeypatch.setattr("pm15min.data.pipelines.orderbook_recent.write_parquet_atomic", _fake_write)
+
+    first = pd.DataFrame(
+        [
+            {
+                "captured_ts_ms": 1_742_374_800_000,
+                "market_id": "market-1",
+                "token_id": "token-up",
+                "side": "up",
+                "best_ask": 0.12,
+                "best_bid": 0.11,
+                "ask_size_1": 10.0,
+                "bid_size_1": 8.0,
+                "spread": 0.01,
+            }
+        ]
+    )
+    second = pd.DataFrame(
+        [
+            {
+                "captured_ts_ms": 1_742_374_860_000,
+                "market_id": "market-1",
+                "token_id": "token-down",
+                "side": "down",
+                "best_ask": 0.22,
+                "best_bid": 0.21,
+                "ask_size_1": 11.0,
+                "bid_size_1": 9.0,
+                "spread": 0.01,
+            }
+        ]
+    )
+
+    out1 = update_recent_orderbook_index(
+        path=path,
+        incoming=first,
+        now_ts_ms=1_742_374_800_000,
+        window_minutes=15,
+        persist_interval_seconds=60.0,
+    )
+    monotonic_now["value"] += 1.0
+    out2 = update_recent_orderbook_index(
+        path=path,
+        incoming=second,
+        now_ts_ms=1_742_374_860_000,
+        window_minutes=15,
+        persist_interval_seconds=60.0,
+    )
+
+    assert len(out1) == 1
+    assert len(out2) == 2
+    assert writes == [1]
+    assert len(pd.read_parquet(path)) == 1
+
+
+def test_record_orderbooks_once_uses_live_depth_compression_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2", market_depth=1)
+    market_table = pd.DataFrame(
+        [
+            {
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "asset": "sol",
+                "cycle": "15m",
+                "cycle_start_ts": 1_710_000_000,
+                "cycle_end_ts": 1_910_000_000,
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "slug": "sol-up-or-down-15m-1710000000",
+                "question": "Sol up or down",
+                "resolution_source": "https://data.chain.link/streams/sol-usd",
+                "event_id": "event-1",
+                "event_slug": "event-slug",
+                "event_title": "title",
+                "series_slug": "sol-up-or-down-15m",
+                "closed_ts": None,
+                "source_snapshot_ts": "2026-03-19T09-00-00Z",
+            }
+        ]
+    )
+    write_parquet_atomic(market_table, cfg.layout.market_catalog_table_path)
+    seen: list[int] = []
+
+    def _fake_append(path: Path, records: list[dict[str, object]], *, level: int = 7) -> Path:
+        del records
+        seen.append(int(level))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        return path
+
+    monkeypatch.setattr("pm15min.data.pipelines.orderbook_recording.append_ndjson_zst", _fake_append)
+    monkeypatch.setenv("PM15MIN_ORDERBOOK_DEPTH_ZSTD_LEVEL", "2")
+
+    summary = record_orderbooks_once(
+        cfg,
+        client=_FakeClobClient(),
+        captured_ts_ms=1_742_374_800_000,
+    )
+
+    assert summary["selected_markets"] == 1
+    assert seen == [2]
+
+
 def test_record_orderbooks_once_recovers_corrupt_orderbook_index(tmp_path: Path) -> None:
     cfg = DataConfig.build(market="sol", cycle="15m", root=tmp_path / "v2", market_depth=1)
     market_table = pd.DataFrame(
@@ -492,6 +616,52 @@ def test_record_orderbooks_once_recovers_corrupt_orderbook_index(tmp_path: Path)
     rebuilt_index_path = Path(summary["index_path"])
     assert len(pd.read_parquet(rebuilt_index_path)) == 2
     assert len(list(rebuilt_index_path.parent.glob("data.parquet.corrupt.*"))) == 1
+
+
+def test_record_orderbooks_once_live_reuses_stale_market_catalog_when_refresh_times_out(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = DataConfig.build(market="sol", cycle="5m", surface="live", root=tmp_path / "v2", market_depth=1)
+    market_table = pd.DataFrame(
+        [
+            {
+                "market_id": "market-1",
+                "condition_id": "cond-1",
+                "asset": "sol",
+                "cycle": "5m",
+                "cycle_start_ts": 1_710_000_000,
+                "cycle_end_ts": 1_910_000_000,
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "slug": "sol-up-or-down-5m-1710000000",
+                "question": "Sol up or down",
+                "resolution_source": "https://data.chain.link/streams/sol-usd",
+                "event_id": "event-1",
+                "event_slug": "event-slug",
+                "event_title": "title",
+                "series_slug": "sol-up-or-down-5m",
+                "closed_ts": None,
+                "source_snapshot_ts": "2026-03-19T09-00-00Z",
+            }
+        ]
+    )
+    write_parquet_atomic(market_table, cfg.layout.market_catalog_table_path)
+    monkeypatch.setattr("pm15min.data.pipelines.orderbook_recording._path_age_seconds", lambda **kwargs: 999.0)
+
+    def _fake_sync_market_catalog(*args, **kwargs):
+        raise RuntimeError("gamma timeout")
+
+    monkeypatch.setattr("pm15min.data.pipelines.orderbook_recording.sync_market_catalog", _fake_sync_market_catalog)
+
+    summary = record_orderbooks_once(
+        cfg,
+        client=_FakeClobClient(),
+        captured_ts_ms=1_742_374_800_000,
+    )
+
+    assert summary["selected_markets"] == 1
+    assert summary["snapshot_rows"] == 2
 
 
 def test_record_orderbooks_once_keeps_recent_index_rows_visible_via_journal(

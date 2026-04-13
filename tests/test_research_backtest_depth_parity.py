@@ -64,7 +64,7 @@ def _write_depth(
     return path
 
 
-def test_canonical_fills_use_profile_depth_constraints_before_quote_fallback(tmp_path: Path) -> None:
+def test_canonical_fills_reject_when_profile_depth_constraints_block_fill(tmp_path: Path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
     captured_ts_ms = int(pd.Timestamp("2026-03-01T00:05:30Z").timestamp() * 1000)
@@ -96,25 +96,9 @@ def test_canonical_fills_use_profile_depth_constraints_before_quote_fallback(tmp
         profile_spec=profile_spec,
     )
 
-    assert rejected.empty
-    assert len(filled) == 1
-    row = filled.iloc[0]
-    assert row["fill_model"] == "canonical_quote"
-    assert row["depth_status"] == "blocked"
-    assert row["depth_reason"] == "depth_fill_ratio_below_threshold"
-    assert row["depth_source_path"] == str(depth_path)
-    assert row["depth_fill_ratio"] == pytest.approx(0.4)
-    assert row["depth_requested_notional"] == pytest.approx(1.0)
-    assert row["depth_remaining_notional"] == pytest.approx(0.6)
-    assert row["depth_levels_available"] == 2
-    assert row["depth_levels_consumed"] == 1
-    assert bool(row["depth_partial_fill"]) is True
-    assert row["depth_stop_reason"] == "price_limit_reached"
-    assert row["depth_price_limit"] == pytest.approx(0.20)
-    assert row["depth_snapshot_ts_ms"] == captured_ts_ms
-    assert row["depth_snapshot_age_ms"] == 0
-    assert row["depth_snapshot_distance_ms"] == 0
-    assert row["stake"] == pytest.approx(1.0)
+    assert filled.empty
+    assert len(rejected) == 1
+    assert rejected.iloc[0]["reason"] == "depth_fill_ratio_below_threshold"
 
 
 def test_canonical_fills_surface_depth_diagnostics_on_depth_fill(tmp_path: Path) -> None:

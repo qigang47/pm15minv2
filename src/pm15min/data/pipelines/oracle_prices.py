@@ -57,18 +57,30 @@ def build_oracle_prices_table(cfg: DataConfig) -> dict[str, object]:
         direct["cycle_end_ts"] = pd.to_numeric(direct["cycle_end_ts"], errors="coerce")
         direct["price_to_beat"] = pd.to_numeric(direct["price_to_beat"], errors="coerce")
         direct["final_price"] = pd.to_numeric(direct["final_price"], errors="coerce")
+        if "source" not in direct.columns:
+            direct["source"] = ""
+        else:
+            direct["source"] = direct["source"].fillna("").astype(str)
+        if "source_price_to_beat" not in direct.columns:
+            direct["source_price_to_beat"] = ""
+        else:
+            direct["source_price_to_beat"] = direct["source_price_to_beat"].fillna("").astype(str)
+        if "source_final_price" not in direct.columns:
+            direct["source_final_price"] = ""
+        else:
+            direct["source_final_price"] = direct["source_final_price"].fillna("").astype(str)
         if "source_priority" not in direct.columns:
             direct["source_priority"] = 0
         if "fetched_at" not in direct.columns:
             direct["fetched_at"] = ""
-        if "source" not in direct.columns:
-            direct["source"] = ""
         direct = direct.dropna(subset=["cycle_start_ts", "cycle_end_ts"], how="any").copy()
         direct = direct.sort_values(["cycle_start_ts", "source_priority", "fetched_at"]).drop_duplicates(
             subset=["asset", "cycle_start_ts"], keep="last"
         )
         direct["has_direct_price_to_beat"] = direct["price_to_beat"].notna()
         direct["has_direct_final_price"] = direct["final_price"].notna()
+        direct.loc[direct["has_direct_price_to_beat"] & direct["source_price_to_beat"].eq(""), "source_price_to_beat"] = direct["source"]
+        direct.loc[direct["has_direct_final_price"] & direct["source_final_price"].eq(""), "source_final_price"] = direct["source"]
         direct = direct[
             [
                 "asset",
@@ -79,14 +91,16 @@ def build_oracle_prices_table(cfg: DataConfig) -> dict[str, object]:
                 "has_price_to_beat",
                 "has_final_price",
                 "has_both",
-                "source",
+                "source_price_to_beat",
+                "source_final_price",
                 "has_direct_price_to_beat",
                 "has_direct_final_price",
             ]
         ].copy()
         direct = direct.rename(
             columns={
-                "source": "direct_source",
+                "source_price_to_beat": "direct_source_price_to_beat",
+                "source_final_price": "direct_source_final_price",
             }
         )
         out = out.merge(direct, on=["asset", "cycle_start_ts", "cycle_end_ts"], how="left")
@@ -96,7 +110,8 @@ def build_oracle_prices_table(cfg: DataConfig) -> dict[str, object]:
         out["has_price_to_beat"] = False
         out["has_final_price"] = False
         out["has_both"] = False
-        out["direct_source"] = ""
+        out["direct_source_price_to_beat"] = ""
+        out["direct_source_final_price"] = ""
         out["has_direct_price_to_beat"] = False
         out["has_direct_final_price"] = False
 
@@ -131,17 +146,17 @@ def build_oracle_prices_table(cfg: DataConfig) -> dict[str, object]:
         out["final_price"] = pd.to_numeric(out["final_price"], errors="coerce").combine_first(
             pd.to_numeric(out.get("final_price_streams"), errors="coerce")
         )
-        out["source_price_to_beat"] = out["direct_source"].where(
+        out["source_price_to_beat"] = out["direct_source_price_to_beat"].where(
             out["has_direct_price_to_beat"],
             out.get("source_price_to_beat_streams", ""),
         )
-        out["source_final_price"] = out["direct_source"].where(
+        out["source_final_price"] = out["direct_source_final_price"].where(
             out["has_direct_final_price"],
             out.get("source_final_price_streams", ""),
         )
     else:
-        out["source_price_to_beat"] = out.get("direct_source", "")
-        out["source_final_price"] = out.get("direct_source", "")
+        out["source_price_to_beat"] = out.get("direct_source_price_to_beat", "")
+        out["source_final_price"] = out.get("direct_source_final_price", "")
 
     out["has_price_to_beat"] = pd.to_numeric(out["price_to_beat"], errors="coerce").notna()
     out["has_final_price"] = pd.to_numeric(out["final_price"], errors="coerce").notna()

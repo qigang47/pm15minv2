@@ -112,9 +112,20 @@ class ResearchLayout:
         ):
             path.mkdir(parents=True, exist_ok=True)
 
-    def for_market(self, market: str | AssetSpec, cycle: str | int = "15m") -> "MarketResearchLayout":
+    def for_market(
+        self,
+        market: str | AssetSpec,
+        cycle: str | int = "5m",
+        *,
+        target: str = "direction",
+    ) -> "MarketResearchLayout":
         asset = market if isinstance(market, AssetSpec) else resolve_asset(str(market))
-        return MarketResearchLayout(storage=self, asset=asset, cycle=normalize_cycle(cycle))
+        return MarketResearchLayout(
+            storage=self,
+            asset=asset,
+            cycle=normalize_cycle(cycle),
+            default_target=normalize_target(target),
+        )
 
     def suite_spec_path(self, suite_name: str) -> Path:
         return self.suite_specs_root / f"{slug_token(suite_name)}.json"
@@ -166,6 +177,7 @@ class MarketResearchLayout:
     storage: ResearchLayout
     asset: AssetSpec
     cycle: str
+    default_target: str = "direction"
 
     @property
     def cycle_root(self) -> str:
@@ -241,12 +253,20 @@ class MarketResearchLayout:
     def training_set_manifest_path(self, *, feature_set: str, label_set: str, target: str, window: str, offset: int) -> Path:
         return self.training_set_dir(feature_set=feature_set, label_set=label_set, target=target, window=window, offset=offset) / "manifest.json"
 
-    def training_run_dir(self, *, model_family: str, target: str, run_label: str | None = None) -> Path:
+    def training_run_dir(
+        self,
+        *,
+        model_family: str,
+        target: str,
+        run_label: str | None = None,
+        run_label_text: str | None = None,
+    ) -> Path:
+        resolved_label = _resolve_run_label(run_label=run_label, run_label_text=run_label_text)
         return (
             self.training_runs_root
             / f"model_family={slug_token(model_family)}"
             / f"target={normalize_target(target)}"
-            / f"run={slug_token(run_label or utc_run_label())}"
+            / f"run={slug_token(resolved_label or utc_run_label())}"
         )
 
     def model_bundle_dir(self, *, profile: str, target: str, bundle_label: str | None = None) -> Path:
@@ -257,16 +277,32 @@ class MarketResearchLayout:
             / f"bundle={slug_token(bundle_label or utc_run_label())}"
         )
 
+    def bundle_dir(self, *, profile: str, target: str, bundle_label_text: str) -> Path:
+        return self.model_bundle_dir(
+            profile=profile,
+            target=target,
+            bundle_label=bundle_label_text,
+        )
+
     def active_bundle_selection_path(self, *, profile: str, target: str) -> Path:
         return self.active_bundles_root / f"profile={slug_token(profile)}" / f"target={normalize_target(target)}" / "selection.json"
 
-    def backtest_run_dir(self, *, profile: str, target: str, spec_name: str, run_label: str | None = None) -> Path:
+    def backtest_run_dir(
+        self,
+        *,
+        profile: str,
+        target: str | None = None,
+        spec_name: str,
+        run_label: str | None = None,
+        run_label_text: str | None = None,
+    ) -> Path:
+        resolved_label = _resolve_run_label(run_label=run_label, run_label_text=run_label_text)
         return (
             self.backtests_root
             / f"profile={slug_token(profile)}"
-            / f"target={normalize_target(target)}"
+            / f"target={normalize_target(target or self.default_target)}"
             / f"spec={slug_token(spec_name)}"
-            / f"run={slug_token(run_label or utc_run_label())}"
+            / f"run={slug_token(resolved_label or utc_run_label())}"
         )
 
     def to_dict(self) -> dict[str, str]:
@@ -284,3 +320,13 @@ class MarketResearchLayout:
             "market_active_bundles_root": str(self.active_bundles_root),
             "market_backtests_root": str(self.backtests_root),
         }
+
+
+def _resolve_run_label(*, run_label: str | None, run_label_text: str | None) -> str | None:
+    for value in (run_label, run_label_text):
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
