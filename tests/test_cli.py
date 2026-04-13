@@ -169,6 +169,30 @@ def _prepare_sol_research_inputs(root: Path) -> ResearchConfig:
     )
 
 
+def _write_live_market_catalog(data_cfg: DataConfig) -> None:
+    cycle_start = pd.Timestamp.now(tz="UTC").floor("15min")
+    cycle_end = cycle_start + pd.Timedelta(minutes=15)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "live-market-1",
+                    "condition_id": "live-cond-1",
+                    "asset": data_cfg.asset.slug,
+                    "cycle": data_cfg.cycle,
+                    "cycle_start_ts": int(cycle_start.timestamp()),
+                    "cycle_end_ts": int(cycle_end.timestamp()),
+                    "token_up": "live-token-up",
+                    "token_down": "live-token-down",
+                    "question": f"{data_cfg.asset.slug.upper()} current cycle?",
+                    "source_snapshot_ts": cycle_start.isoformat(),
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+
+
 def _prepare_sol_research_inputs_5m(root: Path):
     from pm5min.research.config import ResearchConfig as Pm5minResearchConfig
 
@@ -864,6 +888,7 @@ def test_live_check_and_decide_latest(capsys, tmp_path: Path, monkeypatch) -> No
         _sample_oracle_prices("sol", cycle_start_ts=1_772_323_200, n_cycles=32, price_base=120.0),
         live_cfg.layout.oracle_prices_table_path,
     )
+    _write_live_market_catalog(live_cfg)
 
     research_cfg = _prepare_sol_research_inputs(root)
     build_feature_frame_dataset(research_cfg)
@@ -948,6 +973,7 @@ def test_live_quote_latest_reports_missing_inputs(capsys, tmp_path: Path, monkey
         _sample_oracle_prices("sol", cycle_start_ts=1_772_323_200, n_cycles=32, price_base=120.0),
         live_cfg.layout.oracle_prices_table_path,
     )
+    _write_live_market_catalog(live_cfg)
 
     research_cfg = _prepare_sol_research_inputs(root)
     build_feature_frame_dataset(research_cfg)

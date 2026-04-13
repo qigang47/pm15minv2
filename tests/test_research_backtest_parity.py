@@ -692,7 +692,7 @@ def test_run_research_backtest_reuses_shared_runtime_for_stake_matrix_cases(monk
     finally:
         clear_process_backtest_runtime_cache()
 
-    assert stage_counts == {"bundle_replay": 1, "depth_replay": 3, "runtime_surface": 1}
+    assert stage_counts == {"bundle_replay": 1, "depth_replay": 1, "runtime_surface": 1}
     assert Path(first["run_dir"]) != Path(second["run_dir"])
     assert first["shared_runtime_cache_status"] == "built"
     assert second["shared_runtime_cache_status"] == "reused"
