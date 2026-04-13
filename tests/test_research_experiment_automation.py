@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
 
 from pm15min.research.automation import (
@@ -11,6 +12,7 @@ from pm15min.research.automation import (
     build_codex_exec_extra_args,
     build_codex_cycle_prompt,
     build_autorun_status_report,
+    find_recent_completed_experiment_runs,
     find_incomplete_experiment_runs,
     is_transient_codex_provider_failure,
     next_autorun_failure_state,
@@ -284,12 +286,18 @@ def test_build_codex_cycle_prompt_references_program_and_session(tmp_path: Path)
     assert str(root) in prompt
     assert str(session_dir) in prompt
     assert str(program_path) in prompt
-    assert "read program_custom.md and the latest session artifacts before making changes." in prompt.lower()
+    assert "read program_custom.md and the latest session artifacts before making changes; start with results.tsv plus the newest cycle eval" in prompt.lower()
     assert "one completed cycle only" in prompt.lower()
     assert "two simultaneous formal market runs" in prompt
     assert "do not scan the entire repository" in prompt.lower()
-    assert "prefer resuming or launching one formal experiment" in prompt.lower()
+    assert "prefer formal experiment launches over unrelated environment or infrastructure edits" in prompt.lower()
     assert "if `rg` is unavailable" in prompt.lower()
+    assert "trust the current run directories" in prompt.lower()
+    assert "summary.json is finished" in prompt.lower()
+    assert "idle coin slots" in prompt.lower()
+    assert "newest cycle eval" in prompt.lower()
+    assert "fill every allowed idle slot" in prompt.lower()
+    assert "still counts as one bounded cycle" in prompt.lower()
 
 
 def test_build_codex_cycle_prompt_includes_existing_autorun_snapshot(tmp_path: Path) -> None:
@@ -322,6 +330,220 @@ def test_build_codex_cycle_prompt_includes_existing_autorun_snapshot(tmp_path: P
     assert "current autorun snapshot already collected for you:" in prompt.lower()
     assert "autorun state: idle" in prompt.lower()
     assert "test_suite / test_run / state=stuck_seed_case" in prompt
+
+
+def test_build_codex_cycle_prompt_includes_recent_completed_runs(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    complete_run = root / "research" / "experiments" / "runs" / "suite=demo" / "run=complete"
+    (complete_run / "logs").mkdir(parents=True, exist_ok=True)
+    (complete_run / "summary.json").write_text(
+        '{"suite_name":"demo","run_label":"complete","completed_cases":9,"failed_cases":0}',
+        encoding="utf-8",
+    )
+    (complete_run / "logs" / "suite.jsonl").write_text(
+        json.dumps({"event": "market_completed", "case_label": "done"}) + "\n",
+        encoding="utf-8",
+    )
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
+
+    assert "recent completed runs:" in prompt.lower()
+    assert "demo / complete / completed=9 / failed=0" in prompt
+
+
+def test_build_codex_cycle_prompt_prefers_latest_cycle_eval_before_full_session(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    cycles_dir = session_dir / "cycles" / "016"
+    cycles_dir.mkdir(parents=True, exist_ok=True)
+    (cycles_dir / "eval-results.md").write_text("# Cycle 016\n", encoding="utf-8")
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
+
+    assert str(cycles_dir / "eval-results.md") in prompt
+    start_section = prompt.split("Start with only these files unless they prove insufficient:", 1)[1]
+    start_section = start_section.split("Use repository commands sparingly.", 1)[0]
+    assert str(session_dir / "session.md") not in start_section
+
+
+def test_build_codex_cycle_prompt_includes_coin_slot_snapshot_and_feature_brief(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (root / "program.md").write_text(
+        "\n".join(
+            [
+                "# Demo Program",
+                "",
+                "- coins: `btc / eth`",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cycles_dir = session_dir / "cycles" / "016"
+    cycles_dir.mkdir(parents=True, exist_ok=True)
+    (cycles_dir / "eval-results.md").write_text(
+        "# Cycle 016\n\n- frontier: `focus_btc_40_v4`\n",
+        encoding="utf-8",
+    )
+
+    experiments_root = root / "research" / "experiments"
+    experiments_root.mkdir(parents=True, exist_ok=True)
+    (experiments_root / "custom_feature_sets.json").write_text(
+        json.dumps(
+            {
+                "focus_btc_40_v4": {
+                    "market": "btc",
+                    "width": 40,
+                    "columns": ["ret_1m", "ret_3m", "ret_5m"],
+                    "notes": "btc frontier",
+                },
+                "focus_eth_40_v4": {
+                    "market": "eth",
+                    "width": 40,
+                    "columns": ["ret_1m", "ret_3m", "obv_z"],
+                    "notes": "eth frontier",
+                },
+                "focus_eth_40_v5": {
+                    "market": "eth",
+                    "width": 40,
+                    "columns": ["ret_1m", "ret_3m", "atr_14"],
+                    "notes": "eth challenger",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    suite_specs_dir = experiments_root / "suite_specs"
+    suite_specs_dir.mkdir(parents=True, exist_ok=True)
+    (suite_specs_dir / "btc_suite.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "btc_suite",
+                "parallel_case_workers": 1,
+                "markets": {
+                    "btc": {
+                        "groups": {
+                            "focus_search": {
+                                "runs": [
+                                    {
+                                        "run_name": "focus_search",
+                                        "target": "reversal",
+                                        "feature_set_variants": [
+                                            {"label": "frontier", "feature_set": "focus_btc_40_v4"}
+                                        ],
+                                        "weight_variants": [
+                                            {"label": "current_default"},
+                                            {"label": "offset_reversal_mild"},
+                                        ],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (suite_specs_dir / "eth_suite.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "eth_suite",
+                "parallel_case_workers": 1,
+                "markets": {
+                    "eth": {
+                        "groups": {
+                            "focus_search": {
+                                "runs": [
+                                    {
+                                        "run_name": "focus_search",
+                                        "target": "reversal",
+                                        "feature_set_variants": [
+                                            {"label": "frontier", "feature_set": "focus_eth_40_v4"},
+                                            {"label": "challenger", "feature_set": "focus_eth_40_v5"},
+                                        ],
+                                        "weight_variants": [
+                                            {"label": "current_default"},
+                                            {"label": "offset_reversal_mild"},
+                                        ],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    btc_run = experiments_root / "runs" / "suite=btc_suite" / "run=btc_complete"
+    (btc_run / "logs").mkdir(parents=True, exist_ok=True)
+    (btc_run / "summary.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "btc_suite",
+                "run_label": "btc_complete",
+                "cases": 2,
+                "completed_cases": 2,
+                "failed_cases": 0,
+                "leaderboard_rows": 1,
+                "top_roi_pct": 12.5,
+                "markets": ["btc"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (btc_run / "leaderboard.csv").write_text(
+        "\n".join(
+            [
+                "market,group_name,run_name,target,variant_label,roi_pct,pnl_sum,trades",
+                "btc,focus_search,focus_search,reversal,offset_reversal_mild,12.5,4.0,3",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (btc_run / "logs" / "suite.jsonl").write_text(
+        json.dumps({"event": "market_completed", "case_label": "btc/focus_search"}) + "\n",
+        encoding="utf-8",
+    )
+
+    eth_run = experiments_root / "runs" / "suite=eth_suite" / "run=eth_active"
+    (eth_run / "logs").mkdir(parents=True, exist_ok=True)
+    (eth_run / "logs" / "suite.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"event": "execution_group_started", "group_label": "eth/focus_search"}),
+                json.dumps({"event": "market_cache_resolved", "run_name": "focus_search"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
+
+    assert "coin slot snapshot already collected for you:" in prompt.lower()
+    assert "btc: state=idle" in prompt.lower()
+    assert "latest_completed=btc_suite" in prompt
+    assert "feature_sets=focus_btc_40_v4" in prompt
+    assert "weights=current_default,offset_reversal_mild" in prompt
+    assert "eth: state=active" in prompt.lower()
+    assert "feature_sets=focus_eth_40_v4,focus_eth_40_v5" in prompt
+    assert "relevant feature-family brief already extracted for you:" in prompt.lower()
+    assert "focus_btc_40_v4: market=btc / width=40 / notes=btc frontier" in prompt
+    assert "columns: ret_1m, ret_3m, ret_5m" in prompt
+    assert "diagnosis_groups:" in prompt
+    assert "protect_core=q_bs_up_strike,ret_from_strike,basis_bp,ret_from_cycle_open,first_half_ret,cycle_range_pos,rv_30,macd_z,volume_z,obv_z,vwap_gap_60,bias_60,regime_high_vol" in prompt
+    assert "drop_from_first=short_mid_returns,price_position,momentum_oscillator" in prompt
+    assert "add_toward=timing,persistence,strike_distance,flip_feasibility,market_quality,junk_cheap_filter" in prompt
+    assert "do not open large raw registry files like `research/experiments/custom_feature_sets.json`" in prompt.lower()
 
 
 def test_build_codex_exec_extra_args_adds_skip_git_repo_check_once() -> None:
@@ -605,6 +827,14 @@ def test_find_incomplete_experiment_runs_marks_seed_case_stall(tmp_path: Path) -
         json.dumps({"event": "market_completed", "case_label": "done"}) + "\n",
         encoding="utf-8",
     )
+    stalled_log_path = stalled_logs / "suite.jsonl"
+    summary_path = complete_run / "summary.json"
+    stalled_stat = stalled_log_path.stat()
+    summary_stat = summary_path.stat()
+    newer_time = max(stalled_stat.st_mtime, summary_stat.st_mtime) + 5
+    older_time = min(stalled_stat.st_mtime, summary_stat.st_mtime) - 5
+    os.utime(summary_path, (older_time, older_time))
+    os.utime(stalled_log_path, (newer_time, newer_time))
 
     payload = find_incomplete_experiment_runs(root)
 
@@ -613,6 +843,79 @@ def test_find_incomplete_experiment_runs_marks_seed_case_stall(tmp_path: Path) -
     assert payload[0]["state"] == "stuck_seed_case"
     assert payload[0]["last_event"] == "execution_group_seed_case_started"
     assert payload[0]["completed_cases"] == 0
+
+
+def test_find_incomplete_experiment_runs_ignores_stale_run_when_newer_completed_run_exists(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    stale_run = root / "research" / "experiments" / "runs" / "suite=demo" / "run=stale"
+    stale_logs = stale_run / "logs"
+    stale_logs.mkdir(parents=True, exist_ok=True)
+    stale_log_path = stale_logs / "suite.jsonl"
+    stale_log_path.write_text(
+        json.dumps({"event": "market_cache_resolved", "case_label": "stale"}) + "\n",
+        encoding="utf-8",
+    )
+
+    complete_run = root / "research" / "experiments" / "runs" / "suite=demo" / "run=complete"
+    complete_logs = complete_run / "logs"
+    complete_logs.mkdir(parents=True, exist_ok=True)
+    (complete_logs / "suite.jsonl").write_text(
+        json.dumps({"event": "market_completed", "case_label": "done"}) + "\n",
+        encoding="utf-8",
+    )
+    summary_path = complete_run / "summary.json"
+    summary_path.write_text('{"suite_name":"demo"}', encoding="utf-8")
+
+    stale_stat = stale_log_path.stat()
+    summary_stat = summary_path.stat()
+    older_time = min(stale_stat.st_mtime, summary_stat.st_mtime) - 5
+    newer_time = max(stale_stat.st_mtime, summary_stat.st_mtime) + 5
+    os.utime(stale_log_path, (older_time, older_time))
+    os.utime(summary_path, (newer_time, newer_time))
+
+    payload = find_incomplete_experiment_runs(root)
+
+    assert payload == []
+
+
+def test_find_recent_completed_experiment_runs_returns_latest_completed_runs(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    first_run = root / "research" / "experiments" / "runs" / "suite=demo" / "run=first"
+    (first_run / "logs").mkdir(parents=True, exist_ok=True)
+    (first_run / "summary.json").write_text(
+        '{"suite_name":"demo","run_label":"first","completed_cases":1,"failed_cases":0}',
+        encoding="utf-8",
+    )
+    (first_run / "logs" / "suite.jsonl").write_text(
+        json.dumps({"event": "market_completed", "case_label": "done"}) + "\n",
+        encoding="utf-8",
+    )
+
+    second_run = root / "research" / "experiments" / "runs" / "suite=demo" / "run=second"
+    (second_run / "logs").mkdir(parents=True, exist_ok=True)
+    (second_run / "summary.json").write_text(
+        '{"suite_name":"demo","run_label":"second","completed_cases":9,"failed_cases":0}',
+        encoding="utf-8",
+    )
+    (second_run / "logs" / "suite.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"event": "market_completed", "case_label": "done-1"}),
+                json.dumps({"event": "market_completed", "case_label": "done-2"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    payload = find_recent_completed_experiment_runs(root)
+
+    assert len(payload) == 2
+    assert payload[0]["run_dir"] == str(second_run)
+    assert payload[0]["state"] == "completed"
+    assert payload[0]["completed_cases"] == 9
+    assert payload[0]["failed_cases"] == 0
+    assert payload[1]["run_dir"] == str(first_run)
 
 
 def test_build_autorun_status_report_includes_incomplete_runs(tmp_path: Path) -> None:
@@ -650,6 +953,7 @@ def test_build_autorun_status_report_includes_incomplete_runs(tmp_path: Path) ->
     assert payload["log_tail"] == ["line2", "line3"]
     assert len(payload["incomplete_runs"]) == 1
     assert payload["incomplete_runs"][0]["state"] == "stuck_seed_case"
+    assert payload["completed_runs"] == []
 
 
 def test_build_autorun_status_report_marks_missing_running_pid_as_stale(tmp_path: Path) -> None:

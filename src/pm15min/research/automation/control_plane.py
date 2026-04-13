@@ -25,6 +25,8 @@ _ACTIVE_SESSION_LINE_RE = re.compile(
     r"(?im)^\s*-\s*(?:active session|new active session)\s*:\s*`?([^`\n]+/(?:session\.md|results\.tsv))`?\s*$"
 )
 _SESSION_REF_RE = re.compile(r"(sessions/[^\s`]+/(?:session\.md|results\.tsv))")
+_PROGRAM_MARKETS_RE = re.compile(r"(?im)^\s*-\s*coins\s*:\s*(.+)$")
+_FOCUS_FEATURE_REF_RE = re.compile(r"\b(focus_[a-z0-9]+_[0-9]+_[a-z0-9_]+)\b")
 _TRANSIENT_PROVIDER_FAILURE_MARKERS = (
     "503 service unavailable",
     "429 too many requests",
@@ -37,6 +39,130 @@ _TRANSIENT_PROVIDER_FAILURE_MARKERS = (
     "failed to connect to websocket",
     "http error: 500 internal server error",
 )
+
+# Diagnosis-guided family policy distilled from
+# docs/DEEP_OTM_BASELINE_UP_DIAGNOSIS.md for bounded factor replacement.
+_DIAGNOSIS_PROTECT_CORE = (
+    "q_bs_up_strike",
+    "ret_from_strike",
+    "basis_bp",
+    "ret_from_cycle_open",
+    "first_half_ret",
+    "cycle_range_pos",
+    "rv_30",
+    "macd_z",
+    "volume_z",
+    "obv_z",
+    "vwap_gap_60",
+    "bias_60",
+    "regime_high_vol",
+)
+_DIAGNOSIS_REDUNDANT_FAMILIES = (
+    (
+        "short_mid_returns",
+        (
+            "ret_1m",
+            "ret_3m",
+            "ret_5m",
+            "ret_15m",
+            "ret_30m",
+            "ret_60m",
+            "z_ret_30m",
+            "z_ret_60m",
+            "ret_1m_lag1",
+            "ret_1m_lag2",
+            "ret_5m_lag1",
+            "ret_15m_lag1",
+        ),
+    ),
+    (
+        "price_position",
+        (
+            "ma_gap_5",
+            "ma_gap_15",
+            "ema_gap_12",
+            "ma_15_slope",
+            "bb_pos_20",
+            "median_gap_20",
+            "price_pos_iqr_20",
+            "donch_pos_20",
+            "vwap_gap_20",
+            "vwap_gap_60",
+            "bias_60",
+        ),
+    ),
+    (
+        "volatility",
+        (
+            "rv_30",
+            "rv_30_lag1",
+            "atr_14",
+            "gk_vol_30",
+            "rs_vol_30",
+            "rr_30",
+        ),
+    ),
+    (
+        "momentum_oscillator",
+        (
+            "macd_hist",
+            "rsi_14",
+            "rsi_14_lag1",
+            "delta_rsi",
+            "delta_rsi_5",
+            "macd_z",
+            "macd_extreme",
+            "rsi_divergence",
+            "momentum_agree",
+        ),
+    ),
+    (
+        "flow",
+        (
+            "taker_buy_ratio",
+            "taker_buy_ratio_z",
+            "taker_buy_ratio_lag1",
+            "trade_intensity",
+            "volume_z",
+            "volume_z_3",
+            "obv_z",
+            "vol_price_corr_15",
+            "vol_ratio_5_60",
+        ),
+    ),
+    (
+        "calendar",
+        (
+            "hour_sin",
+            "hour_cos",
+            "dow_sin",
+            "dow_cos",
+        ),
+    ),
+)
+_DIAGNOSIS_DEFAULT_DROP_ORDER = (
+    "short_mid_returns",
+    "price_position",
+    "momentum_oscillator",
+)
+_DIAGNOSIS_ADD_THEMES = (
+    "timing",
+    "persistence",
+    "strike_distance",
+    "flip_feasibility",
+    "market_quality",
+    "junk_cheap_filter",
+)
+_DIAGNOSIS_PROTECT_CORE_SET = set(_DIAGNOSIS_PROTECT_CORE)
+_DIAGNOSIS_REDUNDANT_FAMILY_MEMBERS = {
+    label: tuple(columns)
+    for label, columns in _DIAGNOSIS_REDUNDANT_FAMILIES
+}
+_DIAGNOSIS_REDUNDANT_MEMBER_SET = {
+    column
+    for columns in _DIAGNOSIS_REDUNDANT_FAMILY_MEMBERS.values()
+    for column in columns
+}
 
 
 def summarize_experiment_run(run_dir: Path) -> dict[str, object]:
@@ -270,16 +396,64 @@ def find_incomplete_experiment_runs(project_root: Path, *, limit: int = 10) -> l
     runs_root = root / "research" / "experiments" / "runs"
     if not runs_root.exists():
         return []
+    latest_completed_by_suite: dict[str, float] = {}
+    for path in runs_root.glob("suite=*/run=*"):
+        if not path.is_dir():
+            continue
+        summary_path = path / "summary.json"
+        if not summary_path.exists():
+            continue
+        suite_name = _suite_name_from_run_dir(path)
+        if suite_name is None:
+            continue
+        latest_completed_by_suite[suite_name] = max(
+            latest_completed_by_suite.get(suite_name, 0.0),
+            summary_path.stat().st_mtime,
+        )
     run_dirs = sorted(
         (
             path
             for path in runs_root.glob("suite=*/run=*")
-            if path.is_dir() and (path / "logs" / "suite.jsonl").exists() and not (path / "summary.json").exists()
+            if path.is_dir()
+            and (path / "logs" / "suite.jsonl").exists()
+            and not (path / "summary.json").exists()
+            and (
+                _suite_name_from_run_dir(path) is None
+                or (path / "logs" / "suite.jsonl").stat().st_mtime
+                >= latest_completed_by_suite.get(_suite_name_from_run_dir(path) or "", 0.0)
+            )
         ),
         key=lambda item: (item / "logs" / "suite.jsonl").stat().st_mtime,
         reverse=True,
     )
     return [inspect_experiment_run(path) for path in run_dirs[: max(1, int(limit))]]
+
+
+def find_recent_completed_experiment_runs(project_root: Path, *, limit: int = 10) -> list[dict[str, object]]:
+    root = Path(project_root).resolve()
+    runs_root = root / "research" / "experiments" / "runs"
+    if not runs_root.exists():
+        return []
+    run_dirs = sorted(
+        (
+            path
+            for path in runs_root.glob("suite=*/run=*")
+            if path.is_dir() and (path / "summary.json").exists()
+        ),
+        key=lambda item: (item / "summary.json").stat().st_mtime,
+        reverse=True,
+    )
+    payloads: list[dict[str, object]] = []
+    for path in run_dirs[: max(1, int(limit))]:
+        summary = summarize_experiment_run(path)
+        payloads.append(
+            {
+                **summary,
+                "run_dir": str(path),
+                "state": "completed",
+            }
+        )
+    return payloads
 
 
 def build_autorun_status_report(
@@ -305,6 +479,7 @@ def build_autorun_status_report(
         "status": status_payload,
         "log_tail": _tail_lines(log_path, limit=max(0, int(log_tail_lines))),
         "incomplete_runs": find_incomplete_experiment_runs(root, limit=max_incomplete_runs),
+        "completed_runs": find_recent_completed_experiment_runs(root, limit=max_incomplete_runs),
     }
 
 
@@ -332,6 +507,356 @@ def resolve_autorun_session_dir(
     return (root / "sessions" / "autoresearch").resolve()
 
 
+def resolve_latest_cycle_eval_file(session_dir: Path) -> Path | None:
+    session = Path(session_dir).resolve()
+    cycles_dir = session / "cycles"
+    if not cycles_dir.exists():
+        return None
+    candidates = [path for path in cycles_dir.glob("*/eval-results.md") if path.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item.stat().st_mtime)
+
+
+def resolve_program_markets(program_path: Path) -> list[str]:
+    program = Path(program_path).resolve()
+    if not program.exists():
+        return []
+    match = _PROGRAM_MARKETS_RE.search(program.read_text(encoding="utf-8"))
+    if not match:
+        return []
+    seen: set[str] = set()
+    markets: list[str] = []
+    for token in re.findall(r"\b(?:btc|eth|sol|xrp)\b", match.group(1).lower()):
+        if token in seen:
+            continue
+        seen.add(token)
+        markets.append(token)
+    return markets
+
+
+def _infer_markets_from_run_payload(payload: dict[str, object]) -> list[str]:
+    seen: set[str] = set()
+    markets: list[str] = []
+    for raw in payload.get("markets") or []:
+        token = str(raw).strip().lower()
+        if token and token not in seen:
+            seen.add(token)
+            markets.append(token)
+    if markets:
+        return markets
+    for field_name in ("suite_name", "run_label", "run_dir"):
+        raw_value = payload.get(field_name)
+        if not raw_value:
+            continue
+        for token in re.findall(r"\b(?:btc|eth|sol|xrp)\b", str(raw_value).lower()):
+            if token in seen:
+                continue
+            seen.add(token)
+            markets.append(token)
+    return markets
+
+
+def _suite_spec_path(project_root: Path, suite_name: str | None) -> Path | None:
+    if not suite_name:
+        return None
+    path = Path(project_root).resolve() / "research" / "experiments" / "suite_specs" / f"{suite_name}.json"
+    return path if path.exists() else None
+
+
+def _read_suite_spec_by_name(project_root: Path, suite_name: str | None) -> dict[str, object] | None:
+    path = _suite_spec_path(project_root, suite_name)
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _summarize_suite_variants(project_root: Path, suite_name: str | None) -> dict[str, object] | None:
+    suite_spec = _read_suite_spec_by_name(project_root, suite_name)
+    if not suite_spec:
+        return None
+    feature_sets: list[str] = []
+    weight_labels: list[str] = []
+    targets: list[str] = []
+    seen_feature_sets: set[str] = set()
+    seen_weight_labels: set[str] = set()
+    seen_targets: set[str] = set()
+    markets_payload = suite_spec.get("markets")
+    if not isinstance(markets_payload, dict):
+        return None
+    for market_payload in markets_payload.values():
+        if not isinstance(market_payload, dict):
+            continue
+        groups = market_payload.get("groups")
+        if not isinstance(groups, dict):
+            continue
+        for group_payload in groups.values():
+            if not isinstance(group_payload, dict):
+                continue
+            runs = group_payload.get("runs")
+            if not isinstance(runs, list):
+                continue
+            for run_payload in runs:
+                if not isinstance(run_payload, dict):
+                    continue
+                target = str(run_payload.get("target") or "").strip()
+                if target and target not in seen_targets:
+                    seen_targets.add(target)
+                    targets.append(target)
+                feature_variants = run_payload.get("feature_set_variants")
+                if isinstance(feature_variants, list):
+                    for variant in feature_variants:
+                        if not isinstance(variant, dict):
+                            continue
+                        feature_set = str(variant.get("feature_set") or "").strip()
+                        if feature_set and feature_set not in seen_feature_sets:
+                            seen_feature_sets.add(feature_set)
+                            feature_sets.append(feature_set)
+                weight_variants = run_payload.get("weight_variants")
+                if isinstance(weight_variants, list):
+                    for variant in weight_variants:
+                        if not isinstance(variant, dict):
+                            continue
+                        label = str(variant.get("label") or "").strip()
+                        if label and label not in seen_weight_labels:
+                            seen_weight_labels.add(label)
+                            weight_labels.append(label)
+    return {
+        "path": str(_suite_spec_path(project_root, suite_name)) if suite_name else None,
+        "markets": [str(key) for key in markets_payload.keys()],
+        "feature_sets": feature_sets,
+        "weight_labels": weight_labels,
+        "targets": targets,
+        "parallel_case_workers": _optional_int(suite_spec.get("parallel_case_workers")),
+    }
+
+
+def _format_coin_slot_snapshot(
+    *,
+    project_root: Path,
+    markets: list[str],
+    incomplete_runs: list[dict[str, object]],
+    completed_runs: list[dict[str, object]],
+) -> list[str]:
+    incomplete_by_market: dict[str, list[dict[str, object]]] = {market: [] for market in markets}
+    completed_by_market: dict[str, list[dict[str, object]]] = {market: [] for market in markets}
+    for payload in incomplete_runs:
+        suite_summary = _summarize_suite_variants(project_root, str(payload.get("suite_name") or ""))
+        payload_markets = list(suite_summary.get("markets") or []) if suite_summary else _infer_markets_from_run_payload(payload)
+        for market in payload_markets:
+            incomplete_by_market.setdefault(market, []).append(payload)
+    for payload in completed_runs:
+        suite_summary = _summarize_suite_variants(project_root, str(payload.get("suite_name") or ""))
+        payload_markets = list(suite_summary.get("markets") or []) if suite_summary else _infer_markets_from_run_payload(payload)
+        for market in payload_markets:
+            completed_by_market.setdefault(market, []).append(payload)
+
+    lines: list[str] = []
+    for market in markets:
+        active_payload = next(iter(incomplete_by_market.get(market) or []), None)
+        latest_completed = next(iter(completed_by_market.get(market) or []), None)
+        if active_payload is not None:
+            suite_name = str(active_payload.get("suite_name") or "")
+            suite_summary = _summarize_suite_variants(project_root, suite_name)
+            detail_parts = [
+                "state=active",
+                f"suite={suite_name or '?'}",
+                f"run={active_payload.get('run_label') or '?'}",
+                f"progress={active_payload.get('completed_cases') or 0}/{active_payload.get('cases') or '?'}",
+                f"last_event={active_payload.get('raw_summary', {}).get('last_event') or active_payload.get('last_event') or 'unknown'}",
+            ]
+            if suite_summary:
+                if suite_summary.get("targets"):
+                    detail_parts.append(f"targets={','.join(str(item) for item in suite_summary['targets'])}")
+                if suite_summary.get("feature_sets"):
+                    detail_parts.append(
+                        "feature_sets=" + ",".join(str(item) for item in suite_summary["feature_sets"][:4])
+                    )
+                if suite_summary.get("weight_labels"):
+                    detail_parts.append(
+                        "weights=" + ",".join(str(item) for item in suite_summary["weight_labels"][:4])
+                    )
+            lines.append(f"- {market}: " + " / ".join(detail_parts))
+            continue
+
+        if latest_completed is not None:
+            suite_name = str(latest_completed.get("suite_name") or "")
+            suite_summary = _summarize_suite_variants(project_root, suite_name)
+            top_case = latest_completed.get("top_case") or {}
+            detail_parts = [
+                "state=idle",
+                f"latest_completed={suite_name or '?'}",
+                f"run={latest_completed.get('run_label') or '?'}",
+            ]
+            if isinstance(top_case, dict):
+                variant_label = str(top_case.get("variant_label") or "").strip()
+                if variant_label:
+                    detail_parts.append(f"lead_variant={variant_label}")
+                if top_case.get("roi_pct") is not None:
+                    detail_parts.append(f"roi={top_case['roi_pct']}")
+                if top_case.get("trades") is not None:
+                    detail_parts.append(f"trades={top_case['trades']}")
+            if suite_summary:
+                if suite_summary.get("feature_sets"):
+                    detail_parts.append(
+                        "feature_sets=" + ",".join(str(item) for item in suite_summary["feature_sets"][:4])
+                    )
+                if suite_summary.get("weight_labels"):
+                    detail_parts.append(
+                        "weights=" + ",".join(str(item) for item in suite_summary["weight_labels"][:4])
+                    )
+            lines.append(f"- {market}: " + " / ".join(detail_parts))
+            continue
+
+        lines.append(f"- {market}: state=idle / no recent formal run summary found")
+    return lines
+
+
+def _extract_referenced_feature_sets(text: str) -> list[str]:
+    seen: set[str] = set()
+    names: list[str] = []
+    for match in _FOCUS_FEATURE_REF_RE.finditer(str(text or "")):
+        token = match.group(1).strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        names.append(token)
+    return names
+
+
+def _load_custom_feature_registry(project_root: Path) -> dict[str, dict[str, object]]:
+    path = Path(project_root).resolve() / "research" / "experiments" / "custom_feature_sets.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, dict[str, object]] = {}
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            out[str(key)] = value
+    return out
+
+
+def _collect_relevant_feature_set_names(
+    *,
+    project_root: Path,
+    latest_cycle_eval: Path | None,
+    incomplete_runs: list[dict[str, object]],
+    completed_runs: list[dict[str, object]],
+) -> list[str]:
+    seen: set[str] = set()
+    names: list[str] = []
+
+    def remember(items: list[str]) -> None:
+        for item in items:
+            token = str(item).strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            names.append(token)
+
+    if latest_cycle_eval is not None and latest_cycle_eval.exists():
+        remember(_extract_referenced_feature_sets(latest_cycle_eval.read_text(encoding="utf-8")))
+
+    for payload in [*incomplete_runs, *completed_runs]:
+        suite_summary = _summarize_suite_variants(project_root, str(payload.get("suite_name") or ""))
+        if not suite_summary:
+            continue
+        remember(list(suite_summary.get("feature_sets") or []))
+        if len(names) >= 8:
+            break
+
+    return names[:8]
+
+
+def _diagnosis_feature_set_summary(columns: list[str]) -> dict[str, object]:
+    ordered_columns = [str(item).strip() for item in columns if str(item).strip()]
+    column_set = set(ordered_columns)
+    core_hits = [name for name in _DIAGNOSIS_PROTECT_CORE if name in column_set]
+    group_counts: list[tuple[str, int]] = []
+    drop_scores: list[tuple[str, int]] = []
+    for label, members in _DIAGNOSIS_REDUNDANT_FAMILIES:
+        hits = [name for name in ordered_columns if name in members]
+        group_counts.append((label, len(hits)))
+        drop_scores.append((label, sum(1 for name in hits if name not in _DIAGNOSIS_PROTECT_CORE_SET)))
+    other_count = sum(1 for name in ordered_columns if name not in _DIAGNOSIS_REDUNDANT_MEMBER_SET)
+    ranked_drop_groups = [
+        label
+        for label, score in sorted(
+            drop_scores,
+            key=lambda item: (
+                -int(item[1]),
+                _DIAGNOSIS_DEFAULT_DROP_ORDER.index(item[0])
+                if item[0] in _DIAGNOSIS_DEFAULT_DROP_ORDER
+                else len(_DIAGNOSIS_DEFAULT_DROP_ORDER),
+                item[0],
+            ),
+        )
+        if int(score) > 0
+    ]
+    return {
+        "core_hits": core_hits,
+        "group_counts": group_counts,
+        "other_count": other_count,
+        "drop_bias": ranked_drop_groups[:3],
+    }
+
+
+def _format_diagnosis_policy_lines() -> list[str]:
+    return [
+        "- diagnosis_policy: protect_core=" + ",".join(_DIAGNOSIS_PROTECT_CORE),
+        "- diagnosis_policy: drop_from_first=" + ",".join(_DIAGNOSIS_DEFAULT_DROP_ORDER),
+        "- diagnosis_policy: add_toward=" + ",".join(_DIAGNOSIS_ADD_THEMES),
+    ]
+
+
+def _format_feature_family_brief(project_root: Path, feature_names: list[str]) -> list[str]:
+    registry = _load_custom_feature_registry(project_root)
+    lines: list[str] = _format_diagnosis_policy_lines()
+    for name in feature_names:
+        payload = registry.get(name)
+        if not payload:
+            continue
+        market = str(payload.get("market") or "").strip()
+        width = _optional_int(payload.get("width"))
+        notes = str(payload.get("notes") or "").strip()
+        columns = [str(item) for item in payload.get("columns") or [] if str(item).strip()]
+        header_parts = [name]
+        meta_parts: list[str] = []
+        if market:
+            meta_parts.append(f"market={market}")
+        if width is not None:
+            meta_parts.append(f"width={width}")
+        if notes:
+            meta_parts.append(f"notes={notes}")
+        if meta_parts:
+            header_parts.append(": " + " / ".join(meta_parts))
+        lines.append("- " + "".join(header_parts))
+        if columns:
+            lines.append("  columns: " + ", ".join(columns))
+            diagnosis_summary = _diagnosis_feature_set_summary(columns)
+            group_parts = [
+                f"{label}={count}"
+                for label, count in diagnosis_summary["group_counts"]
+                if int(count) > 0
+            ]
+            group_parts.append(f"other={diagnosis_summary['other_count']}")
+            lines.append("  diagnosis_groups: " + " / ".join(group_parts))
+            if diagnosis_summary["core_hits"]:
+                lines.append("  diagnosis_core_hits: " + ",".join(diagnosis_summary["core_hits"]))
+            if diagnosis_summary["drop_bias"]:
+                lines.append("  diagnosis_drop_bias: " + ",".join(diagnosis_summary["drop_bias"]))
+    return lines
+
+
 def build_codex_cycle_prompt(
     *,
     project_root: Path,
@@ -344,6 +869,33 @@ def build_codex_cycle_prompt(
     status_report = build_autorun_status_report(root, log_tail_lines=5, max_incomplete_runs=5)
     status_payload = status_report.get("status") or {}
     incomplete_runs = list(status_report.get("incomplete_runs") or [])
+    completed_runs = list(status_report.get("completed_runs") or [])
+    latest_cycle_eval = resolve_latest_cycle_eval_file(session)
+    program_markets = resolve_program_markets(program)
+    if not program_markets:
+        seen_markets: set[str] = set()
+        program_markets = []
+        for payload in [*incomplete_runs, *completed_runs]:
+            for market in _infer_markets_from_run_payload(payload):
+                if market in seen_markets:
+                    continue
+                seen_markets.add(market)
+                program_markets.append(market)
+    coin_slot_lines = _format_coin_slot_snapshot(
+        project_root=root,
+        markets=program_markets,
+        incomplete_runs=incomplete_runs,
+        completed_runs=completed_runs,
+    )
+    feature_brief_lines = _format_feature_family_brief(
+        root,
+        _collect_relevant_feature_set_names(
+            project_root=root,
+            latest_cycle_eval=latest_cycle_eval,
+            incomplete_runs=incomplete_runs,
+            completed_runs=completed_runs,
+        ),
+    )
     snapshot_lines: list[str] = []
     if status_payload:
         snapshot_lines.append(
@@ -365,38 +917,73 @@ def build_codex_cycle_prompt(
                 f"failed={item.get('failed_cases') or 0} / "
                 f"last_event={item.get('last_event') or 'unknown'}"
             )
+    if completed_runs:
+        snapshot_lines.append("- recent completed runs:")
+        for item in completed_runs[:4]:
+            snapshot_lines.append(
+                "  - "
+                f"{item.get('suite_name') or item.get('run_dir')} / "
+                f"{item.get('run_label') or 'unknown'} / "
+                f"completed={item.get('completed_cases') or 0} / "
+                f"failed={item.get('failed_cases') or 0}"
+            )
+    initial_files = [
+        f"- {root / 'AGENTS.md'}",
+        f"- {program}",
+        f"- {session / 'results.tsv'}",
+    ]
+    if latest_cycle_eval is not None:
+        initial_files.append(f"- {latest_cycle_eval}")
+    else:
+        initial_files.append(f"- {session / 'session.md'}")
+
     return "\n".join(
         [
             "Read the repository research instructions and complete exactly one autonomous research cycle.",
+            "One bounded cycle may launch multiple distinct formal runs if that is needed to refill idle coin slots allowed by program.md.",
             "",
             f"Project root: {root}",
             f"Program: {program}",
             f"Session dir: {session}",
             "",
             "Start with only these files unless they prove insufficient:",
-            f"- {root / 'AGENTS.md'}",
-            f"- {program}",
-            f"- {session / 'session.md'}",
-            f"- {session / 'results.tsv'}",
+            *initial_files,
             "",
             "Use repository commands sparingly. Do not scan the entire repository or the full experiment history unless the cycle is blocked.",
+            "Do not open large raw registry files like `research/experiments/custom_feature_sets.json` in the normal decision path; use the pre-extracted coin snapshot and feature-family brief below first.",
+            "If you still need exact factor columns, inspect only the exact named feature family that is missing from the brief instead of dumping broad file ranges.",
+            "Use the diagnosis-guided family policy in the brief: protect the named core skeleton features, prefer dropping from overloaded repetitive families, and add toward the listed missing-information themes before inventing broader searches.",
             "If `rg` is unavailable, use `find`, `grep`, `sed`, and targeted `ls`.",
-            "Prefer resuming or launching one formal experiment over unrelated environment or infrastructure edits.",
+            "When the session is long, start from results.tsv plus the newest cycle eval and open the full session history only if those are insufficient.",
+            "Prefer formal experiment launches over unrelated environment or infrastructure edits.",
             "Only make code changes when they directly unblock the next formal experiment for this session.",
+            "When session artifacts disagree with current run directories, trust the current run directories.",
+            "A formal run that already has summary.json is finished and must not be resumed or relaunched blindly.",
+            "If the active program explicitly allows multiple simultaneous formal runs and some coin slots are idle, keep launching distinct follow-ups in the same cycle until you fill every allowed idle slot that still has a clear next follow-up.",
+            "Launching several distinct coin follow-ups in one decision pass still counts as one bounded cycle.",
             "",
             "Current autorun snapshot already collected for you:",
             *(snapshot_lines or ["- no existing autorun status snapshot found"]),
             "",
+            "Coin slot snapshot already collected for you:",
+            *(coin_slot_lines or ["- no explicit coin slot snapshot available"]),
+            "",
+            "Relevant feature-family brief already extracted for you:",
+            *(feature_brief_lines or ["- no focused feature-family brief available"]),
+            "",
             "Required cycle steps:",
-            f"1. Read {program.name} and the latest session artifacts before making changes.",
-            "2. Inspect only the specific active or incomplete experiment runs needed to avoid duplicates blindly.",
-            "3. Decide the next single experiment or code change.",
-            "4. If needed, edit code or create/update a suite spec.",
-            "5. Use scripts/research/run_one_experiment.sh for any formal experiment run.",
-            "6. Use scripts/research/summarize_experiment.py to summarize the experiment run you just completed.",
-            "7. Never have more than two simultaneous formal market runs active unless program.md explicitly overrides it.",
-            "8. Update the session artifacts under the session dir.",
-            "9. Stop after this one cycle and summarize what changed, what ran, and what should happen next.",
+            f"1. Read {program.name} and the latest session artifacts before making changes; start with results.tsv plus the newest cycle eval, and only open the full session history if they are insufficient.",
+            "2. Reconcile the active session artifacts against the current run directories before deciding what is still live, blocked, or already complete.",
+            "3. Inspect only the specific active, incomplete, or most recent completed experiment runs needed to avoid duplicates blindly and choose the next step.",
+            "4. Decide the next experiment set or code change.",
+            "5. If there are idle coin slots that the active program allows you to fill, refill as many distinct idle coin slots as possible in this same cycle instead of stopping after the first new launch.",
+            "6. If needed, edit code or create/update a suite spec.",
+            "7. Launch distinct formal runs for different idle coins until you fill every allowed idle slot or run out of clear same-session follow-ups.",
+            "8. Use scripts/research/run_one_experiment.sh for any formal run.",
+            "9. Use scripts/research/summarize_experiment.py to summarize any formal run you completed, resumed, or used as the current frontier evidence.",
+            "10. Never have more than two simultaneous formal market runs active unless program.md explicitly overrides it.",
+            "11. Update the session artifacts under the session dir.",
+            "12. Stop after this one cycle and summarize what changed, what ran, and what should happen next.",
             "",
             "Do not run forever in this Codex invocation. One completed cycle only.",
         ]
