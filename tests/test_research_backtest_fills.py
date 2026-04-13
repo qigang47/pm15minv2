@@ -1038,7 +1038,7 @@ def test_build_canonical_fills_does_not_reuse_unchanged_raw_depth_queue(tmp_path
     assert rejects.empty
     assert len(fills) == 1
     row = fills.iloc[0]
-    assert row["fill_model"] == "canonical_depth_quote"
+    assert row["fill_model"] == "canonical_depth"
     assert row["depth_status"] == "partial"
     assert row["depth_reason"] == "queue_path_stalled"
     assert row["depth_fill_ratio"] == pytest.approx(0.4)
@@ -1046,11 +1046,11 @@ def test_build_canonical_fills_does_not_reuse_unchanged_raw_depth_queue(tmp_path
     assert row["depth_candidate_progress_count"] == 1
     assert row["depth_chain_mode"] == "single_snapshot"
     assert row["depth_queue_turnover_count"] == 0
-    assert row["stake"] == pytest.approx(1.0)
-    assert row["shares"] == pytest.approx(2.0 + (0.6 / 0.205))
+    assert row["stake"] == pytest.approx(0.4)
+    assert row["shares"] == pytest.approx(2.0)
 
 
-def test_build_canonical_fills_reuses_same_price_only_after_queue_attrition(tmp_path) -> None:
+def test_build_canonical_fills_keeps_partial_depth_after_queue_attrition_without_quote_completion(tmp_path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
     accepted = pd.DataFrame(
@@ -1151,7 +1151,7 @@ def test_build_canonical_fills_reuses_same_price_only_after_queue_attrition(tmp_
     assert rejects.empty
     assert len(fills) == 1
     row = fills.iloc[0]
-    assert row["fill_model"] == "canonical_depth_quote"
+    assert row["fill_model"] == "canonical_depth"
     assert row["depth_status"] == "partial"
     assert row["depth_reason"] == "depth_exhausted"
     assert row["depth_fill_ratio"] == pytest.approx(0.6)
@@ -1159,11 +1159,11 @@ def test_build_canonical_fills_reuses_same_price_only_after_queue_attrition(tmp_
     assert row["depth_candidate_progress_count"] == 2
     assert row["depth_chain_mode"] == "queue_growth"
     assert row["depth_queue_turnover_count"] == 1
-    assert row["stake"] == pytest.approx(1.0)
-    assert row["shares"] == pytest.approx(3.0 + (0.4 / 0.205))
+    assert row["stake"] == pytest.approx(0.6)
+    assert row["shares"] == pytest.approx(3.0)
 
 
-def test_build_canonical_fills_uses_same_price_queue_growth_once(tmp_path) -> None:
+def test_build_canonical_fills_keeps_partial_depth_after_single_queue_growth_without_quote_completion(tmp_path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
     accepted = pd.DataFrame(
@@ -1249,7 +1249,7 @@ def test_build_canonical_fills_uses_same_price_queue_growth_once(tmp_path) -> No
     assert rejects.empty
     assert len(fills) == 1
     row = fills.iloc[0]
-    assert row["fill_model"] == "canonical_depth_quote"
+    assert row["fill_model"] == "canonical_depth"
     assert row["depth_status"] == "partial"
     assert row["depth_reason"] == "depth_exhausted"
     assert row["depth_fill_ratio"] == pytest.approx(0.6)
@@ -1257,8 +1257,8 @@ def test_build_canonical_fills_uses_same_price_queue_growth_once(tmp_path) -> No
     assert row["depth_candidate_progress_count"] == 2
     assert row["depth_chain_mode"] == "queue_growth"
     assert row["depth_queue_turnover_count"] == 0
-    assert row["stake"] == pytest.approx(1.0)
-    assert row["shares"] == pytest.approx(3.0 + (0.4 / 0.205))
+    assert row["stake"] == pytest.approx(0.6)
+    assert row["shares"] == pytest.approx(3.0)
 
 
 def test_build_canonical_fills_allows_same_price_after_time_turnover_gap(tmp_path) -> None:
@@ -2152,6 +2152,75 @@ def test_materialize_fill_row_recovers_quote_missing_with_raw_depth_candidates(t
     assert float(out["entry_price"]) == pytest.approx(0.20)
 
 
+def test_materialize_fill_row_marks_partial_depth_when_quote_missing_uses_valid_partial_raw_depth(tmp_path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    profile_spec = replace(
+        resolve_backtest_profile_spec(profile="deep_otm"),
+        orderbook_min_fill_ratio=0.3,
+        orderbook_max_slippage_bps=150.0,
+    )
+    row = {
+        "decision_ts": "2026-03-01T00:08:00Z",
+        "cycle_start_ts": "2026-03-01T00:00:00Z",
+        "cycle_end_ts": "2026-03-01T00:15:00Z",
+        "offset": 7,
+        "market_id": "market-1",
+        "condition_id": "cond-1",
+        "token_up": "token-up",
+        "token_down": "token-down",
+        "quote_up_ask": None,
+        "quote_up_bid": None,
+        "quote_up_ask_size_1": None,
+        "p_up": 0.95,
+        "p_down": 0.05,
+        "predicted_side": "UP",
+        "predicted_prob": 0.95,
+        "winner_side": "UP",
+        "stake": 1.0,
+        "entry_price": None,
+        "entry_price_source": "",
+        "price_cap": 0.30,
+        "fill_valid": False,
+        "fill_reason": "quote_missing",
+    }
+    raw_depth_candidates = [
+        {
+            "depth_source_path": str(data_cfg.layout.orderbook_depth_path("2026-03-01")),
+            "depth_up_record": {
+                "logged_at": "2026-03-01T00:08:10Z",
+                "asks": [[0.20, 2.0]],
+                "bids": [[0.19, 1.0]],
+            },
+            "depth_up_snapshot_ts_ms": int(pd.Timestamp("2026-03-01T00:08:10Z").timestamp() * 1000),
+            "depth_down_record": None,
+        }
+    ]
+
+    out = fills_module._materialize_fill_row(
+        row,
+        data_cfg=data_cfg,
+        config=BacktestFillConfig(
+            base_stake=1.0,
+            max_stake=1.0,
+            fee_bps=0.0,
+            high_conf_threshold=0.99,
+            high_conf_multiplier=1.0,
+            raw_depth_fak_refresh_enabled=True,
+            profile_spec=profile_spec,
+        ),
+        raw_depth_candidates=raw_depth_candidates,
+    )
+
+    assert bool(out["fill_valid"]) is True
+    assert out["fill_model"] == "canonical_depth"
+    assert out["fill_reason"] == ""
+    assert float(out["fill_ratio"]) == pytest.approx(0.4)
+    assert bool(out["depth_partial_fill"]) is True
+    assert out["depth_status"] == "partial"
+    assert out["depth_reason"] == "depth_exhausted"
+
+
 def test_build_canonical_fills_legacy_fak_refresh_rejects_repriced_net_edge_below_threshold(tmp_path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
@@ -2433,7 +2502,7 @@ def test_build_canonical_fills_legacy_fak_refresh_keeps_partial_fill_without_quo
     assert row["stake"] == pytest.approx(0.6)
 
 
-def test_build_canonical_fills_completes_partial_depth_with_quote_fallback(tmp_path) -> None:
+def test_build_canonical_fills_keeps_partial_depth_without_quote_fallback(tmp_path) -> None:
     root = tmp_path / "v2"
     data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
     accepted = pd.DataFrame(
@@ -2504,15 +2573,15 @@ def test_build_canonical_fills_completes_partial_depth_with_quote_fallback(tmp_p
     assert rejects.empty
     assert len(fills) == 1
     row = fills.iloc[0]
-    assert row["fill_model"] == "canonical_depth_quote"
+    assert row["fill_model"] == "canonical_depth"
     assert row["depth_status"] == "partial"
     assert row["depth_reason"] == "depth_exhausted"
     assert row["depth_fill_ratio"] == pytest.approx(0.6)
     assert bool(row["depth_partial_fill"]) is True
-    assert row["fill_ratio"] == pytest.approx(1.0)
-    assert row["stake"] == pytest.approx(1.0)
-    assert row["shares"] == pytest.approx(3.0 + (0.4 / 0.205))
-    assert row["entry_price"] == pytest.approx(1.0 / (3.0 + (0.4 / 0.205)))
+    assert row["fill_ratio"] == pytest.approx(0.6)
+    assert row["stake"] == pytest.approx(0.6)
+    assert row["shares"] == pytest.approx(3.0)
+    assert row["entry_price"] == pytest.approx(0.2)
 
 
 def test_settle_fill_frame_and_equity_curve() -> None:

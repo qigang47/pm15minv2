@@ -640,6 +640,8 @@ def _materialize_fill_row(
                     use_conservative_price=bool(raw_depth_candidates and config.raw_depth_fak_refresh_enabled),
                 )
             )
+            if bool(depth_fill.get("partial_fill")):
+                _mark_partial_depth_outcome(out, depth_fill=depth_fill)
             return out
         out["fill_valid"] = False
         out["fill_reason"] = str(depth_reason or fill_reason or "depth_fill_unavailable")
@@ -700,26 +702,6 @@ def _materialize_fill_row(
         )
         if bool(depth_fill.get("partial_fill")):
             _mark_partial_depth_outcome(out, depth_fill=depth_fill)
-            if raw_depth_candidates and bool(config.raw_depth_fak_refresh_enabled):
-                return out
-            quote_completion = _resolve_quote_fill(
-                row=row,
-                requested_notional=max(0.0, requested_notional - float(depth_fill["total_cost"])),
-                fee_rate=fee_rate,
-                config=config,
-                min_fill_ratio_override=0.0,
-                allow_synthetic_entry_price=allow_synthetic_entry_price,
-            )
-            if bool(quote_completion.get("fill_valid")):
-                out.update(
-                    _build_depth_quote_fill_values(
-                        depth_fill=depth_fill,
-                        quote_fill=quote_completion,
-                        requested_notional=requested_notional,
-                        fee_rate=fee_rate,
-                        fallback_entry_price=entry_price,
-                    )
-                )
         return out
     if depth_attempted:
         out["fill_valid"] = False
@@ -1248,37 +1230,6 @@ def _resolve_raw_depth_reprice_guard_reason(
     if not reasons:
         return None
     return str(reasons[0] or "").strip() or None
-
-
-def _build_depth_quote_fill_values(
-    *,
-    depth_fill: dict[str, object],
-    quote_fill: dict[str, object],
-    requested_notional: float,
-    fee_rate: float,
-    fallback_entry_price: float | None,
-) -> dict[str, object]:
-    depth_cost = float(depth_fill["total_cost"])
-    depth_shares = float(depth_fill["filled_shares"])
-    quote_cost = float(quote_fill["stake"])
-    quote_shares = float(quote_fill["shares"])
-    total_cost = depth_cost + quote_cost
-    total_shares = depth_shares + quote_shares
-    entry_price = fallback_entry_price if fallback_entry_price is not None else 0.0
-    if total_shares > 0.0:
-        entry_price = total_cost / total_shares
-    return {
-        "entry_price": float(entry_price),
-        "stake": float(total_cost),
-        "shares": float(total_shares),
-        "fee_rate": float(fee_rate),
-        "fee_paid": float(total_cost * fee_rate),
-        "fill_ratio": 0.0 if requested_notional <= 0.0 else float(total_cost / requested_notional),
-        "fill_model": "canonical_depth_quote",
-        "fill_reason": "",
-        "fill_valid": True,
-    }
-
 
 def _mark_partial_depth_outcome(out: dict[str, object], *, depth_fill: dict[str, object]) -> None:
     stop_reason = str(depth_fill.get("stop_reason") or "partial_fill")

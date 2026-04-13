@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from pm15min.data.config import DataConfig
+from pm15min.data.io.ndjson_zst import append_ndjson_zst
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.data.pipelines.oracle_prices import build_oracle_prices_15m
 from pm15min.data.pipelines.truth import build_truth_15m
@@ -93,6 +94,68 @@ def _sample_oracle_prices_for_cycle(
             }
         )
     return pd.DataFrame(rows)
+
+
+def _write_market_catalog_and_depth(
+    data_cfg: DataConfig,
+    *,
+    asset: str,
+    cycle_start_ts: int,
+    n_cycles: int,
+    cycle_seconds: int = 900,
+) -> None:
+    market_rows: list[dict[str, object]] = []
+    depth_rows_by_date: dict[str, list[dict[str, object]]] = {}
+    for idx in range(n_cycles):
+        start_ts = cycle_start_ts + idx * cycle_seconds
+        end_ts = start_ts + cycle_seconds
+        market_id = f"market-{idx}"
+        token_up = f"token-up-{idx}"
+        token_down = f"token-down-{idx}"
+        market_rows.append(
+            {
+                "market_id": market_id,
+                "condition_id": f"cond-{idx}",
+                "asset": asset,
+                "cycle": data_cfg.cycle,
+                "cycle_start_ts": start_ts,
+                "cycle_end_ts": end_ts,
+                "token_up": token_up,
+                "token_down": token_down,
+                "question": f"{asset.upper()} {idx}?",
+                "source_snapshot_ts": "2026-03-01T00:00:00Z",
+            }
+        )
+        for decision_offset in (7, 8):
+            orderbook_ts = pd.Timestamp(start_ts, unit="s", tz="UTC") + pd.Timedelta(minutes=decision_offset)
+            date_str = orderbook_ts.strftime("%Y-%m-%d")
+            rows = depth_rows_by_date.setdefault(date_str, [])
+            rows.extend(
+                [
+                    {
+                        "logged_at": orderbook_ts.isoformat(),
+                        "orderbook_ts": orderbook_ts.isoformat(),
+                        "market_id": market_id,
+                        "token_id": token_up,
+                        "side": "up",
+                        "asks": [[0.20, 50.0]],
+                        "bids": [[0.19, 50.0]],
+                    },
+                    {
+                        "logged_at": orderbook_ts.isoformat(),
+                        "orderbook_ts": orderbook_ts.isoformat(),
+                        "market_id": market_id,
+                        "token_id": token_down,
+                        "side": "down",
+                        "asks": [[0.20, 50.0]],
+                        "bids": [[0.19, 50.0]],
+                    },
+                ]
+            )
+
+    write_parquet_atomic(pd.DataFrame(market_rows), data_cfg.layout.market_catalog_table_path)
+    for date_str, rows in depth_rows_by_date.items():
+        append_ndjson_zst(data_cfg.layout.orderbook_depth_path(date_str), rows)
 
 
 def test_build_feature_frame_dataset(tmp_path: Path) -> None:
@@ -575,7 +638,6 @@ def test_train_research_run_writes_offset_artifacts(tmp_path: Path) -> None:
         ),
         data_cfg.layout.truth_table_path,
     )
-
     cfg = ResearchConfig.build(
         market="sol",
         cycle="15m",
@@ -665,7 +727,6 @@ def test_build_model_bundle_from_training_run(tmp_path: Path) -> None:
         ),
         data_cfg.layout.truth_table_path,
     )
-
     cfg = ResearchConfig.build(
         market="sol",
         cycle="15m",
@@ -763,6 +824,36 @@ def test_run_research_backtest_from_bundle(tmp_path: Path) -> None:
         ),
         data_cfg.layout.truth_table_path,
     )
+    _write_market_catalog_and_depth(
+        data_cfg,
+        asset="sol",
+        cycle_start_ts=1_772_323_200,
+        n_cycles=32,
+    )
+    write_parquet_atomic(
+        _sample_oracle_prices("sol", cycle_start_ts=1_772_323_200, n_cycles=32, price_base=120.0),
+        data_cfg.layout.oracle_prices_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "asset": "sol",
+                    "cycle_start_ts": 1_772_323_200 + idx * 900,
+                    "cycle_end_ts": 1_772_324_100 + idx * 900,
+                    "market_id": f"market-{idx}",
+                    "condition_id": f"cond-{idx}",
+                    "winner_side": "UP" if idx % 2 == 0 else "DOWN",
+                    "label_updown": "UP" if idx % 2 == 0 else "DOWN",
+                    "resolved": True,
+                    "truth_source": "settlement_truth",
+                    "full_truth": True,
+                }
+                for idx in range(32)
+            ]
+        ),
+        data_cfg.layout.truth_table_path,
+    )
 
     cfg = ResearchConfig.build(
         market="sol",
@@ -775,8 +866,8 @@ def test_run_research_backtest_from_bundle(tmp_path: Path) -> None:
         model_family="deep_otm",
         root=root,
     )
-    build_feature_frame_dataset(cfg)
-    build_label_frame_dataset(cfg)
+    build_feature_frame_dataset(cfg, skip_freshness=True)
+    build_label_frame_dataset(cfg, skip_freshness=True)
     for offset in (7, 8):
         build_training_set_dataset(
             cfg,

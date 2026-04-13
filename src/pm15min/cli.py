@@ -51,10 +51,10 @@ def build_parser(requested_domain: str | None = None) -> argparse.ArgumentParser
 
     layout_parser = subparsers.add_parser(
         "layout",
-        help="Show the canonical v2 market layout.",
+        help="Show the canonical 15m market layout.",
     )
     layout_parser.add_argument("--market", default="btc", help="Market slug: btc/eth/sol/xrp.")
-    layout_parser.add_argument("--cycle", default="15m", help="Cycle slug: 5m or 15m.")
+    layout_parser.add_argument("--cycle", default="15m", choices=("15m",), help="Cycle slug: 15m only.")
     layout_parser.add_argument(
         "--json",
         action="store_true",

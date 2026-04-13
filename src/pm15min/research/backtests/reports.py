@@ -313,8 +313,6 @@ def render_backtest_report(
         "",
         f"- depth_fill_model_counts: `{summary.get('depth_fill_model_counts', {})}`",
         f"- depth_canonical_depth_rows: `{summary.get('depth_canonical_depth_rows', 0)}`",
-        f"- depth_quote_fallback_rows: `{summary.get('depth_quote_fallback_rows', 0)}`",
-        f"- depth_quote_completion_rows: `{summary.get('depth_quote_completion_rows', 0)}`",
         f"- depth_partial_fill_rows: `{summary.get('depth_partial_fill_rows', 0)}`",
         f"- depth_queue_growth_rows: `{summary.get('depth_queue_growth_rows', 0)}`",
         f"- depth_price_path_rows: `{summary.get('depth_price_path_rows', 0)}`",
@@ -584,8 +582,6 @@ def build_depth_usage_summary(trades: pd.DataFrame) -> dict[str, object]:
         return {
             "depth_fill_model_counts": {},
             "depth_canonical_depth_rows": 0,
-            "depth_quote_fallback_rows": 0,
-            "depth_quote_completion_rows": 0,
             "depth_partial_fill_rows": 0,
             "depth_queue_growth_rows": 0,
             "depth_price_path_rows": 0,
@@ -618,11 +614,9 @@ def build_depth_usage_summary(trades: pd.DataFrame) -> dict[str, object]:
     depth_retry_stage = trades.get("depth_retry_stage", pd.Series("", index=trades.index, dtype="string")).astype("string").fillna("")
     depth_retry_exit_reason = trades.get("depth_retry_exit_reason", pd.Series("", index=trades.index, dtype="string")).astype("string").fillna("")
     depth_retry_snapshot_unchanged_count = _numeric_series(trades, "depth_retry_snapshot_unchanged_count")
-    depth_executed_mask = fill_models.isin(["canonical_depth", "canonical_depth_quote"])
+    depth_executed_mask = fill_models.eq("canonical_depth")
     canonical_depth_mask = fill_models.eq("canonical_depth")
-    quote_fallback_mask = fill_models.eq("canonical_quote") & depth_status.isin(["blocked", "missing"])
-    quote_completion_mask = fill_models.eq("canonical_depth_quote")
-    partial_fill_mask = depth_status.eq("partial") | quote_completion_mask | (canonical_depth_mask & depth_fill_ratio.lt(1.0))
+    partial_fill_mask = depth_status.eq("partial") | (canonical_depth_mask & depth_fill_ratio.lt(1.0))
     queue_growth_mask = depth_chain_modes.isin(["queue_growth", "queue_price_path", "queue_time_turnover", "queue_price_time_turnover"])
     price_path_mask = depth_chain_modes.isin(["price_path", "queue_price_path", "price_time_turnover", "queue_price_time_turnover"])
     queue_turnover_mask = depth_queue_turnover_count.gt(0)
@@ -649,8 +643,6 @@ def build_depth_usage_summary(trades: pd.DataFrame) -> dict[str, object]:
     return {
         "depth_fill_model_counts": {str(index): int(value) for index, value in fill_model_counts.items() if str(index)},
         "depth_canonical_depth_rows": int(canonical_depth_mask.sum()),
-        "depth_quote_fallback_rows": int(quote_fallback_mask.sum()),
-        "depth_quote_completion_rows": int(quote_completion_mask.sum()),
         "depth_partial_fill_rows": int(partial_fill_mask.sum()),
         "depth_queue_growth_rows": int(queue_growth_mask.sum()),
         "depth_price_path_rows": int(price_path_mask.sum()),
