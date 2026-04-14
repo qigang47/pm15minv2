@@ -3,7 +3,10 @@ from __future__ import annotations
 import csv
 import json
 import os
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from pm15min.research.automation import (
     apply_codex_auth_override,
@@ -20,8 +23,10 @@ from pm15min.research.automation import (
     record_session_update,
     resolve_autorun_session_dir,
     resolve_codex_exec_binary,
+    resolve_codex_exec_path_prefix,
     summarize_experiment_run,
 )
+from pm15min.research.automation import control_plane
 
 
 def test_summarize_experiment_run_reads_summary_and_top_case(tmp_path: Path) -> None:
@@ -287,17 +292,163 @@ def test_build_codex_cycle_prompt_references_program_and_session(tmp_path: Path)
     assert str(session_dir) in prompt
     assert str(program_path) in prompt
     assert "read program_custom.md and the latest session artifacts before making changes; start with results.tsv plus the newest cycle eval" in prompt.lower()
-    assert "one completed cycle only" in prompt.lower()
-    assert "two simultaneous formal market runs" in prompt
+    assert "your codex decision pass must end after this cycle" in prompt.lower()
+    assert "healthy formal experiment workers you started or observed may continue running after you exit" in prompt.lower()
+    assert "3 simultaneous formal market runs" in prompt
+    assert "keep occupancy near 3" in prompt
     assert "do not scan the entire repository" in prompt.lower()
     assert "prefer formal experiment launches over unrelated environment or infrastructure edits" in prompt.lower()
     assert "if `rg` is unavailable" in prompt.lower()
     assert "trust the current run directories" in prompt.lower()
-    assert "summary.json is finished" in prompt.lower()
+    assert "finished only when `completed_cases + failed_cases` reaches `cases`" in prompt.lower()
     assert "idle coin slots" in prompt.lower()
     assert "newest cycle eval" in prompt.lower()
     assert "fill every allowed idle slot" in prompt.lower()
     assert "still counts as one bounded cycle" in prompt.lower()
+    assert "resume as many checkpointed current-line runs as needed to fill those live slots in the same cycle" in prompt.lower()
+    assert "do not stop or checkpoint a healthy live formal run merely to end the current codex cycle" in prompt.lower()
+    assert "run_one_experiment_background.sh" in prompt
+
+
+def test_build_codex_cycle_prompt_uses_queue_max_live_runs_for_concurrency_guard(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    autorun_dir = root / "var" / "research" / "autorun"
+    autorun_dir.mkdir(parents=True, exist_ok=True)
+    (autorun_dir / "experiment-queue.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-04-13T16:00:00Z",
+                "max_live_runs": 4,
+                "items": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
+
+    assert "keeping up to 4 live formal runs active" in prompt.lower()
+    assert "keep occupancy near 4" in prompt.lower()
+    assert "4 simultaneous formal market runs" in prompt
+
+
+def test_find_live_formal_workers_deduplicates_same_run_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir(parents=True, exist_ok=True)
+    duplicate_output = "\n".join(
+        [
+            f"101 1 /bin/bash {root}/scripts/research/run_one_experiment.sh --suite demo_suite --run-label demo_run --market btc",
+            f"202 101 /bin/bash {root}/scripts/research/run_one_experiment.sh --suite demo_suite --run-label demo_run --market btc",
+            f"303 1 /bin/bash {root}/scripts/research/run_one_experiment.sh --suite other_suite --run-label other_run --market eth",
+        ]
+    )
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=0, stdout=duplicate_output, stderr=""),
+    )
+
+    workers = control_plane.find_live_formal_workers(root)
+
+    assert workers == [
+        {
+            "pid": 101,
+            "ppid": 1,
+            "run_label": "demo_run",
+            "suite_name": "demo_suite",
+            "market": "btc",
+            "cmd": f"/bin/bash {root}/scripts/research/run_one_experiment.sh --suite demo_suite --run-label demo_run --market btc",
+        },
+        {
+            "pid": 303,
+            "ppid": 1,
+            "run_label": "other_run",
+            "suite_name": "other_suite",
+            "market": "eth",
+            "cmd": f"/bin/bash {root}/scripts/research/run_one_experiment.sh --suite other_suite --run-label other_run --market eth",
+        },
+    ]
+
+
+def test_find_live_formal_workers_includes_direct_run_suite_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir(parents=True, exist_ok=True)
+    direct_output = "\n".join(
+        [
+            f"101 1 /home/demo/.venv_server/bin/python -m pm15min research experiment run-suite --suite sol_suite --run-label sol_run --market sol --project-root {root}",
+            f"202 1 /home/demo/.venv_server/bin/python -m pm15min research experiment run-suite --suite btc_suite --run-label btc_run --market btc --root /tmp/other",
+        ]
+    )
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=0, stdout=direct_output, stderr=""),
+    )
+
+    workers = control_plane.find_live_formal_workers(root)
+
+    assert workers == [
+        {
+            "pid": 101,
+            "ppid": 1,
+            "run_label": "sol_run",
+            "suite_name": "sol_suite",
+            "market": "sol",
+            "cmd": f"/home/demo/.venv_server/bin/python -m pm15min research experiment run-suite --suite sol_suite --run-label sol_run --market sol --project-root {root}",
+        }
+    ]
+
+
+def test_find_live_autorun_processes_matches_loop_and_codex_exec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir(parents=True, exist_ok=True)
+    output_path = root / "var" / "research" / "autorun" / "codex-last-output.txt"
+    script_path = root / "scripts" / "research" / "codex_background_loop.sh"
+    ps_output = "\n".join(
+        [
+            f"101 1 /bin/bash {script_path} __run_loop",
+            f"202 101 /home/demo/.local/bin/codex exec --cd {root} --output-last-message {output_path} --sandbox danger-full-access -",
+            f"303 1 /bin/bash {root}/scripts/research/other_loop.sh __run_loop",
+            f"404 1 /home/demo/.local/bin/codex exec --cd /tmp/other --output-last-message {output_path} --sandbox danger-full-access -",
+        ]
+    )
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=0, stdout=ps_output, stderr=""),
+    )
+
+    processes = control_plane.find_live_autorun_processes(root)
+
+    assert processes == [
+        {
+            "pid": 101,
+            "ppid": 1,
+            "kind": "background_loop",
+            "cmd": f"/bin/bash {script_path} __run_loop",
+        },
+        {
+            "pid": 202,
+            "ppid": 101,
+            "kind": "codex_exec",
+            "cmd": f"/home/demo/.local/bin/codex exec --cd {root} --output-last-message {output_path} --sandbox danger-full-access -",
+        },
+    ]
 
 
 def test_build_codex_cycle_prompt_includes_existing_autorun_snapshot(tmp_path: Path) -> None:
@@ -368,7 +519,10 @@ def test_build_codex_cycle_prompt_prefers_latest_cycle_eval_before_full_session(
     assert str(session_dir / "session.md") not in start_section
 
 
-def test_build_codex_cycle_prompt_includes_coin_slot_snapshot_and_feature_brief(tmp_path: Path) -> None:
+def test_build_codex_cycle_prompt_includes_coin_slot_snapshot_and_feature_brief(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     root = tmp_path / "repo"
     session_dir = root / "sessions" / "demo"
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -527,6 +681,8 @@ def test_build_codex_cycle_prompt_includes_coin_slot_snapshot_and_feature_brief(
         encoding="utf-8",
     )
 
+    monkeypatch.setattr(control_plane, "find_live_formal_workers", lambda _root: [])
+
     prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
 
     assert "coin slot snapshot already collected for you:" in prompt.lower()
@@ -534,7 +690,7 @@ def test_build_codex_cycle_prompt_includes_coin_slot_snapshot_and_feature_brief(
     assert "latest_completed=btc_suite" in prompt
     assert "feature_sets=focus_btc_40_v4" in prompt
     assert "weights=current_default,offset_reversal_mild" in prompt
-    assert "eth: state=active" in prompt.lower()
+    assert "eth: state=checkpointed" in prompt.lower()
     assert "feature_sets=focus_eth_40_v4,focus_eth_40_v5" in prompt
     assert "relevant feature-family brief already extracted for you:" in prompt.lower()
     assert "focus_btc_40_v4: market=btc / width=40 / notes=btc frontier" in prompt
@@ -544,6 +700,90 @@ def test_build_codex_cycle_prompt_includes_coin_slot_snapshot_and_feature_brief(
     assert "drop_from_first=short_mid_returns,price_position,momentum_oscillator" in prompt
     assert "add_toward=timing,persistence,strike_distance,flip_feasibility,market_quality,junk_cheap_filter" in prompt
     assert "do not open large raw registry files like `research/experiments/custom_feature_sets.json`" in prompt.lower()
+
+
+def test_build_codex_cycle_prompt_marks_live_worker_slots_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (root / "program.md").write_text("# Demo Program\n\n- coins: `btc`\n", encoding="utf-8")
+    experiments_root = root / "research" / "experiments"
+    experiments_root.mkdir(parents=True, exist_ok=True)
+    suite_specs_dir = experiments_root / "suite_specs"
+    suite_specs_dir.mkdir(parents=True, exist_ok=True)
+    (suite_specs_dir / "btc_suite.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "btc_suite",
+                "markets": {
+                    "btc": {
+                        "groups": {
+                            "focus_search": {
+                                "runs": [
+                                    {
+                                        "run_name": "focus_search",
+                                        "target": "reversal",
+                                        "feature_set_variants": [{"label": "frontier", "feature_set": "focus_btc_40_v4"}],
+                                        "weight_variants": [{"label": "current_default"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (experiments_root / "custom_feature_sets.json").write_text(
+        json.dumps(
+            {
+                "focus_btc_40_v4": {
+                    "market": "btc",
+                    "width": 40,
+                    "columns": ["q_bs_up_strike", "ret_from_strike", "basis_bp"],
+                    "notes": "btc frontier",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_dir = experiments_root / "runs" / "suite=btc_suite" / "run=btc_live"
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+    (run_dir / "logs" / "suite.jsonl").write_text(
+        json.dumps({"event": "execution_group_warmup_started", "run_name": "focus_search"}) + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        control_plane,
+        "find_live_formal_workers",
+        lambda _root: [{"run_label": "btc_live", "suite_name": "btc_suite", "pid": 123}],
+    )
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
+
+    assert "btc: state=active" in prompt.lower()
+    assert "live_worker=yes" in prompt.lower()
+
+
+def test_build_autorun_status_report_tolerates_non_utf8_log_bytes(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    autorun_dir = root / "var" / "research" / "autorun"
+    autorun_dir.mkdir(parents=True, exist_ok=True)
+    (autorun_dir / "codex-background.status.json").write_text(
+        json.dumps({"state": "idle", "iteration": 1, "pid": None}),
+        encoding="utf-8",
+    )
+    (autorun_dir / "codex-background.log").write_bytes(b"good line\nbad byte:\x8d\nlast line\n")
+
+    payload = build_autorun_status_report(root, log_tail_lines=5, max_incomplete_runs=1)
+
+    assert payload["status"]["state"] == "idle"
+    assert payload["log_tail"][-1] == "last line"
 
 
 def test_build_codex_exec_extra_args_adds_skip_git_repo_check_once() -> None:
@@ -634,6 +874,17 @@ def test_resolve_codex_exec_binary_falls_back_to_local_bin(tmp_path: Path) -> No
     resolved = resolve_codex_exec_binary(home_root=home_root, env_path="/usr/bin:/bin")
 
     assert resolved == str(codex_path.resolve())
+
+
+def test_resolve_codex_exec_path_prefix_prefers_repo_venv_server(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    bin_dir = root / ".venv_server" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / "python").write_text("", encoding="utf-8")
+
+    resolved = resolve_codex_exec_path_prefix(root)
+
+    assert resolved == str(bin_dir.resolve())
 
 
 def test_prepare_codex_home_copies_minimal_runtime_files_without_skills(tmp_path: Path) -> None:
@@ -780,6 +1031,62 @@ def test_is_transient_codex_provider_failure_ignores_regular_traceback() -> None
     assert is_transient_codex_provider_failure(output) is False
 
 
+def test_is_transient_codex_provider_failure_ignores_plain_base_url_mentions() -> None:
+    output = """
+    Switching to fallback provider https://ai.changyou.club/v1 for the next attempt.
+    The previous attempt failed because /bin/bash: python: command not found
+    """
+    assert (
+        is_transient_codex_provider_failure(
+            output,
+            base_url="https://ai.changyou.club/v1",
+        )
+        is False
+    )
+
+
+def test_codex_background_loop_includes_secondary_nimabo_fallback_layer() -> None:
+    script_text = Path("scripts/research/codex_background_loop.sh").read_text(encoding="utf-8")
+
+    assert "CODEX_SECONDARY_BASE_URL" in script_text
+    assert "CODEX_SECONDARY_API_KEY" in script_text
+    assert "CODEX_SECONDARY_HOME_DIR" in script_text
+    assert "retrying with secondary fallback provider" in script_text
+    assert script_text.index("retrying with secondary fallback provider") < script_text.index(
+        "retrying with fallback provider"
+    )
+    assert script_text.index("retrying with fallback provider") < script_text.index(
+        "retrying with official auth fallback"
+    )
+
+
+def test_codex_background_loop_terminates_full_attempt_process_group() -> None:
+    script_text = Path("scripts/research/codex_background_loop.sh").read_text(encoding="utf-8")
+
+    assert "setsid" in script_text
+    assert "kill -- -\"$attempt_pid\"" in script_text or "kill -TERM -- -\"$attempt_pid\"" in script_text
+    assert "kill -9 -- -\"$attempt_pid\"" in script_text or "kill -KILL -- -\"$attempt_pid\"" in script_text
+
+
+def test_codex_background_loop_does_not_launch_attempt_pid_via_command_substitution() -> None:
+    script_text = Path("scripts/research/codex_background_loop.sh").read_text(encoding="utf-8")
+
+    assert 'attempt_pid="$(start_codex_attempt_process' not in script_text
+    assert 'echo "$!"' not in script_text
+    assert "STARTED_ATTEMPT_PID" in script_text
+
+
+def test_research_readme_documents_secondary_nimabo_fallback_order() -> None:
+    readme_text = Path("scripts/research/README.md").read_text(encoding="utf-8")
+
+    assert "CODEX_SECONDARY_BASE_URL" in readme_text
+    assert "CODEX_SECONDARY_API_KEY" in readme_text
+    assert "primary Nimabo" in readme_text
+    assert "secondary Nimabo" in readme_text
+    assert "ai.changyou.club" in readme_text
+    assert "official" in readme_text
+
+
 def test_next_autorun_failure_state_stops_after_threshold() -> None:
     first = next_autorun_failure_state(previous_failures=0, exit_code=1, max_consecutive_failures=3)
     second = next_autorun_failure_state(
@@ -876,6 +1183,74 @@ def test_find_incomplete_experiment_runs_ignores_stale_run_when_newer_completed_
     payload = find_incomplete_experiment_runs(root)
 
     assert payload == []
+
+
+def test_find_incomplete_experiment_runs_keeps_partial_summary_run_resumable(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    partial_run = root / "research" / "experiments" / "runs" / "suite=demo" / "run=partial"
+    partial_logs = partial_run / "logs"
+    partial_logs.mkdir(parents=True, exist_ok=True)
+    (partial_logs / "suite.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"event": "market_completed", "case_label": "done-1"}),
+                json.dumps({"event": "market_cache_resolved", "case_label": "pending-2"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (partial_run / "summary.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "demo",
+                "run_label": "partial",
+                "cases": 8,
+                "completed_cases": 1,
+                "failed_cases": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = find_incomplete_experiment_runs(root)
+
+    assert len(payload) == 1
+    assert payload[0]["run_dir"] == str(partial_run)
+    assert payload[0]["state"] == "checkpointed"
+    assert payload[0]["completed_cases"] == 1
+    assert payload[0]["cases"] == 8
+
+
+def test_find_recent_completed_experiment_runs_ignores_partial_summary_runs(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    partial_run = root / "research" / "experiments" / "runs" / "suite=demo" / "run=partial"
+    (partial_run / "logs").mkdir(parents=True, exist_ok=True)
+    (partial_run / "summary.json").write_text(
+        '{"suite_name":"demo","run_label":"partial","cases":8,"completed_cases":1,"failed_cases":0}',
+        encoding="utf-8",
+    )
+    (partial_run / "logs" / "suite.jsonl").write_text(
+        json.dumps({"event": "market_completed", "case_label": "done-1"}) + "\n",
+        encoding="utf-8",
+    )
+
+    full_run = root / "research" / "experiments" / "runs" / "suite=demo" / "run=full"
+    (full_run / "logs").mkdir(parents=True, exist_ok=True)
+    (full_run / "summary.json").write_text(
+        '{"suite_name":"demo","run_label":"full","cases":1,"completed_cases":1,"failed_cases":0}',
+        encoding="utf-8",
+    )
+    (full_run / "logs" / "suite.jsonl").write_text(
+        json.dumps({"event": "market_completed", "case_label": "done"}) + "\n",
+        encoding="utf-8",
+    )
+
+    payload = find_recent_completed_experiment_runs(root)
+
+    assert len(payload) == 1
+    assert payload[0]["run_dir"] == str(full_run)
+    assert payload[0]["run_label"] == "full"
 
 
 def test_find_recent_completed_experiment_runs_returns_latest_completed_runs(tmp_path: Path) -> None:

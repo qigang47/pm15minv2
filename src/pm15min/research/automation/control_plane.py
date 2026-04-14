@@ -8,6 +8,9 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import subprocess
+
+from .queue_state import experiment_queue_path, load_experiment_queue
 
 
 _CODEX_HOME_COPY_FILES = (
@@ -215,6 +218,20 @@ def summarize_experiment_run(run_dir: Path) -> dict[str, object]:
     raise FileNotFoundError(f"Missing experiment summary: {summary_path}")
 
 
+def _summary_progress_payload(summary_payload: dict[str, object]) -> tuple[int | None, int, int]:
+    cases = _optional_int(summary_payload.get("cases"))
+    completed_cases = _optional_int(summary_payload.get("completed_cases")) or 0
+    failed_cases = _optional_int(summary_payload.get("failed_cases")) or 0
+    return cases, int(completed_cases), int(failed_cases)
+
+
+def _summary_is_terminal(summary_payload: dict[str, object]) -> bool:
+    cases, completed_cases, failed_cases = _summary_progress_payload(summary_payload)
+    if cases is None or int(cases) <= 0:
+        return True
+    return int(completed_cases) + int(failed_cases) >= int(cases)
+
+
 def prepare_codex_home(home_root: Path, *, source_home: Path | None = None) -> dict[str, object]:
     target_home = Path(home_root).resolve()
     source_root = Path.home() if source_home is None else Path(source_home).resolve()
@@ -333,8 +350,6 @@ def is_transient_codex_provider_failure(output: str, *, base_url: str | None = N
     text = str(output or "").lower()
     if not text:
         return False
-    if base_url and str(base_url).strip().lower() in text:
-        return True
     return any(marker in text for marker in _TRANSIENT_PROVIDER_FAILURE_MARKERS)
 
 
@@ -359,11 +374,22 @@ def inspect_experiment_run(run_dir: Path) -> dict[str, object]:
     summary_path = path / "summary.json"
     log_path = path / "logs" / "suite.jsonl"
     events = _read_jsonl(log_path)
+    summary_payload: dict[str, object] = {}
+    if summary_path.exists():
+        try:
+            summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            summary_payload = {}
     completed_cases = sum(1 for item in events if item.get("event") == "market_completed")
     failed_cases = sum(1 for item in events if item.get("event") == "market_failed")
+    cases = None
+    if summary_payload:
+        cases, summary_completed_cases, summary_failed_cases = _summary_progress_payload(summary_payload)
+        completed_cases = max(completed_cases, int(summary_completed_cases))
+        failed_cases = max(failed_cases, int(summary_failed_cases))
     last_event_payload = events[-1] if events else {}
     last_event = str(last_event_payload.get("event") or "") or None
-    if summary_path.exists():
+    if summary_payload and _summary_is_terminal(summary_payload):
         state = "completed"
     elif completed_cases == 0 and failed_cases == 0 and last_event in {
         "execution_group_seed_case_started",
@@ -371,6 +397,8 @@ def inspect_experiment_run(run_dir: Path) -> dict[str, object]:
         "market_cache_resolved",
     }:
         state = "stuck_seed_case"
+    elif completed_cases > 0 or failed_cases > 0:
+        state = "checkpointed"
     else:
         state = "incomplete"
     return {
@@ -378,6 +406,7 @@ def inspect_experiment_run(run_dir: Path) -> dict[str, object]:
         "suite_name": _suite_name_from_run_dir(path),
         "run_label": _run_label_from_run_dir(path),
         "summary_exists": summary_path.exists(),
+        "cases": cases,
         "log_path": str(log_path) if log_path.exists() else None,
         "last_event": last_event,
         "last_case_label": (
@@ -403,6 +432,12 @@ def find_incomplete_experiment_runs(project_root: Path, *, limit: int = 10) -> l
         summary_path = path / "summary.json"
         if not summary_path.exists():
             continue
+        try:
+            summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not _summary_is_terminal(summary_payload):
+            continue
         suite_name = _suite_name_from_run_dir(path)
         if suite_name is None:
             continue
@@ -416,11 +451,14 @@ def find_incomplete_experiment_runs(project_root: Path, *, limit: int = 10) -> l
             for path in runs_root.glob("suite=*/run=*")
             if path.is_dir()
             and (path / "logs" / "suite.jsonl").exists()
-            and not (path / "summary.json").exists()
             and (
                 _suite_name_from_run_dir(path) is None
                 or (path / "logs" / "suite.jsonl").stat().st_mtime
                 >= latest_completed_by_suite.get(_suite_name_from_run_dir(path) or "", 0.0)
+            )
+            and (
+                not (path / "summary.json").exists()
+                or not _summary_is_terminal(json.loads((path / "summary.json").read_text(encoding="utf-8")))
             )
         ),
         key=lambda item: (item / "logs" / "suite.jsonl").stat().st_mtime,
@@ -438,7 +476,9 @@ def find_recent_completed_experiment_runs(project_root: Path, *, limit: int = 10
         (
             path
             for path in runs_root.glob("suite=*/run=*")
-            if path.is_dir() and (path / "summary.json").exists()
+            if path.is_dir()
+            and (path / "summary.json").exists()
+            and _summary_is_terminal(json.loads((path / "summary.json").read_text(encoding="utf-8")))
         ),
         key=lambda item: (item / "summary.json").stat().st_mtime,
         reverse=True,
@@ -473,11 +513,18 @@ def build_autorun_status_report(
         if str(status_payload.get("state") or "") == "running" and not _pid_is_live(status_payload.get("pid")):
             status_payload["state"] = "stale"
             status_payload["state_reason"] = "missing_pid"
+    queue_payload = load_experiment_queue(root)
     return {
         "status_path": str(resolved_status_path),
         "log_path": str(log_path),
         "status": status_payload,
         "log_tail": _tail_lines(log_path, limit=max(0, int(log_tail_lines))),
+        "queue": {
+            "queue_path": str(experiment_queue_path(root)),
+            "max_live_runs": int(queue_payload.get("max_live_runs") or 3),
+            "items": list(queue_payload.get("items") or []),
+        },
+        "formal_workers": find_live_formal_workers(root),
         "incomplete_runs": find_incomplete_experiment_runs(root, limit=max_incomplete_runs),
         "completed_runs": find_recent_completed_experiment_runs(root, limit=max_incomplete_runs),
     }
@@ -641,6 +688,7 @@ def _format_coin_slot_snapshot(
     markets: list[str],
     incomplete_runs: list[dict[str, object]],
     completed_runs: list[dict[str, object]],
+    live_run_labels: set[str],
 ) -> list[str]:
     incomplete_by_market: dict[str, list[dict[str, object]]] = {market: [] for market in markets}
     completed_by_market: dict[str, list[dict[str, object]]] = {market: [] for market in markets}
@@ -662,12 +710,15 @@ def _format_coin_slot_snapshot(
         if active_payload is not None:
             suite_name = str(active_payload.get("suite_name") or "")
             suite_summary = _summarize_suite_variants(project_root, suite_name)
+            run_label = str(active_payload.get("run_label") or "")
+            has_live_worker = bool(run_label and run_label in live_run_labels)
             detail_parts = [
-                "state=active",
+                "state=active" if has_live_worker else "state=checkpointed",
                 f"suite={suite_name or '?'}",
-                f"run={active_payload.get('run_label') or '?'}",
+                f"run={run_label or '?'}",
                 f"progress={active_payload.get('completed_cases') or 0}/{active_payload.get('cases') or '?'}",
                 f"last_event={active_payload.get('raw_summary', {}).get('last_event') or active_payload.get('last_event') or 'unknown'}",
+                "live_worker=yes" if has_live_worker else "live_worker=no",
             ]
             if suite_summary:
                 if suite_summary.get("targets"):
@@ -857,6 +908,168 @@ def _format_feature_family_brief(project_root: Path, feature_names: list[str]) -
     return lines
 
 
+def _format_queue_snapshot(queue_payload: dict[str, object]) -> list[str]:
+    items = [dict(item) for item in queue_payload.get("items") or [] if isinstance(item, dict)]
+    if not items:
+        return ["- no queued formal work"]
+    lines = [
+        f"- max_live_runs={int(queue_payload.get('max_live_runs') or 3)}",
+    ]
+    items.sort(
+        key=lambda item: (
+            str(item.get("status") or ""),
+            str(item.get("action") or ""),
+            str(item.get("market") or ""),
+            str(item.get("run_label") or ""),
+        )
+    )
+    for item in items[:8]:
+        lines.append(
+            "- "
+            + " / ".join(
+                [
+                    f"market={item.get('market') or '?'}",
+                    f"status={item.get('status') or '?'}",
+                    f"action={item.get('action') or '?'}",
+                    f"suite={item.get('suite_name') or '?'}",
+                    f"run={item.get('run_label') or '?'}",
+                    f"retry={item.get('retry_count') or 0}",
+                    f"reason={item.get('reason') or ''}".rstrip(),
+                ]
+            )
+        )
+    return lines
+
+
+def find_live_formal_workers(project_root: Path) -> list[dict[str, object]]:
+    root = Path(project_root).resolve()
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,cmd="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    deduped_workers: dict[tuple[str, str, str], dict[str, object]] = {}
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line or (
+            "run_one_experiment.sh" not in line
+            and "research experiment run-suite" not in line
+        ):
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        cmd = parts[2]
+        if str(root) not in cmd:
+            continue
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            continue
+        run_label = _extract_cli_flag(tokens, "--run-label")
+        suite_name = _extract_cli_flag(tokens, "--suite")
+        market = _extract_cli_flag(tokens, "--market")
+        payload = {
+            "pid": pid,
+            "ppid": ppid,
+            "run_label": run_label,
+            "suite_name": suite_name,
+            "market": market,
+            "cmd": cmd,
+        }
+        dedupe_key = (
+            str(run_label or ""),
+            str(suite_name or ""),
+            str(market or ""),
+        )
+        existing = deduped_workers.get(dedupe_key)
+        if existing is None or int(pid) < int(existing.get("pid") or pid):
+            deduped_workers[dedupe_key] = payload
+    return sorted(deduped_workers.values(), key=lambda item: int(item.get("pid") or 0))
+
+
+def find_live_autorun_processes(
+    project_root: Path,
+    *,
+    output_path: Path | None = None,
+) -> list[dict[str, object]]:
+    root = Path(project_root).resolve()
+    loop_script = root / "scripts" / "research" / "codex_background_loop.sh"
+    resolved_output_path = (
+        Path(output_path).resolve()
+        if output_path is not None
+        else root / "var" / "research" / "autorun" / "codex-last-output.txt"
+    )
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,cmd="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    processes: list[dict[str, object]] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        cmd = parts[2]
+        kind: str | None = None
+        if str(loop_script) in cmd and "__run_loop" in cmd:
+            kind = "background_loop"
+        elif (
+            "codex exec" in cmd
+            and f"--cd {root}" in cmd
+            and f"--output-last-message {resolved_output_path}" in cmd
+        ):
+            kind = "codex_exec"
+        if kind is None:
+            continue
+        processes.append(
+            {
+                "pid": pid,
+                "ppid": ppid,
+                "kind": kind,
+                "cmd": cmd,
+            }
+        )
+    return sorted(processes, key=lambda item: int(item.get("pid") or 0))
+
+
+def _extract_cli_flag(tokens: list[str], flag: str) -> str | None:
+    for index, token in enumerate(tokens):
+        if token != flag:
+            continue
+        next_index = index + 1
+        if next_index < len(tokens):
+            value = str(tokens[next_index]).strip()
+            return value or None
+        break
+    return None
+
+
 def build_codex_cycle_prompt(
     *,
     project_root: Path,
@@ -868,6 +1081,14 @@ def build_codex_cycle_prompt(
     program = (program_path or (root / "program.md")).resolve()
     status_report = build_autorun_status_report(root, log_tail_lines=5, max_incomplete_runs=5)
     status_payload = status_report.get("status") or {}
+    formal_workers = list(status_report.get("formal_workers") or [])
+    queue_payload = dict(status_report.get("queue") or {})
+    allowed_live_runs = int(queue_payload.get("max_live_runs") or 3)
+    live_run_labels = {
+        str(item.get("run_label") or "").strip()
+        for item in formal_workers
+        if str(item.get("run_label") or "").strip()
+    }
     incomplete_runs = list(status_report.get("incomplete_runs") or [])
     completed_runs = list(status_report.get("completed_runs") or [])
     latest_cycle_eval = resolve_latest_cycle_eval_file(session)
@@ -886,6 +1107,7 @@ def build_codex_cycle_prompt(
         markets=program_markets,
         incomplete_runs=incomplete_runs,
         completed_runs=completed_runs,
+        live_run_labels=live_run_labels,
     )
     feature_brief_lines = _format_feature_family_brief(
         root,
@@ -896,6 +1118,7 @@ def build_codex_cycle_prompt(
             completed_runs=completed_runs,
         ),
     )
+    queue_lines = _format_queue_snapshot(queue_payload)
     snapshot_lines: list[str] = []
     if status_payload:
         snapshot_lines.append(
@@ -905,6 +1128,7 @@ def build_codex_cycle_prompt(
             snapshot_lines.append(f"- last_started_at: {status_payload['last_started_at']}")
         if status_payload.get("last_finished_at"):
             snapshot_lines.append(f"- last_finished_at: {status_payload['last_finished_at']}")
+    snapshot_lines.append(f"- live formal workers: {len(formal_workers)}")
     if incomplete_runs:
         snapshot_lines.append("- current incomplete runs:")
         for item in incomplete_runs[:3]:
@@ -940,7 +1164,7 @@ def build_codex_cycle_prompt(
     return "\n".join(
         [
             "Read the repository research instructions and complete exactly one autonomous research cycle.",
-            "One bounded cycle may launch multiple distinct formal runs if that is needed to refill idle coin slots allowed by program.md.",
+            "One bounded decision cycle may launch multiple distinct formal runs if that is needed to refill idle coin slots allowed by program.md.",
             "",
             f"Project root: {root}",
             f"Program: {program}",
@@ -953,20 +1177,32 @@ def build_codex_cycle_prompt(
             "Do not open large raw registry files like `research/experiments/custom_feature_sets.json` in the normal decision path; use the pre-extracted coin snapshot and feature-family brief below first.",
             "If you still need exact factor columns, inspect only the exact named feature family that is missing from the brief instead of dumping broad file ranges.",
             "Use the diagnosis-guided family policy in the brief: protect the named core skeleton features, prefer dropping from overloaded repetitive families, and add toward the listed missing-information themes before inventing broader searches.",
+            "Only a run with a live `run_one_experiment.sh` worker counts as an active occupied slot; a checkpoint-only incomplete run with `live_worker=no` is resumable but does not currently consume live concurrency.",
+            "A bounded cycle refers to the Codex decision pass, not an automatic timeout for every formal worker.",
             "If `rg` is unavailable, use `find`, `grep`, `sed`, and targeted `ls`.",
             "When the session is long, start from results.tsv plus the newest cycle eval and open the full session history only if those are insufficient.",
             "Prefer formal experiment launches over unrelated environment or infrastructure edits.",
             "Only make code changes when they directly unblock the next formal experiment for this session.",
             "When session artifacts disagree with current run directories, trust the current run directories.",
-            "A formal run that already has summary.json is finished and must not be resumed or relaunched blindly.",
+            "A formal run is finished only when `completed_cases + failed_cases` reaches `cases`; if `summary.json` exists but work remains, treat it as a checkpointed resumable run rather than a finished run.",
+            "If a healthy live formal worker already fills a coin slot, leave it running; a monitor-only cycle is valid when the active workers are still the right frontier.",
             "If the active program explicitly allows multiple simultaneous formal runs and some coin slots are idle, keep launching distinct follow-ups in the same cycle until you fill every allowed idle slot that still has a clear next follow-up.",
             "Launching several distinct coin follow-ups in one decision pass still counts as one bounded cycle.",
+            "If live formal workers are below the allowed concurrency and some current-line runs are only checkpointed with `live_worker=no`, resume as many checkpointed current-line runs as needed to fill those live slots in the same cycle before opening any new branch.",
+            "When you need a long-lived formal worker to keep running after this cycle, launch it detached with `scripts/research/run_one_experiment_background.sh` and do not add `--timeout-sec` unless you intentionally want a bounded diagnostic probe.",
+            "Reserve `scripts/research/run_one_experiment.sh` with `--timeout-sec` for deliberate bounded checkpoints, diagnostics, or stuck-run inspection.",
+            "Do not stop or checkpoint a healthy live formal run merely to end the current Codex cycle.",
+            f"Queue formal launches and repairs instead of directly filling all slots yourself; the queue supervisor is responsible for keeping up to {allowed_live_runs} live formal runs active.",
+            "Use `scripts/research/experiment_queue.py enqueue ...` for normal formal work and reserve direct launches for deliberate bounded diagnostics only.",
             "",
             "Current autorun snapshot already collected for you:",
             *(snapshot_lines or ["- no existing autorun status snapshot found"]),
             "",
             "Coin slot snapshot already collected for you:",
             *(coin_slot_lines or ["- no explicit coin slot snapshot available"]),
+            "",
+            "Queue snapshot already collected for you:",
+            *queue_lines,
             "",
             "Relevant feature-family brief already extracted for you:",
             *(feature_brief_lines or ["- no focused feature-family brief available"]),
@@ -977,15 +1213,17 @@ def build_codex_cycle_prompt(
             "3. Inspect only the specific active, incomplete, or most recent completed experiment runs needed to avoid duplicates blindly and choose the next step.",
             "4. Decide the next experiment set or code change.",
             "5. If there are idle coin slots that the active program allows you to fill, refill as many distinct idle coin slots as possible in this same cycle instead of stopping after the first new launch.",
+            "5a. If there are no idle coin slots but live formal workers are still below the allowed concurrency, resume multiple checkpointed current-line runs in this same cycle until the live slots are filled or no clear resume target remains.",
             "6. If needed, edit code or create/update a suite spec.",
-            "7. Launch distinct formal runs for different idle coins until you fill every allowed idle slot or run out of clear same-session follow-ups.",
-            "8. Use scripts/research/run_one_experiment.sh for any formal run.",
-            "9. Use scripts/research/summarize_experiment.py to summarize any formal run you completed, resumed, or used as the current frontier evidence.",
-            "10. Never have more than two simultaneous formal market runs active unless program.md explicitly overrides it.",
-            "11. Update the session artifacts under the session dir.",
-            "12. Stop after this one cycle and summarize what changed, what ran, and what should happen next.",
+            "7. Queue distinct formal runs or repairs for different idle coins until you have recorded every clear next same-session follow-up needed to refill the allowed slots.",
+            f"8. Use `scripts/research/experiment_queue.py enqueue --market ... --suite ... --run-label ... --action launch|resume|repair --reason ...` for normal formal work; let the queue supervisor consume queued items and keep occupancy near {allowed_live_runs}.",
+            "9. Use `scripts/research/run_one_experiment.sh` only for intentionally bounded probes, checkpoints, or diagnostics.",
+            "10. Use `scripts/research/summarize_experiment.py` for completed, failed, or intentionally checkpointed runs; do not interrupt a healthy live worker just to summarize it.",
+            f"11. Never have more than {allowed_live_runs} simultaneous formal market runs active unless program.md imposes a stricter limit.",
+            "12. Update the session artifacts under the session dir.",
+            "13. Stop after this one decision cycle and summarize what changed, what ran, what you queued, and what should happen next.",
             "",
-            "Do not run forever in this Codex invocation. One completed cycle only.",
+            "Your Codex decision pass must end after this cycle, but any healthy formal experiment workers you started or observed may continue running after you exit.",
         ]
     )
 
@@ -1019,6 +1257,19 @@ def resolve_codex_exec_binary(
             return str(candidate.resolve())
 
     return "codex"
+
+
+def resolve_codex_exec_path_prefix(project_root: Path) -> str | None:
+    root = Path(project_root).resolve()
+    for candidate in (
+        root / ".venv_server" / "bin",
+        root / ".venv" / "bin",
+    ):
+        if not candidate.is_dir():
+            continue
+        if any((candidate / name).exists() for name in ("python", "python3", "codex")):
+            return str(candidate)
+    return None
 
 
 def build_codex_exec_command(
@@ -1367,7 +1618,7 @@ def _suite_markets(suite_spec: dict[str, object] | None, *, inspection: dict[str
 def _tail_lines(path: Path, *, limit: int) -> list[str]:
     if limit <= 0 or not path.exists():
         return []
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
     return lines[-limit:]
 
 

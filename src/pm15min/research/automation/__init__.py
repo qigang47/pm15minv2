@@ -7,6 +7,7 @@ from .control_plane import (
     build_codex_exec_extra_args,
     build_autorun_status_report,
     build_codex_cycle_prompt,
+    find_live_autorun_processes,
     find_recent_completed_experiment_runs,
     find_incomplete_experiment_runs,
     is_transient_codex_provider_failure,
@@ -15,6 +16,7 @@ from .control_plane import (
     record_session_update,
     resolve_autorun_session_dir,
     resolve_codex_exec_binary,
+    resolve_codex_exec_path_prefix,
     summarize_experiment_run,
 )
 
@@ -25,6 +27,7 @@ __all__ = [
     "build_codex_exec_extra_args",
     "build_autorun_status_report",
     "build_codex_cycle_prompt",
+    "find_live_autorun_processes",
     "find_recent_completed_experiment_runs",
     "find_incomplete_experiment_runs",
     "is_transient_codex_provider_failure",
@@ -33,5 +36,6 @@ __all__ = [
     "record_session_update",
     "resolve_autorun_session_dir",
     "resolve_codex_exec_binary",
+    "resolve_codex_exec_path_prefix",
     "summarize_experiment_run",
 ]
