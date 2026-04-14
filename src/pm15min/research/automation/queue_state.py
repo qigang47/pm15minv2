@@ -63,7 +63,7 @@ def load_experiment_queue(project_root: Path) -> dict[str, object]:
     if not isinstance(items, list):
         payload["items"] = []
     payload.setdefault("version", 1)
-    payload.setdefault("max_live_runs", 3)
+    payload.setdefault("max_live_runs", 4)
     payload.setdefault("updated_at", _utc_now())
     return payload
 
@@ -71,7 +71,7 @@ def load_experiment_queue(project_root: Path) -> dict[str, object]:
 def save_experiment_queue(project_root: Path, payload: dict[str, object]) -> dict[str, object]:
     normalized = dict(payload)
     normalized["version"] = 1
-    normalized["max_live_runs"] = max(1, int(normalized.get("max_live_runs") or 3))
+    normalized["max_live_runs"] = max(1, int(normalized.get("max_live_runs") or 4))
     normalized["updated_at"] = _utc_now()
     items = normalized.get("items")
     normalized["items"] = list(items) if isinstance(items, list) else []
@@ -138,7 +138,8 @@ def select_launchable_queue_items(
     queue_items = [
         dict(item)
         for item in payload.get("items") or []
-        if isinstance(item, dict) and str(item.get("status") or "").strip().lower() == "queued"
+        if isinstance(item, dict)
+        and str(item.get("status") or "").strip().lower() in {"queued", "repair"}
     ]
     queue_items.sort(key=_queue_sort_key)
     for item in queue_items:
@@ -203,6 +204,7 @@ def reconcile_queue_with_live_workers(
         if next_retry_count >= max(1, int(max_repair_attempts)):
             item["status"] = "dead"
         else:
+            item["action"] = "repair"
             item["status"] = "repair"
         updated_items.append(item)
 
@@ -277,6 +279,8 @@ def launch_ready_queue_items(
         item = dict(raw_item)
         item_id = str(item.get("id") or "")
         if item_id in launched_ids:
+            if str(item.get("status") or "").strip().lower() == "repair":
+                item["action"] = "repair"
             item["status"] = "running"
             item["updated_at"] = _utc_now()
             launch_result = launch_results.get(item_id, {})
@@ -322,12 +326,16 @@ def set_queue_item_status(
 
 
 def _queue_sort_key(item: dict[str, object]) -> tuple[int, int, str, str]:
+    status = str(item.get("status") or "").strip().lower()
     action = str(item.get("action") or "").strip().lower()
-    action_rank = {
-        "repair": 0,
-        "resume": 1,
-        "launch": 2,
-    }.get(action, 9)
+    if status == "repair":
+        action_rank = 0
+    else:
+        action_rank = {
+            "repair": 0,
+            "resume": 1,
+            "launch": 2,
+        }.get(action, 9)
     priority = -int(item.get("priority") or 0)
     created_at = str(item.get("created_at") or "")
     run_label = str(item.get("run_label") or "")
@@ -350,7 +358,7 @@ def _default_inspect_run(run_dir: Path) -> dict[str, object]:
 def _empty_queue_payload() -> dict[str, object]:
     return {
         "version": 1,
-        "max_live_runs": 3,
+        "max_live_runs": 4,
         "updated_at": _utc_now(),
         "items": [],
     }

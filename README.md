@@ -1010,12 +1010,7 @@
 
 ## `scripts/`
 
-`scripts/` 不是业务真相，但它们决定了你平时怎么启动系统、怎么导入历史 bundle。改 shell 入口、环境变量加载顺序或迁移脚本时，需要看这里。
-
-### 顶层文件
-
-- `scripts/import_direction_model_bundles.py`
-  一次性 bundle 导入/整理脚本，用来把既有 direction 模型包按 v2 目录约定导入到 canonical `research/model_bundles/` 体系。
+`scripts/` 不是业务真相，但它们决定了你平时怎么启动系统、怎么导入历史 bundle、怎么做运维检查。改 shell 入口、环境变量加载顺序、迁移脚本或巡检脚本时，需要看这里。
 
 ### `scripts/entrypoints/`
 
@@ -1031,6 +1026,38 @@
   启动 live runner / live trading 主流程的标准 shell 入口。
 - `scripts/entrypoints/start_v2_orderbook_fleet.sh`
   启动多市场 orderbook recorder fleet 的标准 shell 入口。
+
+### `scripts/research/`
+
+- `scripts/research/analyze_address_trade_windows.py`
+  地址交易窗口复盘和人工研究脚本。
+- `scripts/research/build_focus_feature_search.py`
+  生成 focus feature search 用的特征集和 suite spec。
+- `scripts/research/merge_experiment_runs.py`
+  把主实验和补跑结果合并成一套统一输出。
+- `scripts/research/run_grouped_backtest_grid.py`
+  跑分组回测网格的批量入口。
+- `scripts/research/run_quick_screen_suite.py`
+  跑快速筛选，不走完整正式实验。
+
+### `scripts/importers/`
+
+- `scripts/importers/import_direction_model_bundles.py`
+  一次性 bundle 导入/整理脚本，用来把既有 direction 模型包按 v2 目录约定导入到 canonical `research/model_bundles/` 体系。
+
+### `scripts/monitoring/`
+
+- `scripts/monitoring/monitor_orderbook_persist_rate.py`
+  观察订单簿落盘频率，适合看 recorder 是否持续在写。
+- `scripts/monitoring/monitor_orderbook_recorders.py`
+  检查 recorder 健康度，例如状态、积压、延迟和错误数。
+- `scripts/monitoring/report_orderbook_capture_health.py`
+  输出订单簿抓取质量报告，偏诊断和巡检。
+
+### `scripts/maintenance/`
+
+- `scripts/maintenance/untrack_generated_artifacts.sh`
+  把生成产物从 Git 索引里移除，但不删除磁盘文件。
 
 ## `var/`
 

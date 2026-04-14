@@ -35,7 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("show", help="Print queue JSON.")
 
     supervise = subparsers.add_parser("supervise-once", help="Reconcile queue state and fill empty slots once.")
-    supervise.add_argument("--max-live-runs", type=int, default=3)
+    supervise.add_argument("--max-live-runs", type=int, default=4)
     supervise.add_argument("--max-repair-attempts", type=int, default=3)
 
     return parser
@@ -44,7 +44,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _default_artifact_paths(root: Path, run_label: str) -> dict[str, str]:
     from pm15min.research.automation import resolve_autorun_session_dir
 
-    session_dir = resolve_autorun_session_dir(root, program_path=root / "program.md")
+    session_dir = resolve_autorun_session_dir(root, program_path=root / "auto_research" / "program.md")
     bootstrap_dir = session_dir / "bootstrap"
     queue_dir = root / "var" / "research" / "autorun" / "queue"
     bootstrap_dir.mkdir(parents=True, exist_ok=True)
@@ -57,7 +57,7 @@ def _default_artifact_paths(root: Path, run_label: str) -> dict[str, str]:
 
 
 def _queue_launcher(root: Path):
-    script = (root / "scripts" / "research" / "run_one_experiment_background.sh").resolve()
+    script = (root / "auto_research" / "run_one_experiment_background.sh").resolve()
 
     def launcher(item: dict[str, object]) -> dict[str, object]:
         artifact_paths = _default_artifact_paths(root, str(item["run_label"]))

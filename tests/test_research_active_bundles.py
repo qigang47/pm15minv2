@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from pm15min.research.bundles.active_registry import write_active_bundle_selection
+import pytest
+
+from pm15min.research.bundles.active_registry import read_active_bundle_selection, write_active_bundle_selection
 from pm15min.research.bundles.loader import resolve_model_bundle_dir
 from pm15min.research.config import ResearchConfig
 from pm15min.research.manifests import build_manifest, write_manifest
@@ -152,3 +155,67 @@ def test_resolve_model_bundle_dir_uses_active_selection_dir_when_bundle_label_is
         bundle_label="baseline_bundle",
     )
     assert resolved == baseline_bundle
+
+
+def test_read_active_bundle_selection_returns_none_for_invalid_json(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        target="direction",
+        root=root,
+    )
+    selection_path = cfg.layout.active_bundle_selection_path(profile="deep_otm", target="direction")
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text("{", encoding="utf-8")
+
+    assert read_active_bundle_selection(cfg, profile="deep_otm", target="direction") is None
+
+
+def test_write_active_bundle_selection_preserves_existing_file_on_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "v2"
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        target="direction",
+        root=root,
+    )
+    selection_path = cfg.layout.active_bundle_selection_path(profile="deep_otm", target="direction")
+
+    write_active_bundle_selection(
+        cfg,
+        profile="deep_otm",
+        target="direction",
+        bundle_label="stable",
+        bundle_dir=root / "research" / "stable",
+        usage="live_current",
+        source_run_dir="/tmp/source-stable",
+    )
+    original_payload = json.loads(selection_path.read_text(encoding="utf-8"))
+    original_write_text = Path.write_text
+
+    def _failing_write_text(self: Path, data: str, *args, **kwargs):
+        if self.parent == selection_path.parent and self.name.startswith(selection_path.name):
+            original_write_text(self, "{", *args, **kwargs)
+            raise RuntimeError("simulated selection write failure")
+        return original_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", _failing_write_text)
+
+    with pytest.raises(RuntimeError, match="simulated selection write failure"):
+        write_active_bundle_selection(
+            cfg,
+            profile="deep_otm",
+            target="direction",
+            bundle_label="candidate",
+            bundle_dir=root / "research" / "candidate",
+            usage="live_candidate",
+            source_run_dir="/tmp/source-candidate",
+        )
+
+    assert read_active_bundle_selection(cfg, profile="deep_otm", target="direction") == original_payload

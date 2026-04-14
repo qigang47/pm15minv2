@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-This repository uses a Python `src/` layout. Maintain source code in `src/pm15min/`, organized by domain: `core/`, `data/`, `research/`, `live/`, and `console/`. Keep tests in `tests/` and mirror the domain naming with files like `test_live_runner.py` or `test_research_backtest_fills.py`. Long-lived design docs live in `docs/`. Use `scripts/entrypoints/` for canonical shell wrappers and `scripts/research/` for one-off research automation.
+This repository uses a Python `src/` layout. Maintain source code in `src/pm15min/`, organized by domain: `core/`, `data/`, `research/`, `live/`, and `console/`. Keep tests in `tests/` and mirror the domain naming with files like `test_live_runner.py` or `test_research_backtest_fills.py`. Long-lived design docs live in `docs/`. Use `scripts/entrypoints/` for canonical shell wrappers, `scripts/research/` for one-off research utilities, `scripts/importers/` for migration/import helpers, `scripts/monitoring/` for operational checks, and `scripts/maintenance/` for repository housekeeping.
 
 Treat `data/`, `research/`, and `var/` as runtime or generated artifact roots. Do not hand-edit outputs there unless the task is explicitly about generated data layout.
 

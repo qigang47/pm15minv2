@@ -19,10 +19,12 @@
 
 Repo 内自动化入口：
 
-- `program.md`
+- `auto_research/program.md`
   - 外部 `codex` 每一轮读取的仓库内研究指令。
-- `scripts/research/README.md`
+- `auto_research/README.md`
   - `codex_background_loop.sh`、`status_autorun.sh`、`run_one_experiment.sh` 等控制面脚本的使用说明。
+- `scripts/`
+  - 普通研究工具、导入脚本、运维监控脚本和仓库维护脚本的归类目录。
 
 入口包：
 

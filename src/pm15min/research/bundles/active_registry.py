@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from pm15min.data.io.json_files import write_json_atomic
 from pm15min.research.config import ResearchConfig
 from pm15min.research.layout import normalize_target, slug_token
 from pm15min.research.manifests import utc_manifest_timestamp
@@ -17,7 +18,11 @@ def read_active_bundle_selection(cfg: ResearchConfig, *, profile: str, target: s
     path = active_bundle_selection_path(cfg, profile=profile, target=target)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def write_active_bundle_selection(
@@ -48,7 +53,7 @@ def write_active_bundle_selection(
         "metadata": dict(metadata or {}),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    write_json_atomic(payload, path)
     return path
 
 

@@ -261,7 +261,7 @@ def test_record_session_update_appends_results_and_session_sections(tmp_path: Pa
         metric="roi_pct=12.5",
         status="partial",
         description="ran one cycle",
-        files_changed=["program.md", "scripts/research/run_one_experiment.sh"],
+        files_changed=["auto_research/program.md", "auto_research/run_one_experiment.sh"],
         timestamp="2026-04-04T16:00:00+08:00",
         cycle_eval_md="# Cycle 007\n\nsummary",
         cycle_notes=["started codex background automation mvp"],
@@ -271,7 +271,7 @@ def test_record_session_update_appends_results_and_session_sections(tmp_path: Pa
 
     results_lines = (session_dir / "results.tsv").read_text(encoding="utf-8").strip().splitlines()
     assert results_lines[0] == "cycle\tteam\tmetric\tstatus\tdescription\tfiles_changed\ttimestamp"
-    assert results_lines[1].startswith("007\tgreen\troi_pct=12.5\tpartial\tran one cycle\tprogram.md,scripts/research/run_one_experiment.sh\t2026-04-04T16:00:00+08:00")
+    assert results_lines[1].startswith("007\tgreen\troi_pct=12.5\tpartial\tran one cycle\tauto_research/program.md,auto_research/run_one_experiment.sh\t2026-04-04T16:00:00+08:00")
     session_text = (session_dir / "session.md").read_text(encoding="utf-8")
     assert "- `007`" in session_text
     assert "started codex background automation mvp" in session_text
@@ -294,8 +294,8 @@ def test_build_codex_cycle_prompt_references_program_and_session(tmp_path: Path)
     assert "read program_custom.md and the latest session artifacts before making changes; start with results.tsv plus the newest cycle eval" in prompt.lower()
     assert "your codex decision pass must end after this cycle" in prompt.lower()
     assert "healthy formal experiment workers you started or observed may continue running after you exit" in prompt.lower()
-    assert "3 simultaneous formal market runs" in prompt
-    assert "keep occupancy near 3" in prompt
+    assert "4 simultaneous formal market runs" in prompt
+    assert "keep occupancy near 4" in prompt
     assert "do not scan the entire repository" in prompt.lower()
     assert "prefer formal experiment launches over unrelated environment or infrastructure edits" in prompt.lower()
     assert "if `rg` is unavailable" in prompt.lower()
@@ -304,6 +304,7 @@ def test_build_codex_cycle_prompt_references_program_and_session(tmp_path: Path)
     assert "idle coin slots" in prompt.lower()
     assert "newest cycle eval" in prompt.lower()
     assert "fill every allowed idle slot" in prompt.lower()
+    assert "do not leave an idle coin slot unfilled solely because the latest result is thin-sample" in prompt.lower()
     assert "still counts as one bounded cycle" in prompt.lower()
     assert "resume as many checkpointed current-line runs as needed to fill those live slots in the same cycle" in prompt.lower()
     assert "do not stop or checkpoint a healthy live formal run merely to end the current codex cycle" in prompt.lower()
@@ -343,9 +344,9 @@ def test_find_live_formal_workers_deduplicates_same_run_label(
     root.mkdir(parents=True, exist_ok=True)
     duplicate_output = "\n".join(
         [
-            f"101 1 /bin/bash {root}/scripts/research/run_one_experiment.sh --suite demo_suite --run-label demo_run --market btc",
-            f"202 101 /bin/bash {root}/scripts/research/run_one_experiment.sh --suite demo_suite --run-label demo_run --market btc",
-            f"303 1 /bin/bash {root}/scripts/research/run_one_experiment.sh --suite other_suite --run-label other_run --market eth",
+            f"101 1 /bin/bash {root}/auto_research/run_one_experiment.sh --suite demo_suite --run-label demo_run --market btc",
+            f"202 101 /bin/bash {root}/auto_research/run_one_experiment.sh --suite demo_suite --run-label demo_run --market btc",
+            f"303 1 /bin/bash {root}/auto_research/run_one_experiment.sh --suite other_suite --run-label other_run --market eth",
         ]
     )
 
@@ -364,7 +365,7 @@ def test_find_live_formal_workers_deduplicates_same_run_label(
             "run_label": "demo_run",
             "suite_name": "demo_suite",
             "market": "btc",
-            "cmd": f"/bin/bash {root}/scripts/research/run_one_experiment.sh --suite demo_suite --run-label demo_run --market btc",
+            "cmd": f"/bin/bash {root}/auto_research/run_one_experiment.sh --suite demo_suite --run-label demo_run --market btc",
         },
         {
             "pid": 303,
@@ -372,7 +373,7 @@ def test_find_live_formal_workers_deduplicates_same_run_label(
             "run_label": "other_run",
             "suite_name": "other_suite",
             "market": "eth",
-            "cmd": f"/bin/bash {root}/scripts/research/run_one_experiment.sh --suite other_suite --run-label other_run --market eth",
+            "cmd": f"/bin/bash {root}/auto_research/run_one_experiment.sh --suite other_suite --run-label other_run --market eth",
         },
     ]
 
@@ -417,7 +418,7 @@ def test_find_live_autorun_processes_matches_loop_and_codex_exec(
     root = tmp_path / "repo"
     root.mkdir(parents=True, exist_ok=True)
     output_path = root / "var" / "research" / "autorun" / "codex-last-output.txt"
-    script_path = root / "scripts" / "research" / "codex_background_loop.sh"
+    script_path = root / "auto_research" / "codex_background_loop.sh"
     ps_output = "\n".join(
         [
             f"101 1 /bin/bash {script_path} __run_loop",
@@ -526,7 +527,8 @@ def test_build_codex_cycle_prompt_includes_coin_slot_snapshot_and_feature_brief(
     root = tmp_path / "repo"
     session_dir = root / "sessions" / "demo"
     session_dir.mkdir(parents=True, exist_ok=True)
-    (root / "program.md").write_text(
+    (root / "auto_research").mkdir(parents=True, exist_ok=True)
+    (root / "auto_research" / "program.md").write_text(
         "\n".join(
             [
                 "# Demo Program",
@@ -709,7 +711,8 @@ def test_build_codex_cycle_prompt_marks_live_worker_slots_active(
     root = tmp_path / "repo"
     session_dir = root / "sessions" / "demo"
     session_dir.mkdir(parents=True, exist_ok=True)
-    (root / "program.md").write_text("# Demo Program\n\n- coins: `btc`\n", encoding="utf-8")
+    (root / "auto_research").mkdir(parents=True, exist_ok=True)
+    (root / "auto_research" / "program.md").write_text("# Demo Program\n\n- coins: `btc`\n", encoding="utf-8")
     experiments_root = root / "research" / "experiments"
     experiments_root.mkdir(parents=True, exist_ok=True)
     suite_specs_dir = experiments_root / "suite_specs"
@@ -835,7 +838,7 @@ def test_resolve_autorun_session_dir_prefers_explicit_value(tmp_path: Path) -> N
     resolved = resolve_autorun_session_dir(
         root,
         explicit_session_dir=explicit,
-        program_path=root / "program.md",
+        program_path=root / "auto_research" / "program.md",
     )
 
     assert resolved == explicit.resolve()
@@ -844,7 +847,8 @@ def test_resolve_autorun_session_dir_prefers_explicit_value(tmp_path: Path) -> N
 def test_resolve_autorun_session_dir_reads_active_session_from_program(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir(parents=True, exist_ok=True)
-    program_path = root / "program.md"
+    (root / "auto_research").mkdir(parents=True, exist_ok=True)
+    program_path = root / "auto_research" / "program.md"
     program_path.write_text(
         "\n".join(
             [
@@ -1046,7 +1050,7 @@ def test_is_transient_codex_provider_failure_ignores_plain_base_url_mentions() -
 
 
 def test_codex_background_loop_includes_secondary_nimabo_fallback_layer() -> None:
-    script_text = Path("scripts/research/codex_background_loop.sh").read_text(encoding="utf-8")
+    script_text = Path("auto_research/codex_background_loop.sh").read_text(encoding="utf-8")
 
     assert "CODEX_SECONDARY_BASE_URL" in script_text
     assert "CODEX_SECONDARY_API_KEY" in script_text
@@ -1061,7 +1065,7 @@ def test_codex_background_loop_includes_secondary_nimabo_fallback_layer() -> Non
 
 
 def test_codex_background_loop_terminates_full_attempt_process_group() -> None:
-    script_text = Path("scripts/research/codex_background_loop.sh").read_text(encoding="utf-8")
+    script_text = Path("auto_research/codex_background_loop.sh").read_text(encoding="utf-8")
 
     assert "setsid" in script_text
     assert "kill -- -\"$attempt_pid\"" in script_text or "kill -TERM -- -\"$attempt_pid\"" in script_text
@@ -1069,7 +1073,7 @@ def test_codex_background_loop_terminates_full_attempt_process_group() -> None:
 
 
 def test_codex_background_loop_does_not_launch_attempt_pid_via_command_substitution() -> None:
-    script_text = Path("scripts/research/codex_background_loop.sh").read_text(encoding="utf-8")
+    script_text = Path("auto_research/codex_background_loop.sh").read_text(encoding="utf-8")
 
     assert 'attempt_pid="$(start_codex_attempt_process' not in script_text
     assert 'echo "$!"' not in script_text
@@ -1077,7 +1081,7 @@ def test_codex_background_loop_does_not_launch_attempt_pid_via_command_substitut
 
 
 def test_research_readme_documents_secondary_nimabo_fallback_order() -> None:
-    readme_text = Path("scripts/research/README.md").read_text(encoding="utf-8")
+    readme_text = Path("auto_research/README.md").read_text(encoding="utf-8")
 
     assert "CODEX_SECONDARY_BASE_URL" in readme_text
     assert "CODEX_SECONDARY_API_KEY" in readme_text

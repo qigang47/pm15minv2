@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from pm15min.data.io.json_files import write_json_atomic
+
 
 _SCHEMA_VERSION = "pm15min.research.v1"
 
@@ -71,7 +73,7 @@ def write_manifest(path: str | Path, manifest: ResearchManifest | dict[str, Any]
     target = resolve_manifest_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = manifest.to_dict() if isinstance(manifest, ResearchManifest) else dict(manifest)
-    target.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    write_json_atomic(payload, target)
     return target
 
 

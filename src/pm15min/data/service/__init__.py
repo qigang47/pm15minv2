@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import json
 import pandas as pd
 
 from ..config import DataConfig
+from ..io.json_files import write_json_atomic
 from ..layout import utc_snapshot_label
 from .audit import build_data_audit
 from .datasets import build_data_datasets
@@ -92,13 +92,11 @@ def persist_data_summary(*, cfg: DataConfig, payload: dict[str, Any]) -> dict[st
     latest_manifest_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True)
     manifest = build_data_summary_manifest(cfg=cfg, payload=payload)
-    manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True)
-    latest_path.write_text(text, encoding="utf-8")
-    snapshot_path.write_text(text, encoding="utf-8")
-    latest_manifest_path.write_text(manifest_text, encoding="utf-8")
-    manifest_snapshot_path.write_text(manifest_text, encoding="utf-8")
+    write_json_atomic(payload, latest_path)
+    write_json_atomic(payload, snapshot_path)
+    write_json_atomic(manifest, latest_manifest_path)
+    write_json_atomic(manifest, manifest_snapshot_path)
     return {
         "latest": latest_path,
         "snapshot": snapshot_path,

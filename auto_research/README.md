@@ -4,29 +4,29 @@ This repository keeps the experiment control plane inside the repo. The external
 
 Main entrypoints:
 
-- `program.md`
+- `auto_research/program.md`
   - repo-local research instructions for each Codex cycle
-- `scripts/research/run_one_experiment.sh`
+- `auto_research/run_one_experiment.sh`
   - run one formal experiment suite
-- `scripts/research/run_one_experiment_background.sh`
+- `auto_research/run_one_experiment_background.sh`
   - launch one formal experiment suite in the background and return immediately
-- `scripts/research/experiment_queue.py`
+- `auto_research/experiment_queue.py`
   - enqueue formal launches and repairs, inspect queue state, or run one queue-supervisor pass
-- `scripts/research/experiment_queue_supervisor.sh`
+- `auto_research/experiment_queue_supervisor.sh`
   - keep up to three live formal experiments running from the repo-local queue
-- `scripts/research/summarize_experiment.py`
+- `auto_research/summarize_experiment.py`
   - extract a compact JSON summary from a finished experiment run
-- `scripts/research/update_session.py`
+- `auto_research/update_session.py`
   - append one cycle into the active session files
-- `scripts/research/codex_background_loop.sh`
+- `auto_research/codex_background_loop.sh`
   - start, stop, restart, or run one background Codex cycle
-- `scripts/research/status_autorun.sh`
+- `auto_research/status_autorun.sh`
   - inspect background status plus incomplete experiment runs
 
 Default session resolution:
 
 - `codex_background_loop.sh` now resolves the session directory from the active program file
-- if `SESSION_DIR` is unset, it reads the first `Active session:` reference in `program.md`
+- if `SESSION_DIR` is unset, it reads the first `Active session:` reference in `auto_research/program.md`
 - this keeps the background loop from mixing a new program with an old session log
 
 Default Codex home behavior:
@@ -66,17 +66,17 @@ Background retry order:
 Typical commands:
 
 ```bash
-./scripts/research/experiment_queue_supervisor.sh start
-./scripts/research/codex_background_loop.sh start
-./scripts/research/status_autorun.sh
-./scripts/research/codex_background_loop.sh stop
-./scripts/research/experiment_queue_supervisor.sh stop
+./auto_research/experiment_queue_supervisor.sh start
+./auto_research/codex_background_loop.sh start
+./auto_research/status_autorun.sh
+./auto_research/codex_background_loop.sh stop
+./auto_research/experiment_queue_supervisor.sh stop
 ```
 
 Queue one formal follow-up instead of launching it immediately:
 
 ```bash
-./scripts/research/experiment_queue.py enqueue \
+./auto_research/experiment_queue.py enqueue \
   --market btc \
   --suite baseline_focus_feature_search_btc_reversal_40v6_bias60_2usd_5max_20260413 \
   --run-label auto_btc_40v6_bias60_2usd_5max_20260413 \
@@ -87,7 +87,7 @@ Queue one formal follow-up instead of launching it immediately:
 Long-lived formal worker launch:
 
 ```bash
-./scripts/research/run_one_experiment_background.sh \
+./auto_research/run_one_experiment_background.sh \
   --suite baseline_focus_feature_search_btc_reversal_40v4_novolweight_2usd_5max_20260413 \
   --run-label auto_btc_40v4_novolweight_2usd_5max_r1_20260413 \
   --market btc

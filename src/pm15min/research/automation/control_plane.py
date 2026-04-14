@@ -12,6 +12,10 @@ import subprocess
 
 from .queue_state import experiment_queue_path, load_experiment_queue
 
+_AUTORESEARCH_DIRNAME = "auto_research"
+_LEGACY_AUTORESEARCH_DIR = Path("scripts") / "research"
+_AUTORESEARCH_PROGRAM_NAME = "program.md"
+_AUTORESEARCH_README_NAME = "README.md"
 
 _CODEX_HOME_COPY_FILES = (
     "auth.json",
@@ -166,6 +170,61 @@ _DIAGNOSIS_REDUNDANT_MEMBER_SET = {
     for columns in _DIAGNOSIS_REDUNDANT_FAMILY_MEMBERS.values()
     for column in columns
 }
+
+
+def _autoresearch_dir(project_root: Path) -> Path:
+    return Path(project_root).resolve() / _AUTORESEARCH_DIRNAME
+
+
+def _legacy_autoresearch_dir(project_root: Path) -> Path:
+    return Path(project_root).resolve() / _LEGACY_AUTORESEARCH_DIR
+
+
+def _resolve_repo_relative_path(project_root: Path, path: Path | str) -> Path:
+    root = Path(project_root).resolve()
+    raw = Path(path)
+    return raw if raw.is_absolute() else (root / raw)
+
+
+def resolve_autoresearch_program_path(
+    project_root: Path,
+    program_path: Path | str | None = None,
+) -> Path:
+    root = Path(project_root).resolve()
+    if program_path is not None and str(program_path).strip():
+        return _resolve_repo_relative_path(root, program_path)
+    preferred = _autoresearch_dir(root) / _AUTORESEARCH_PROGRAM_NAME
+    legacy = root / _AUTORESEARCH_PROGRAM_NAME
+    if preferred.exists() or not legacy.exists():
+        return preferred
+    return legacy
+
+
+def resolve_autoresearch_script_path(project_root: Path, script_name: str) -> Path:
+    root = Path(project_root).resolve()
+    preferred = _autoresearch_dir(root) / str(script_name)
+    legacy = _legacy_autoresearch_dir(root) / str(script_name)
+    if preferred.exists() or not legacy.exists():
+        return preferred
+    return legacy
+
+
+def resolve_autoresearch_readme_path(project_root: Path) -> Path:
+    root = Path(project_root).resolve()
+    preferred = _autoresearch_dir(root) / _AUTORESEARCH_README_NAME
+    legacy = _legacy_autoresearch_dir(root) / _AUTORESEARCH_README_NAME
+    if preferred.exists() or not legacy.exists():
+        return preferred
+    return legacy
+
+
+def _repo_display_path(project_root: Path, path: Path | str) -> str:
+    root = Path(project_root).resolve()
+    resolved = _resolve_repo_relative_path(root, path).resolve()
+    try:
+        return str(resolved.relative_to(root))
+    except ValueError:
+        return str(resolved)
 
 
 def summarize_experiment_run(run_dir: Path) -> dict[str, object]:
@@ -540,8 +599,7 @@ def resolve_autorun_session_dir(
         return Path(explicit_session_dir).expanduser().resolve()
 
     root = Path(project_root).resolve()
-    raw_program = Path(program_path) if program_path is not None else (root / "program.md")
-    program = raw_program if raw_program.is_absolute() else (root / raw_program)
+    program = resolve_autoresearch_program_path(root, program_path)
     if program.exists():
         text = program.read_text(encoding="utf-8")
         match = _ACTIVE_SESSION_LINE_RE.search(text) or _SESSION_REF_RE.search(text)
@@ -1005,7 +1063,10 @@ def find_live_autorun_processes(
     output_path: Path | None = None,
 ) -> list[dict[str, object]]:
     root = Path(project_root).resolve()
-    loop_script = root / "scripts" / "research" / "codex_background_loop.sh"
+    loop_scripts = {
+        _autoresearch_dir(root) / "codex_background_loop.sh",
+        _legacy_autoresearch_dir(root) / "codex_background_loop.sh",
+    }
     resolved_output_path = (
         Path(output_path).resolve()
         if output_path is not None
@@ -1037,7 +1098,7 @@ def find_live_autorun_processes(
             continue
         cmd = parts[2]
         kind: str | None = None
-        if str(loop_script) in cmd and "__run_loop" in cmd:
+        if any(str(loop_script) in cmd for loop_script in loop_scripts) and "__run_loop" in cmd:
             kind = "background_loop"
         elif (
             "codex exec" in cmd
@@ -1078,12 +1139,16 @@ def build_codex_cycle_prompt(
 ) -> str:
     root = Path(project_root).resolve()
     session = Path(session_dir).resolve()
-    program = (program_path or (root / "program.md")).resolve()
+    program = resolve_autoresearch_program_path(root, program_path).resolve()
+    queue_script = _repo_display_path(root, resolve_autoresearch_script_path(root, "experiment_queue.py"))
+    background_script = _repo_display_path(root, resolve_autoresearch_script_path(root, "run_one_experiment_background.sh"))
+    one_shot_script = _repo_display_path(root, resolve_autoresearch_script_path(root, "run_one_experiment.sh"))
+    summarize_script = _repo_display_path(root, resolve_autoresearch_script_path(root, "summarize_experiment.py"))
     status_report = build_autorun_status_report(root, log_tail_lines=5, max_incomplete_runs=5)
     status_payload = status_report.get("status") or {}
     formal_workers = list(status_report.get("formal_workers") or [])
     queue_payload = dict(status_report.get("queue") or {})
-    allowed_live_runs = int(queue_payload.get("max_live_runs") or 3)
+    allowed_live_runs = int(queue_payload.get("max_live_runs") or 4)
     live_run_labels = {
         str(item.get("run_label") or "").strip()
         for item in formal_workers
@@ -1187,13 +1252,14 @@ def build_codex_cycle_prompt(
             "A formal run is finished only when `completed_cases + failed_cases` reaches `cases`; if `summary.json` exists but work remains, treat it as a checkpointed resumable run rather than a finished run.",
             "If a healthy live formal worker already fills a coin slot, leave it running; a monitor-only cycle is valid when the active workers are still the right frontier.",
             "If the active program explicitly allows multiple simultaneous formal runs and some coin slots are idle, keep launching distinct follow-ups in the same cycle until you fill every allowed idle slot that still has a clear next follow-up.",
+            "Do not leave an idle coin slot unfilled solely because the latest result is thin-sample, tied, or still marked `research_only`; when the frontier is unresolved but the slot is free, choose the next bounded follow-up that can strengthen or falsify that edge.",
             "Launching several distinct coin follow-ups in one decision pass still counts as one bounded cycle.",
             "If live formal workers are below the allowed concurrency and some current-line runs are only checkpointed with `live_worker=no`, resume as many checkpointed current-line runs as needed to fill those live slots in the same cycle before opening any new branch.",
-            "When you need a long-lived formal worker to keep running after this cycle, launch it detached with `scripts/research/run_one_experiment_background.sh` and do not add `--timeout-sec` unless you intentionally want a bounded diagnostic probe.",
-            "Reserve `scripts/research/run_one_experiment.sh` with `--timeout-sec` for deliberate bounded checkpoints, diagnostics, or stuck-run inspection.",
+            f"When you need a long-lived formal worker to keep running after this cycle, launch it detached with `{background_script}` and do not add `--timeout-sec` unless you intentionally want a bounded diagnostic probe.",
+            f"Reserve `{one_shot_script}` with `--timeout-sec` for deliberate bounded checkpoints, diagnostics, or stuck-run inspection.",
             "Do not stop or checkpoint a healthy live formal run merely to end the current Codex cycle.",
             f"Queue formal launches and repairs instead of directly filling all slots yourself; the queue supervisor is responsible for keeping up to {allowed_live_runs} live formal runs active.",
-            "Use `scripts/research/experiment_queue.py enqueue ...` for normal formal work and reserve direct launches for deliberate bounded diagnostics only.",
+            f"Use `{queue_script} enqueue ...` for normal formal work and reserve direct launches for deliberate bounded diagnostics only.",
             "",
             "Current autorun snapshot already collected for you:",
             *(snapshot_lines or ["- no existing autorun status snapshot found"]),
@@ -1216,9 +1282,9 @@ def build_codex_cycle_prompt(
             "5a. If there are no idle coin slots but live formal workers are still below the allowed concurrency, resume multiple checkpointed current-line runs in this same cycle until the live slots are filled or no clear resume target remains.",
             "6. If needed, edit code or create/update a suite spec.",
             "7. Queue distinct formal runs or repairs for different idle coins until you have recorded every clear next same-session follow-up needed to refill the allowed slots.",
-            f"8. Use `scripts/research/experiment_queue.py enqueue --market ... --suite ... --run-label ... --action launch|resume|repair --reason ...` for normal formal work; let the queue supervisor consume queued items and keep occupancy near {allowed_live_runs}.",
-            "9. Use `scripts/research/run_one_experiment.sh` only for intentionally bounded probes, checkpoints, or diagnostics.",
-            "10. Use `scripts/research/summarize_experiment.py` for completed, failed, or intentionally checkpointed runs; do not interrupt a healthy live worker just to summarize it.",
+            f"8. Use `{queue_script} enqueue --market ... --suite ... --run-label ... --action launch|resume|repair --reason ...` for normal formal work; let the queue supervisor consume queued items and keep occupancy near {allowed_live_runs}.",
+            f"9. Use `{one_shot_script}` only for intentionally bounded probes, checkpoints, or diagnostics.",
+            f"10. Use `{summarize_script}` for completed, failed, or intentionally checkpointed runs; do not interrupt a healthy live worker just to summarize it.",
             f"11. Never have more than {allowed_live_runs} simultaneous formal market runs active unless program.md imposes a stricter limit.",
             "12. Update the session artifacts under the session dir.",
             "13. Stop after this one decision cycle and summarize what changed, what ran, what you queued, and what should happen next.",

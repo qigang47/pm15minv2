@@ -4,11 +4,12 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from pm15min.data.config import DataConfig
 from pm15min.data.io.ndjson_zst import append_ndjson_zst
 from pm15min.data.io.parquet import write_parquet_atomic
-from pm15min.data.service import show_data_summary
+from pm15min.data.service import persist_data_summary, show_data_summary
 
 
 def test_show_data_summary_reports_core_dataset_stats(tmp_path: Path) -> None:
@@ -414,3 +415,50 @@ def test_show_data_summary_flags_stale_and_lagging_live_datasets(tmp_path: Path)
     assert "oracle_prices_table_vs_direct_oracle_source" in payload["audit"]["alignment_issue_checks"]
     assert payload["audit"]["dataset_audits"]["orderbook_index_table"]["status"] == "warning"
     assert any(issue["code"] == "alignment_check_failed" for issue in payload["issues"])
+
+
+def test_persist_data_summary_preserves_existing_latest_file_on_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
+    original_payload = {
+        "generated_at": "2026-03-19T00-20-00Z",
+        "generated_at_iso": "2026-03-19T00:20:00+00:00",
+        "market": "sol",
+        "cycle": "15m",
+        "surface": "live",
+        "surface_data_root": str(cfg.layout.surface_data_root),
+        "summary": {"dataset_count": 1, "existing_dataset_count": 1, "missing_dataset_count": 0},
+        "audit": {
+            "status": "ok",
+            "critical_expected_datasets": [],
+            "dataset_audits": {},
+        },
+        "completeness": {"status": "ok"},
+        "issues": [],
+        "datasets": {},
+    }
+    persist_data_summary(cfg=cfg, payload=original_payload)
+    original_write_text = Path.write_text
+
+    def _failing_write_text(self: Path, data: str, *args, **kwargs):
+        if self.parent == cfg.layout.latest_summary_path.parent and self.name.startswith(cfg.layout.latest_summary_path.name):
+            original_write_text(self, "{", *args, **kwargs)
+            raise RuntimeError("simulated summary write failure")
+        return original_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", _failing_write_text)
+
+    with pytest.raises(RuntimeError, match="simulated summary write failure"):
+        persist_data_summary(
+            cfg=cfg,
+            payload={
+                **original_payload,
+                "generated_at": "2026-03-19T00-25-00Z",
+                "generated_at_iso": "2026-03-19T00:25:00+00:00",
+            },
+        )
+
+    persisted = json.loads(cfg.layout.latest_summary_path.read_text(encoding="utf-8"))
+    assert persisted["generated_at"] == original_payload["generated_at"]

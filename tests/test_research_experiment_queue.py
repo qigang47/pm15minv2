@@ -14,6 +14,14 @@ from pm15min.research.automation.queue_state import (
 )
 
 
+def test_load_experiment_queue_defaults_to_four_live_runs(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+
+    state = load_experiment_queue(root)
+
+    assert state["max_live_runs"] == 4
+
+
 def test_upsert_queue_item_replaces_older_normal_candidate_for_same_market(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     older = build_queue_item(
@@ -135,7 +143,43 @@ def test_reconcile_queue_with_live_workers_marks_missing_nonterminal_run_as_repa
 
     item = next(entry for entry in state["items"] if entry["run_label"] == "btc_run")
     assert item["status"] == "repair"
+    assert item["action"] == "repair"
     assert item["retry_count"] == 1
+
+
+def test_launch_ready_queue_items_relaunches_repair_status_item(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    running = build_queue_item(
+        market="sol",
+        suite_name="sol_suite",
+        run_label="sol_run",
+        action="launch",
+        status="running",
+        reason="running",
+    )
+    upsert_queue_item(root, running)
+
+    reconciled = reconcile_queue_with_live_workers(
+        root,
+        live_workers=[],
+        inspect_run=lambda _run_dir: {"state": "checkpointed", "last_event": "market_cache_resolved"},
+        max_repair_attempts=3,
+    )
+    repair_item = next(entry for entry in reconciled["items"] if entry["run_label"] == "sol_run")
+    assert repair_item["status"] == "repair"
+
+    launched: list[str] = []
+    relaunched_state, launched_items = launch_ready_queue_items(
+        root,
+        live_workers=[],
+        launcher=lambda item: launched.append(str(item["run_label"])) or {"pid": 456},
+    )
+
+    assert [item["run_label"] for item in launched_items] == ["sol_run"]
+    assert launched == ["sol_run"]
+    relaunched_item = next(entry for entry in relaunched_state["items"] if entry["run_label"] == "sol_run")
+    assert relaunched_item["status"] == "running"
+    assert relaunched_item["action"] == "repair"
 
 
 def test_reconcile_queue_with_live_workers_marks_terminal_run_done(tmp_path: Path) -> None:
@@ -276,7 +320,8 @@ def test_build_codex_cycle_prompt_includes_queue_snapshot_and_queue_instruction(
     root = tmp_path / "repo"
     session_dir = root / "sessions" / "demo"
     session_dir.mkdir(parents=True, exist_ok=True)
-    (root / "program.md").write_text("# Demo\n\n- coins: btc, eth, sol, xrp\n", encoding="utf-8")
+    (root / "auto_research").mkdir(parents=True, exist_ok=True)
+    (root / "auto_research" / "program.md").write_text("# Demo\n\n- coins: btc, eth, sol, xrp\n", encoding="utf-8")
     (session_dir / "results.tsv").write_text(
         "cycle\tteam\tmetric\tstatus\tdescription\tfiles_changed\ttimestamp\n",
         encoding="utf-8",
