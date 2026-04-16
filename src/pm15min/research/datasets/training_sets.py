@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pandas as pd
 
+from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
+from pm15min.research.backtests.orderbook_surface import QUOTE_SURFACE_COLUMNS, attach_canonical_quote_surface
+from pm15min.research.backtests.regime_parity import resolve_backtest_profile_spec
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import TrainingSetSpec
 from pm15min.research.datasets.loaders import load_feature_frame, load_label_frame
@@ -36,6 +39,12 @@ TRAINING_SET_META_COLUMNS = [
     "price_to_beat",
     "final_price",
     "full_truth",
+    "quote_status",
+    "quote_reason",
+    "quote_up_ask",
+    "quote_down_ask",
+    "winner_entry_price",
+    "winner_in_band",
 ]
 
 TRAINING_SET_LABEL_REQUIRED_COLUMNS = [
@@ -94,9 +103,11 @@ def build_training_set_dataset(
 
     merged, alignment_metadata = merge_feature_and_label_frames(features, labels)
     filtered = _filter_training_window(merged, start=spec.window.start, end=spec.window.end, offset=spec.offset)
+    filtered, quote_metadata = _attach_tradeable_winner_metadata(cfg, filtered)
     dataset, metadata = _build_target_frame(filtered, target=spec.target)
     metadata = {
         **alignment_metadata,
+        **quote_metadata,
         **metadata,
     }
 
@@ -251,6 +262,95 @@ def _build_target_frame(frame: pd.DataFrame, *, target: str) -> tuple[pd.DataFra
     }
     metadata.update(summarize_label_sources(dataset.get("label_source", pd.Series(dtype="string"))))
     return dataset, metadata
+
+
+_TRAINING_QUOTE_COLUMNS = {
+    "quote_status",
+    "quote_reason",
+    "quote_up_ask",
+    "quote_down_ask",
+}
+
+
+def _attach_tradeable_winner_metadata(
+    cfg: ResearchConfig,
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    if frame.empty:
+        out = frame.copy()
+        out["quote_status"] = pd.Series(dtype="string")
+        out["quote_reason"] = pd.Series(dtype="string")
+        out["quote_up_ask"] = pd.Series(dtype=float)
+        out["quote_down_ask"] = pd.Series(dtype=float)
+        out["winner_entry_price"] = pd.Series(dtype=float)
+        out["winner_in_band"] = pd.Series(dtype="boolean")
+        return out, {
+            "quote_ready_rows_in_window": 0,
+            "quote_missing_rows_in_window": 0,
+            "winner_in_band_rows": 0,
+        }
+
+    out = frame.copy()
+    for column in _TRAINING_QUOTE_COLUMNS:
+        if column not in out.columns:
+            out[column] = pd.NA
+
+    try:
+        data_cfg = DataConfig.build(
+            market=cfg.asset.slug,
+            cycle=cfg.cycle,
+            surface=cfg.source_surface,
+            root=cfg.layout.storage.rewrite_root,
+        )
+        quoted, quote_summary = attach_canonical_quote_surface(replay=out, data_cfg=data_cfg)
+        out = quoted
+        for column in QUOTE_SURFACE_COLUMNS:
+            if column in out.columns and column not in _TRAINING_QUOTE_COLUMNS:
+                out = out.drop(columns=[column])
+        quote_ready_rows = int(getattr(quote_summary, "quote_ready_rows", 0))
+        quote_missing_rows = int(getattr(quote_summary, "quote_missing_rows", len(out) - quote_ready_rows))
+    except Exception as exc:
+        out["quote_status"] = "quote_attach_failed"
+        out["quote_reason"] = str(exc)
+        out["quote_up_ask"] = pd.NA
+        out["quote_down_ask"] = pd.NA
+        quote_ready_rows = 0
+        quote_missing_rows = int(len(out))
+
+    profile_spec = resolve_backtest_profile_spec(
+        market=cfg.asset.slug,
+        profile=cfg.profile,
+    )
+    winner_entry_price = _winner_entry_price(out)
+    winner_in_band = (
+        out.get("quote_status", pd.Series("", index=out.index, dtype="string")).astype("string").eq("ok")
+        & winner_entry_price.notna()
+    )
+    entry_price_min = getattr(profile_spec, "entry_price_min", None)
+    entry_price_max = getattr(profile_spec, "entry_price_max", None)
+    if entry_price_min is not None:
+        winner_in_band &= winner_entry_price.ge(float(entry_price_min))
+    if entry_price_max is not None:
+        winner_in_band &= winner_entry_price.le(float(entry_price_max))
+    out["winner_entry_price"] = winner_entry_price
+    out["winner_in_band"] = winner_in_band.astype(bool)
+    return out, {
+        "quote_ready_rows_in_window": quote_ready_rows,
+        "quote_missing_rows_in_window": quote_missing_rows,
+        "winner_in_band_rows": int(winner_in_band.sum()),
+    }
+
+
+def _winner_entry_price(frame: pd.DataFrame) -> pd.Series:
+    winner_side = frame.get("winner_side", pd.Series("", index=frame.index, dtype="string")).astype("string").str.upper()
+    up_price = pd.to_numeric(frame.get("quote_up_ask"), errors="coerce")
+    down_price = pd.to_numeric(frame.get("quote_down_ask"), errors="coerce")
+    out = pd.Series(pd.NA, index=frame.index, dtype="Float64")
+    up_mask = winner_side.eq("UP")
+    down_mask = winner_side.eq("DOWN")
+    out.loc[up_mask] = up_price.loc[up_mask]
+    out.loc[down_mask] = down_price.loc[down_mask]
+    return pd.to_numeric(out, errors="coerce")
 
 
 def _primary_label_source(metadata: dict[str, object], *, fallback: str | None) -> str | None:

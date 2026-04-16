@@ -141,6 +141,7 @@ class ExperimentMarketSpec:
     contrarian_weight: float | None = None
     contrarian_quantile: float | None = None
     contrarian_return_col: str | None = None
+    winner_in_band_weight: float | None = None
     offset_weight_overrides: dict[int, dict[str, Any]] = field(default_factory=dict)
     matrix_parent_run_name: str = ""
     matrix_stake_label: str = ""
@@ -182,6 +183,8 @@ class ExperimentMarketSpec:
             payload.pop("contrarian_quantile", None)
         if self.contrarian_return_col is None:
             payload.pop("contrarian_return_col", None)
+        if self.winner_in_band_weight is None:
+            payload.pop("winner_in_band_weight", None)
         if not self.offset_weight_overrides:
             payload.pop("offset_weight_overrides", None)
         else:
@@ -246,6 +249,7 @@ def load_suite_definition(path: Path) -> ExperimentSuiteDefinition:
         "contrarian_weight": _coerce_optional_float(payload.get("contrarian_weight")),
         "contrarian_quantile": _coerce_optional_float(payload.get("contrarian_quantile")),
         "contrarian_return_col": _coerce_optional_string(payload.get("contrarian_return_col")),
+        "winner_in_band_weight": _coerce_optional_float(payload.get("winner_in_band_weight")),
         "offset_weight_overrides": normalize_offset_weight_overrides(payload.get("offset_weight_overrides")),
         "matrix_parent_run_name": "",
         "matrix_stake_label": "",
@@ -716,6 +720,7 @@ def _context_to_market_spec(context: dict[str, Any]) -> ExperimentMarketSpec:
         contrarian_weight=_coerce_optional_float(context.get("contrarian_weight")),
         contrarian_quantile=_coerce_optional_float(context.get("contrarian_quantile")),
         contrarian_return_col=_coerce_optional_string(context.get("contrarian_return_col")),
+        winner_in_band_weight=_coerce_optional_float(context.get("winner_in_band_weight")),
         offset_weight_overrides=normalize_offset_weight_overrides(context.get("offset_weight_overrides")),
         matrix_parent_run_name=str(context.get("matrix_parent_run_name") or ""),
         matrix_stake_label=str(context.get("matrix_stake_label") or ""),
@@ -779,6 +784,8 @@ def _merge_context(
             merged[key] = _coerce_optional_float(payload.get(key))
     if "contrarian_return_col" in payload:
         merged["contrarian_return_col"] = _coerce_optional_string(payload.get("contrarian_return_col"))
+    if "winner_in_band_weight" in payload:
+        merged["winner_in_band_weight"] = _coerce_optional_float(payload.get("winner_in_band_weight"))
     if "offset_weight_overrides" in payload:
         merged["offset_weight_overrides"] = normalize_offset_weight_overrides(payload.get("offset_weight_overrides"))
     if not _is_missing_value(payload.get("offsets")):

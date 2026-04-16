@@ -1,0 +1,48 @@
+# Codex Research Program
+
+This is the canonical dense autoresearch entry for the `deep_otm_baseline`
+`direction` line.
+
+## Canonical References
+
+- Active session:
+  `sessions/deep_otm_baseline_direction_dense_autoresearch/session.md`
+- Active results log:
+  `sessions/deep_otm_baseline_direction_dense_autoresearch/results.tsv`
+
+## Frozen Dense Window
+
+- frozen decision / backtest window from `2026-04-01` through `2026-04-15`
+- dense goal: 10-20 trades per coin per day
+- target band over `2026-04-01` through `2026-04-15`: `150-300` trades per coin
+
+## Dense Direction Objective
+
+- run only the dense `direction` track
+- target fixed to `direction`
+- coins: `btc`, `eth`, `sol`, `xrp`
+- sparse winners cannot become frontiers
+- count must be checked before ROI
+
+## Dense Count Gate
+
+- reject `< 56` trades per coin over the frozen window
+- classify `56-139` as `subtarget`
+- classify `140-280` as `on_target`
+- classify `281+` as `over_target`
+
+## Width Search Band
+
+- feature-set width is not fixed to `40`
+- allowed width ladder: `30 / 34 / 38 / 40 / 44 / 48`
+- move width by one bucket per bounded cycle only
+- below `56` trades, prefer the next wider bucket before another same-width cosmetic swap
+- inside `140-280` trades, keep width stable and prefer family replacement before changing width again
+- if count is clearly excessive and quality degrades, consider only the next narrower bucket
+
+## Hard Constraints
+
+- do not open `reversal` or `hybrid` runs in this session
+- sparse winners cannot become frontiers even if ROI looks strong
+- count must be checked before ROI in every formal frontier decision
+- keep track decisions coin-specific under the frozen dense window

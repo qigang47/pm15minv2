@@ -328,6 +328,7 @@ def ensure_training_and_bundle(
                 contrarian_weight=getattr(market_spec, "contrarian_weight", None),
                 contrarian_quantile=getattr(market_spec, "contrarian_quantile", None),
                 contrarian_return_col=getattr(market_spec, "contrarian_return_col", None),
+                winner_in_band_weight=getattr(market_spec, "winner_in_band_weight", None),
                 offset_weight_overrides=getattr(market_spec, "offset_weight_overrides", None),
             ),
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+from types import SimpleNamespace
 
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research.config import ResearchConfig
@@ -715,3 +716,102 @@ def test_build_training_set_dataset_precise_start_filters_label_cycles(
         ("cycle_end_ts", ">", int(pd.Timestamp("2026-03-01T00:16:00Z").timestamp())),
         ("cycle_start_ts", "<", int(pd.Timestamp("2026-03-02T00:00:00Z").timestamp())),
     ]
+
+
+def test_build_training_set_dataset_attaches_tradeable_winner_metadata(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "v2"
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm_baseline",
+        source_surface="backtest",
+        feature_set="deep_otm_v1",
+        label_set="truth",
+        target="direction",
+        root=root,
+    )
+
+    feature_frame = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "ret_1m": 0.1,
+                "ret_from_strike": 0.05,
+            }
+        ]
+    )
+    label_frame = pd.DataFrame(
+        [
+            {
+                "asset": "sol",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+                "label_set": "truth",
+                "settlement_source": "settlement_truth",
+                "label_source": "settlement_truth",
+                "resolved": True,
+                "price_to_beat": 120.0,
+                "final_price": 121.0,
+                "winner_side": "UP",
+                "direction_up": 1.0,
+                "full_truth": True,
+            }
+        ]
+    )
+    write_parquet_atomic(feature_frame, cfg.layout.feature_frame_path(cfg.feature_set, source_surface=cfg.source_surface))
+    write_parquet_atomic(label_frame, cfg.layout.label_frame_path(cfg.label_set))
+
+    monkeypatch.setattr(
+        "pm15min.research.datasets.training_sets.attach_canonical_quote_surface",
+        lambda *, replay, data_cfg: (
+            replay.assign(
+                quote_status="ok",
+                quote_reason="",
+                quote_up_ask=0.12,
+                quote_down_ask=0.88,
+            ),
+            SimpleNamespace(
+                market_rows_loaded=1,
+                replay_rows=len(replay),
+                quote_ready_rows=len(replay),
+                quote_missing_rows=0,
+                to_dict=lambda: {
+                    "market_rows_loaded": 1,
+                    "replay_rows": len(replay),
+                    "quote_ready_rows": len(replay),
+                    "quote_missing_rows": 0,
+                },
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "pm15min.research.datasets.training_sets.resolve_backtest_profile_spec",
+        lambda **kwargs: SimpleNamespace(entry_price_min=0.01, entry_price_max=0.30),
+    )
+
+    summary = build_training_set_dataset(
+        cfg,
+        TrainingSetSpec(
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+            offset=7,
+        ),
+    )
+    out = pd.read_parquet(summary["target_path"])
+    manifest = read_manifest(summary["manifest_path"])
+
+    assert bool(out.iloc[0]["winner_in_band"]) is True
+    assert float(out.iloc[0]["winner_entry_price"]) == 0.12
+    assert out.iloc[0]["quote_status"] == "ok"
+    assert manifest.metadata["quote_ready_rows_in_window"] == 1
+    assert manifest.metadata["winner_in_band_rows"] == 1

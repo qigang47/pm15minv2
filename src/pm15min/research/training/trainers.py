@@ -66,6 +66,7 @@ class TrainerConfig:
     contrarian_weight: float = 1.0
     contrarian_quantile: float = 0.8
     contrarian_return_col: str = "ret_from_strike"
+    winner_in_band_weight: float = 1.0
     apply_shared_blacklist: bool = False
     extra_drop_columns: tuple[str, ...] = ()
     parallel_workers: int = 1
@@ -94,6 +95,12 @@ def training_features(df: pd.DataFrame) -> list[str]:
         "price_to_beat",
         "final_price",
         "full_truth",
+        "quote_status",
+        "quote_reason",
+        "quote_up_ask",
+        "quote_down_ask",
+        "winner_entry_price",
+        "winner_in_band",
     }
     return [column for column in df.columns if column not in exclude]
 
@@ -210,6 +217,7 @@ def generate_oof_predictions(
             contrarian_weight=cfg.contrarian_weight,
             contrarian_quantile=cfg.contrarian_quantile,
             contrarian_return_col=cfg.contrarian_return_col,
+            winner_in_band_weight=cfg.winner_in_band_weight,
         )
         logreg = fit_logreg(X_train, y_train, cfg=cfg, sample_weight=sample_weight)
         lgbm = fit_lgbm(X_train, y_train, cfg=cfg, sample_weight=sample_weight)

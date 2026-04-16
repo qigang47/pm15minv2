@@ -19,6 +19,7 @@ from .control_plane import (
     resolve_codex_exec_path_prefix,
     summarize_experiment_run,
 )
+from .dense_policy import classify_dense_gate, prefer_dense_candidate
 
 __all__ = [
     "apply_codex_auth_override",
@@ -37,5 +38,7 @@ __all__ = [
     "resolve_autorun_session_dir",
     "resolve_codex_exec_binary",
     "resolve_codex_exec_path_prefix",
+    "classify_dense_gate",
+    "prefer_dense_candidate",
     "summarize_experiment_run",
 ]

@@ -1566,6 +1566,7 @@ def _seed_training_cache(rows) -> dict[str, dict[str, object]]:
             contrarian_weight=row.get("contrarian_weight"),
             contrarian_quantile=row.get("contrarian_quantile"),
             contrarian_return_col=row.get("contrarian_return_col"),
+            winner_in_band_weight=row.get("winner_in_band_weight"),
             offset_weight_overrides=normalize_offset_weight_overrides(row.get("offset_weight_overrides_json")),
         )
         cache[key] = {
@@ -1692,6 +1693,7 @@ def _resolve_training_summary(
             contrarian_weight=getattr(market_spec, "contrarian_weight", None),
             contrarian_quantile=getattr(market_spec, "contrarian_quantile", None),
             contrarian_return_col=getattr(market_spec, "contrarian_return_col", None),
+            winner_in_band_weight=getattr(market_spec, "winner_in_band_weight", None),
             offset_weight_overrides=getattr(market_spec, "offset_weight_overrides", None),
         ),
     )
@@ -1711,6 +1713,7 @@ def _resolve_training_summary(
         contrarian_weight=getattr(market_spec, "contrarian_weight", None),
         contrarian_quantile=getattr(market_spec, "contrarian_quantile", None),
         contrarian_return_col=getattr(market_spec, "contrarian_return_col", None),
+        winner_in_band_weight=getattr(market_spec, "winner_in_band_weight", None),
         offset_weight_overrides=getattr(market_spec, "offset_weight_overrides", None),
     )
     cached = training_cache.get(cache_key)
@@ -1734,6 +1737,7 @@ def _resolve_training_summary(
         contrarian_weight=getattr(market_spec, "contrarian_weight", None),
         contrarian_quantile=getattr(market_spec, "contrarian_quantile", None),
         contrarian_return_col=getattr(market_spec, "contrarian_return_col", None),
+        winner_in_band_weight=getattr(market_spec, "winner_in_band_weight", None),
         offset_weight_overrides=getattr(market_spec, "offset_weight_overrides", None),
     )
     try:
@@ -2015,6 +2019,7 @@ def _case_key(market_spec) -> str:
         "contrarian_weight": getattr(market_spec, "contrarian_weight", None),
         "contrarian_quantile": getattr(market_spec, "contrarian_quantile", None),
         "contrarian_return_col": str(getattr(market_spec, "contrarian_return_col", "") or "").strip() or None,
+        "winner_in_band_weight": getattr(market_spec, "winner_in_band_weight", None),
         "offset_weight_overrides": offset_weight_overrides_payload(
             getattr(market_spec, "offset_weight_overrides", None)
         ),
@@ -2111,6 +2116,7 @@ def _training_cache_key(
     contrarian_weight: float | None = None,
     contrarian_quantile: float | None = None,
     contrarian_return_col: str | None = None,
+    winner_in_band_weight: float | None = None,
     offset_weight_overrides: dict[int, dict[str, object]] | None = None,
 ) -> str:
     payload = {
@@ -2129,6 +2135,7 @@ def _training_cache_key(
         "contrarian_weight": contrarian_weight,
         "contrarian_quantile": contrarian_quantile,
         "contrarian_return_col": str(contrarian_return_col or "").strip() or None,
+        "winner_in_band_weight": winner_in_band_weight,
         "offset_weight_overrides": offset_weight_overrides_payload(offset_weight_overrides),
     }
     return _stable_key(payload)

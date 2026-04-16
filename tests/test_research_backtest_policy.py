@@ -346,6 +346,49 @@ def test_backtest_summary_surfaces_truth_source_diagnostics() -> None:
     assert "chainlink_datafeeds" in report
 
 
+def test_backtest_summary_surfaces_orderbook_preflight_gap_warning() -> None:
+    summary = build_backtest_summary(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        spec_name="baseline_truth",
+        target="direction",
+        bundle_dir="/tmp/bundle",
+        feature_set="deep_otm_v1",
+        label_set="truth",
+        available_offsets=[7],
+        trades=pd.DataFrame(),
+        rejects=pd.DataFrame(),
+        orderbook_preflight_summary={
+            "requested_dates": ["2026-03-01", "2026-03-02", "2026-03-03"],
+            "requested_date_count": 3,
+            "status_counts": {
+                "ready": 1,
+                "missing_depth": 1,
+                "partial_market_coverage": 1,
+            },
+            "missing_depth_dates": ["2026-03-02"],
+            "missing_depth_date_count": 1,
+            "empty_depth_source_dates": [],
+            "empty_depth_source_date_count": 0,
+            "partial_market_coverage_dates": ["2026-03-03"],
+            "partial_market_coverage_date_count": 1,
+            "index_missing_dates": [],
+            "index_missing_date_count": 0,
+        },
+    )
+
+    report = render_backtest_report(summary)
+
+    assert summary["orderbook_preflight_has_gaps"] is True
+    assert summary["orderbook_preflight_gap_date_count"] == 2
+    assert summary["orderbook_preflight_gap_dates"] == ["2026-03-02", "2026-03-03"]
+    assert "missing_depth=1" in summary["orderbook_preflight_gap_summary"]
+    assert "partial_market_coverage=1" in summary["orderbook_preflight_gap_summary"]
+    assert "orderbook_preflight_has_gaps" in report
+    assert "orderbook_preflight_gap_summary" in report
+
+
 def test_render_backtest_report_falls_back_without_tabulate(monkeypatch) -> None:
     summary = build_backtest_summary(
         market="sol",

@@ -125,6 +125,7 @@ def test_experiment_shared_cache_persists_prepared_training_and_bundle_metadata(
         "contrarian_weight": None,
         "contrarian_quantile": None,
         "contrarian_return_col": None,
+        "winner_in_band_weight": None,
         "run_label": "sol-train-a",
         "run_dir": str(training_run_dir),
         "source_suite_name": "suite-a",

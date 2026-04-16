@@ -61,6 +61,8 @@ def normalize_offset_weight_overrides(raw: Any) -> dict[int, dict[str, Any]]:
             token = str(raw_override.get("contrarian_return_col") or "").strip()
             if token:
                 item["contrarian_return_col"] = token
+        if raw_override.get("winner_in_band_weight") is not None:
+            item["winner_in_band_weight"] = float(raw_override.get("winner_in_band_weight"))
         if item:
             normalized[offset] = item
     return {int(offset): dict(normalized[offset]) for offset in sorted(normalized)}
@@ -129,6 +131,7 @@ class TrainingRunSpec:
     contrarian_weight: float | None = None
     contrarian_quantile: float | None = None
     contrarian_return_col: str | None = None
+    winner_in_band_weight: float | None = None
     offset_weight_overrides: dict[int, dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
@@ -166,6 +169,8 @@ class TrainingRunSpec:
             object.__setattr__(self, "contrarian_quantile", float(self.contrarian_quantile))
         if self.contrarian_return_col is not None:
             object.__setattr__(self, "contrarian_return_col", str(self.contrarian_return_col).strip() or None)
+        if self.winner_in_band_weight is not None:
+            object.__setattr__(self, "winner_in_band_weight", float(self.winner_in_band_weight))
         object.__setattr__(self, "offset_weight_overrides", normalize_offset_weight_overrides(self.offset_weight_overrides))
 
     @property
@@ -194,6 +199,7 @@ class TrainingRunSpec:
             "contrarian_weight": self.contrarian_weight,
             "contrarian_quantile": self.contrarian_quantile,
             "contrarian_return_col": self.contrarian_return_col,
+            "winner_in_band_weight": self.winner_in_band_weight,
             "object_type": self.object_type,
             "object_id": self.object_id,
             **(

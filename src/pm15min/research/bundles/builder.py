@@ -45,6 +45,8 @@ def build_model_bundle(cfg: ResearchConfig, spec: ModelBundleSpec) -> dict[str, 
         target=spec.target,
         bundle_label_text=spec.bundle_label,
     )
+    if bundle_dir.exists():
+        shutil.rmtree(bundle_dir)
     bundle_dir.mkdir(parents=True, exist_ok=True)
     summary_path = bundle_dir / "summary.json"
     report_path = bundle_dir / "report.md"

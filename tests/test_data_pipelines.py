@@ -6,10 +6,11 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import requests
 
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
-from pm15min.data.pipelines.binance_klines import sync_binance_klines_1m
+from pm15min.data.pipelines.binance_klines import _fetch_coinbase_klines_batch, sync_binance_klines_1m
 from pm15min.data.pipelines.market_catalog import sync_market_catalog
 from pm15min.data.pipelines.orderbook_recording import _select_markets, record_orderbooks_once
 from pm15min.data.pipelines.orderbook_recent import update_recent_orderbook_index
@@ -113,6 +114,18 @@ class _FakeBinanceClient:
             "taker_buy_quote_volume",
             "ignore",
         ])
+
+
+class _FailingBinanceClient:
+    def fetch_klines(self, request):
+        raise RuntimeError(f"Failed to fetch Binance klines for {request.symbol}: restricted location")
+
+
+class _SlowFailingBinanceClient:
+    timeout_sec = 4.8
+
+    def fetch_klines(self, request):
+        raise RuntimeError(f"Failed to fetch Binance klines for {request.symbol}: timeout")
 
 
 def test_sync_market_catalog_writes_snapshot_and_canonical(tmp_path: Path) -> None:
@@ -806,3 +819,205 @@ def test_sync_binance_klines_1m_appends_new_rows(tmp_path: Path) -> None:
     assert summary["rows_fetched"] == 3
     assert len(out) == 4
     assert out["open_time"].max() == pd.Timestamp("2026-03-19T00:03:00Z")
+
+
+def test_sync_binance_klines_1m_falls_back_to_coinbase_when_binance_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=tmp_path / "v2")
+
+    def _fake_coinbase_fetch(*, symbol: str, start_time_ms: int, end_time_ms: int, timeout_sec: float):
+        _ = end_time_ms, timeout_sec
+        start = pd.to_datetime(int(start_time_ms), unit="ms", utc=True)
+        rows = []
+        for idx in range(2):
+            open_time = start + pd.Timedelta(minutes=idx)
+            close_time = open_time + pd.Timedelta(minutes=1) - pd.Timedelta(milliseconds=1)
+            rows.append(
+                {
+                    "open_time": open_time,
+                    "open": 150.0 + idx,
+                    "high": 151.0 + idx,
+                    "low": 149.0 + idx,
+                    "close": 150.5 + idx,
+                    "volume": 20.0 + idx,
+                    "close_time": close_time,
+                    "quote_asset_volume": 3000.0 + idx,
+                    "number_of_trades": 0,
+                    "taker_buy_base_volume": 0.0,
+                    "taker_buy_quote_volume": 0.0,
+                    "ignore": 0.0,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    monkeypatch.setattr(
+        "pm15min.data.pipelines.binance_klines._fetch_coinbase_klines_batch",
+        _fake_coinbase_fetch,
+        raising=False,
+    )
+
+    summary = sync_binance_klines_1m(
+        cfg,
+        client=_FailingBinanceClient(),
+        start_time_ms=int(pd.Timestamp("2026-03-19T00:00:00Z").timestamp() * 1000),
+        end_time_ms=int(pd.Timestamp("2026-03-19T00:01:00Z").timestamp() * 1000),
+        now=datetime(2026, 3, 19, 0, 2, tzinfo=timezone.utc),
+    )
+
+    out = pd.read_parquet(cfg.layout.binance_klines_path())
+    assert summary["rows_fetched"] == 2
+    assert summary["fallback_source"] == "coinbase"
+    assert len(out) == 2
+    assert out["open_time"].max() == pd.Timestamp("2026-03-19T00:01:00Z")
+
+
+def test_sync_binance_klines_1m_coinbase_fallback_continues_until_end_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = DataConfig.build(market="btc", cycle="15m", surface="backtest", root=tmp_path / "v2")
+    fetch_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr("pm15min.data.pipelines.binance_klines._COINBASE_MAX_BATCH_MINUTES", 2)
+
+    def _fake_coinbase_fetch(*, symbol: str, start_time_ms: int, end_time_ms: int, timeout_sec: float):
+        _ = symbol, timeout_sec
+        fetch_calls.append((start_time_ms, end_time_ms))
+        start = pd.to_datetime(int(start_time_ms), unit="ms", utc=True)
+        end = pd.to_datetime(int(end_time_ms), unit="ms", utc=True)
+        rows = []
+        for idx in range(2):
+            open_time = start + pd.Timedelta(minutes=idx)
+            if open_time > end:
+                break
+            close_time = open_time + pd.Timedelta(minutes=1) - pd.Timedelta(milliseconds=1)
+            rows.append(
+                {
+                    "open_time": open_time,
+                    "open": 200.0 + idx,
+                    "high": 201.0 + idx,
+                    "low": 199.0 + idx,
+                    "close": 200.5 + idx,
+                    "volume": 30.0 + idx,
+                    "close_time": close_time,
+                    "quote_asset_volume": 6000.0 + idx,
+                    "number_of_trades": 0,
+                    "taker_buy_base_volume": 0.0,
+                    "taker_buy_quote_volume": 0.0,
+                    "ignore": 0.0,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    monkeypatch.setattr(
+        "pm15min.data.pipelines.binance_klines._fetch_coinbase_klines_batch",
+        _fake_coinbase_fetch,
+        raising=False,
+    )
+
+    summary = sync_binance_klines_1m(
+        cfg,
+        client=_FailingBinanceClient(),
+        start_time_ms=int(pd.Timestamp("2026-03-19T00:00:00Z").timestamp() * 1000),
+        end_time_ms=int(pd.Timestamp("2026-03-19T00:05:00Z").timestamp() * 1000),
+        now=datetime(2026, 3, 19, 0, 6, tzinfo=timezone.utc),
+    )
+
+    out = pd.read_parquet(cfg.layout.binance_klines_path())
+    assert summary["fallback_source"] == "coinbase"
+    assert summary["rows_fetched"] == 6
+    assert len(fetch_calls) == 3
+    assert len(out) == 6
+    assert out["open_time"].max() == pd.Timestamp("2026-03-19T00:05:00Z")
+
+
+def test_sync_binance_klines_1m_coinbase_fallback_uses_longer_timeout_for_slow_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = DataConfig.build(market="btc", cycle="15m", surface="backtest", root=tmp_path / "v2")
+    observed_timeouts: list[float] = []
+
+    def _fake_coinbase_fetch(*, symbol: str, start_time_ms: int, end_time_ms: int, timeout_sec: float):
+        _ = symbol, start_time_ms, end_time_ms
+        observed_timeouts.append(timeout_sec)
+        open_time = pd.Timestamp("2026-03-19T00:00:00Z")
+        close_time = open_time + pd.Timedelta(minutes=1) - pd.Timedelta(milliseconds=1)
+        return pd.DataFrame(
+            [
+                {
+                    "open_time": open_time,
+                    "open": 200.0,
+                    "high": 201.0,
+                    "low": 199.0,
+                    "close": 200.5,
+                    "volume": 30.0,
+                    "close_time": close_time,
+                    "quote_asset_volume": 6000.0,
+                    "number_of_trades": 0,
+                    "taker_buy_base_volume": 0.0,
+                    "taker_buy_quote_volume": 0.0,
+                    "ignore": 0.0,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(
+        "pm15min.data.pipelines.binance_klines._fetch_coinbase_klines_batch",
+        _fake_coinbase_fetch,
+        raising=False,
+    )
+
+    summary = sync_binance_klines_1m(
+        cfg,
+        client=_SlowFailingBinanceClient(),
+        start_time_ms=int(pd.Timestamp("2026-03-19T00:00:00Z").timestamp() * 1000),
+        end_time_ms=int(pd.Timestamp("2026-03-19T00:00:00Z").timestamp() * 1000),
+        now=datetime(2026, 3, 19, 0, 1, tzinfo=timezone.utc),
+    )
+
+    assert summary["fallback_source"] == "coinbase"
+    assert observed_timeouts == [30.0]
+
+
+def test_fetch_coinbase_klines_batch_retries_after_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            first_open_sec = int(pd.Timestamp("2026-03-19T00:03:00Z").timestamp())
+            return [
+                [first_open_sec, 99.0, 101.0, 100.0, 100.5, 20.0],
+                [first_open_sec + 60, 100.0, 102.0, 101.0, 101.5, 21.0],
+            ]
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise requests.exceptions.ReadTimeout("slow proxy")
+            return _FakeResponse()
+
+    fake_session = _FakeSession()
+    monkeypatch.setattr(
+        "pm15min.data.pipelines.binance_klines.requests.Session",
+        lambda: fake_session,
+    )
+
+    out = _fetch_coinbase_klines_batch(
+        symbol="BTCUSDT",
+        start_time_ms=int(pd.Timestamp("2026-03-19T00:03:00Z").timestamp() * 1000),
+        end_time_ms=int(pd.Timestamp("2026-03-19T00:04:00Z").timestamp() * 1000),
+        timeout_sec=30.0,
+    )
+
+    assert fake_session.calls == 2
+    assert len(out) == 2
+    assert out["open_time"].max() == pd.Timestamp("2026-03-19T00:04:00Z")

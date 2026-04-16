@@ -74,7 +74,9 @@ export PYTHONPATH="$PROJECT_DIR/src:$PROJECT_DIR:${PYTHONPATH:-}"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_python_env.sh"
 
+export PM15MIN_MANAGED_PROXY_ENABLE="${PM15MIN_MANAGED_PROXY_ENABLE:-1}"
 pm15min_load_project_env
+pm15min_load_managed_proxy_env
 pm15min_activate_python
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 

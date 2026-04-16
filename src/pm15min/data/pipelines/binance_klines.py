@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import pandas as pd
+import requests
 
 from ..config import DataConfig
 from ..io.json_files import write_json_atomic
@@ -41,6 +42,15 @@ _LATEST_TAIL_COLUMNS = [
     "number_of_trades",
 ]
 
+_COINBASE_PRODUCT_BY_SYMBOL = {
+    "BTCUSDT": "BTC-USD",
+    "ETHUSDT": "ETH-USD",
+    "SOLUSDT": "SOL-USD",
+    "XRPUSDT": "XRP-USD",
+}
+_COINBASE_MAX_BATCH_MINUTES = 300
+_COINBASE_TIMEOUT_SEC = 30.0
+
 
 def _normalize_klines_frame(df: pd.DataFrame, *, now: datetime) -> pd.DataFrame:
     if df.empty:
@@ -67,6 +77,111 @@ def _max_open_time(df: pd.DataFrame) -> pd.Timestamp | None:
     if ts.empty:
         return None
     return ts.max()
+
+
+def _empty_klines_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=BINANCE_KLINE_COLUMNS)
+
+
+def _finalize_external_klines_frame(df: pd.DataFrame, *, now: datetime) -> pd.DataFrame:
+    if df.empty:
+        return _empty_klines_frame()
+    out = df.copy()
+    if "open_time" in out.columns:
+        out["open_time"] = pd.to_datetime(out["open_time"], utc=True, errors="coerce")
+    if "close_time" in out.columns:
+        out["close_time"] = pd.to_datetime(out["close_time"], utc=True, errors="coerce")
+    for column in NUMERIC_COLUMNS:
+        if column in out.columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce")
+    if "number_of_trades" in out.columns:
+        out["number_of_trades"] = pd.to_numeric(out["number_of_trades"], errors="coerce").fillna(0).astype("int64")
+    if "taker_buy_base_volume" not in out.columns:
+        out["taker_buy_base_volume"] = 0.0
+    if "taker_buy_quote_volume" not in out.columns:
+        out["taker_buy_quote_volume"] = 0.0
+    if "ignore" not in out.columns:
+        out["ignore"] = 0.0
+    if "quote_asset_volume" not in out.columns:
+        out["quote_asset_volume"] = pd.to_numeric(out.get("close"), errors="coerce") * pd.to_numeric(
+            out.get("volume"), errors="coerce"
+        )
+    out = out.loc[:, [column for column in BINANCE_KLINE_COLUMNS if column in out.columns]].copy()
+    out = out.dropna(subset=["open_time", "close_time"]).copy()
+    out = out[out["close_time"] <= pd.Timestamp(now)]
+    out = out.sort_values("open_time").drop_duplicates(subset=["open_time"], keep="last").reset_index(drop=True)
+    return out
+
+
+def _fetch_coinbase_klines_batch(
+    *,
+    symbol: str,
+    start_time_ms: int,
+    end_time_ms: int,
+    timeout_sec: float,
+) -> pd.DataFrame:
+    product = _COINBASE_PRODUCT_BY_SYMBOL.get(str(symbol or "").strip().upper())
+    if not product:
+        return _empty_klines_frame()
+    start_ts = pd.to_datetime(int(start_time_ms), unit="ms", utc=True)
+    end_ts = pd.to_datetime(int(end_time_ms), unit="ms", utc=True)
+    if end_ts < start_ts:
+        return _empty_klines_frame()
+    last_error: Exception | None = None
+    response = None
+    for _attempt in range(3):
+        try:
+            response = requests.Session().get(
+                f"https://api.exchange.coinbase.com/products/{product}/candles",
+                params={
+                    "granularity": 60,
+                    "start": start_ts.isoformat().replace("+00:00", "Z"),
+                    "end": (end_ts + pd.Timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+                },
+                timeout=max(_COINBASE_TIMEOUT_SEC, float(timeout_sec)),
+            )
+            response.raise_for_status()
+            break
+        except requests.RequestException as exc:
+            last_error = exc
+            response = None
+    if response is None:
+        assert last_error is not None
+        raise last_error
+    payload = response.json()
+    if not isinstance(payload, list) or not payload:
+        return _empty_klines_frame()
+    frame = pd.DataFrame(
+        payload,
+        columns=["open_time_sec", "low", "high", "open", "close", "volume"],
+    )
+    frame["open_time"] = pd.to_datetime(pd.to_numeric(frame["open_time_sec"], errors="coerce"), unit="s", utc=True)
+    for column in ("open", "high", "low", "close", "volume"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["quote_asset_volume"] = frame["close"] * frame["volume"]
+    frame["number_of_trades"] = 0
+    frame["taker_buy_base_volume"] = 0.0
+    frame["taker_buy_quote_volume"] = 0.0
+    frame["close_time"] = frame["open_time"] + pd.Timedelta(minutes=1) - pd.Timedelta(milliseconds=1)
+    frame["ignore"] = 0.0
+    frame = frame.loc[
+        frame["open_time"].ge(start_ts) & frame["open_time"].le(end_ts),
+        [
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "quote_asset_volume",
+            "number_of_trades",
+            "taker_buy_base_volume",
+            "taker_buy_quote_volume",
+            "ignore",
+        ],
+    ].copy()
+    return frame.sort_values("open_time").reset_index(drop=True)
 
 
 def _latest_tail_path(cfg: DataConfig, *, symbol: str) -> Path:
@@ -173,17 +288,38 @@ def sync_binance_klines_1m(
     fetched_batches: list[pd.DataFrame] = []
     rows_fetched = 0
     cursor_ms = effective_start_ms
+    fallback_source: str | None = None
     while cursor_ms <= effective_end_ms:
-        batch = client.fetch_klines(
-            BinanceSpotKlinesRequest(
-                symbol=resolved_symbol,
-                interval="1m",
-                start_time_ms=cursor_ms,
-                end_time_ms=effective_end_ms,
-                limit=batch_limit,
+        source_batch_limit = int(batch_limit)
+        try:
+            batch = client.fetch_klines(
+                BinanceSpotKlinesRequest(
+                    symbol=resolved_symbol,
+                    interval="1m",
+                    start_time_ms=cursor_ms,
+                    end_time_ms=effective_end_ms,
+                    limit=batch_limit,
+                )
             )
-        )
-        batch = _normalize_klines_frame(batch, now=now_utc)
+            batch = _normalize_klines_frame(batch, now=now_utc)
+        except Exception:
+            source_batch_limit = min(int(batch_limit), _COINBASE_MAX_BATCH_MINUTES)
+            fallback_end_ms = min(
+                effective_end_ms,
+                cursor_ms + ((source_batch_limit - 1) * 60_000),
+            )
+            batch = _finalize_external_klines_frame(
+                _fetch_coinbase_klines_batch(
+                    symbol=resolved_symbol,
+                    start_time_ms=cursor_ms,
+                    end_time_ms=fallback_end_ms,
+                    timeout_sec=max(_COINBASE_TIMEOUT_SEC, float(getattr(client, "timeout_sec", 10.0))),
+                ),
+                now=now_utc,
+            )
+            if batch.empty:
+                raise
+            fallback_source = "coinbase"
         if batch.empty:
             break
         fetched_batches.append(batch)
@@ -193,7 +329,7 @@ def sync_binance_klines_1m(
         if next_cursor_ms <= cursor_ms:
             break
         cursor_ms = next_cursor_ms
-        if len(batch) < int(batch_limit):
+        if len(batch) < source_batch_limit:
             break
 
     incoming = (
@@ -224,6 +360,7 @@ def sync_binance_klines_1m(
         "start_time_ms": int(effective_start_ms),
         "end_time_ms": int(effective_end_ms),
         "latest_open_time": None if latest_open_time is None else latest_open_time.isoformat(),
+        "fallback_source": fallback_source,
         "target_path": str(target_path),
         "latest_tail_path": str(latest_tail_path),
     }

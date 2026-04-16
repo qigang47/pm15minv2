@@ -168,6 +168,7 @@ def build_case_row_prefix(market_spec, *, case_key: str) -> dict[str, object]:
         "contrarian_weight": getattr(market_spec, "contrarian_weight", None),
         "contrarian_quantile": getattr(market_spec, "contrarian_quantile", None),
         "contrarian_return_col": getattr(market_spec, "contrarian_return_col", None),
+        "winner_in_band_weight": getattr(market_spec, "winner_in_band_weight", None),
         "offset_weight_overrides_json": _json_text(
             offset_weight_overrides_payload(getattr(market_spec, "offset_weight_overrides", None))
         ),

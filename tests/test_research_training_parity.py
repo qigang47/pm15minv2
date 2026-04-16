@@ -147,6 +147,27 @@ def test_compute_sample_weights_balances_classes_and_weights_vol() -> None:
     assert float(weights.max()) > float(weights.min())
 
 
+def test_compute_sample_weights_upweights_tradeable_winner_rows() -> None:
+    frame = pd.DataFrame(
+        {
+            "winner_in_band": [True, False, True, False],
+        }
+    )
+    y = pd.Series([0, 0, 1, 1], dtype=int)
+
+    weights = compute_sample_weights(
+        frame,
+        y,
+        balance_classes=False,
+        weight_by_vol=False,
+        inverse_vol=False,
+        contrarian_weight=1.0,
+        winner_in_band_weight=2.5,
+    )
+
+    assert weights.tolist() == [2.5, 1.0, 2.5, 1.0]
+
+
 def test_train_research_run_writes_reports_and_rich_offset_summary(tmp_path: Path) -> None:
     cfg = _prepare_cfg(tmp_path)
     build_feature_frame_dataset(cfg)
@@ -203,6 +224,63 @@ def test_train_research_run_writes_reports_and_rich_offset_summary(tmp_path: Pat
         assert factor_direction_payload["rows"]
         correlation_payload = pd.read_parquet(offset_dir / "factor_correlations.parquet")
         assert not correlation_payload.empty
+
+
+def test_train_research_run_rerun_removes_stale_offset_outputs(monkeypatch, tmp_path: Path) -> None:
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        source_surface="backtest",
+        feature_set="deep_otm_v1",
+        label_set="truth",
+        target="direction",
+        model_family="deep_otm",
+        root=tmp_path / "v2",
+    )
+    run_dir = cfg.layout.training_run_dir(model_family="deep_otm", target="direction", run_label_text="rerun-clean")
+    stale_dir = run_dir / "offsets" / "offset=8"
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    (stale_dir / "stale.txt").write_text("old", encoding="utf-8")
+
+    monkeypatch.setattr("pm15min.research.training.runner.prepare_research_artifacts", lambda *args, **kwargs: None)
+
+    def _fake_execute_training_offset(*, cfg, spec, offset, run_dir, trainer_cfg, reporter=None):
+        offset_dir = run_dir / "offsets" / f"offset={offset}"
+        offset_dir.mkdir(parents=True, exist_ok=True)
+        (offset_dir / "summary.json").write_text("{}", encoding="utf-8")
+        return run_dir / f"offset={offset}.parquet", {
+            "rows": 16,
+            "positive_rate": 0.5,
+            "metrics": {
+                "lgbm": {"brier": 0.2, "auc": 0.7},
+                "logreg": {"brier": 0.21, "auc": 0.69},
+                "blend": {"brier": 0.19, "auc": 0.71},
+            },
+            "dropped_features": [],
+            "weight_summary": {},
+            "split_summary": {"folds_built": 1, "folds_used": 1},
+            "explainability": {},
+        }
+
+    monkeypatch.setattr("pm15min.research.training.runner._execute_training_offset", _fake_execute_training_offset)
+
+    summary = train_research_run(
+        cfg,
+        TrainingRunSpec(
+            model_family="deep_otm",
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+            run_label="rerun-clean",
+            offsets=(7,),
+        ),
+    )
+
+    resolved_run_dir = Path(summary["run_dir"])
+    assert (resolved_run_dir / "offsets" / "offset=7").exists()
+    assert not (resolved_run_dir / "offsets" / "offset=8").exists()
 
 
 def test_generate_oof_predictions_reports_fold_heartbeats() -> None:

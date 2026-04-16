@@ -86,7 +86,7 @@ def quote_guard_reasons(
     if fee_rate is None:
         fee_rate = profile_spec.fee_rate(price=effective_price)
     roi_net = float_or_none(metrics.get("roi_net_vs_quote"))
-    if roi_net is None:
+    if roi_net is None and p_side is not None:
         roi_net = float(p_side) / max(effective_price, 1e-9) - 1.0 - fee_rate
     roi_threshold = float_or_none(metrics.get("roi_threshold_required"))
     if roi_threshold is None:
@@ -96,6 +96,10 @@ def quote_guard_reasons(
     metrics["effective_entry_price"] = effective_price
     metrics["roi_net_vs_quote"] = roi_net
     metrics["roi_threshold_required"] = roi_threshold
+    if raw_edge is not None and min_net_edge is not None and raw_edge < min_net_edge:
+        reasons.append("net_edge_below_quote_threshold")
+    if roi_net is not None and roi_threshold is not None and roi_net < roi_threshold:
+        reasons.append("roi_net_below_threshold")
 
     return reasons, metrics
 

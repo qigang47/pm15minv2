@@ -14,6 +14,7 @@ def compute_sample_weights(
     contrarian_weight: float = 1.0,
     contrarian_quantile: float = 0.8,
     contrarian_return_col: str = "ret_from_strike",
+    winner_in_band_weight: float = 1.0,
 ) -> pd.Series:
     weights = pd.Series(1.0, index=frame.index, dtype=float)
 
@@ -38,5 +39,9 @@ def compute_sample_weights(
         threshold = returns.abs().quantile(float(contrarian_quantile))
         contrarian_mask = returns.abs().ge(float(threshold)) & returns.notna()
         weights.loc[contrarian_mask] *= float(contrarian_weight)
+
+    if winner_in_band_weight > 1.0 and "winner_in_band" in frame.columns:
+        winner_in_band = frame["winner_in_band"].astype("boolean").fillna(False).astype(bool)
+        weights.loc[winner_in_band] *= float(winner_in_band_weight)
 
     return weights.clip(lower=1e-6)

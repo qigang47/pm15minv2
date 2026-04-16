@@ -160,3 +160,44 @@ PYTHONPATH=src python -m pm15min research show-active-bundle --market sol --prof
 - 先确认数据和接入是否 ready，再追业务逻辑。
 - 真实状态以 `var/live/` 为准，不以 shell wrapper 输出为准。
 - 需要长期保留的值班知识写在本 runbook，不把一次性验证记录继续留在 `docs/`。
+
+## 6. 受管代理切换
+
+如果服务器代理节点不稳定，可以启用仓库里的受管代理切换脚本：
+
+```bash
+bash scripts/maintenance/install_managed_proxy_timer.sh
+```
+
+如果机器上的真实代理入口不是配置文件里的固定端口，而是当前在线的单个本地代理口，可以在安装时直接指定：
+
+```bash
+PM15MIN_MANAGED_PROXY_CANDIDATE_PORTS="20171" \
+PM15MIN_MANAGED_PROXY_SCHEME="http" \
+PM15MIN_MANAGED_PROXY_HEALTHCHECK_URLS="https://gamma-api.polymarket.com/markets?limit=1 https://clob.polymarket.com/time" \
+bash scripts/maintenance/install_managed_proxy_timer.sh
+```
+
+它会做三件事：
+
+- 每 5 分钟探测一次当前配置的受管代理入口
+- 尽量保留当前还能正常工作的入口，只有当前入口失效时才切到别的入口
+- 把选中的入口写到 `~/.local/state/pm15min-managed-proxy/active_proxy.env`
+
+如果用了上面的显式端口模式，探测对象就会改成你指定的那组端口，而不是去读 `config.json`。
+
+当前状态文件在：
+
+```text
+~/.local/state/pm15min-managed-proxy/state.json
+~/.local/state/pm15min-managed-proxy/active_proxy.env
+```
+
+当前接线规则是：
+
+- `auto_research/run_one_experiment.sh`
+- `scripts/entrypoints/start_v2_live_foundation.sh`
+
+这两个入口默认会尝试加载受管代理。
+
+`start_v2_orderbook_fleet.sh` 目前不走这套自动代理切换，默认仍保持原来的直连行为，目的是减少 orderbook 录制因为代理切换造成的瞬时空档。

@@ -96,6 +96,11 @@ def build_backtest_summary(
     pre_submit_retry_summary = build_pre_submit_retry_summary(scored)
     truth_summary = build_truth_source_summary(scored)
     truth_runtime_visibility = summarize_truth_runtime_visibility(truth_runtime_summary)
+    orderbook_preflight_details = {
+        f"orderbook_preflight_{key}": value
+        for key, value in dict(orderbook_preflight_summary or {}).items()
+    }
+    orderbook_preflight_gap_summary = build_orderbook_preflight_gap_summary(orderbook_preflight_summary)
     return {
         "market": market,
         "cycle": cycle,
@@ -106,10 +111,8 @@ def build_backtest_summary(
         "feature_set": feature_set,
         "label_set": label_set,
         "available_offsets": available_offsets,
-        **{
-            f"orderbook_preflight_{key}": value
-            for key, value in dict(orderbook_preflight_summary or {}).items()
-        },
+        **orderbook_preflight_details,
+        **orderbook_preflight_gap_summary,
         **dict(replay_summary or {}),
         **{
             f"raw_depth_{key}": value
@@ -198,6 +201,10 @@ def render_backtest_report(
         f"- orderbook_preflight_partial_market_coverage_date_count: `{summary.get('orderbook_preflight_partial_market_coverage_date_count', 0)}`",
         f"- orderbook_preflight_index_missing_date_count: `{summary.get('orderbook_preflight_index_missing_date_count', 0)}`",
         f"- orderbook_preflight_status_counts: `{summary.get('orderbook_preflight_status_counts', {})}`",
+        f"- orderbook_preflight_has_gaps: `{summary.get('orderbook_preflight_has_gaps', False)}`",
+        f"- orderbook_preflight_gap_date_count: `{summary.get('orderbook_preflight_gap_date_count', 0)}`",
+        f"- orderbook_preflight_gap_dates: `{summary.get('orderbook_preflight_gap_dates', [])}`",
+        f"- orderbook_preflight_gap_summary: `{summary.get('orderbook_preflight_gap_summary', 'none')}`",
         f"- orderbook_preflight_missing_depth_dates: `{summary.get('orderbook_preflight_missing_depth_dates', [])}`",
         f"- orderbook_preflight_empty_depth_source_dates: `{summary.get('orderbook_preflight_empty_depth_source_dates', [])}`",
         f"- orderbook_preflight_partial_market_coverage_dates: `{summary.get('orderbook_preflight_partial_market_coverage_dates', [])}`",
@@ -705,9 +712,46 @@ def build_truth_source_summary(scored: pd.DataFrame | None) -> dict[str, object]
     return payload
 
 
+def build_orderbook_preflight_gap_summary(
+    orderbook_preflight_summary: dict[str, object] | None,
+) -> dict[str, object]:
+    payload = dict(orderbook_preflight_summary or {})
+    gap_dates: set[str] = set()
+    parts: list[str] = []
+    for key in (
+        "missing_depth",
+        "empty_depth_source",
+        "partial_market_coverage",
+        "index_missing",
+    ):
+        dates = sorted({str(value) for value in payload.get(f"{key}_dates", []) or [] if str(value)})
+        gap_dates.update(dates)
+        date_count = _int_or_none(payload.get(f"{key}_date_count"))
+        if date_count is None:
+            date_count = len(dates)
+        if date_count > 0:
+            parts.append(f"{key}={date_count}")
+    ordered_gap_dates = sorted(gap_dates)
+    return {
+        "orderbook_preflight_has_gaps": bool(ordered_gap_dates),
+        "orderbook_preflight_gap_date_count": len(ordered_gap_dates),
+        "orderbook_preflight_gap_dates": ordered_gap_dates,
+        "orderbook_preflight_gap_summary": ", ".join(parts) if parts else "none",
+    }
+
+
 def _numeric_series(frame: pd.DataFrame, column: str) -> pd.Series:
     values = frame[column] if column in frame.columns else pd.Series(0.0, index=frame.index, dtype=float)
     return pd.to_numeric(values, errors="coerce")
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
 
 
 def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:

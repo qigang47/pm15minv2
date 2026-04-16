@@ -6,6 +6,10 @@ Main entrypoints:
 
 - `auto_research/program.md`
   - repo-local research instructions for each Codex cycle
+- `auto_research/program_direction_dense.md`
+  - repo-local dense direction instructions
+- `auto_research/program_reversal_dense.md`
+  - repo-local dense reversal instructions
 - `auto_research/run_one_experiment.sh`
   - run one formal experiment suite
 - `auto_research/run_one_experiment_background.sh`
@@ -13,15 +17,21 @@ Main entrypoints:
 - `auto_research/experiment_queue.py`
   - enqueue formal launches and repairs, inspect queue state, or run one queue-supervisor pass
 - `auto_research/experiment_queue_supervisor.sh`
-  - keep up to three live formal experiments running from the repo-local queue
+  - keep up to four live formal experiments running from the repo-local queue
 - `auto_research/summarize_experiment.py`
   - extract a compact JSON summary from a finished experiment run
 - `auto_research/update_session.py`
   - append one cycle into the active session files
 - `auto_research/codex_background_loop.sh`
   - start, stop, restart, or run one background Codex cycle
+- `auto_research/start_direction_dense.sh`
+  - start, stop, restart, or run one dense direction background instance
+- `auto_research/start_reversal_dense.sh`
+  - start, stop, restart, or run one dense reversal background instance
 - `auto_research/status_autorun.sh`
   - inspect background status plus incomplete experiment runs
+- `auto_research/status_dense_autorun.sh`
+  - inspect both dense background instances
 
 Default session resolution:
 
@@ -71,6 +81,16 @@ Typical commands:
 ./auto_research/status_autorun.sh
 ./auto_research/codex_background_loop.sh stop
 ./auto_research/experiment_queue_supervisor.sh stop
+```
+
+Dense instance commands:
+
+```bash
+./auto_research/start_direction_dense.sh start
+./auto_research/start_reversal_dense.sh start
+./auto_research/status_dense_autorun.sh
+./auto_research/start_direction_dense.sh stop
+./auto_research/start_reversal_dense.sh stop
 ```
 
 Queue one formal follow-up instead of launching it immediately:

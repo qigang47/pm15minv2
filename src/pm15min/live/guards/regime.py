@@ -96,6 +96,11 @@ def build_account_context(
     positions_summary = positions_snapshot.get("summary") if isinstance(positions_snapshot, dict) else {}
     open_orders_summary = open_orders_summary if isinstance(open_orders_summary, dict) else {}
     positions_summary = positions_summary if isinstance(positions_summary, dict) else {}
+    open_orders_status = _status_token(open_orders_snapshot.get("status") if isinstance(open_orders_snapshot, dict) else None)
+    positions_status = _status_token(positions_snapshot.get("status") if isinstance(positions_snapshot, dict) else None)
+    cash_balance_status = _status_token(
+        positions_snapshot.get("cash_balance_status") if isinstance(positions_snapshot, dict) else None
+    ) or _status_token(account_summary.get("cash_balance_status"))
     open_orders = open_orders_snapshot.get("orders") if isinstance(open_orders_snapshot, dict) else open_orders_snapshot
     positions = positions_snapshot.get("positions") if isinstance(positions_snapshot, dict) else positions_snapshot
     open_orders = open_orders if isinstance(open_orders, list) else []
@@ -126,6 +131,14 @@ def build_account_context(
             )
         )
     cash_balance_usd = float_or_none(account_summary.get("cash_balance_usd"))
+    if cash_balance_usd is None and isinstance(positions_snapshot, dict):
+        cash_balance_usd = float_or_none(positions_snapshot.get("cash_balance_usd"))
+    account_state_available = open_orders_status == "ok" and positions_status == "ok"
+    cash_balance_available = (
+        positions_status == "ok"
+        and cash_balance_usd is not None
+        and (cash_balance_status == "ok" or (cash_balance_status is None and bool(account_summary.get("cash_balance_available", False))))
+    )
     cap_context = _resolve_trade_count_context(
         profile_spec=profile_spec,
         market=market,
@@ -161,9 +174,12 @@ def build_account_context(
             "active_market_ids": sorted(active_market_ids),
             "active_market_count": len(active_market_ids),
             "current_market_active": False,
-            "account_state_available": bool(state),
+            "account_state_available": account_state_available,
+            "open_orders_status": open_orders_status,
+            "positions_status": positions_status,
             "cash_balance_usd": cash_balance_usd,
-            "cash_balance_available": cash_balance_usd is not None,
+            "cash_balance_available": cash_balance_available,
+            "cash_balance_status": cash_balance_status,
             **base_context,
         }
     open_orders_count = int_or_none((open_orders_summary.get("by_market_id") or {}).get(market_id))
@@ -192,9 +208,12 @@ def build_account_context(
         "active_market_ids": sorted(active_market_ids),
         "active_market_count": len(active_market_ids),
         "current_market_active": market_id in active_market_ids,
-        "account_state_available": bool(state),
+        "account_state_available": account_state_available,
+        "open_orders_status": open_orders_status,
+        "positions_status": positions_status,
         "cash_balance_usd": cash_balance_usd,
-        "cash_balance_available": cash_balance_usd is not None,
+        "cash_balance_available": cash_balance_available,
+        "cash_balance_status": cash_balance_status,
         **base_context,
     }
 
@@ -318,3 +337,8 @@ def float_or_none(value) -> float | None:
     if out != out:
         return None
     return out
+
+
+def _status_token(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    return text or None

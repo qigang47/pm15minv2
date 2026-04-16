@@ -297,6 +297,89 @@ def test_decision_rejects_when_entry_price_band_fails() -> None:
     assert "entry_price_max" in out["rejected_offsets"][0]["guard_reasons"]
 
 
+def test_decision_rejects_when_net_edge_is_below_quote_threshold(monkeypatch) -> None:
+    guarded_spec = replace(resolve_live_profile_spec("deep_otm"), entry_price_max=1.0)
+    monkeypatch.setattr("pm15min.live.signal.decision.resolve_live_profile_spec", lambda profile: guarded_spec)
+
+    row = _base_signal_row()
+    _set_up_interval_signal(row, raw=0.70, lcb=0.70, eff_up=0.70, ucb=0.70)
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.695,
+                "quote_down_ask": 0.10,
+                "quote_up_bid": 0.694,
+                "quote_down_bid": 0.09,
+                "reasons": [],
+            }
+        ],
+    }
+
+    out = build_decision_snapshot(payload, quote_payload)
+
+    assert out["decision"]["status"] == "reject"
+    assert "net_edge_below_quote_threshold" in out["rejected_offsets"][0]["guard_reasons"]
+
+
+def test_decision_rejects_when_roi_net_is_below_threshold(monkeypatch) -> None:
+    guarded_spec = replace(
+        resolve_live_profile_spec("deep_otm"),
+        entry_price_max=1.0,
+        min_net_edge_default=0.0,
+        min_net_edge_by_offset={7: 0.0, 8: 0.0, 9: 0.0},
+        roi_threshold_default=0.02,
+        roi_threshold_by_offset={7: 0.02, 8: 0.02, 9: 0.02},
+    )
+    monkeypatch.setattr("pm15min.live.signal.decision.resolve_live_profile_spec", lambda profile: guarded_spec)
+
+    row = _base_signal_row()
+    _set_up_interval_signal(row, raw=0.70, lcb=0.70, eff_up=0.70, ucb=0.70)
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.695,
+                "quote_down_ask": 0.10,
+                "quote_up_bid": 0.694,
+                "quote_down_bid": 0.09,
+                "reasons": [],
+            }
+        ],
+    }
+
+    out = build_decision_snapshot(payload, quote_payload)
+
+    assert out["decision"]["status"] == "reject"
+    assert "roi_net_below_threshold" in out["rejected_offsets"][0]["guard_reasons"]
+
+
 def test_decision_rejects_when_down_ucb_is_not_below_threshold() -> None:
     row = _base_signal_row()
     _set_down_interval_signal(row, raw=0.41, eff_down=0.59, ucb=0.41)
@@ -1080,6 +1163,80 @@ def test_decision_rejects_when_cash_balance_stop_hits(monkeypatch) -> None:
     assert "cash_balance_guard" in out["applied_guard_layers"]
     assert "cash_balance_stop" in out["rejected_offsets"][0]["guard_reasons"]
     assert out["rejected_offsets"][0]["account_context"]["cash_balance_usd"] == 80.0
+
+
+def test_decision_rejects_when_cash_balance_is_unavailable(monkeypatch) -> None:
+    guarded_spec = replace(resolve_live_profile_spec("deep_otm"), stop_trading_below_cash_usd=100.0)
+    monkeypatch.setattr("pm15min.live.signal.decision.resolve_live_profile_spec", lambda profile: guarded_spec)
+
+    row = _base_signal_row()
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.29,
+                "quote_up_bid": 0.19,
+                "quote_down_bid": 0.28,
+                "reasons": [],
+            }
+        ],
+    }
+
+    out = build_decision_snapshot(payload, quote_payload)
+
+    assert out["decision"]["status"] == "reject"
+    assert "cash_balance_unavailable" in out["rejected_offsets"][0]["guard_reasons"]
+
+
+def test_decision_rejects_when_open_market_state_is_unavailable(monkeypatch) -> None:
+    guarded_spec = replace(resolve_live_profile_spec("deep_otm"), max_open_markets=1)
+    monkeypatch.setattr("pm15min.live.signal.decision.resolve_live_profile_spec", lambda profile: guarded_spec)
+
+    row = _base_signal_row()
+    payload = {
+        "market": "sol",
+        "profile": "deep_otm",
+        "cycle": "15m",
+        "target": "direction",
+        "active_bundle": {},
+        "active_bundle_selection_path": "/tmp/selection.json",
+        "snapshot_ts": "2026-03-19T15-00-00Z",
+        "offset_signals": [row],
+    }
+    quote_payload = {
+        "snapshot_ts": "2026-03-19T15-00-10Z",
+        "quote_rows": [
+            {
+                "offset": 7,
+                "status": "ok",
+                "market_id": "market-1",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.29,
+                "quote_up_bid": 0.19,
+                "quote_down_bid": 0.28,
+                "reasons": [],
+            }
+        ],
+    }
+
+    out = build_decision_snapshot(payload, quote_payload)
+
+    assert out["decision"]["status"] == "reject"
+    assert "account_state_unavailable" in out["rejected_offsets"][0]["guard_reasons"]
 
 
 def test_decision_uses_compact_account_summary_without_raw_positions() -> None:

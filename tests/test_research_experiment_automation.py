@@ -27,6 +27,31 @@ from pm15min.research.automation import (
     summarize_experiment_run,
 )
 from pm15min.research.automation import control_plane
+from pm15min.research.automation.queue_state import build_queue_item, upsert_queue_item
+
+
+def _write_autorun_runtime_snapshot(
+    autorun_dir: Path,
+    *,
+    state: str,
+    iteration: int,
+    failure_count: int,
+    log_lines: list[str],
+    extra_fields: dict[str, object] | None = None,
+) -> Path:
+    autorun_dir.mkdir(parents=True, exist_ok=True)
+    status_path = autorun_dir / "codex-background.status.json"
+    payload: dict[str, object] = {
+        "state": state,
+        "iteration": iteration,
+        "failure_count": failure_count,
+        "pid": None,
+    }
+    if extra_fields:
+        payload.update(extra_fields)
+    status_path.write_text(json.dumps(payload), encoding="utf-8")
+    (autorun_dir / "codex-background.log").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+    return status_path
 
 
 def test_summarize_experiment_run_reads_summary_and_top_case(tmp_path: Path) -> None:
@@ -291,7 +316,7 @@ def test_build_codex_cycle_prompt_references_program_and_session(tmp_path: Path)
     assert str(root) in prompt
     assert str(session_dir) in prompt
     assert str(program_path) in prompt
-    assert "read program_custom.md and the latest session artifacts before making changes; start with results.tsv plus the newest cycle eval" in prompt.lower()
+    assert "read the machine decision summary plus program_custom.md before making changes; open results.tsv plus the newest cycle eval only if you still need historical rationale after accepting the current occupancy in the summary." in prompt.lower()
     assert "your codex decision pass must end after this cycle" in prompt.lower()
     assert "healthy formal experiment workers you started or observed may continue running after you exit" in prompt.lower()
     assert "4 simultaneous formal market runs" in prompt
@@ -300,6 +325,7 @@ def test_build_codex_cycle_prompt_references_program_and_session(tmp_path: Path)
     assert "prefer formal experiment launches over unrelated environment or infrastructure edits" in prompt.lower()
     assert "if `rg` is unavailable" in prompt.lower()
     assert "trust the current run directories" in prompt.lower()
+    assert "historical cycle eval notes about live workers or cpu health are not authoritative for the current cycle" in prompt.lower()
     assert "finished only when `completed_cases + failed_cases` reaches `cases`" in prompt.lower()
     assert "idle coin slots" in prompt.lower()
     assert "newest cycle eval" in prompt.lower()
@@ -307,8 +333,309 @@ def test_build_codex_cycle_prompt_references_program_and_session(tmp_path: Path)
     assert "do not leave an idle coin slot unfilled solely because the latest result is thin-sample" in prompt.lower()
     assert "still counts as one bounded cycle" in prompt.lower()
     assert "resume as many checkpointed current-line runs as needed to fill those live slots in the same cycle" in prompt.lower()
+    assert "if the current autorun snapshot reports `live formal workers: 0`, you are expected to queue or resume work for every coin slot" in prompt.lower()
+    assert "if a feature-set name mentioned by old session artifacts is missing from the current registry, treat that as historical drift rather than a blocker" in prompt.lower()
     assert "do not stop or checkpoint a healthy live formal run merely to end the current codex cycle" in prompt.lower()
     assert "run_one_experiment_background.sh" in prompt
+
+
+def test_build_codex_cycle_prompt_first_cycle_starts_from_summary_not_results_tsv(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (root / "auto_research").mkdir(parents=True, exist_ok=True)
+    program_path = root / "auto_research" / "program.md"
+    program_path.write_text("# demo program\n- coins: btc, eth\n", encoding="utf-8")
+    (root / "research").mkdir(parents=True, exist_ok=True)
+    (root / "research" / "AGENTS.md").write_text("# repo guidance\n", encoding="utf-8")
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir, program_path=program_path)
+
+    start_section = prompt.split("Start with only these files unless they prove insufficient:", 1)[1]
+    start_section = start_section.split("Use repository commands sparingly.", 1)[0]
+    assert str(session_dir / "results.tsv") not in start_section
+    assert "use the machine decision summary and current autorun snapshot first" in prompt.lower()
+    assert "queue or resume formal work for the idle coin slots first" in prompt.lower()
+
+
+def test_build_codex_cycle_prompt_falls_back_to_research_agents_path(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    research_dir = root / "research"
+    research_dir.mkdir(parents=True, exist_ok=True)
+    agents_path = research_dir / "AGENTS.md"
+    agents_path.write_text("# repo guidance\n", encoding="utf-8")
+    program_path = root / "program_custom.md"
+    program_path.write_text("# demo program\n", encoding="utf-8")
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir, program_path=program_path)
+
+    assert str(agents_path) in prompt
+    assert str(root / "AGENTS.md") not in prompt
+
+
+def test_build_codex_cycle_prompt_mentions_dense_trade_gates(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "dense_direction"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    auto_research_dir = root / "auto_research"
+    auto_research_dir.mkdir(parents=True, exist_ok=True)
+    program_path = auto_research_dir / "program_direction_dense.md"
+    program_path.write_text(
+        "\n".join(
+            [
+                "# dense direction program",
+                "- coins: btc",
+                "- target fixed to `direction`",
+                "- target `10-20` trades per coin per day",
+                "- frozen-window target: `140-280` trades per coin",
+                "- feature-set width is not fixed to `40`",
+                "- allowed width ladder: `30 / 34 / 38 / 40 / 44 / 48`",
+                "- move width by one bucket per bounded cycle only",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir, program_path=program_path)
+
+    assert "10-20 trades per coin per day" in prompt
+    assert "140-280 trades per coin" in prompt
+    assert "check count before roi" in prompt.lower()
+    assert "do not promote sparse winners" in prompt.lower()
+    assert "width is not fixed to 40" in prompt.lower()
+    assert "30 / 34 / 38 / 40 / 44 / 48" in prompt
+    assert "one bucket per bounded cycle" in prompt.lower()
+    assert "prefer the next wider bucket" in prompt.lower()
+
+
+def test_build_codex_cycle_prompt_queue_snapshot_includes_track_for_queue_items(tmp_path: Path) -> None:
+    from pm15min.research.automation.queue_state import build_queue_item, upsert_queue_item
+
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "dense_direction"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    auto_research_dir = root / "auto_research"
+    auto_research_dir.mkdir(parents=True, exist_ok=True)
+    program_path = auto_research_dir / "program_direction_dense.md"
+    program_path.write_text("# dense direction program\n- coins: btc\n", encoding="utf-8")
+
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="btc",
+            suite_name="btc_direction_suite",
+            run_label="btc_direction_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+    )
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir, program_path=program_path)
+
+    assert "track=direction_dense / market=btc / status=queued" in prompt
+
+
+def test_build_autorun_status_report_filters_to_current_dense_track(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from pm15min.research.automation.queue_state import build_queue_item, upsert_queue_item
+
+    root = tmp_path / "repo"
+    autorun_dir = root / "var" / "research" / "autorun" / "direction_dense"
+    status_path = _write_autorun_runtime_snapshot(
+        autorun_dir,
+        state="running",
+        iteration=3,
+        failure_count=0,
+        log_lines=["direction-log-line"],
+        extra_fields={"session_dir": str(root / "sessions" / "deep_otm_baseline_direction_dense_autoresearch")},
+    )
+
+    suite_specs_dir = root / "research" / "experiments" / "suite_specs"
+    suite_specs_dir.mkdir(parents=True, exist_ok=True)
+    (suite_specs_dir / "direction_suite.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "direction_suite",
+                "markets": {
+                    "btc": {
+                        "groups": {
+                            "focus_search": {
+                                "runs": [
+                                    {
+                                        "run_name": "focus_search",
+                                        "target": "direction",
+                                        "feature_set_variants": [{"label": "frontier", "feature_set": "focus_btc_direction"}],
+                                        "weight_variants": [{"label": "current_default"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (suite_specs_dir / "reversal_suite.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "reversal_suite",
+                "markets": {
+                    "btc": {
+                        "groups": {
+                            "focus_search": {
+                                "runs": [
+                                    {
+                                        "run_name": "focus_search",
+                                        "target": "reversal",
+                                        "feature_set_variants": [{"label": "frontier", "feature_set": "focus_btc_reversal"}],
+                                        "weight_variants": [{"label": "current_default"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    for suite_name, run_label in (("direction_suite", "direction_run"), ("reversal_suite", "reversal_run")):
+        run_dir = root / "research" / "experiments" / "runs" / f"suite={suite_name}" / f"run={run_label}"
+        (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+        (run_dir / "logs" / "suite.jsonl").write_text(
+            json.dumps({"event": "market_cache_resolved", "run_name": "focus_search"}) + "\n",
+            encoding="utf-8",
+        )
+
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="btc",
+            suite_name="direction_suite",
+            run_label="direction_run",
+            action="resume",
+            status="running",
+            track="direction_dense",
+            session_dir=root / "sessions" / "deep_otm_baseline_direction_dense_autoresearch",
+            program_path=root / "auto_research" / "program_direction_dense.md",
+        ),
+    )
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="btc",
+            suite_name="reversal_suite",
+            run_label="reversal_run",
+            action="resume",
+            status="running",
+            track="reversal_dense",
+            session_dir=root / "sessions" / "deep_otm_baseline_reversal_dense_autoresearch",
+            program_path=root / "auto_research" / "program_reversal_dense.md",
+        ),
+    )
+
+    monkeypatch.setattr(
+        control_plane,
+        "find_live_formal_workers",
+        lambda _root: [
+            {"pid": 101, "ppid": 1, "suite_name": "direction_suite", "run_label": "direction_run", "market": "btc", "cmd": "direction"},
+            {"pid": 202, "ppid": 1, "suite_name": "reversal_suite", "run_label": "reversal_run", "market": "btc", "cmd": "reversal"},
+        ],
+    )
+
+    payload = build_autorun_status_report(root, status_path=status_path, log_tail_lines=1, max_incomplete_runs=10)
+
+    assert [item["suite_name"] for item in payload["queue"]["items"]] == ["direction_suite"]
+    assert [item["suite_name"] for item in payload["formal_workers"]] == ["direction_suite"]
+    assert [item["suite_name"] for item in payload["incomplete_runs"]] == ["direction_suite"]
+
+
+def test_build_codex_cycle_prompt_ignores_opposite_track_occupancy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "deep_otm_baseline_direction_dense_autoresearch"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    auto_research_dir = root / "auto_research"
+    auto_research_dir.mkdir(parents=True, exist_ok=True)
+    program_path = auto_research_dir / "program_direction_dense.md"
+    program_path.write_text(
+        "\n".join(
+            [
+                "# dense direction program",
+                "- coins: btc",
+                "- target fixed to `direction`",
+                "- target `10-20` trades per coin per day",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    autorun_dir = root / "var" / "research" / "autorun"
+    autorun_dir.mkdir(parents=True, exist_ok=True)
+    (autorun_dir / "experiment-queue.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-04-15T12:00:00Z",
+                "max_live_runs": 4,
+                "track_slot_caps": {"direction_dense": 2, "reversal_dense": 2},
+                "items": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    suite_specs_dir = root / "research" / "experiments" / "suite_specs"
+    suite_specs_dir.mkdir(parents=True, exist_ok=True)
+    (suite_specs_dir / "reversal_suite.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "reversal_suite",
+                "markets": {
+                    "btc": {
+                        "groups": {
+                            "focus_search": {
+                                "runs": [
+                                    {
+                                        "run_name": "focus_search",
+                                        "target": "reversal",
+                                        "feature_set_variants": [{"label": "frontier", "feature_set": "focus_btc_reversal"}],
+                                        "weight_variants": [{"label": "current_default"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    reversal_run = root / "research" / "experiments" / "runs" / "suite=reversal_suite" / "run=reversal_run"
+    (reversal_run / "logs").mkdir(parents=True, exist_ok=True)
+    (reversal_run / "logs" / "suite.jsonl").write_text(
+        json.dumps({"event": "market_cache_resolved", "run_name": "focus_search"}) + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        control_plane,
+        "find_live_formal_workers",
+        lambda _root: [
+            {"pid": 202, "ppid": 1, "suite_name": "reversal_suite", "run_label": "reversal_run", "market": "btc", "cmd": "reversal"}
+        ],
+    )
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir, program_path=program_path)
+
+    assert "occupancy=0/2" in prompt.lower()
+    assert "btc: slot=idle / action=refill_now" in prompt.lower()
+    assert "reversal_suite / reversal_run" not in prompt
 
 
 def test_build_codex_cycle_prompt_uses_queue_max_live_runs_for_concurrency_guard(tmp_path: Path) -> None:
@@ -687,6 +1014,10 @@ def test_build_codex_cycle_prompt_includes_coin_slot_snapshot_and_feature_brief(
 
     prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
 
+    assert "machine decision summary already collected for you:" in prompt.lower()
+    assert "btc: slot=idle / action=refill_now" in prompt.lower()
+    assert "eth: slot=checkpointed / action=resume_or_replace_now" in prompt.lower()
+    assert "use the machine decision summary and current autorun snapshot first; open `results.tsv` or historical cycle eval only if you still need extra rationale after accepting the current occupancy in the summary." in prompt.lower()
     assert "coin slot snapshot already collected for you:" in prompt.lower()
     assert "btc: state=idle" in prompt.lower()
     assert "latest_completed=btc_suite" in prompt
@@ -696,12 +1027,255 @@ def test_build_codex_cycle_prompt_includes_coin_slot_snapshot_and_feature_brief(
     assert "feature_sets=focus_eth_40_v4,focus_eth_40_v5" in prompt
     assert "relevant feature-family brief already extracted for you:" in prompt.lower()
     assert "focus_btc_40_v4: market=btc / width=40 / notes=btc frontier" in prompt
-    assert "columns: ret_1m, ret_3m, ret_5m" in prompt
+    assert "columns: ret_1m, ret_3m, ret_5m" not in prompt
     assert "diagnosis_groups:" in prompt
     assert "protect_core=q_bs_up_strike,ret_from_strike,basis_bp,ret_from_cycle_open,first_half_ret,cycle_range_pos,rv_30,macd_z,volume_z,obv_z,vwap_gap_60,bias_60,regime_high_vol" in prompt
     assert "drop_from_first=short_mid_returns,price_position,momentum_oscillator" in prompt
     assert "add_toward=timing,persistence,strike_distance,flip_feasibility,market_quality,junk_cheap_filter" in prompt
     assert "do not open large raw registry files like `research/experiments/custom_feature_sets.json`" in prompt.lower()
+
+
+def test_build_codex_cycle_prompt_backfills_latest_completed_run_per_program_coin(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (root / "auto_research").mkdir(parents=True, exist_ok=True)
+    (root / "auto_research" / "program.md").write_text(
+        "# Demo Program\n\n- coins: `btc / eth`\n",
+        encoding="utf-8",
+    )
+
+    experiments_root = root / "research" / "experiments"
+    suite_specs_dir = experiments_root / "suite_specs"
+    suite_specs_dir.mkdir(parents=True, exist_ok=True)
+    (experiments_root / "custom_feature_sets.json").write_text(
+        json.dumps(
+            {
+                "focus_btc_latest": {
+                    "market": "btc",
+                    "width": 48,
+                    "columns": ["ret_15m", "volume_z"],
+                    "notes": "btc latest",
+                },
+                "focus_eth_latest": {
+                    "market": "eth",
+                    "width": 48,
+                    "columns": ["ret_30m", "obv_z"],
+                    "notes": "eth latest",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (suite_specs_dir / "btc_suite.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "btc_suite",
+                "markets": {
+                    "btc": {
+                        "groups": {
+                            "focus_search": {
+                                "runs": [
+                                    {
+                                        "run_name": "focus_search",
+                                        "feature_set_variants": [
+                                            {"label": "frontier", "feature_set": "focus_btc_latest"}
+                                        ],
+                                        "weight_variants": [{"label": "nvol"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (suite_specs_dir / "eth_suite.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "eth_suite",
+                "markets": {
+                    "eth": {
+                        "groups": {
+                            "focus_search": {
+                                "runs": [
+                                    {
+                                        "run_name": "focus_search",
+                                        "feature_set_variants": [
+                                            {"label": "frontier", "feature_set": "focus_eth_latest"}
+                                        ],
+                                        "weight_variants": [{"label": "nvol"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def write_completed_run(suite_name: str, run_label: str, market: str, mtime: int) -> None:
+        run_dir = experiments_root / "runs" / f"suite={suite_name}" / f"run={run_label}"
+        logs_dir = run_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = run_dir / "summary.json"
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "suite_name": suite_name,
+                    "run_label": run_label,
+                    "cases": 2,
+                    "completed_cases": 2,
+                    "failed_cases": 0,
+                    "markets": [market],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (logs_dir / "suite.jsonl").write_text(
+            json.dumps({"event": "market_completed", "case_label": f"{market}/focus_search"}) + "\n",
+            encoding="utf-8",
+        )
+        os.utime(summary_path, (mtime, mtime))
+
+    write_completed_run("eth_suite", "eth_complete", "eth", 100)
+    for index in range(5):
+        write_completed_run("btc_suite", f"btc_complete_{index}", "btc", 200 + index)
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
+
+    assert "btc: state=idle / latest_completed=btc_suite" in prompt.lower()
+    assert "eth: state=idle / latest_completed=eth_suite" in prompt.lower()
+    assert "feature_sets=focus_eth_latest" in prompt
+
+
+def test_build_codex_cycle_prompt_prefers_same_target_completed_runs_when_suite_specs_omit_target(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    auto_research_dir = root / "auto_research"
+    auto_research_dir.mkdir(parents=True, exist_ok=True)
+    (auto_research_dir / "program_direction_dense.md").write_text(
+        "# Demo Program\n\n- coins: `btc`\n- target fixed to `direction`\n",
+        encoding="utf-8",
+    )
+
+    experiments_root = root / "research" / "experiments"
+    suite_specs_dir = experiments_root / "suite_specs"
+    suite_specs_dir.mkdir(parents=True, exist_ok=True)
+    (experiments_root / "custom_feature_sets.json").write_text(
+        json.dumps(
+            {
+                "focus_btc_direction": {
+                    "market": "btc",
+                    "width": 48,
+                    "columns": ["ret_15m", "volume_z"],
+                    "notes": "btc direction",
+                },
+                "focus_btc_reversal": {
+                    "market": "btc",
+                    "width": 48,
+                    "columns": ["ret_30m", "obv_z"],
+                    "notes": "btc reversal",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (suite_specs_dir / "btc_direction_suite.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "btc_direction_suite",
+                "markets": {
+                    "btc": {
+                        "groups": {
+                            "focus_search": {
+                                "runs": [
+                                    {
+                                        "run_name": "focus_search",
+                                        "feature_set_variants": [
+                                            {"label": "frontier", "feature_set": "focus_btc_direction"}
+                                        ],
+                                        "weight_variants": [{"label": "nvol"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (suite_specs_dir / "btc_reversal_suite.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "btc_reversal_suite",
+                "markets": {
+                    "btc": {
+                        "groups": {
+                            "focus_search": {
+                                "runs": [
+                                    {
+                                        "run_name": "focus_search",
+                                        "feature_set_variants": [
+                                            {"label": "frontier", "feature_set": "focus_btc_reversal"}
+                                        ],
+                                        "weight_variants": [{"label": "nvol"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def write_completed_run(suite_name: str, run_label: str, mtime: int) -> None:
+        run_dir = experiments_root / "runs" / f"suite={suite_name}" / f"run={run_label}"
+        logs_dir = run_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = run_dir / "summary.json"
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "suite_name": suite_name,
+                    "run_label": run_label,
+                    "cases": 2,
+                    "completed_cases": 2,
+                    "failed_cases": 0,
+                    "markets": ["btc"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (logs_dir / "suite.jsonl").write_text(
+            json.dumps({"event": "market_completed", "case_label": "btc/focus_search"}) + "\n",
+            encoding="utf-8",
+        )
+        os.utime(summary_path, (mtime, mtime))
+
+    write_completed_run("btc_direction_suite", "btc_direction_complete", 100)
+    write_completed_run("btc_reversal_suite", "btc_reversal_complete", 200)
+
+    prompt = build_codex_cycle_prompt(
+        project_root=root,
+        session_dir=session_dir,
+        program_path=auto_research_dir / "program_direction_dense.md",
+    )
+
+    assert "latest_completed=btc_direction_suite" in prompt
+    assert "latest_completed=btc_reversal_suite" not in prompt
 
 
 def test_build_codex_cycle_prompt_marks_live_worker_slots_active(
@@ -773,6 +1347,73 @@ def test_build_codex_cycle_prompt_marks_live_worker_slots_active(
     assert "live_worker=yes" in prompt.lower()
 
 
+def test_build_codex_cycle_prompt_marks_active_slots_without_successor_for_next_queueing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (root / "auto_research").mkdir(parents=True, exist_ok=True)
+    (root / "auto_research" / "program.md").write_text("# Demo Program\n\n- coins: `btc`\n", encoding="utf-8")
+    run_dir = root / "research" / "experiments" / "runs" / "suite=btc_suite" / "run=btc_live"
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+    (run_dir / "logs" / "suite.jsonl").write_text(
+        json.dumps({"event": "execution_group_warmup_started", "run_name": "focus_search"}) + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        control_plane,
+        "find_live_formal_workers",
+        lambda _root: [{"run_label": "btc_live", "suite_name": "btc_suite", "pid": 123}],
+    )
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
+
+    assert "btc: slot=active / action=prepare_next_now" in prompt.lower()
+    assert "queued_successor=no" in prompt.lower()
+    assert "for active coin slots with `action=prepare_next_now`, queue exactly one queued successor" in prompt.lower()
+
+
+def test_build_codex_cycle_prompt_keeps_active_slots_running_when_successor_already_queued(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "demo"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (root / "auto_research").mkdir(parents=True, exist_ok=True)
+    (root / "auto_research" / "program.md").write_text("# Demo Program\n\n- coins: `btc`\n", encoding="utf-8")
+    run_dir = root / "research" / "experiments" / "runs" / "suite=btc_suite" / "run=btc_live"
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+    (run_dir / "logs" / "suite.jsonl").write_text(
+        json.dumps({"event": "execution_group_warmup_started", "run_name": "focus_search"}) + "\n",
+        encoding="utf-8",
+    )
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="btc",
+            suite_name="btc_followup_suite",
+            run_label="btc_followup",
+            action="launch",
+            reason="queued successor",
+        ),
+    )
+
+    monkeypatch.setattr(
+        control_plane,
+        "find_live_formal_workers",
+        lambda _root: [{"run_label": "btc_live", "suite_name": "btc_suite", "pid": 123}],
+    )
+
+    prompt = build_codex_cycle_prompt(project_root=root, session_dir=session_dir)
+
+    assert "btc: slot=active / action=keep_running" in prompt.lower()
+    assert "queued_successor=yes" in prompt.lower()
+
+
 def test_build_autorun_status_report_tolerates_non_utf8_log_bytes(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     autorun_dir = root / "var" / "research" / "autorun"
@@ -787,6 +1428,110 @@ def test_build_autorun_status_report_tolerates_non_utf8_log_bytes(tmp_path: Path
 
     assert payload["status"]["state"] == "idle"
     assert payload["log_tail"][-1] == "last line"
+
+
+def test_build_autorun_status_report_prefers_explicit_status_path_over_default_autorun_dir(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    default_dir = root / "var" / "research" / "autorun"
+    instance_dir = default_dir / "direction_dense"
+    _write_autorun_runtime_snapshot(
+        default_dir,
+        state="default-idle",
+        iteration=1,
+        failure_count=9,
+        log_lines=["default-log-1"],
+    )
+    instance_status = _write_autorun_runtime_snapshot(
+        instance_dir,
+        state="instance-idle",
+        iteration=7,
+        failure_count=2,
+        log_lines=["instance-log-1"],
+    )
+
+    payload = build_autorun_status_report(root, status_path=instance_status, log_tail_lines=1, max_incomplete_runs=1)
+
+    assert payload["status_path"] == str(instance_status)
+    assert payload["status"]["state"] == "instance-idle"
+    assert payload["status"]["iteration"] == 7
+    assert payload["status"]["failure_count"] == 2
+
+
+def test_build_autorun_status_report_uses_sibling_log_for_explicit_status_path(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    default_dir = root / "var" / "research" / "autorun"
+    instance_dir = default_dir / "direction_dense"
+    _write_autorun_runtime_snapshot(
+        default_dir,
+        state="default-idle",
+        iteration=1,
+        failure_count=0,
+        log_lines=["default-log-1", "default-log-2"],
+    )
+    instance_status = _write_autorun_runtime_snapshot(
+        instance_dir,
+        state="instance-idle",
+        iteration=3,
+        failure_count=1,
+        log_lines=["instance-log-1", "instance-log-2", "instance-log-3"],
+    )
+
+    payload = build_autorun_status_report(root, status_path=instance_status, log_tail_lines=2, max_incomplete_runs=1)
+
+    assert payload["log_path"] == str(instance_dir / "codex-background.log")
+    assert payload["log_tail"] == ["instance-log-2", "instance-log-3"]
+    assert "default-log-2" not in payload["log_tail"]
+
+
+def test_status_autorun_runtime_respects_autorun_dir_override(tmp_path: Path) -> None:
+    workspace_root = Path(__file__).resolve().parents[1]
+    temp_root = tmp_path / "repo"
+    script_path = temp_root / "auto_research" / "status_autorun.sh"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(
+        (workspace_root / "auto_research" / "status_autorun.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (temp_root / "src").symlink_to(workspace_root / "src", target_is_directory=True)
+
+    default_dir = temp_root / "var" / "research" / "autorun"
+    instance_dir = default_dir / "direction_dense"
+    _write_autorun_runtime_snapshot(
+        default_dir,
+        state="default-idle",
+        iteration=1,
+        failure_count=9,
+        log_lines=["default-log-line"],
+        extra_fields={"session_dir": "sessions/default"},
+    )
+    _write_autorun_runtime_snapshot(
+        instance_dir,
+        state="instance-idle",
+        iteration=8,
+        failure_count=3,
+        log_lines=["instance-log-line"],
+        extra_fields={"session_dir": "sessions/direction_dense"},
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", str(script_path)],
+        cwd=temp_root,
+        env={**os.environ, "AUTORUN_DIR": str(instance_dir)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "state: instance-idle" in result.stdout
+    assert "iteration: 8" in result.stdout
+    assert "failure_count: 3" in result.stdout
+    assert "session_dir: sessions/direction_dense" in result.stdout
+    assert "instance-log-line" in result.stdout
+    assert "default-idle" not in result.stdout
+    assert "default-log-line" not in result.stdout
 
 
 def test_build_codex_exec_extra_args_adds_skip_git_repo_check_once() -> None:
@@ -952,6 +1697,7 @@ def test_apply_codex_provider_override_updates_only_isolated_home(tmp_path: Path
     assert payload["codex_dir"] == str(isolated_codex_dir)
     config_text = (isolated_codex_dir / "config.toml").read_text(encoding="utf-8")
     assert 'base_url = "https://ai.changyou.club/v1"' in config_text
+    assert "requires_openai_auth = false" in config_text
     auth_payload = json.loads((isolated_codex_dir / "auth.json").read_text(encoding="utf-8"))
     assert auth_payload["OPENAI_API_KEY"] == "fallback-key"
     source_auth_payload = json.loads((source_codex_dir / "auth.json").read_text(encoding="utf-8"))
@@ -1080,6 +1826,14 @@ def test_codex_background_loop_does_not_launch_attempt_pid_via_command_substitut
     assert "STARTED_ATTEMPT_PID" in script_text
 
 
+def test_codex_background_loop_treats_any_initial_output_as_startup_progress() -> None:
+    script_text = Path("auto_research/codex_background_loop.sh").read_text(encoding="utf-8")
+
+    assert 'if [[ "$current_size" -gt 0 ]]; then' in script_text
+    assert "startup_progress=1" in script_text
+    assert '"$current_size" -gt "$startup_baseline_size"' not in script_text
+
+
 def test_research_readme_documents_secondary_nimabo_fallback_order() -> None:
     readme_text = Path("auto_research/README.md").read_text(encoding="utf-8")
 
@@ -1089,6 +1843,326 @@ def test_research_readme_documents_secondary_nimabo_fallback_order() -> None:
     assert "secondary Nimabo" in readme_text
     assert "ai.changyou.club" in readme_text
     assert "official" in readme_text
+
+
+def test_research_readme_documents_dense_dual_track_startup() -> None:
+    readme_text = Path("auto_research/README.md").read_text(encoding="utf-8")
+
+    assert "start_direction_dense.sh" in readme_text
+    assert "start_reversal_dense.sh" in readme_text
+    assert "direction_dense" in readme_text
+    assert "reversal_dense" in readme_text
+
+
+def test_dense_program_files_exist_and_define_track_targets() -> None:
+    direction_text = Path("auto_research/program_direction_dense.md").read_text(encoding="utf-8")
+    reversal_text = Path("auto_research/program_reversal_dense.md").read_text(encoding="utf-8")
+
+    assert "target fixed to `direction`" in direction_text
+    assert "target fixed to `reversal`" in reversal_text
+    assert "10-20 trades per coin per day" in direction_text
+    assert "10-20 trades per coin per day" in reversal_text
+    assert "140-280" in direction_text
+    assert "140-280" in reversal_text
+    assert "not fixed to `40`" in direction_text
+    assert "not fixed to `40`" in reversal_text
+    assert "30 / 34 / 38 / 40 / 44 / 48" in direction_text
+    assert "30 / 34 / 38 / 40 / 44 / 48" in reversal_text
+    assert "one bucket per bounded cycle" in direction_text.lower()
+    assert "one bucket per bounded cycle" in reversal_text.lower()
+
+
+def test_dense_start_wrappers_bind_distinct_program_and_autorun_dirs() -> None:
+    direction_text = Path("auto_research/start_direction_dense.sh").read_text(encoding="utf-8")
+    reversal_text = Path("auto_research/start_reversal_dense.sh").read_text(encoding="utf-8")
+
+    assert "program_direction_dense.md" in direction_text
+    assert "program_reversal_dense.md" in reversal_text
+    assert "var/research/autorun/direction_dense" in direction_text
+    assert "var/research/autorun/reversal_dense" in reversal_text
+
+
+def test_status_dense_autorun_reads_both_dense_instances() -> None:
+    script_text = Path("auto_research/status_dense_autorun.sh").read_text(encoding="utf-8")
+
+    assert "direction_dense" in script_text
+    assert "reversal_dense" in script_text
+    assert "status_autorun.sh" in script_text
+
+
+def test_codex_background_loop_allows_autorun_dir_override() -> None:
+    script_text = Path("auto_research/codex_background_loop.sh").read_text(encoding="utf-8")
+
+    assert 'AUTORUN_DIR="${AUTORUN_DIR:-$ROOT_DIR/var/research/autorun}"' in script_text
+    assert 'STATUS_PATH="${STATUS_PATH:-$AUTORUN_DIR/codex-background.status.json}"' in script_text
+    assert 'LOG_PATH="${LOG_PATH:-$AUTORUN_DIR/codex-background.log}"' in script_text
+
+
+def test_status_autorun_allows_status_path_override() -> None:
+    script_text = Path("auto_research/status_autorun.sh").read_text(encoding="utf-8")
+
+    assert 'AUTORUN_DIR="${AUTORUN_DIR:-$ROOT_DIR/var/research/autorun}"' in script_text
+    assert "build_autorun_status_report(" in script_text
+    assert "status_path=" in script_text
+
+
+def test_build_codex_cycle_prompt_accepts_status_path_override() -> None:
+    source = Path("src/pm15min/research/automation/control_plane.py").read_text(encoding="utf-8")
+
+    assert "def build_codex_cycle_prompt(" in source
+    assert "status_path: Path | None = None" in source
+    assert (
+        "build_autorun_status_report(root, log_tail_lines=5, max_incomplete_runs=5, status_path=status_path)"
+        in source
+    )
+
+
+def test_auto_research_scripts_resolve_repo_root_from_new_directory_layout() -> None:
+    shell_scripts = [
+        Path("auto_research/bootstrap_keepalive.sh"),
+        Path("auto_research/codex_background_loop.sh"),
+        Path("auto_research/experiment_queue_supervisor.sh"),
+        Path("auto_research/run_one_experiment.sh"),
+        Path("auto_research/run_one_experiment_background.sh"),
+        Path("auto_research/status_autorun.sh"),
+    ]
+    python_scripts = [
+        Path("auto_research/experiment_queue.py"),
+        Path("auto_research/summarize_experiment.py"),
+        Path("auto_research/update_session.py"),
+    ]
+
+    for path in shell_scripts:
+        script_text = path.read_text(encoding="utf-8")
+        assert 'ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"' in script_text
+        assert 'ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"' not in script_text
+
+    for path in python_scripts:
+        script_text = path.read_text(encoding="utf-8")
+        assert "parents[1]" in script_text
+        assert "parents[2]" not in script_text
+
+
+def test_python_env_activation_uses_real_home_when_home_is_overridden(tmp_path: Path) -> None:
+    fake_real_home = tmp_path / "real-home"
+    fake_diag_home = tmp_path / "diag-home"
+    fake_conda_base = fake_real_home / "miniconda3"
+    fake_python = fake_conda_base / "envs" / "pm15min" / "bin" / "python"
+    conda_sh = fake_conda_base / "etc" / "profile.d" / "conda.sh"
+
+    fake_diag_home.mkdir(parents=True, exist_ok=True)
+    fake_python.parent.mkdir(parents=True, exist_ok=True)
+    conda_sh.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_python.write_text(
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        "if [[ \"${1:-}\" == \"-c\" ]]; then\n"
+        "  printf '%s\\n' \"$0\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    conda_sh.write_text(
+        "conda() {\n"
+        "  if [[ \"$1\" == \"info\" && \"${2:-}\" == \"--base\" ]]; then\n"
+        "    printf '%s\\n' \"$FAKE_CONDA_BASE\"\n"
+        "    return 0\n"
+        "  fi\n"
+        "  if [[ \"$1\" == \"env\" && \"${2:-}\" == \"list\" ]]; then\n"
+        "    printf '# conda environments:\\n'\n"
+        "    printf 'base * %s\\n' \"$FAKE_CONDA_BASE\"\n"
+        "    printf 'pm15min %s/envs/pm15min\\n' \"$FAKE_CONDA_BASE\"\n"
+        "    return 0\n"
+        "  fi\n"
+        "  if [[ \"$1\" == \"activate\" ]]; then\n"
+        "    export CONDA_PREFIX=\"$FAKE_CONDA_BASE/envs/$2\"\n"
+        "    return 0\n"
+        "  fi\n"
+        "  return 0\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(fake_diag_home),
+            "PM15MIN_REAL_HOME": str(fake_real_home),
+            "FAKE_CONDA_BASE": str(fake_conda_base),
+            "PATH": "/usr/bin:/bin",
+        }
+    )
+    env.pop("CONDA_EXE", None)
+    env.pop("CONDA_PREFIX", None)
+
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-lc",
+            "\n".join(
+                [
+                    "set -euo pipefail",
+                    "source scripts/entrypoints/_python_env.sh",
+                    "pm15min_activate_python",
+                    "printf 'PM15MIN_CONDA_ENV=%s\\n' \"$PM15MIN_CONDA_ENV\"",
+                    "printf 'PYTHON_BIN=%s\\n' \"$PYTHON_BIN\"",
+                ]
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"PM15MIN_CONDA_ENV=pm15min" in result.stdout
+    assert f"PYTHON_BIN={fake_python}" in result.stdout
+
+
+def test_python_env_can_load_managed_proxy_env_when_enabled(tmp_path: Path) -> None:
+    proxy_env = tmp_path / "managed_proxy.env"
+    proxy_env.write_text(
+        "export HTTP_PROXY='socks5h://127.0.0.1:36897'\n"
+        "export HTTPS_PROXY='socks5h://127.0.0.1:36897'\n"
+        "export ALL_PROXY='socks5h://127.0.0.1:36897'\n"
+        "export PM15MIN_MANAGED_PROXY_ACTIVE_PORT='36897'\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PM15MIN_MANAGED_PROXY_ENABLE": "1",
+            "PM15MIN_MANAGED_PROXY_ENV_FILE": str(proxy_env),
+        }
+    )
+    env.pop("HTTP_PROXY", None)
+    env.pop("HTTPS_PROXY", None)
+    env.pop("ALL_PROXY", None)
+
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-lc",
+            "\n".join(
+                [
+                    "set -euo pipefail",
+                    "source scripts/entrypoints/_python_env.sh",
+                    "pm15min_load_managed_proxy_env",
+                    "printf 'HTTP_PROXY=%s\\n' \"$HTTP_PROXY\"",
+                    "printf 'PM15MIN_MANAGED_PROXY_ACTIVE_PORT=%s\\n' \"$PM15MIN_MANAGED_PROXY_ACTIVE_PORT\"",
+                ]
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "HTTP_PROXY=socks5h://127.0.0.1:36897" in result.stdout
+    assert "PM15MIN_MANAGED_PROXY_ACTIVE_PORT=36897" in result.stdout
+
+
+def test_python_env_keeps_explicit_proxy_when_managed_proxy_enabled(tmp_path: Path) -> None:
+    proxy_env = tmp_path / "managed_proxy.env"
+    proxy_env.write_text(
+        "export HTTP_PROXY='socks5h://127.0.0.1:36897'\n"
+        "export HTTPS_PROXY='socks5h://127.0.0.1:36897'\n"
+        "export ALL_PROXY='socks5h://127.0.0.1:36897'\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PM15MIN_MANAGED_PROXY_ENABLE": "1",
+            "PM15MIN_MANAGED_PROXY_ENV_FILE": str(proxy_env),
+            "HTTP_PROXY": "http://127.0.0.1:20171",
+            "HTTPS_PROXY": "http://127.0.0.1:20171",
+            "ALL_PROXY": "http://127.0.0.1:20171",
+        }
+    )
+
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-lc",
+            "\n".join(
+                [
+                    "set -euo pipefail",
+                    "source scripts/entrypoints/_python_env.sh",
+                    "pm15min_load_managed_proxy_env",
+                    "printf 'HTTP_PROXY=%s\\n' \"$HTTP_PROXY\"",
+                ]
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "HTTP_PROXY=http://127.0.0.1:20171" in result.stdout
+
+
+def test_python_env_replaces_stale_lowercase_proxy_when_managed_proxy_enabled(tmp_path: Path) -> None:
+    proxy_env = tmp_path / "managed_proxy.env"
+    proxy_env.write_text(
+        "export HTTP_PROXY='socks5h://127.0.0.1:36897'\n"
+        "export HTTPS_PROXY='socks5h://127.0.0.1:36897'\n"
+        "export ALL_PROXY='socks5h://127.0.0.1:36897'\n"
+        "export PM15MIN_MANAGED_PROXY_ACTIVE_PORT='36897'\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PM15MIN_MANAGED_PROXY_ENABLE": "1",
+            "PM15MIN_MANAGED_PROXY_ENV_FILE": str(proxy_env),
+            "http_proxy": "http://127.0.0.1:20171",
+            "https_proxy": "http://127.0.0.1:20171",
+            "all_proxy": "http://127.0.0.1:20171",
+        }
+    )
+    env.pop("HTTP_PROXY", None)
+    env.pop("HTTPS_PROXY", None)
+    env.pop("ALL_PROXY", None)
+
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-lc",
+            "\n".join(
+                [
+                    "set -euo pipefail",
+                    "source scripts/entrypoints/_python_env.sh",
+                    "pm15min_load_managed_proxy_env",
+                    "printf 'HTTP_PROXY=%s\\n' \"$HTTP_PROXY\"",
+                    "printf 'http_proxy=%s\\n' \"$http_proxy\"",
+                ]
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "HTTP_PROXY=socks5h://127.0.0.1:36897" in result.stdout
+    assert "http_proxy=socks5h://127.0.0.1:36897" in result.stdout
 
 
 def test_next_autorun_failure_state_stops_after_threshold() -> None:

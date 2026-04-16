@@ -47,6 +47,7 @@ _TRAINING_REUSE_COLUMNS = [
     "contrarian_weight",
     "contrarian_quantile",
     "contrarian_return_col",
+    "winner_in_band_weight",
     "offset_weight_overrides_json",
     "run_label",
     "run_dir",
@@ -110,6 +111,7 @@ def training_cache_key(
     contrarian_weight: float | None = None,
     contrarian_quantile: float | None = None,
     contrarian_return_col: str | None = None,
+    winner_in_band_weight: float | None = None,
     offset_weight_overrides: dict[int, dict[str, object]] | None = None,
 ) -> str:
     return stable_key(
@@ -129,6 +131,7 @@ def training_cache_key(
             "contrarian_weight": contrarian_weight,
             "contrarian_quantile": contrarian_quantile,
             "contrarian_return_col": str(contrarian_return_col).strip() if contrarian_return_col else None,
+            "winner_in_band_weight": winner_in_band_weight,
             "offset_weight_overrides": offset_weight_overrides_payload(offset_weight_overrides),
         }
     )
@@ -358,6 +361,7 @@ class ExperimentSharedCache:
         contrarian_weight: float | None = None,
         contrarian_quantile: float | None = None,
         contrarian_return_col: str | None = None,
+        winner_in_band_weight: float | None = None,
         offset_weight_overrides: dict[int, dict[str, object]] | None = None,
     ) -> dict[str, object] | None:
         key = training_cache_key(
@@ -376,6 +380,7 @@ class ExperimentSharedCache:
             contrarian_weight=contrarian_weight,
             contrarian_quantile=contrarian_quantile,
             contrarian_return_col=contrarian_return_col,
+            winner_in_band_weight=winner_in_band_weight,
             offset_weight_overrides=offset_weight_overrides,
         )
         cached = self.training_reuse.get(key)
@@ -401,6 +406,7 @@ class ExperimentSharedCache:
         contrarian_weight: float | None = None,
         contrarian_quantile: float | None = None,
         contrarian_return_col: str | None = None,
+        winner_in_band_weight: float | None = None,
         offset_weight_overrides: dict[int, dict[str, object]] | None = None,
         source_suite_name: str | None = None,
         source_run_label: str | None = None,
@@ -424,6 +430,7 @@ class ExperimentSharedCache:
             contrarian_weight=contrarian_weight,
             contrarian_quantile=contrarian_quantile,
             contrarian_return_col=contrarian_return_col,
+            winner_in_band_weight=winner_in_band_weight,
             offset_weight_overrides=offset_weight_overrides,
         )
         normalized_run_label = _partition_label(run_label or normalized_run_dir)
@@ -456,6 +463,7 @@ class ExperimentSharedCache:
             "contrarian_weight": contrarian_weight,
             "contrarian_quantile": contrarian_quantile,
             "contrarian_return_col": _clean_optional_text(contrarian_return_col),
+            "winner_in_band_weight": _clean_optional_float(winner_in_band_weight),
             "offset_weight_overrides": normalize_offset_weight_overrides(offset_weight_overrides),
             "run_label": normalized_run_label,
             "run_dir": normalized_run_dir,
@@ -578,6 +586,7 @@ class ExperimentSharedCache:
                     contrarian_weight=_clean_optional_float(row.get("contrarian_weight")),
                     contrarian_quantile=_clean_optional_float(row.get("contrarian_quantile")),
                     contrarian_return_col=_clean_optional_text(row.get("contrarian_return_col")),
+                    winner_in_band_weight=_clean_optional_float(row.get("winner_in_band_weight")),
                     offset_weight_overrides=_parse_offset_weight_overrides_json(row.get("offset_weight_overrides_json")),
                     source_suite_name=source_suite_name,
                     source_run_label=source_run_label,
@@ -772,6 +781,7 @@ def _training_reuse_from_frame(frame: pd.DataFrame) -> dict[str, dict[str, objec
             "contrarian_weight": _clean_optional_float(row.get("contrarian_weight")),
             "contrarian_quantile": _clean_optional_float(row.get("contrarian_quantile")),
             "contrarian_return_col": _clean_optional_text(row.get("contrarian_return_col")),
+            "winner_in_band_weight": _clean_optional_float(row.get("winner_in_band_weight")),
             "offset_weight_overrides": _parse_offset_weight_overrides_json(row.get("offset_weight_overrides_json")),
             "run_label": _partition_label(_clean_optional_text(row.get("run_label")) or run_dir),
             "run_dir": run_dir,

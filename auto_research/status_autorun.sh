@@ -1,9 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+AUTORUN_DIR="${AUTORUN_DIR:-$ROOT_DIR/var/research/autorun}"
+STATUS_PATH="${STATUS_PATH:-$AUTORUN_DIR/codex-background.status.json}"
 
-PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$ROOT_DIR"
+PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$ROOT_DIR" "$STATUS_PATH"
 from __future__ import annotations
 import json
 import sys
@@ -12,7 +14,8 @@ from pathlib import Path
 from pm15min.research.automation import build_autorun_status_report
 
 root = Path(sys.argv[1]).resolve()
-payload = build_autorun_status_report(root, log_tail_lines=20, max_incomplete_runs=10)
+status_path = Path(sys.argv[2]).resolve()
+payload = build_autorun_status_report(root, log_tail_lines=20, max_incomplete_runs=10, status_path=status_path)
 status = payload.get("status") or {}
 if not status:
     print("No background autorun status file found.")

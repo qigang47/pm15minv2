@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT_DIR/scripts/entrypoints/_python_env.sh"
 
 SUITE_NAME=""
@@ -49,7 +49,9 @@ if [[ -z "$SUITE_NAME" || -z "$RUN_LABEL" ]]; then
 fi
 
 export PM15MIN_PROJECT_DIR="$ROOT_DIR"
+export PM15MIN_MANAGED_PROXY_ENABLE="${PM15MIN_MANAGED_PROXY_ENABLE:-1}"
 pm15min_load_project_env
+pm15min_load_managed_proxy_env
 pm15min_activate_python
 
 export PYTHONPATH="$ROOT_DIR/src"

@@ -7,6 +7,55 @@ _pm15min_trim_ws() {
   printf '%s' "$value"
 }
 
+_pm15min_is_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON|y|Y)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+_pm15min_detect_login_home() {
+  local login_user="${PM15MIN_REAL_USER:-${SUDO_USER:-${LOGNAME:-${USER:-}}}}"
+  local candidate=""
+
+  if [[ -z "$login_user" ]]; then
+    return 1
+  fi
+  if [[ ! "$login_user" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    return 1
+  fi
+
+  candidate="$(eval "printf '%s' ~$login_user" 2>/dev/null || true)"
+  if [[ -z "$candidate" || "$candidate" == "~$login_user" ]]; then
+    return 1
+  fi
+  printf '%s' "$candidate"
+}
+
+_pm15min_source_conda_from_home_candidates() {
+  local login_home=""
+  local candidate=""
+  local conda_sh=""
+
+  login_home="$(_pm15min_detect_login_home || true)"
+
+  for candidate in "${PM15MIN_REAL_HOME:-}" "${REAL_HOME:-}" "$login_home" "${HOME:-}"; do
+    [[ -z "$candidate" ]] && continue
+    conda_sh="$candidate/miniconda3/etc/profile.d/conda.sh"
+    if [[ -f "$conda_sh" ]]; then
+      # shellcheck source=/dev/null
+      source "$conda_sh"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 pm15min_load_project_env() {
   local project_dir="${PM15MIN_PROJECT_DIR:-$PWD}"
   local parent_dir
@@ -69,15 +118,51 @@ pm15min_load_project_env() {
   echo "✓ 已导入环境变量: ${env_path}"
 }
 
+pm15min_load_managed_proxy_env() {
+  local enabled="${PM15MIN_MANAGED_PROXY_ENABLE:-0}"
+  local env_path="${PM15MIN_MANAGED_PROXY_ENV_FILE:-${HOME:-}/.local/state/pm15min-managed-proxy/active_proxy.env}"
+  local required="${PM15MIN_MANAGED_PROXY_REQUIRED:-0}"
+
+  if ! _pm15min_is_truthy "$enabled"; then
+    return 0
+  fi
+
+  if [[ -n "${HTTP_PROXY:-}" || -n "${HTTPS_PROXY:-}" || -n "${ALL_PROXY:-}" ]]; then
+    echo "✓ 检测到显式代理环境，跳过受管代理加载"
+    return 0
+  fi
+
+  if [[ ! -f "$env_path" ]]; then
+    if _pm15min_is_truthy "$required"; then
+      echo "WARN: 受管代理环境文件不存在，跳过: ${env_path}"
+    fi
+    return 0
+  fi
+
+  # shellcheck source=/dev/null
+  source "$env_path"
+  if [[ -n "${HTTP_PROXY:-}" ]]; then
+    export http_proxy="${HTTP_PROXY}"
+  fi
+  if [[ -n "${HTTPS_PROXY:-}" ]]; then
+    export https_proxy="${HTTPS_PROXY}"
+  fi
+  if [[ -n "${ALL_PROXY:-}" ]]; then
+    export all_proxy="${ALL_PROXY}"
+  fi
+  if [[ -n "${NO_PROXY:-}" ]]; then
+    export no_proxy="${NO_PROXY}"
+  fi
+  export PM15MIN_MANAGED_PROXY_ENV_LOADED="$env_path"
+  echo "✓ 已加载受管代理: ${PM15MIN_MANAGED_PROXY_ACTIVE_URL:-${HTTP_PROXY:-}}"
+}
+
 pm15min_activate_python() {
   local requested_env="${CONDA_ENV:-pm15min}"
   local resolved_env=""
 
   if ! command -v conda >/dev/null 2>&1; then
-    if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
-      # shellcheck source=/dev/null
-      source "$HOME/miniconda3/etc/profile.d/conda.sh"
-    fi
+    _pm15min_source_conda_from_home_candidates || true
   fi
 
   if ! command -v conda >/dev/null 2>&1; then
@@ -110,6 +195,7 @@ pm15min_activate_python() {
   conda activate "$resolved_env"
 
   export PM15MIN_CONDA_ENV="$resolved_env"
+  export PM15MIN_CONDA_BASE="$conda_base"
   export PYTHON_BIN="${CONDA_PREFIX:-}/bin/python"
 
   if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -117,7 +203,7 @@ pm15min_activate_python() {
     return 1
   fi
 
-  if [[ "$PYTHON_BIN" == "$HOME/miniconda3/bin/python" ]]; then
+  if [[ "$PYTHON_BIN" == "$conda_base/bin/python" ]]; then
     echo "❌ 当前 Python 仍指向 Miniconda base: ${PYTHON_BIN}"
     echo "   为避免再次用错解释器，脚本中止。"
     return 1

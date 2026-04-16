@@ -18,11 +18,11 @@ rewritten again.
 
 ## Frozen Evaluation Slice
 
-- training window through `2026-03-27`
-- frozen decision / backtest window from `2026-03-28` through `2026-04-10`
-- use this fixed slice until newer canonical labels, kline, and orderbook
-  artifacts are available
-- do not silently roll the decision end date past `2026-04-10` inside this
+- training window through `2026-03-31`
+- frozen decision / backtest window from `2026-04-01` through `2026-04-15`
+- use this fixed slice until a newer canonical evaluation slice is explicitly
+  approved
+- do not silently roll the decision end date past `2026-04-15` inside this
   session
 
 ## Current Objective
@@ -54,7 +54,7 @@ Retired for this session:
 - the old Stage 0 to Stage 5 retrain ladder
 - wide feature-width family search outside near-40 custom families
 - `hybrid` target search
-- stale `1 USD / max3` or stale `2026-04-03` windows
+- stale `1 USD / max3` or stale pre-`2026-04-15` frozen windows
 
 ## Track R: 40-Factor Reversal
 
@@ -203,7 +203,7 @@ Each Codex background iteration must complete exactly one bounded cycle:
    but do not treat a completed run as resumable just because an older session
    note still says it is unresolved.
 6. If a current `reversal` near-40 suite spec is missing for the frozen
-   `2 USD / max5 / 2026-04-10` judge, create or update it from the nearest
+   `2 USD / max5 / 2026-04-15` judge, create or update it from the nearest
    same-target template before launching.
 7. If a new challenger requires factor replacement, update
    `research/experiments/custom_feature_sets.json` first and record the parent /

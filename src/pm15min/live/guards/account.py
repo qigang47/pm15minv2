@@ -14,7 +14,7 @@ def cash_balance_guard_reasons(
     if threshold <= 0.0:
         return []
     if not bool(account_context.get("cash_balance_available", False)):
-        return []
+        return ["cash_balance_unavailable"]
     balance = float_or_none(account_context.get("cash_balance_usd"))
     if balance is None or balance > threshold:
         return []
@@ -30,7 +30,7 @@ def max_open_markets_guard_reasons(
     if cap <= 0:
         return []
     if not bool(account_context.get("account_state_available", False)):
-        return []
+        return ["account_state_unavailable"]
     if bool(account_context.get("current_market_active", False)):
         return []
     active_market_count = int(account_context.get("active_market_count") or 0)

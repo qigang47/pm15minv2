@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 import json
+import shutil
 from pathlib import Path
 
 import joblib
@@ -56,6 +57,8 @@ def train_research_run(
         target=spec.target,
         run_label_text=spec.run_label,
     )
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
     logs_dir = run_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     event_log_path = logs_dir / "train.jsonl"
@@ -77,6 +80,11 @@ def train_research_run(
             TrainerConfig.contrarian_return_col
             if spec.contrarian_return_col in {None, ""}
             else str(spec.contrarian_return_col)
+        ),
+        winner_in_band_weight=(
+            TrainerConfig.winner_in_band_weight
+            if spec.winner_in_band_weight is None
+            else float(spec.winner_in_band_weight)
         ),
         feature_set_root=cfg.layout.storage.rewrite_root,
     )
@@ -225,6 +233,7 @@ def train_research_run(
         "contrarian_weight": base_trainer_cfg.contrarian_weight,
         "contrarian_quantile": base_trainer_cfg.contrarian_quantile,
         "contrarian_return_col": base_trainer_cfg.contrarian_return_col,
+        "winner_in_band_weight": base_trainer_cfg.winner_in_band_weight,
         "offset_weight_overrides": offset_weight_overrides_payload(spec.offset_weight_overrides),
         "offset_summaries": summary_df.to_dict(orient="records"),
     }
@@ -315,6 +324,7 @@ def _train_single_offset(
         contrarian_weight=trainer_cfg.contrarian_weight,
         contrarian_quantile=trainer_cfg.contrarian_quantile,
         contrarian_return_col=trainer_cfg.contrarian_return_col,
+        winner_in_band_weight=trainer_cfg.winner_in_band_weight,
     )
     split_rows = build_purged_time_series_splits(
         df.loc[X.index, "decision_ts"],
@@ -453,6 +463,7 @@ def _train_single_offset(
         "contrarian_weight": float(trainer_cfg.contrarian_weight),
         "contrarian_quantile": float(trainer_cfg.contrarian_quantile),
         "contrarian_return_col": str(trainer_cfg.contrarian_return_col),
+        "winner_in_band_weight": float(trainer_cfg.winner_in_band_weight),
     }
     split_summary = {
         "folds_requested": int(min(int(trainer_cfg.n_splits), max(2, len(X) // 4))),
@@ -613,6 +624,11 @@ def _trainer_cfg_for_offset(
             base_cfg.contrarian_return_col
             if override.get("contrarian_return_col") in {None, ""}
             else str(override["contrarian_return_col"])
+        ),
+        winner_in_band_weight=(
+            base_cfg.winner_in_band_weight
+            if override.get("winner_in_band_weight") is None
+            else float(override["winner_in_band_weight"])
         ),
     )
 
