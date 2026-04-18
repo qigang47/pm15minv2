@@ -40,7 +40,8 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("show", help="Print queue JSON.")
 
     supervise = subparsers.add_parser("supervise-once", help="Reconcile queue state and fill empty slots once.")
-    supervise.add_argument("--max-live-runs", type=int, default=4)
+    supervise.add_argument("--max-live-runs", type=int, default=16)
+    supervise.add_argument("--max-queued-items", type=int, default=24)
     supervise.add_argument("--max-repair-attempts", type=int, default=3)
     supervise.add_argument(
         "--track-slot-caps",
@@ -167,6 +168,7 @@ def main() -> int:
         launch_ready_queue_items,
         load_experiment_queue,
         reconcile_queue_with_live_workers,
+        reseed_empty_tracks_from_recent_done,
         save_experiment_queue,
         set_queue_item_status,
         upsert_queue_item,
@@ -230,6 +232,7 @@ def main() -> int:
             parser.error(str(exc))
         queue_payload = load_experiment_queue(root)
         queue_payload["max_live_runs"] = args.max_live_runs
+        queue_payload["max_queued_items"] = args.max_queued_items
         queue_payload["track_slot_caps"] = track_slot_caps
         save_experiment_queue(root, queue_payload)
         live_workers = find_live_formal_workers(root)
@@ -240,6 +243,10 @@ def main() -> int:
             max_repair_attempts=args.max_repair_attempts,
         )
         live_workers = find_live_formal_workers(root)
+        queue_payload, reseeded_items = reseed_empty_tracks_from_recent_done(
+            root,
+            live_workers=live_workers,
+        )
         queue_payload, launched_items = launch_ready_queue_items(
             root,
             live_workers=live_workers,
@@ -249,6 +256,7 @@ def main() -> int:
         payload = {
             "queue_path": str((root / "var" / "research" / "autorun" / "experiment-queue.json").resolve()),
             "live_workers": len(live_workers),
+            "max_queued_items": args.max_queued_items,
             "track_slot_caps": track_slot_caps,
             "launched": [
                 {
@@ -259,6 +267,16 @@ def main() -> int:
                     "action": item.get("action"),
                 }
                 for item in launched_items
+            ],
+            "reseeded": [
+                {
+                    "market": item.get("market"),
+                    "track": item.get("track"),
+                    "suite_name": item.get("suite_name"),
+                    "run_label": item.get("run_label"),
+                    "action": item.get("action"),
+                }
+                for item in reseeded_items
             ],
             "queue_items": len(queue_payload.get("items") or []),
             "status_report": build_autorun_status_report(root, log_tail_lines=0, max_incomplete_runs=5).get("status") or {},

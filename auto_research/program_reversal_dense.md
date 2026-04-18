@@ -40,6 +40,15 @@ This is the canonical dense autoresearch entry for the `deep_otm_baseline`
 - inside `140-280` trades, keep width stable and prefer family replacement before changing width again
 - if count is clearly excessive and quality degrades, consider only the next narrower bucket
 
+## Profitable Offset Pool Gate
+
+- profitable offset pool is coin-level and shared by both dense tracks
+- profitable offset pool window is `2026-04-01` through `2026-04-15` at `2usd`
+- one `offset` equals one exact window
+- count a capture only when the candidate reaches a final tradeable winner-side entry at `<= 0.30`
+- target about `70%` profitable-pool coverage before spending a full formal slot
+- formal frontier decisions still require full orderbook validation
+
 ## Hard Constraints
 
 - do not open `direction` or `hybrid` runs in this session

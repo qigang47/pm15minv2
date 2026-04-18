@@ -14,9 +14,11 @@ QueueLauncher = Callable[[dict[str, object]], dict[str, object] | None]
 DEFAULT_QUEUE_TRACK = "default"
 UNKNOWN_QUEUE_TRACK = "unknown"
 BLOCKED_QUEUE_ACTION = "blocked"
+DEFAULT_MAX_LIVE_RUNS = 16
+DEFAULT_MAX_QUEUED_ITEMS = 24
 DEFAULT_TRACK_SLOT_CAPS = {
-    "direction_dense": 2,
-    "reversal_dense": 2,
+    "direction_dense": 16,
+    "reversal_dense": 16,
 }
 
 
@@ -90,7 +92,8 @@ def load_experiment_queue(project_root: Path) -> dict[str, object]:
         if isinstance(entry, dict)
     ]
     payload.setdefault("version", 1)
-    payload.setdefault("max_live_runs", 4)
+    payload.setdefault("max_live_runs", DEFAULT_MAX_LIVE_RUNS)
+    payload.setdefault("max_queued_items", DEFAULT_MAX_QUEUED_ITEMS)
     payload["track_slot_caps"] = _normalize_track_slot_caps(payload.get("track_slot_caps"))
     payload.setdefault("updated_at", _utc_now())
     return payload
@@ -100,7 +103,8 @@ def save_experiment_queue(project_root: Path, payload: dict[str, object]) -> dic
     root = Path(project_root).resolve()
     normalized = dict(payload)
     normalized["version"] = 1
-    normalized["max_live_runs"] = max(1, int(normalized.get("max_live_runs") or 4))
+    normalized["max_live_runs"] = max(1, int(normalized.get("max_live_runs") or DEFAULT_MAX_LIVE_RUNS))
+    normalized["max_queued_items"] = max(1, int(normalized.get("max_queued_items") or DEFAULT_MAX_QUEUED_ITEMS))
     normalized["track_slot_caps"] = _normalize_track_slot_caps(normalized.get("track_slot_caps"))
     normalized["updated_at"] = _utc_now()
     items = normalized.get("items")
@@ -109,6 +113,10 @@ def save_experiment_queue(project_root: Path, payload: dict[str, object]) -> dic
         for item in (items if isinstance(items, list) else [])
         if isinstance(item, dict)
     ]
+    normalized["items"] = _prune_pending_queue_items(
+        normalized["items"],
+        max_queued_items=int(normalized["max_queued_items"]),
+    )
     write_json_atomic(normalized, experiment_queue_path(project_root))
     return normalized
 
@@ -119,33 +127,16 @@ def upsert_queue_item(project_root: Path, item: dict[str, object]) -> dict[str, 
     items = [dict(entry) for entry in payload.get("items") or [] if isinstance(entry, dict)]
     target_item = _normalize_queue_item(root, item)
     target_id = str(target_item.get("id") or "").strip()
-    target_market = str(target_item.get("market") or "").strip().lower()
-    target_track = _item_track(target_item)
-    target_action = str(target_item.get("action") or "").strip().lower()
-    target_status = str(target_item.get("status") or "").strip().lower()
-    target_is_normal = target_status == "queued" and target_action in {"launch", "resume"}
 
     retained: list[dict[str, object]] = []
     replaced = False
     replaced_created_at: str | None = None
     for entry in items:
         entry_id = str(entry.get("id") or "").strip()
-        entry_market = str(entry.get("market") or "").strip().lower()
-        entry_track = _item_track(entry)
-        entry_action = str(entry.get("action") or "").strip().lower()
-        entry_status = str(entry.get("status") or "").strip().lower()
-        entry_is_normal = entry_status == "queued" and entry_action in {"launch", "resume"}
 
         if entry_id and entry_id == target_id:
             replaced = True
             replaced_created_at = str(entry.get("created_at") or "").strip() or None
-            continue
-        if (
-            target_is_normal
-            and entry_market == target_market
-            and entry_track == target_track
-            and entry_is_normal
-        ):
             continue
         retained.append(entry)
 
@@ -186,11 +177,6 @@ def select_launchable_queue_items(
     if capacity <= 0:
         return []
 
-    occupied_market_tracks = {
-        _market_track_key(item)
-        for item in occupied_exact.values()
-        if _market_track_key(item) is not None
-    }
     occupied_unknown_markets = {
         str(item.get("market") or "").strip().lower()
         for item in occupied_fallback.values()
@@ -203,7 +189,6 @@ def select_launchable_queue_items(
     unknown_track_usage = len(occupied_fallback)
     track_slot_caps = _normalize_track_slot_caps(payload.get("track_slot_caps"))
     selected: list[dict[str, object]] = []
-    selected_market_tracks: set[tuple[str, str]] = set()
     selected_track_usage: dict[str, int] = {}
     queue_items = [
         dict(item)
@@ -219,15 +204,12 @@ def select_launchable_queue_items(
         market, track = market_track
         if market in occupied_unknown_markets:
             continue
-        if market_track in occupied_market_tracks or market_track in selected_market_tracks:
-            continue
         track_cap = track_slot_caps.get(track)
         if track_cap is not None:
             used = track_usage.get(track, 0) + unknown_track_usage + selected_track_usage.get(track, 0)
             if used >= int(track_cap):
                 continue
         selected.append(item)
-        selected_market_tracks.add(market_track)
         selected_track_usage[track] = selected_track_usage.get(track, 0) + 1
         if len(selected) >= capacity:
             break
@@ -366,6 +348,117 @@ def ensure_running_queue_items(
     return save_experiment_queue(project_root, payload)
 
 
+def reseed_empty_tracks_from_recent_done(
+    project_root: Path,
+    *,
+    live_workers: list[dict[str, object]] | None = None,
+    inspect_run: QueueInspectRun | None = None,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    payload = load_experiment_queue(project_root)
+    items = [dict(item) for item in payload.get("items") or [] if isinstance(item, dict)]
+    inspector = inspect_run or _default_inspect_run
+
+    known_items = [dict(item) for item in items]
+    live_payload = [
+        _resolve_live_worker_metadata(dict(item), known_items)
+        for item in live_workers or []
+        if isinstance(item, dict)
+    ]
+
+    live_track_counts = Counter(
+        _item_track(item)
+        for item in live_payload
+        if _item_track(item) != UNKNOWN_QUEUE_TRACK
+    )
+    pending_track_counts = Counter(
+        _item_track(item)
+        for item in items
+        if _item_track(item) != UNKNOWN_QUEUE_TRACK
+        and str(item.get("status") or "").strip().lower() in {"queued", "repair", "running"}
+    )
+    occupied_markets_by_track: dict[str, set[str]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        track = _item_track(item)
+        if track == UNKNOWN_QUEUE_TRACK:
+            continue
+        if str(item.get("status") or "").strip().lower() not in {"queued", "repair", "running"}:
+            continue
+        market = str(item.get("market") or "").strip().lower()
+        if not market:
+            continue
+        occupied_markets_by_track.setdefault(track, set()).add(market)
+    for item in live_payload:
+        if not isinstance(item, dict):
+            continue
+        track = _item_track(item)
+        if track == UNKNOWN_QUEUE_TRACK:
+            continue
+        market = str(item.get("market") or "").strip().lower()
+        if not market:
+            continue
+        occupied_markets_by_track.setdefault(track, set()).add(market)
+    track_slot_caps = _normalize_track_slot_caps(payload.get("track_slot_caps"))
+
+    selected_ids: set[str] = set()
+    selected_reasons: dict[str, str] = {}
+    for track, raw_cap in track_slot_caps.items():
+        track_cap = max(0, int(raw_cap or 0))
+        if track_cap <= 0:
+            continue
+        track_usage = pending_track_counts.get(track, 0)
+        if track_usage >= track_cap:
+            continue
+        refill_gap = max(0, track_cap - track_usage)
+        if refill_gap <= 0:
+            continue
+        fully_empty_track = live_track_counts.get(track, 0) <= 0 and pending_track_counts.get(track, 0) <= 0
+        candidates = _recent_done_reseed_candidates(
+            project_root=project_root,
+            items=items,
+            track=track,
+            track_cap=refill_gap,
+            inspect_run=inspector,
+            occupied_markets=occupied_markets_by_track.get(track, set()),
+        )
+        for candidate in candidates:
+            item_id = str(candidate.get("id") or "").strip()
+            if item_id:
+                selected_ids.add(item_id)
+                selected_reasons[item_id] = (
+                    "auto_refill_empty_track_from_recent_done"
+                    if fully_empty_track
+                    else "auto_refill_underfilled_track_from_recent_done"
+                )
+
+    if not selected_ids:
+        return payload, []
+
+    updated_items: list[dict[str, object]] = []
+    for item in items:
+        item_id = str(item.get("id") or "").strip()
+        if item_id in selected_ids:
+            item["action"] = "repair"
+            item["status"] = "repair"
+            item["retry_count"] = 0
+            item["reason"] = selected_reasons.get(item_id, "auto_refill_empty_track_from_recent_done")
+            item["updated_at"] = _utc_now()
+            item.pop("pid", None)
+            item.pop("last_error", None)
+        updated_items.append(item)
+
+    payload["items"] = updated_items
+    saved = save_experiment_queue(project_root, payload)
+    reseeded_items = [
+        dict(item)
+        for item in saved.get("items") or []
+        if str(item.get("id") or "").strip() in selected_ids
+    ]
+    reseeded_items.sort(key=_queue_sort_key)
+    return saved, reseeded_items
+
+
 def launch_ready_queue_items(
     project_root: Path,
     *,
@@ -493,6 +586,66 @@ def _queue_sort_key(item: dict[str, object]) -> tuple[int, int, str, str]:
     return (action_rank, priority, created_at, run_label)
 
 
+def _recent_done_reseed_candidates(
+    *,
+    project_root: Path,
+    items: list[dict[str, object]],
+    track: str,
+    track_cap: int,
+    inspect_run: QueueInspectRun,
+    occupied_markets: set[str] | None = None,
+) -> list[dict[str, object]]:
+    candidates: list[dict[str, object]] = []
+    for item in items:
+        if _item_track(item) != track:
+            continue
+        if str(item.get("status") or "").strip().lower() != "done":
+            continue
+        if _launch_candidate_blocker(item) is not None:
+            continue
+        run_payload = inspect_run(_queue_run_dir(project_root, item))
+        if str(run_payload.get("state") or "").strip().lower() != "completed":
+            continue
+        candidates.append(dict(item))
+
+    candidates.sort(
+        key=lambda item: (
+            str(item.get("updated_at") or ""),
+            int(item.get("priority") or 0),
+            str(item.get("run_label") or ""),
+        ),
+        reverse=True,
+    )
+
+    selected: list[dict[str, object]] = []
+    selected_ids: set[str] = set()
+    covered_markets: set[str] = {
+        str(market).strip().lower()
+        for market in (occupied_markets or set())
+        if str(market).strip()
+    }
+    for item in candidates:
+        market = str(item.get("market") or "").strip().lower()
+        item_id = str(item.get("id") or "").strip()
+        if not market or market in covered_markets or not item_id:
+            continue
+        selected.append(item)
+        selected_ids.add(item_id)
+        covered_markets.add(market)
+        if len(selected) >= track_cap:
+            return selected
+
+    for item in candidates:
+        item_id = str(item.get("id") or "").strip()
+        if not item_id or item_id in selected_ids:
+            continue
+        selected.append(item)
+        selected_ids.add(item_id)
+        if len(selected) >= track_cap:
+            break
+    return selected
+
+
 def _queue_run_dir(project_root: Path, item: dict[str, object]) -> Path:
     root = Path(project_root).resolve()
     suite_name = str(item.get("suite_name") or "").strip()
@@ -509,7 +662,8 @@ def _default_inspect_run(run_dir: Path) -> dict[str, object]:
 def _empty_queue_payload() -> dict[str, object]:
     return {
         "version": 1,
-        "max_live_runs": 4,
+        "max_live_runs": DEFAULT_MAX_LIVE_RUNS,
+        "max_queued_items": DEFAULT_MAX_QUEUED_ITEMS,
         "track_slot_caps": dict(DEFAULT_TRACK_SLOT_CAPS),
         "updated_at": _utc_now(),
         "items": [],
@@ -588,6 +742,30 @@ def _normalize_track_slot_caps(raw_caps: object) -> dict[str, int]:
                 continue
             normalized[key] = max(0, int(raw_value or 0))
     return normalized
+
+
+def _prune_pending_queue_items(items: list[dict[str, object]], *, max_queued_items: int) -> list[dict[str, object]]:
+    pending_items = [
+        dict(item)
+        for item in items
+        if str(item.get("status") or "").strip().lower() in {"queued", "repair"}
+    ]
+    if len(pending_items) <= max_queued_items:
+        return [dict(item) for item in items]
+
+    keep_pending_ids = {
+        str(item.get("id") or "").strip()
+        for item in sorted(pending_items, key=_queue_sort_key)[:max_queued_items]
+    }
+    pruned: list[dict[str, object]] = []
+    for item in items:
+        status = str(item.get("status") or "").strip().lower()
+        if status in {"queued", "repair"}:
+            item_id = str(item.get("id") or "").strip()
+            if item_id not in keep_pending_ids:
+                continue
+        pruned.append(dict(item))
+    return pruned
 
 
 def _stringify_queue_path(value: str | Path | None) -> str:

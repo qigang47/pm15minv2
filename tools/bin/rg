@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import fnmatch
+import os
+from pathlib import Path
+import re
+import sys
+
+
+def _split_globs(patterns: list[str]) -> tuple[list[str], list[str]]:
+    include: list[str] = []
+    exclude: list[str] = []
+    for pattern in patterns:
+        text = str(pattern or "").strip()
+        if not text:
+            continue
+        if text.startswith("!"):
+            exclude.append(text[1:])
+        else:
+            include.append(text)
+    return include, exclude
+
+
+def _matches_globs(path_text: str, *, include: list[str], exclude: list[str]) -> bool:
+    normalized = path_text.replace(os.sep, "/")
+    if include and not any(fnmatch.fnmatch(normalized, pattern) for pattern in include):
+        return False
+    if exclude and any(fnmatch.fnmatch(normalized, pattern) for pattern in exclude):
+        return False
+    return True
+
+
+def _iter_files(paths: list[str], *, include: list[str], exclude: list[str]) -> list[str]:
+    search_roots = paths or ["."]
+    results: list[str] = []
+    for raw_root in search_roots:
+        root = Path(raw_root)
+        if root.is_file():
+            if _matches_globs(str(root), include=include, exclude=exclude):
+                results.append(str(root))
+            continue
+        if not root.exists():
+            continue
+        for current_root, dirnames, filenames in os.walk(root):
+            dirnames[:] = [name for name in dirnames if name != ".git"]
+            for filename in filenames:
+                path = Path(current_root) / filename
+                if _matches_globs(str(path), include=include, exclude=exclude):
+                    results.append(str(path))
+    return sorted(dict.fromkeys(results))
+
+
+def _compile_pattern(pattern: str, fixed_strings: bool) -> re.Pattern[str]:
+    if fixed_strings:
+        return re.compile(re.escape(pattern))
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return re.compile(re.escape(pattern))
+
+
+def _search_stream(
+    stream,
+    matcher: re.Pattern[str],
+    *,
+    show_line_numbers: bool,
+) -> int:
+    matched = 0
+    for line_number, raw_line in enumerate(stream, start=1):
+        line = raw_line.rstrip("\n")
+        if matcher.search(line):
+            matched += 1
+            if show_line_numbers:
+                print(f"{line_number}:{line}")
+            else:
+                print(line)
+    return matched
+
+
+def _search_files(
+    matcher: re.Pattern[str],
+    paths: list[str],
+    *,
+    include: list[str],
+    exclude: list[str],
+    show_line_numbers: bool,
+) -> int:
+    matched = 0
+    files = _iter_files(paths, include=include, exclude=exclude)
+    multi_file = len(files) > 1
+    for file_path in files:
+        try:
+            payload = Path(file_path).read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in payload:
+            continue
+        text = payload.decode("utf-8", errors="ignore")
+        for line_number, raw_line in enumerate(text.splitlines(), start=1):
+            if not matcher.search(raw_line):
+                continue
+            matched += 1
+            prefix = ""
+            if multi_file:
+                prefix = f"{file_path}:"
+            if show_line_numbers:
+                prefix = f"{prefix}{line_number}:"
+            print(f"{prefix}{raw_line}")
+    return matched
+
+
+def main(argv: list[str]) -> int:
+    show_files = False
+    show_line_numbers = False
+    fixed_strings = False
+    globs: list[str] = []
+    positional: list[str] = []
+
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--files":
+            show_files = True
+        elif token == "-n":
+            show_line_numbers = True
+        elif token in {"-F", "--fixed-strings"}:
+            fixed_strings = True
+        elif token in {"-S", "--smart-case", "--hidden", "-uu", "--color=never"}:
+            pass
+        elif token in {"-g", "--glob"}:
+            index += 1
+            if index >= len(argv):
+                print("rg fallback: missing glob after -g/--glob", file=sys.stderr)
+                return 2
+            globs.append(argv[index])
+        elif token.startswith("-"):
+            print(f"rg fallback: unsupported option {token}", file=sys.stderr)
+            return 2
+        else:
+            positional.append(token)
+        index += 1
+
+    include, exclude = _split_globs(globs)
+
+    if show_files:
+        for file_path in _iter_files(positional, include=include, exclude=exclude):
+            print(file_path)
+        return 0
+
+    if not positional:
+        print("rg fallback: missing pattern", file=sys.stderr)
+        return 2
+
+    pattern = positional[0]
+    search_paths = positional[1:]
+    matcher = _compile_pattern(pattern, fixed_strings=fixed_strings)
+
+    if not search_paths and not sys.stdin.isatty():
+        matched = _search_stream(sys.stdin, matcher, show_line_numbers=show_line_numbers)
+        return 0 if matched else 1
+
+    matched = _search_files(
+        matcher,
+        search_paths,
+        include=include,
+        exclude=exclude,
+        show_line_numbers=show_line_numbers,
+    )
+    return 0 if matched else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

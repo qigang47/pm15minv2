@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from pm15min.data.config import DataConfig
+from pm15min.data.io import write_json_atomic
+from pm15min.data.io.parquet import read_parquet_if_exists, write_parquet_atomic
 from pm15min.research.bundles.loader import read_bundle_config
 from pm15min.research.backtests.decision_engine_parity import (
     apply_decision_engine_parity,
@@ -20,6 +23,7 @@ from pm15min.research.bundles.builder import build_model_bundle
 from pm15min.research.bundles.loader import read_bundle_summary, read_training_run_summary
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import ModelBundleSpec, TrainingRunSpec
+from pm15min.research.layout_helpers import slug_token
 from pm15min.research.datasets.loaders import load_feature_frame, load_label_frame
 from pm15min.research.training.runner import train_research_run
 
@@ -35,6 +39,144 @@ _LABEL_REQUIRED_COLUMNS = (
     "full_truth",
 )
 _REVERSAL_ANCHOR_COLUMNS = ("ret_from_strike", "ret_from_cycle_open")
+_POOL_STATUS_ORDER = ("captured", "correct_side_no_trade", "missed", "traded_wrong_side")
+_POOL_CACHE_COLUMNS = (*_FEATURE_KEY_COLUMNS, "winner_side", "winner_entry_price")
+
+
+def build_profitable_offset_pool_frame(
+    decisions: pd.DataFrame,
+    *,
+    entry_price_min: float | None,
+    entry_price_max: float | None,
+) -> pd.DataFrame:
+    frame = decisions.copy()
+    out = pd.DataFrame(index=frame.index)
+    for column in _FEATURE_KEY_COLUMNS:
+        out[column] = frame[column] if column in frame.columns else pd.NA
+
+    winner_side = _string_series(frame, "winner_side").str.upper()
+    predicted_side = _string_series(frame, "predicted_side").str.upper()
+    policy_action = _string_series(frame, "policy_action").str.lower()
+    policy_reason = _string_series(frame, "policy_reason")
+    quote_status = _string_series(frame, "quote_status")
+    resolved = _bool_series(frame, "resolved")
+    winner_entry_price = _winner_entry_price(frame, winner_side=winner_side)
+    profitable_pool_window = (
+        resolved
+        & quote_status.eq("ok")
+        & winner_side.isin(["UP", "DOWN"])
+        & winner_entry_price.notna()
+    )
+    if entry_price_min is not None:
+        profitable_pool_window &= winner_entry_price.ge(float(entry_price_min))
+    if entry_price_max is not None:
+        profitable_pool_window &= winner_entry_price.le(float(entry_price_max))
+
+    profitable_pool_correct_side = profitable_pool_window & predicted_side.eq(winner_side)
+    profitable_pool_capture = profitable_pool_correct_side & policy_action.eq("trade")
+    traded_wrong_side = profitable_pool_window & policy_action.eq("trade") & predicted_side.ne(winner_side)
+    correct_side_no_trade = profitable_pool_correct_side & ~policy_action.eq("trade")
+    missed = profitable_pool_window & ~(profitable_pool_capture | correct_side_no_trade | traded_wrong_side)
+
+    profitable_pool_status = pd.Series("not_in_pool", index=frame.index, dtype="string")
+    profitable_pool_status.loc[missed] = "missed"
+    profitable_pool_status.loc[correct_side_no_trade] = "correct_side_no_trade"
+    profitable_pool_status.loc[traded_wrong_side] = "traded_wrong_side"
+    profitable_pool_status.loc[profitable_pool_capture] = "captured"
+
+    out["winner_side"] = winner_side
+    out["predicted_side"] = predicted_side
+    out["policy_action"] = policy_action
+    out["policy_reason"] = policy_reason
+    out["quote_status"] = quote_status
+    out["winner_entry_price"] = winner_entry_price
+    out["profitable_pool_window"] = profitable_pool_window.astype(bool)
+    out["profitable_pool_correct_side"] = profitable_pool_correct_side.astype(bool)
+    out["profitable_pool_capture"] = profitable_pool_capture.astype(bool)
+    out["profitable_pool_status"] = profitable_pool_status.astype(str)
+    return out
+
+
+def profitable_offset_pool_cache_paths(
+    *,
+    cfg: ResearchConfig,
+    profile: str,
+    decision_start: str | None,
+    decision_end: str | None,
+    stake_label: str = "2usd",
+) -> tuple[Path, Path]:
+    cache_dir = (
+        cfg.layout.storage.cache_root
+        / "profitable_offset_pools"
+        / f"cycle={cfg.cycle}"
+        / f"asset={cfg.asset.slug}"
+        / f"profile={slug_token(profile)}"
+        / f"decision_start={slug_token(str(decision_start or 'open'))}"
+        / f"decision_end={slug_token(str(decision_end or 'open'))}"
+        / f"stake={slug_token(stake_label)}"
+    )
+    return cache_dir / "data.parquet", cache_dir / "manifest.json"
+
+
+def resolve_profitable_offset_pool_frame(
+    *,
+    cfg: ResearchConfig,
+    profile: str,
+    decision_start: str | None,
+    decision_end: str | None,
+    decisions: pd.DataFrame,
+    entry_price_min: float | None,
+    entry_price_max: float | None,
+    stake_label: str = "2usd",
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    data_path, manifest_path = profitable_offset_pool_cache_paths(
+        cfg=cfg,
+        profile=profile,
+        decision_start=decision_start,
+        decision_end=decision_end,
+        stake_label=stake_label,
+    )
+    cached_pool = read_parquet_if_exists(data_path)
+    cache_status = "reused"
+    if cached_pool is None:
+        cache_status = "built"
+        built_pool = build_profitable_offset_pool_frame(
+            decisions,
+            entry_price_min=entry_price_min,
+            entry_price_max=entry_price_max,
+        )
+        cached_pool = (
+            built_pool.loc[built_pool.get("profitable_pool_window", False).astype(bool), list(_POOL_CACHE_COLUMNS)]
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        write_parquet_atomic(cached_pool, data_path)
+        write_json_atomic(
+            {
+                "market": cfg.asset.slug,
+                "cycle": cfg.cycle,
+                "profile": str(profile),
+                "decision_start": decision_start,
+                "decision_end": decision_end,
+                "stake_label": stake_label,
+                "entry_price_min": entry_price_min,
+                "entry_price_max": entry_price_max,
+                "pool_rows": int(len(cached_pool)),
+                "data_path": str(data_path),
+            },
+            manifest_path,
+        )
+    pool_frame = _apply_cached_profitable_pool(
+        decisions=decisions,
+        cached_pool=cached_pool.reset_index(drop=True),
+    )
+    return pool_frame, {
+        "cache_status": cache_status,
+        "data_path": str(data_path),
+        "manifest_path": str(manifest_path),
+        "pool_rows": int(len(cached_pool)),
+    }
 
 
 def build_quick_screen_summary(
@@ -42,6 +184,7 @@ def build_quick_screen_summary(
     *,
     entry_price_min: float | None,
     entry_price_max: float | None,
+    profitable_pool_frame: pd.DataFrame | None = None,
 ) -> dict[str, object]:
     frame = decisions.copy()
     if frame.empty:
@@ -55,6 +198,11 @@ def build_quick_screen_summary(
             "traded_winner_rows": 0,
             "backed_winner_in_band_rows": 0,
             "traded_winner_in_band_rows": 0,
+            "profitable_pool_rows": 0,
+            "profitable_pool_correct_side_rows": 0,
+            "profitable_pool_capture_rows": 0,
+            "profitable_pool_coverage_ratio": 0.0,
+            "profitable_pool_status_counts": {status: 0 for status in _POOL_STATUS_ORDER},
             "reject_reason_counts": {},
         }
 
@@ -78,6 +226,26 @@ def build_quick_screen_summary(
 
     backed_winner = resolved & winner_side.isin(["UP", "DOWN"]) & predicted_side.eq(winner_side)
     traded_winner = trade_rows & backed_winner
+    profitable_pool_frame = profitable_pool_frame if profitable_pool_frame is not None else build_profitable_offset_pool_frame(
+        frame,
+        entry_price_min=entry_price_min,
+        entry_price_max=entry_price_max,
+    )
+    profitable_pool_rows = int(_bool_series(profitable_pool_frame, "profitable_pool_window").sum())
+    profitable_pool_correct_side_rows = int(_bool_series(profitable_pool_frame, "profitable_pool_correct_side").sum())
+    profitable_pool_capture_rows = int(_bool_series(profitable_pool_frame, "profitable_pool_capture").sum())
+    profitable_pool_status_counts = {status: 0 for status in _POOL_STATUS_ORDER}
+    pool_only_status = profitable_pool_frame.loc[
+        profitable_pool_frame.get("profitable_pool_window", pd.Series(False, index=profitable_pool_frame.index)).astype(bool),
+        "profitable_pool_status",
+    ].astype("string")
+    for status, value in pool_only_status.value_counts().sort_index().items():
+        profitable_pool_status_counts[str(status)] = int(value)
+    profitable_pool_coverage_ratio = (
+        float(profitable_pool_capture_rows) / float(profitable_pool_rows)
+        if profitable_pool_rows > 0
+        else 0.0
+    )
 
     rejects = build_policy_reject_frame(frame)
     reject_counts = (
@@ -95,17 +263,22 @@ def build_quick_screen_summary(
         "traded_winner_rows": int(traded_winner.sum()),
         "backed_winner_in_band_rows": int((backed_winner & winner_in_band).sum()),
         "traded_winner_in_band_rows": int((traded_winner & winner_in_band).sum()),
+        "profitable_pool_rows": profitable_pool_rows,
+        "profitable_pool_correct_side_rows": profitable_pool_correct_side_rows,
+        "profitable_pool_capture_rows": profitable_pool_capture_rows,
+        "profitable_pool_coverage_ratio": profitable_pool_coverage_ratio,
+        "profitable_pool_status_counts": profitable_pool_status_counts,
         "reject_reason_counts": {str(index): int(value) for index, value in reject_counts.items()},
     }
 
 
-def quick_screen_rank_tuple(summary: dict[str, object]) -> tuple[int, int, int, int, int]:
+def quick_screen_rank_tuple(summary: dict[str, object]) -> tuple[float, int, int, int, int]:
     return (
-        int(summary.get("traded_winner_in_band_rows") or 0),
-        int(summary.get("backed_winner_in_band_rows") or 0),
+        float(summary.get("profitable_pool_coverage_ratio") or 0.0),
+        int(summary.get("profitable_pool_capture_rows") or 0),
+        int(summary.get("profitable_pool_correct_side_rows") or 0),
         int(summary.get("trade_rows") or 0),
-        int(summary.get("backed_winner_rows") or 0),
-        int(summary.get("winner_in_band_rows") or 0),
+        int(summary.get("profitable_pool_rows") or 0),
     )
 
 
@@ -118,6 +291,7 @@ def run_bundle_quick_screen(
     decision_start: str | None,
     decision_end: str | None,
     parity,
+    stake_label: str = "2usd",
 ) -> tuple[dict[str, object], pd.DataFrame]:
     available_offsets = _bundle_offsets(bundle_dir)
     features = _load_quick_screen_feature_frame(
@@ -171,10 +345,21 @@ def run_bundle_quick_screen(
         config=BacktestPolicyConfig(prob_floor=0.55, prob_gap_floor=0.0),
         model_source="primary",
     )
+    profitable_pool_frame, pool_cache = resolve_profitable_offset_pool_frame(
+        cfg=cfg,
+        profile=profile,
+        decision_start=decision_start,
+        decision_end=decision_end,
+        decisions=decisions,
+        entry_price_min=profile_spec.entry_price_min,
+        entry_price_max=profile_spec.entry_price_max,
+        stake_label=stake_label,
+    )
     summary = build_quick_screen_summary(
         decisions,
         entry_price_min=profile_spec.entry_price_min,
         entry_price_max=profile_spec.entry_price_max,
+        profitable_pool_frame=profitable_pool_frame,
     )
     summary.update(
         {
@@ -182,6 +367,9 @@ def run_bundle_quick_screen(
             "ready_rows": int(replay_summary.ready_rows),
             "quote_ready_rows_surface": int(quote_summary.quote_ready_rows),
             "quote_missing_rows_surface": int(quote_summary.quote_missing_rows),
+            "profitable_pool_cache_status": str(pool_cache.get("cache_status") or ""),
+            "profitable_pool_cache_path": str(pool_cache.get("data_path") or ""),
+            "profitable_pool_manifest_path": str(pool_cache.get("manifest_path") or ""),
         }
     )
     return summary, decisions
@@ -320,7 +508,7 @@ def ensure_training_and_bundle(
                 window=market_spec.window,
                 run_label=training_run_label,
                 offsets=market_spec.offsets,
-                parallel_workers=1,
+                parallel_workers=_quick_screen_training_parallel_workers(),
                 weight_variant_label=getattr(market_spec, "weight_variant_label", "default"),
                 balance_classes=getattr(market_spec, "balance_classes", None),
                 weight_by_vol=getattr(market_spec, "weight_by_vol", None),
@@ -360,6 +548,17 @@ def ensure_training_and_bundle(
     return train_result, bundle_result
 
 
+def _quick_screen_training_parallel_workers() -> int:
+    raw = str(os.environ.get("PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS", "") or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 3
+        return max(1, value)
+    return 3
+
+
 def _winner_entry_price(frame: pd.DataFrame, *, winner_side: pd.Series) -> pd.Series:
     up_price = pd.to_numeric(frame.get("quote_up_ask"), errors="coerce")
     down_price = pd.to_numeric(frame.get("quote_down_ask"), errors="coerce")
@@ -374,3 +573,57 @@ def _winner_entry_price(frame: pd.DataFrame, *, winner_side: pd.Series) -> pd.Se
 def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
     values = frame[column] if column in frame.columns else pd.Series(False, index=frame.index, dtype="boolean")
     return values.astype("boolean").fillna(False).astype(bool)
+
+
+def _string_series(frame: pd.DataFrame, column: str) -> pd.Series:
+    values = frame[column] if column in frame.columns else pd.Series("", index=frame.index, dtype="string")
+    return values.astype("string").fillna("").astype(str)
+
+
+def _apply_cached_profitable_pool(
+    *,
+    decisions: pd.DataFrame,
+    cached_pool: pd.DataFrame,
+) -> pd.DataFrame:
+    frame = decisions.copy()
+    out = pd.DataFrame(index=frame.index)
+    for column in _FEATURE_KEY_COLUMNS:
+        out[column] = frame[column] if column in frame.columns else pd.NA
+    cached = cached_pool.rename(
+        columns={
+            "winner_side": "_pool_winner_side",
+            "winner_entry_price": "_pool_winner_entry_price",
+        }
+    )
+    merged = out.merge(cached, on=list(_FEATURE_KEY_COLUMNS), how="left")
+    predicted_side = _string_series(frame, "predicted_side").str.upper()
+    policy_action = _string_series(frame, "policy_action").str.lower()
+    policy_reason = _string_series(frame, "policy_reason")
+    quote_status = _string_series(frame, "quote_status")
+    winner_side = _string_series(merged, "_pool_winner_side").str.upper()
+    winner_entry_price = pd.to_numeric(merged.get("_pool_winner_entry_price"), errors="coerce")
+
+    profitable_pool_window = winner_side.isin(["UP", "DOWN"]) & winner_entry_price.notna()
+    profitable_pool_correct_side = profitable_pool_window & predicted_side.eq(winner_side)
+    profitable_pool_capture = profitable_pool_correct_side & policy_action.eq("trade")
+    traded_wrong_side = profitable_pool_window & policy_action.eq("trade") & predicted_side.ne(winner_side)
+    correct_side_no_trade = profitable_pool_correct_side & ~policy_action.eq("trade")
+    missed = profitable_pool_window & ~(profitable_pool_capture | correct_side_no_trade | traded_wrong_side)
+
+    profitable_pool_status = pd.Series("not_in_pool", index=frame.index, dtype="string")
+    profitable_pool_status.loc[missed] = "missed"
+    profitable_pool_status.loc[correct_side_no_trade] = "correct_side_no_trade"
+    profitable_pool_status.loc[traded_wrong_side] = "traded_wrong_side"
+    profitable_pool_status.loc[profitable_pool_capture] = "captured"
+
+    merged["winner_side"] = winner_side
+    merged["predicted_side"] = predicted_side
+    merged["policy_action"] = policy_action
+    merged["policy_reason"] = policy_reason
+    merged["quote_status"] = quote_status
+    merged["winner_entry_price"] = winner_entry_price
+    merged["profitable_pool_window"] = profitable_pool_window.astype(bool)
+    merged["profitable_pool_correct_side"] = profitable_pool_correct_side.astype(bool)
+    merged["profitable_pool_capture"] = profitable_pool_capture.astype(bool)
+    merged["profitable_pool_status"] = profitable_pool_status.astype(str)
+    return merged

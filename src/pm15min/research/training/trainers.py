@@ -240,4 +240,17 @@ def generate_oof_predictions(
 def _resolve_lgb_n_jobs(cfg: TrainerConfig) -> int:
     cpu_count = max(1, int(os.cpu_count() or 1))
     parallel_workers = max(1, int(cfg.parallel_workers))
-    return max(1, cpu_count // parallel_workers)
+    thread_cap = _read_positive_int_env("PM15MIN_EXPERIMENT_CPU_THREADS")
+    thread_budget = cpu_count if thread_cap is None else min(cpu_count, thread_cap)
+    return max(1, thread_budget // parallel_workers)
+
+
+def _read_positive_int_env(name: str) -> int | None:
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None

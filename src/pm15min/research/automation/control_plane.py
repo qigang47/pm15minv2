@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from collections import Counter
 from datetime import datetime
 import os
 from pathlib import Path
@@ -181,6 +182,7 @@ _DIAGNOSIS_REDUNDANT_MEMBER_SET = {
     for columns in _DIAGNOSIS_REDUNDANT_FAMILY_MEMBERS.values()
     for column in columns
 }
+_DENSE_MAJOR_REWORK_NO_CAPTURE_STREAK = 3
 
 
 def _autoresearch_dir(project_root: Path) -> Path:
@@ -451,14 +453,21 @@ def next_autorun_failure_state(
 def inspect_experiment_run(run_dir: Path) -> dict[str, object]:
     path = Path(run_dir)
     summary_path = path / "summary.json"
+    quick_summary_path = path / "quick_screen_summary.json"
     log_path = path / "logs" / "suite.jsonl"
     events = _read_jsonl(log_path)
     summary_payload: dict[str, object] = {}
+    quick_summary_payload: dict[str, object] = {}
     if summary_path.exists():
         try:
             summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             summary_payload = {}
+    if quick_summary_path.exists():
+        try:
+            quick_summary_payload = json.loads(quick_summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            quick_summary_payload = {}
     completed_cases = sum(1 for item in events if item.get("event") == "market_completed")
     failed_cases = sum(1 for item in events if item.get("event") == "market_failed")
     cases = None
@@ -466,10 +475,17 @@ def inspect_experiment_run(run_dir: Path) -> dict[str, object]:
         cases, summary_completed_cases, summary_failed_cases = _summary_progress_payload(summary_payload)
         completed_cases = max(completed_cases, int(summary_completed_cases))
         failed_cases = max(failed_cases, int(summary_failed_cases))
+    elif quick_summary_payload:
+        quick_rows = _optional_int(quick_summary_payload.get("rows")) or 0
+        cases = quick_rows
+        completed_cases = max(completed_cases, int(quick_rows))
     last_event_payload = events[-1] if events else {}
     last_event = str(last_event_payload.get("event") or "") or None
     if summary_payload and _summary_is_terminal(summary_payload):
         state = "completed"
+    elif quick_summary_payload:
+        state = "completed"
+        last_event = last_event or "quick_screen_completed"
     elif completed_cases == 0 and failed_cases == 0 and last_event in {
         "execution_group_seed_case_started",
         "execution_group_warmup_completed",
@@ -484,7 +500,7 @@ def inspect_experiment_run(run_dir: Path) -> dict[str, object]:
         "run_dir": str(path),
         "suite_name": _suite_name_from_run_dir(path),
         "run_label": _run_label_from_run_dir(path),
-        "summary_exists": summary_path.exists(),
+        "summary_exists": summary_path.exists() or quick_summary_path.exists(),
         "cases": cases,
         "log_path": str(log_path) if log_path.exists() else None,
         "last_event": last_event,
@@ -704,6 +720,7 @@ def build_autorun_status_report(
         "queue": {
             "queue_path": str(experiment_queue_path(root)),
             "max_live_runs": int(queue_payload.get("max_live_runs") or 3),
+            "max_queued_items": int(queue_payload.get("max_queued_items") or 24),
             "track_slot_caps": dict(queue_payload.get("track_slot_caps") or {}),
             "items": filtered_queue_items,
         },
@@ -1096,8 +1113,20 @@ def _collect_coin_slot_statuses(
 
     statuses: dict[str, dict[str, object]] = {}
     for market in markets:
+        completed_market_runs = sorted(
+            completed_by_market.get(market) or [],
+            key=lambda payload: str(
+                payload.get("completed_at")
+                or payload.get("updated_at")
+                or payload.get("created_at")
+                or ""
+            ),
+            reverse=True,
+        )
+        recent_no_capture_streak = _recent_no_capture_streak(completed_market_runs)
+        major_rework_required = recent_no_capture_streak >= _DENSE_MAJOR_REWORK_NO_CAPTURE_STREAK
         active_payload = next(iter(incomplete_by_market.get(market) or []), None)
-        latest_completed = next(iter(completed_by_market.get(market) or []), None)
+        latest_completed = next(iter(completed_market_runs), None)
         if active_payload is not None:
             suite_name = str(active_payload.get("suite_name") or "")
             suite_summary = _summarize_suite_variants(project_root, suite_name)
@@ -1117,6 +1146,8 @@ def _collect_coin_slot_statuses(
                 "live_worker": has_live_worker,
                 "suite_summary": suite_summary,
                 "top_case": None,
+                "recent_no_capture_streak": recent_no_capture_streak,
+                "major_rework_required": major_rework_required,
             }
             continue
 
@@ -1133,6 +1164,8 @@ def _collect_coin_slot_statuses(
                 "live_worker": False,
                 "suite_summary": suite_summary,
                 "top_case": latest_completed.get("top_case") if isinstance(latest_completed.get("top_case"), dict) else None,
+                "recent_no_capture_streak": recent_no_capture_streak,
+                "major_rework_required": major_rework_required,
             }
             continue
 
@@ -1146,8 +1179,23 @@ def _collect_coin_slot_statuses(
             "live_worker": False,
             "suite_summary": None,
             "top_case": None,
+            "recent_no_capture_streak": 0,
+            "major_rework_required": False,
         }
     return statuses
+
+
+def _recent_no_capture_streak(completed_runs: list[dict[str, object]]) -> int:
+    streak = 0
+    for payload in completed_runs:
+        top_case = payload.get("top_case") if isinstance(payload.get("top_case"), dict) else {}
+        capture_rows = _optional_int(top_case.get("profitable_pool_capture_rows"))
+        if capture_rows is None:
+            break
+        if int(capture_rows) > 0:
+            break
+        streak += 1
+    return streak
 
 
 def _backfill_completed_runs_for_markets(
@@ -1192,47 +1240,50 @@ def _format_machine_decision_summary(
     slot_statuses: dict[str, dict[str, object]],
     allowed_live_runs: int,
     queue_payload: dict[str, object],
+    live_worker_count: int,
 ) -> list[str]:
     items = [dict(item) for item in queue_payload.get("items") or [] if isinstance(item, dict)]
-    queued_count = sum(
-        1
+    queued_items = [
+        item
         for item in items
         if str(item.get("status") or "").strip().lower() in {"queued", "repair"}
-    )
-    queued_successor_markets = {
+    ]
+    queued_count = len(queued_items)
+    queued_branch_counts = Counter(
         str(item.get("market") or "").strip().lower()
-        for item in items
+        for item in queued_items
         if str(item.get("market") or "").strip()
-        and str(item.get("status") or "").strip().lower() in {"queued", "repair"}
-    }
-    live_count = sum(
-        1
-        for market in markets
-        if str((slot_statuses.get(market) or {}).get("slot") or "") == "active"
     )
+    live_count = max(0, int(live_worker_count))
     actionable_count = sum(
         1
         for market in markets
         if str((slot_statuses.get(market) or {}).get("slot") or "") in {"idle", "checkpointed"}
     )
-    successor_needed_count = sum(
+    branchless_active_count = sum(
         1
         for market in markets
-        if str((slot_statuses.get(market) or {}).get("slot") or "") == "active" and market not in queued_successor_markets
+        if str((slot_statuses.get(market) or {}).get("slot") or "") == "active"
+        and queued_branch_counts.get(market, 0) <= 0
     )
+    max_queued_items = max(1, int(queue_payload.get("max_queued_items") or 0))
     lines = [
         (
-            f"- occupancy={live_count}/{allowed_live_runs} / queued={queued_count} / "
+            f"- occupancy={live_count}/{allowed_live_runs} / queued={queued_count}/{max_queued_items} / "
             f"refill_required={'yes' if actionable_count > 0 and live_count < allowed_live_runs else 'no'} / "
-            f"successors_needed={successor_needed_count}"
+            f"branch_expansion_required={'yes' if live_count < allowed_live_runs and queued_count < max_queued_items else 'no'} / "
+            f"active_markets_without_queued_branch={branchless_active_count}"
         ),
     ]
     for market in markets:
         payload = dict(slot_statuses.get(market) or {})
         slot = str(payload.get("slot") or "idle")
-        queued_successor = market in queued_successor_markets
-        if slot == "active":
-            action = "keep_running" if queued_successor else "prepare_next_now"
+        queued_branches = queued_branch_counts.get(market, 0)
+        major_rework_required = bool(payload.get("major_rework_required"))
+        if major_rework_required:
+            action = "major_rework_now"
+        elif slot == "active":
+            action = "keep_running" if queued_branches > 0 else "prepare_next_now"
         elif slot == "checkpointed":
             action = "resume_or_replace_now"
         else:
@@ -1241,8 +1292,11 @@ def _format_machine_decision_summary(
             f"{market}: slot={slot}",
             f"action={action}",
         ]
+        no_capture_streak = int(payload.get("recent_no_capture_streak") or 0)
+        if no_capture_streak > 0:
+            detail_parts.append(f"recent_no_capture_streak={no_capture_streak}")
         if slot == "active":
-            detail_parts.append(f"queued_successor={'yes' if queued_successor else 'no'}")
+            detail_parts.append(f"queued_branches={queued_branches}")
         suite_name = str(payload.get("suite_name") or "").strip()
         run_label = str(payload.get("run_label") or "").strip()
         if suite_name:
@@ -1278,6 +1332,7 @@ def _format_coin_slot_snapshot(
         suite_name = str(payload.get("suite_name") or "")
         run_label = str(payload.get("run_label") or "")
         suite_summary = payload.get("suite_summary")
+        no_capture_streak = int(payload.get("recent_no_capture_streak") or 0)
         if slot in {"active", "checkpointed"}:
             detail_parts = [
                 f"state={slot}",
@@ -1298,6 +1353,10 @@ def _format_coin_slot_snapshot(
                     detail_parts.append(
                         "weights=" + ",".join(str(item) for item in suite_summary["weight_labels"][:4])
                     )
+            if no_capture_streak > 0:
+                detail_parts.append(f"recent_no_capture_streak={no_capture_streak}")
+            if payload.get("major_rework_required"):
+                detail_parts.append("major_rework=yes")
             lines.append(f"- {market}: " + " / ".join(detail_parts))
             continue
 
@@ -1316,6 +1375,12 @@ def _format_coin_slot_snapshot(
                     detail_parts.append(f"roi={top_case['roi_pct']}")
                 if top_case.get("trades") is not None:
                     detail_parts.append(f"trades={top_case['trades']}")
+                if top_case.get("profitable_pool_capture_rows") is not None:
+                    detail_parts.append(f"captures={top_case['profitable_pool_capture_rows']}")
+                if top_case.get("profitable_pool_correct_side_rows") is not None:
+                    detail_parts.append(f"correct_side={top_case['profitable_pool_correct_side_rows']}")
+                if top_case.get("profitable_pool_coverage_ratio") is not None:
+                    detail_parts.append(f"coverage={top_case['profitable_pool_coverage_ratio']}")
             if isinstance(suite_summary, dict):
                 if suite_summary.get("feature_sets"):
                     detail_parts.append(
@@ -1325,6 +1390,10 @@ def _format_coin_slot_snapshot(
                     detail_parts.append(
                         "weights=" + ",".join(str(item) for item in suite_summary["weight_labels"][:4])
                     )
+            if no_capture_streak > 0:
+                detail_parts.append(f"recent_no_capture_streak={no_capture_streak}")
+            if payload.get("major_rework_required"):
+                detail_parts.append("major_rework=yes")
             lines.append(f"- {market}: " + " / ".join(detail_parts))
             continue
 
@@ -1525,7 +1594,7 @@ def _dense_prompt_guidance(program_path: Path) -> list[str]:
         return []
     width_ladder_match = _PROGRAM_WIDTH_LADDER_RE.search(program.read_text(encoding="utf-8"))
     width_ladder = width_ladder_match.group(1).strip() if width_ladder_match else "30 / 34 / 38 / 40 / 44 / 48"
-    return [
+    lines = [
         "Dense trade target for this session: 10-20 trades per coin per day.",
         "Frozen-window dense target: 140-280 trades per coin over the frozen window.",
         "Do not promote sparse winners; check count before ROI.",
@@ -1535,7 +1604,20 @@ def _dense_prompt_guidance(program_path: Path) -> list[str]:
         "Move width by one bucket per bounded cycle only.",
         "Below 56 trades, prefer the next wider bucket before another same-width cosmetic swap.",
         "Inside 140-280 trades, keep width stable and prefer family replacement before changing width again.",
+        "If the same coin and track finish 3 consecutive completed fast screens with zero profitable-pool captures, treat that frontier as stuck and switch to major rework immediately.",
+        "Major rework means a material family change, not another cosmetic one-factor shuffle around the same parent assumption.",
     ]
+    if "profitable offset pool" in text or "profitable-offset-pool" in text:
+        lines.extend(
+            [
+                "Run the profitable-offset-pool fast-screen before spending a full formal slot.",
+                "The profitable-offset pool is coin-level, shared by both dense tracks, and fixed to 2026-04-01 through 2026-04-15 at 2usd.",
+                "One offset equals one exact pool window for this fast-screen.",
+                "Count a pool capture only when the candidate reaches a final tradeable winner-side entry at <= 0.30.",
+                "Prefer profitable-pool coverage before formal ROI comparisons.",
+            ]
+        )
+    return lines
 
 
 def find_live_formal_workers(project_root: Path) -> list[dict[str, object]]:
@@ -1557,6 +1639,7 @@ def find_live_formal_workers(project_root: Path) -> list[dict[str, object]]:
         if not line or (
             "run_one_experiment.sh" not in line
             and "research experiment run-suite" not in line
+            and "run_quick_screen_suite.py" not in line
         ):
             continue
         parts = line.split(None, 2)
@@ -1764,6 +1847,7 @@ def build_codex_cycle_prompt(
         slot_statuses=slot_statuses,
         allowed_live_runs=allowed_live_runs,
         queue_payload=queue_payload,
+        live_worker_count=len(formal_workers),
     )
     coin_slot_lines = _format_coin_slot_snapshot(
         project_root=root,
@@ -1828,7 +1912,7 @@ def build_codex_cycle_prompt(
     return "\n".join(
         [
             "Read the repository research instructions and complete exactly one autonomous research cycle.",
-            "One bounded decision cycle may launch multiple distinct formal runs if that is needed to refill idle coin slots allowed by program.md.",
+            "One bounded decision cycle may launch multiple distinct formal runs if that is needed to refill idle coin slots or expand active same-coin branches allowed by program.md.",
             "",
             f"Project root: {root}",
             f"Program: {program}",
@@ -1843,7 +1927,7 @@ def build_codex_cycle_prompt(
             "",
             "Use repository commands sparingly. Do not scan the entire repository or the full experiment history unless the cycle is blocked.",
             "Use the machine decision summary and current autorun snapshot first; open `results.tsv` or historical cycle eval only if you still need extra rationale after accepting the current occupancy in the summary.",
-            "Queue or resume formal work for the idle coin slots first when the machine decision summary already shows clear `refill_now` or `resume_or_replace_now` actions; do not delay those launches just to expand historical reading.",
+            "Queue or resume formal work for the idle coin slots first when the machine decision summary already shows clear `refill_now` or `resume_or_replace_now` actions; after that, use any remaining live or queue headroom to stage additional same-coin follow-ups instead of delaying on extra historical reading.",
             "Do not open large raw registry files like `research/experiments/custom_feature_sets.json` in the normal decision path; use the pre-extracted coin snapshot and feature-family brief below first.",
             "If you still need exact factor columns, inspect only the exact named feature family that is missing from the brief instead of dumping broad file ranges.",
             "Use the diagnosis-guided family policy in the brief: protect the named core skeleton features, prefer dropping from overloaded repetitive families, and add toward the listed missing-information themes before inventing broader searches.",
@@ -1857,13 +1941,18 @@ def build_codex_cycle_prompt(
             "Historical cycle eval notes about live workers or CPU health are not authoritative for the current cycle; only the machine-collected snapshot in this prompt plus any fresh verification you perform in this same cycle may decide current occupancy.",
             "A formal run is finished only when `completed_cases + failed_cases` reaches `cases`; if `summary.json` exists but work remains, treat it as a checkpointed resumable run rather than a finished run.",
             "If a healthy live formal worker already fills a coin slot, leave it running; a monitor-only cycle is valid when the active workers are still the right frontier.",
-            "If a healthy live formal worker already fills a coin slot but the machine decision summary marks that slot as `action=prepare_next_now`, keep the live worker running and queue exactly one successor behind it in this same cycle.",
+            "If a healthy live formal worker already fills a coin slot but the machine decision summary marks that slot as `action=prepare_next_now`, keep the live worker running and queue the next bounded follow-up for that same coin in this same cycle.",
             "If the active program explicitly allows multiple simultaneous formal runs and some coin slots are idle, keep launching distinct follow-ups in the same cycle until you fill every allowed idle slot that still has a clear next follow-up.",
             "Do not leave an idle coin slot unfilled solely because the latest result is thin-sample, tied, or still marked `research_only`; when the frontier is unresolved but the slot is free, choose the next bounded follow-up that can strengthen or falsify that edge.",
             "Launching several distinct coin follow-ups in one decision pass still counts as one bounded cycle.",
             "If the current autorun snapshot reports `live formal workers: 0`, you are expected to queue or resume work for every coin slot that is `state=idle` or `state=checkpointed` in the coin snapshot during this same cycle unless you verify a fresh blocking issue from the exact current run directory.",
+            "If live formal workers are 0 and the queue snapshot has no queued or repair items, do not spend the cycle dumping full factor lists, pairwise column diffs, or broad registry comparisons before you enqueue the next bounded branches.",
+            "In a normal dense cycle, avoid full 48-column dumps; when exact feature-family names already exist, record only the small add/drop rationale that justifies the branch and move on to queue mutations.",
             "If live formal workers are below the allowed concurrency and some current-line runs are only checkpointed with `live_worker=no`, resume as many checkpointed current-line runs as needed to fill those live slots in the same cycle before opening any new branch.",
-            "For active coin slots with `action=prepare_next_now`, queue exactly one queued successor for that same coin and track; the successor should wait in the queue and must not replace or stop the current live frontier during this cycle.",
+            "For active coin slots with `action=prepare_next_now`, keep the current live frontier running and queue a bounded follow-up for that same coin and track; if live workers are still below the allowed concurrency or the queue still has room, you may queue multiple bounded queued branches for that same coin and track as long as each branch is meaningfully distinct.",
+            "If live formal workers remain below the allowed concurrency after those refill and resume steps, do not end the cycle with unused live capacity; queue enough additional distinct bounded branches to reduce the remaining gap as much as clear candidates allow, and explicitly record any unfilled slots and the exact blocker for each one.",
+            f"If the machine summary marks a coin as `action=major_rework_now`, do not spend that cycle on another cosmetic same-parent tweak; switch to a materially different family or width branch for that coin and track in the same cycle.",
+            "Treat `queued_branches=<n>` in the machine decision summary as an informational count, not a hard cap; when capacity remains, you may continue building additional same-coin branches instead of stopping at one successor.",
             "If a feature-set name mentioned by old session artifacts is missing from the current registry, treat that as historical drift rather than a blocker; inspect the exact current suite spec or current run directory for the active coin and continue the decision instead of reconciling the full registry history.",
             f"When you need a long-lived formal worker to keep running after this cycle, launch it detached with `{background_script}` and do not add `--timeout-sec` unless you intentionally want a bounded diagnostic probe.",
             f"Reserve `{one_shot_script}` with `--timeout-sec` for deliberate bounded checkpoints, diagnostics, or stuck-run inspection.",
@@ -1890,8 +1979,9 @@ def build_codex_cycle_prompt(
             "4. Decide the next experiment set or code change.",
             "5. If there are idle coin slots that the active program allows you to fill, refill as many distinct idle coin slots as possible in this same cycle instead of stopping after the first new launch.",
             "5a. If there are no idle coin slots but live formal workers are still below the allowed concurrency, resume multiple checkpointed current-line runs in this same cycle until the live slots are filled or no clear resume target remains.",
+            "5b. If live or queue headroom still remains after that, queue additional bounded same-coin same-track follow-ups for the strongest active frontiers instead of stopping at one successor per coin.",
             "6. If needed, edit code or create/update a suite spec.",
-            "7. Queue distinct formal runs or repairs for different idle coins until you have recorded every clear next same-session follow-up needed to refill the allowed slots.",
+            "7. Queue distinct formal runs or repairs for different idle coins first; then use any remaining headroom to add more bounded same-coin follow-ups until the allowed live and queued capacity is well supplied.",
             f"8. Use `{queue_script} enqueue --market ... --suite ... --run-label ... --action launch|resume|repair --reason ...` for normal formal work; let the queue supervisor consume queued items and keep occupancy near {allowed_live_runs}.",
             f"9. Use `{one_shot_script}` only for intentionally bounded probes, checkpoints, or diagnostics.",
             f"10. Use `{summarize_script}` for completed, failed, or intentionally checkpointed runs; do not interrupt a healthy live worker just to summarize it.",
@@ -1937,6 +2027,10 @@ def resolve_codex_exec_binary(
 
 def resolve_codex_exec_path_prefix(project_root: Path) -> str | None:
     root = Path(project_root).resolve()
+    prefixes: list[str] = []
+    tools_bin = root / "tools" / "bin"
+    if tools_bin.is_dir():
+        prefixes.append(str(tools_bin.resolve()))
     for candidate in (
         root / ".venv_server" / "bin",
         root / ".venv" / "bin",
@@ -1944,8 +2038,9 @@ def resolve_codex_exec_path_prefix(project_root: Path) -> str | None:
         if not candidate.is_dir():
             continue
         if any((candidate / name).exists() for name in ("python", "python3", "codex")):
-            return str(candidate)
-    return None
+            prefixes.append(str(candidate.resolve()))
+            break
+    return ":".join(prefixes) if prefixes else None
 
 
 def build_codex_exec_command(
@@ -2167,6 +2262,10 @@ def _read_quick_screen_top_case(leaderboard_path: Path) -> dict[str, object] | N
         "trade_rows": _optional_int(first_row.get("trade_rows")),
         "traded_winner_in_band_rows": _optional_int(first_row.get("traded_winner_in_band_rows")),
         "backed_winner_in_band_rows": _optional_int(first_row.get("backed_winner_in_band_rows")),
+        "profitable_pool_rows": _optional_int(first_row.get("profitable_pool_rows")),
+        "profitable_pool_correct_side_rows": _optional_int(first_row.get("profitable_pool_correct_side_rows")),
+        "profitable_pool_capture_rows": _optional_int(first_row.get("profitable_pool_capture_rows")),
+        "profitable_pool_coverage_ratio": _optional_float(first_row.get("profitable_pool_coverage_ratio")),
         "rank": _optional_int(first_row.get("rank")),
     }
 

@@ -332,6 +332,28 @@ def test_fit_lgbm_scales_n_jobs_with_parallel_workers(monkeypatch) -> None:
     assert model.get_params()["n_jobs"] == 4
 
 
+def test_fit_lgbm_honors_experiment_cpu_thread_cap(monkeypatch) -> None:
+    monkeypatch.setattr("pm15min.research.training.trainers.os.cpu_count", lambda: 24)
+    monkeypatch.setenv("PM15MIN_EXPERIMENT_CPU_THREADS", "6")
+    X = pd.DataFrame({"feature_a": np.linspace(0.0, 1.0, 12), "feature_b": np.linspace(1.0, 0.0, 12)})
+    y = pd.Series([0, 1] * 6, dtype=int)
+
+    model = fit_lgbm(X, y, cfg=TrainerConfig(parallel_workers=1))
+
+    assert model.get_params()["n_jobs"] == 6
+
+
+def test_fit_lgbm_splits_experiment_cpu_thread_cap_across_parallel_workers(monkeypatch) -> None:
+    monkeypatch.setattr("pm15min.research.training.trainers.os.cpu_count", lambda: 24)
+    monkeypatch.setenv("PM15MIN_EXPERIMENT_CPU_THREADS", "6")
+    X = pd.DataFrame({"feature_a": np.linspace(0.0, 1.0, 12), "feature_b": np.linspace(1.0, 0.0, 12)})
+    y = pd.Series([0, 1] * 6, dtype=int)
+
+    model = fit_lgbm(X, y, cfg=TrainerConfig(parallel_workers=3))
+
+    assert model.get_params()["n_jobs"] == 2
+
+
 def test_train_research_run_reports_offset_progress_and_oof_heartbeats(tmp_path: Path) -> None:
     cfg = _prepare_cfg(tmp_path)
     build_feature_frame_dataset(cfg)

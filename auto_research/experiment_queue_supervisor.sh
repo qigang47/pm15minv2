@@ -9,14 +9,24 @@ STATUS_PATH="$STATE_DIR/experiment-queue-supervisor.status.json"
 LOG_PATH="$STATE_DIR/experiment-queue-supervisor.log"
 STOP_FLAG="$STATE_DIR/experiment-queue-supervisor.stop.flag"
 LOOP_SLEEP_SEC="${LOOP_SLEEP_SEC:-15}"
-MAX_LIVE_RUNS="${MAX_LIVE_RUNS:-4}"
+MAX_LIVE_RUNS="${MAX_LIVE_RUNS:-16}"
+MAX_QUEUED_ITEMS="${MAX_QUEUED_ITEMS:-24}"
 MAX_REPAIR_ATTEMPTS="${MAX_REPAIR_ATTEMPTS:-3}"
-TRACK_SLOT_CAPS_JSON="${TRACK_SLOT_CAPS_JSON:-{\"direction_dense\":2,\"reversal_dense\":2}}"
+TRACK_SLOT_CAPS_JSON="${TRACK_SLOT_CAPS_JSON:-{\"direction_dense\":8,\"reversal_dense\":8}}"
+PM15MIN_EXPERIMENT_LAUNCH_MODE="${PM15MIN_EXPERIMENT_LAUNCH_MODE:-quick_screen}"
+PM15MIN_QUICK_SCREEN_TOP_K="${PM15MIN_QUICK_SCREEN_TOP_K:-1}"
+PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS="${PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS:-3}"
+PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY="${PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY:-$MAX_LIVE_RUNS}"
+
+export PM15MIN_EXPERIMENT_LAUNCH_MODE
+export PM15MIN_QUICK_SCREEN_TOP_K
+export PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS
+export PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY
 
 mkdir -p "$STATE_DIR"
 
 write_status() {
-  python3 - <<'PY' "$STATUS_PATH" "$PID_PATH" "$LOG_PATH" "$MAX_LIVE_RUNS" "$TRACK_SLOT_CAPS_JSON" "$1"
+  python3 - <<'PY' "$STATUS_PATH" "$PID_PATH" "$LOG_PATH" "$MAX_LIVE_RUNS" "$MAX_QUEUED_ITEMS" "$TRACK_SLOT_CAPS_JSON" "$1"
 from __future__ import annotations
 import json
 import sys
@@ -27,8 +37,9 @@ status_path = Path(sys.argv[1])
 pid_path = Path(sys.argv[2])
 log_path = Path(sys.argv[3])
 max_live_runs = int(sys.argv[4])
-track_slot_caps = json.loads(sys.argv[5])
-state = sys.argv[6]
+max_queued_items = int(sys.argv[5])
+track_slot_caps = json.loads(sys.argv[6])
+state = sys.argv[7]
 
 payload = {
     "state": state,
@@ -36,6 +47,7 @@ payload = {
     "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "log_path": str(log_path),
     "max_live_runs": max_live_runs,
+    "max_queued_items": max_queued_items,
     "track_slot_caps": track_slot_caps,
 }
 status_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
@@ -47,6 +59,7 @@ run_once() {
     --root "$ROOT_DIR" \
     supervise-once \
     --max-live-runs "$MAX_LIVE_RUNS" \
+    --max-queued-items "$MAX_QUEUED_ITEMS" \
     --max-repair-attempts "$MAX_REPAIR_ATTEMPTS" \
     --track-slot-caps "$TRACK_SLOT_CAPS_JSON"
 }

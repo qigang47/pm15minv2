@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from pm15min.research.automation import classify_dense_gate as exported_classify_dense_gate
+from pm15min.research.automation import prefer_dense_screen_candidate as exported_prefer_dense_screen_candidate
 from pm15min.research.automation import prefer_dense_candidate as exported_prefer_dense_candidate
-from pm15min.research.automation.dense_policy import classify_dense_gate, prefer_dense_candidate
+from pm15min.research.automation.dense_policy import (
+    classify_dense_gate,
+    prefer_dense_candidate,
+    prefer_dense_screen_candidate,
+)
 
 
 def test_classify_dense_gate_marks_sparse_subtarget_and_on_target() -> None:
@@ -33,6 +38,24 @@ def test_prefer_dense_candidate_prefers_higher_roi_pct_when_gate_and_trades_tie(
     assert prefer_dense_candidate(left, right) is right
 
 
+def test_prefer_dense_screen_candidate_prefers_coverage_before_trade_count() -> None:
+    lower_coverage = {
+        "profitable_pool_coverage_ratio": 0.58,
+        "profitable_pool_capture_rows": 58,
+        "profitable_pool_correct_side_rows": 70,
+        "trade_rows": 90,
+    }
+    higher_coverage = {
+        "profitable_pool_coverage_ratio": 0.71,
+        "profitable_pool_capture_rows": 57,
+        "profitable_pool_correct_side_rows": 66,
+        "trade_rows": 72,
+    }
+
+    assert prefer_dense_screen_candidate(higher_coverage, lower_coverage) is higher_coverage
+
+
 def test_dense_policy_helpers_are_exported_from_package() -> None:
     assert exported_classify_dense_gate is classify_dense_gate
     assert exported_prefer_dense_candidate is prefer_dense_candidate
+    assert exported_prefer_dense_screen_candidate is prefer_dense_screen_candidate

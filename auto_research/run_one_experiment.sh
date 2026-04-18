@@ -57,17 +57,69 @@ pm15min_activate_python
 export PYTHONPATH="$ROOT_DIR/src"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/pm15min-mpl}"
 export PM15MIN_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES="${PM15MIN_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES:-1}"
+export PM15MIN_EXPERIMENT_LAUNCH_MODE="${PM15MIN_EXPERIMENT_LAUNCH_MODE:-formal}"
+export PM15MIN_QUICK_SCREEN_TOP_K="${PM15MIN_QUICK_SCREEN_TOP_K:-1}"
+export PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS="${PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS:-3}"
+export PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY="${PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY:-16}"
+export PM15MIN_EXPERIMENT_CPU_THREADS="${PM15MIN_EXPERIMENT_CPU_THREADS:-}"
 mkdir -p "$MPLCONFIGDIR"
+
+if [[ -z "$PM15MIN_EXPERIMENT_CPU_THREADS" ]]; then
+  cpu_count=""
+  if command -v nproc >/dev/null 2>&1; then
+    cpu_count="$(nproc)"
+  elif command -v getconf >/dev/null 2>&1; then
+    cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  fi
+  if [[ ! "$cpu_count" =~ ^[0-9]+$ ]] || [[ "$cpu_count" -lt 1 ]]; then
+    cpu_count=1
+  fi
+  expected_concurrency="$PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY"
+  if [[ ! "$expected_concurrency" =~ ^[0-9]+$ ]] || [[ "$expected_concurrency" -lt 1 ]]; then
+    expected_concurrency=4
+  fi
+  PM15MIN_EXPERIMENT_CPU_THREADS="$(( cpu_count / expected_concurrency ))"
+  if [[ "$PM15MIN_EXPERIMENT_CPU_THREADS" -lt 1 ]]; then
+    PM15MIN_EXPERIMENT_CPU_THREADS=1
+  fi
+  export PM15MIN_EXPERIMENT_CPU_THREADS
+fi
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$PM15MIN_EXPERIMENT_CPU_THREADS}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$PM15MIN_EXPERIMENT_CPU_THREADS}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$PM15MIN_EXPERIMENT_CPU_THREADS}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$PM15MIN_EXPERIMENT_CPU_THREADS}"
+export GOTO_NUM_THREADS="${GOTO_NUM_THREADS:-$PM15MIN_EXPERIMENT_CPU_THREADS}"
+export BLIS_NUM_THREADS="${BLIS_NUM_THREADS:-$PM15MIN_EXPERIMENT_CPU_THREADS}"
+export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-$PM15MIN_EXPERIMENT_CPU_THREADS}"
 
 if [[ -z "$LOG_PATH" ]]; then
   LOG_PATH="$ROOT_DIR/var/research/logs/autorun/${RUN_LABEL}.log"
 fi
 mkdir -p "$(dirname "$LOG_PATH")"
 
-CMD=("$PYTHON_BIN" -m pm15min research experiment run-suite --suite "$SUITE_NAME" --run-label "$RUN_LABEL")
-if [[ -n "$MARKET" ]]; then
-  CMD+=(--market "$MARKET")
-fi
+LAUNCH_MODE="${PM15MIN_EXPERIMENT_LAUNCH_MODE:-formal}"
+case "$LAUNCH_MODE" in
+  formal)
+    CMD=("$PYTHON_BIN" -m pm15min research experiment run-suite --suite "$SUITE_NAME" --run-label "$RUN_LABEL")
+    if [[ -n "$MARKET" ]]; then
+      CMD+=(--market "$MARKET")
+    fi
+    ;;
+  quick_screen)
+    CMD=(
+      "$PYTHON_BIN"
+      "$ROOT_DIR/scripts/research/run_quick_screen_suite.py"
+      --suite "$SUITE_NAME"
+      --run-label "$RUN_LABEL"
+      --top-k "${PM15MIN_QUICK_SCREEN_TOP_K}"
+    )
+    ;;
+  *)
+    echo "unknown PM15MIN_EXPERIMENT_LAUNCH_MODE: $LAUNCH_MODE" >&2
+    exit 2
+    ;;
+esac
 
 TIMEOUT_PREFIX=()
 if [[ -n "$TIMEOUT_SEC" ]]; then
@@ -81,7 +133,9 @@ if [[ -n "$TIMEOUT_SEC" ]]; then
 fi
 
 {
-  echo "[run_one_experiment] suite=$SUITE_NAME run_label=$RUN_LABEL market=${MARKET:-all}"
+  echo "[run_one_experiment] mode=$LAUNCH_MODE suite=$SUITE_NAME run_label=$RUN_LABEL market=${MARKET:-all}"
+  echo "[run_one_experiment] cpu_threads=$PM15MIN_EXPERIMENT_CPU_THREADS expected_concurrency=$PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY"
+  echo "[run_one_experiment] quick_screen_train_parallel_workers=$PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS"
   if [[ ${#TIMEOUT_PREFIX[@]} -gt 0 ]]; then
     "${TIMEOUT_PREFIX[@]}" "${CMD[@]}"
   else

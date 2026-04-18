@@ -105,7 +105,7 @@ def main() -> int:
     if frame.empty:
         raise SystemExit("No quick-screen rows produced")
 
-    sort_keys = frame["_rank_tuple"].apply(lambda item: tuple(int(v) for v in item))
+    sort_keys = frame["_rank_tuple"].apply(_sortable_rank_tuple)
     frame["_sort_key"] = sort_keys
     frame = frame.sort_values(
         by=["market", "_sort_key", "feature_set"],
@@ -169,6 +169,16 @@ def _render_markdown_table(frame: pd.DataFrame) -> str:
 def _markdown_cell(value: object) -> str:
     text = "" if value is None else str(value)
     return text.replace("\n", "<br>").replace("|", "\\|")
+
+
+def _sortable_rank_tuple(item: object) -> tuple[float, int, int, int, int]:
+    values = tuple(item) if isinstance(item, (list, tuple)) else ()
+    head = float(values[0]) if len(values) >= 1 else 0.0
+    capture = int(values[1]) if len(values) >= 2 else 0
+    correct_side = int(values[2]) if len(values) >= 3 else 0
+    trades = int(values[3]) if len(values) >= 4 else 0
+    pool_rows = int(values[4]) if len(values) >= 5 else 0
+    return (head, capture, correct_side, trades, pool_rows)
 
 
 if __name__ == "__main__":

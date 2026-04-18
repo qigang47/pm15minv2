@@ -25,6 +25,7 @@ CODEX_SECONDARY_HOME_DIR="${CODEX_SECONDARY_HOME_DIR:-$AUTORUN_DIR/codex-home-se
 CODEX_FALLBACK_HOME_DIR="${CODEX_FALLBACK_HOME_DIR:-$AUTORUN_DIR/codex-home-fallback}"
 CODEX_OFFICIAL_HOME_DIR="${CODEX_OFFICIAL_HOME_DIR:-$AUTORUN_DIR/codex-home-official}"
 CODEX_NETWORK_PROXY_MODE="${CODEX_NETWORK_PROXY_MODE:-direct}"
+CODEX_OFFICIAL_NETWORK_PROXY_MODE="${CODEX_OFFICIAL_NETWORK_PROXY_MODE:-$CODEX_NETWORK_PROXY_MODE}"
 MAX_CONSECUTIVE_FAILURES="${MAX_CONSECUTIVE_FAILURES:-3}"
 CODEX_ATTEMPT_TIMEOUT_SEC="${CODEX_ATTEMPT_TIMEOUT_SEC:-7200}"
 CODEX_STARTUP_TIMEOUT_SEC="${CODEX_STARTUP_TIMEOUT_SEC:-90}"
@@ -353,38 +354,44 @@ if [[ -z "$CODEX_PATH_PREFIX" ]]; then
   CODEX_PATH_PREFIX="$(resolve_codex_path_prefix)"
 fi
 
+declare -a BUILT_ENV_PREFIX=()
+
+build_env_prefix() {
+  local proxy_mode="${1:-inherit}"
+  local home_root="${2:-}"
+
+  BUILT_ENV_PREFIX=(env)
+  if [[ "$proxy_mode" == "direct" ]]; then
+    BUILT_ENV_PREFIX+=(-u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy -u http_proxy -u https_proxy -u all_proxy)
+  fi
+  if [[ -n "$home_root" ]]; then
+    BUILT_ENV_PREFIX+=("HOME=$home_root")
+  fi
+  if [[ -n "${CODEX_PATH_PREFIX:-}" ]]; then
+    BUILT_ENV_PREFIX+=("PATH=$CODEX_PATH_PREFIX:$PATH")
+  fi
+}
+
 run_codex_command() {
   local home_root="$1"
   local output_log="$2"
-
-  local -a env_prefix=(env)
-  if [[ "${CODEX_NETWORK_PROXY_MODE:-direct}" == "direct" ]]; then
-    env_prefix+=(-u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy -u http_proxy -u https_proxy -u all_proxy)
+  if [[ "$home_root" == "$CODEX_OFFICIAL_HOME_DIR" ]]; then
+    build_env_prefix "$CODEX_OFFICIAL_NETWORK_PROXY_MODE" "$home_root"
+  else
+    build_env_prefix "$CODEX_NETWORK_PROXY_MODE" "$home_root"
   fi
-  if [[ -n "$home_root" ]]; then
-    env_prefix+=("HOME=$home_root")
-  fi
-  if [[ -n "${CODEX_PATH_PREFIX:-}" ]]; then
-    env_prefix+=("PATH=$CODEX_PATH_PREFIX:$PATH")
-  fi
-  exec "${env_prefix[@]}" "${CODEX_CMD[@]}" < "$LAST_PROMPT_PATH" > "$output_log" 2>&1
+  exec "${BUILT_ENV_PREFIX[@]}" "${CODEX_CMD[@]}" < "$LAST_PROMPT_PATH" > "$output_log" 2>&1
 }
 
 start_codex_attempt_process() {
   local home_root="$1"
   local output_log="$2"
-
-  local -a env_prefix=(env)
-  if [[ "${CODEX_NETWORK_PROXY_MODE:-direct}" == "direct" ]]; then
-    env_prefix+=(-u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy -u http_proxy -u https_proxy -u all_proxy)
+  if [[ "$home_root" == "$CODEX_OFFICIAL_HOME_DIR" ]]; then
+    build_env_prefix "$CODEX_OFFICIAL_NETWORK_PROXY_MODE" "$home_root"
+  else
+    build_env_prefix "$CODEX_NETWORK_PROXY_MODE" "$home_root"
   fi
-  if [[ -n "$home_root" ]]; then
-    env_prefix+=("HOME=$home_root")
-  fi
-  if [[ -n "${CODEX_PATH_PREFIX:-}" ]]; then
-    env_prefix+=("PATH=$CODEX_PATH_PREFIX:$PATH")
-  fi
-  setsid "${env_prefix[@]}" "${CODEX_CMD[@]}" < "$LAST_PROMPT_PATH" > "$output_log" 2>&1 &
+  setsid "${BUILT_ENV_PREFIX[@]}" "${CODEX_CMD[@]}" < "$LAST_PROMPT_PATH" > "$output_log" 2>&1 &
   STARTED_ATTEMPT_PID="$!"
 }
 
@@ -555,6 +562,7 @@ run_once() {
   else
     write_status "idle" "$iteration" "$exit_code" "$started_at" "$finished_at" "${RUN_STARTED_AT:-None}" "$FAILURE_COUNT"
   fi
+  build_prompt > "$LAST_PROMPT_PATH"
   return "$exit_code"
 }
 

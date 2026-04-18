@@ -35,3 +35,27 @@ def prefer_dense_candidate(
     left_roi = float(left.get("roi_pct") or 0.0)
     right_roi = float(right.get("roi_pct") or 0.0)
     return left if left_roi >= right_roi else right
+
+
+def prefer_dense_screen_candidate(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    left_coverage = float(left.get("profitable_pool_coverage_ratio") or 0.0)
+    right_coverage = float(right.get("profitable_pool_coverage_ratio") or 0.0)
+    if left_coverage != right_coverage:
+        return left if left_coverage > right_coverage else right
+
+    left_capture = int(left.get("profitable_pool_capture_rows") or 0)
+    right_capture = int(right.get("profitable_pool_capture_rows") or 0)
+    if left_capture != right_capture:
+        return left if left_capture > right_capture else right
+
+    left_correct_side = int(left.get("profitable_pool_correct_side_rows") or 0)
+    right_correct_side = int(right.get("profitable_pool_correct_side_rows") or 0)
+    if left_correct_side != right_correct_side:
+        return left if left_correct_side > right_correct_side else right
+
+    left_trades = int(left.get("trade_rows") or 0)
+    right_trades = int(right.get("trade_rows") or 0)
+    return left if left_trades >= right_trades else right
