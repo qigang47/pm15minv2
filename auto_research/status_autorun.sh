@@ -53,6 +53,16 @@ if queue_items:
     print("== Experiment Queue ==")
     print(f"queue_path: {queue_payload.get('queue_path')}")
     print(f"max_live_runs: {queue_payload.get('max_live_runs')}")
+    summary = queue_payload.get("summary") or {}
+    if summary:
+        print(
+            "summary: "
+            f"pending={summary.get('pending_items')} "
+            f"running={summary.get('running_items')} "
+            f"done={summary.get('done_items')} "
+            f"dead={summary.get('dead_items')} "
+            f"total_history={summary.get('total_items')}"
+        )
     for item in queue_items:
         print(
             f"{item.get('status')}: {item.get('market')} / {item.get('action')} / "

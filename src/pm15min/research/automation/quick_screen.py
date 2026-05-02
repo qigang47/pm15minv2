@@ -16,7 +16,13 @@ from pm15min.research.backtests.decision_engine_parity import (
     apply_decision_engine_parity,
     build_profile_decision_engine_parity_config,
 )
-from pm15min.research.backtests.engine import _build_bundle_replay, _bundle_offsets, _filter_replay_window
+from pm15min.research.backtests.engine import (
+    _build_bundle_replay,
+    _bundle_offsets,
+    _feature_frame_filters,
+    _filter_replay_window,
+    _label_frame_filters,
+)
 from pm15min.research.backtests.orderbook_surface import attach_canonical_quote_surface
 from pm15min.research.backtests.policy import BacktestPolicyConfig, build_policy_decisions, build_policy_reject_frame
 from pm15min.research.backtests.regime_parity import resolve_backtest_profile_spec
@@ -502,7 +508,15 @@ def _load_quick_screen_feature_frame(
     decision_end: str | None,
 ) -> pd.DataFrame:
     columns = _required_quick_screen_feature_columns(bundle_dir=bundle_dir, target=target)
-    features = load_feature_frame(cfg, feature_set=cfg.feature_set, columns=columns)
+    features = load_feature_frame(
+        cfg,
+        feature_set=cfg.feature_set,
+        columns=columns,
+        filters=_feature_frame_filters(
+            decision_start=decision_start,
+            decision_end=decision_end,
+        ),
+    )
     if features.empty:
         return features
 
@@ -559,7 +573,12 @@ def _load_quick_screen_label_frame(
     cfg: ResearchConfig,
     scoped_features: pd.DataFrame,
 ) -> pd.DataFrame:
-    labels = load_label_frame(cfg, label_set=cfg.label_set, columns=_LABEL_REQUIRED_COLUMNS)
+    labels = load_label_frame(
+        cfg,
+        label_set=cfg.label_set,
+        columns=_LABEL_REQUIRED_COLUMNS,
+        filters=_label_frame_filters(scoped_features=scoped_features),
+    )
     if labels.empty or scoped_features.empty:
         return labels.iloc[0:0].copy()
 

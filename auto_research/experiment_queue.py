@@ -252,6 +252,7 @@ def main() -> int:
         reseed_empty_tracks_from_recent_done,
         save_experiment_queue,
         set_queue_item_status,
+        summarize_queue_items,
         upsert_queue_item,
     )
 
@@ -342,6 +343,8 @@ def main() -> int:
                 max_live_runs=args.max_live_runs,
                 max_new_launches=args.max_launches_per_pass,
             )
+        queue_summary = summarize_queue_items(queue_payload.get("items") or [])
+        reconciled_summary = summarize_queue_items(reconciled.get("items") or [])
         payload = {
             "queue_path": str((root / "var" / "research" / "autorun" / "experiment-queue.json").resolve()),
             "live_workers": len(live_workers),
@@ -368,9 +371,17 @@ def main() -> int:
                 for item in reseeded_items
             ],
             "memory_gate": memory_gate,
-            "queue_items": len(queue_payload.get("items") or []),
+            "queue_items": queue_summary["pending_items"],
+            "pending_queue_items": queue_summary["pending_items"],
+            "running_queue_items": queue_summary["running_items"],
+            "done_queue_items": queue_summary["done_items"],
+            "dead_queue_items": queue_summary["dead_items"],
+            "total_queue_items": queue_summary["total_items"],
+            "queue_status_counts": queue_summary["status_counts"],
             "status_report": build_autorun_status_report(root, log_tail_lines=0, max_incomplete_runs=5).get("status") or {},
-            "reconciled_queue_items": len(reconciled.get("items") or []),
+            "reconciled_queue_items": reconciled_summary["pending_items"],
+            "reconciled_total_queue_items": reconciled_summary["total_items"],
+            "reconciled_queue_status_counts": reconciled_summary["status_counts"],
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
         return 0

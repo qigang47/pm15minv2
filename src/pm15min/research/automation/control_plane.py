@@ -14,7 +14,7 @@ import subprocess
 from pm15min.research.features.registry import feature_group, feature_registry
 
 from .dense_policy import classify_dense_history_route
-from .queue_state import experiment_queue_path, load_experiment_queue
+from .queue_state import experiment_queue_path, load_experiment_queue, summarize_queue_items
 
 _AUTORESEARCH_DIRNAME = "auto_research"
 _LEGACY_AUTORESEARCH_DIR = Path("scripts") / "research"
@@ -910,6 +910,7 @@ def build_autorun_status_report(
         context=dense_context,
         queue_items=all_queue_items,
     )
+    queue_summary = summarize_queue_items(filtered_queue_items)
     return {
         "status_path": str(resolved_status_path),
         "log_path": str(log_path),
@@ -921,6 +922,7 @@ def build_autorun_status_report(
             "max_queued_items": int(queue_payload.get("max_queued_items") or 24),
             "track_slot_caps": dict(queue_payload.get("track_slot_caps") or {}),
             "items": filtered_queue_items,
+            "summary": queue_summary,
         },
         "formal_workers": filtered_formal_workers,
         "incomplete_runs": filtered_incomplete_runs,

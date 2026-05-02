@@ -3285,6 +3285,15 @@ def test_quick_screen_suite_script_preserves_float_rank_precision() -> None:
     assert "_sortable_rank_tuple" in script_text
 
 
+def test_quick_screen_suite_script_clears_process_caches_after_each_case() -> None:
+    script_text = Path("scripts/research/run_quick_screen_suite.py").read_text(encoding="utf-8")
+
+    assert "clear_process_scoring_runtime_cache" in script_text
+    assert "clear_process_backtest_runtime_cache" in script_text
+    assert "gc.collect()" in script_text
+    assert "finally:" in script_text
+
+
 def test_status_dense_autorun_reads_both_dense_instances() -> None:
     script_text = Path("auto_research/status_dense_autorun.sh").read_text(encoding="utf-8")
 

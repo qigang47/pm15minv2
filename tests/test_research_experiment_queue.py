@@ -83,6 +83,59 @@ def test_cli_supervise_once_skips_launch_when_available_memory_is_low(tmp_path: 
     assert item["status"] == "queued"
 
 
+def test_cli_supervise_once_reports_pending_queue_separately_from_history(tmp_path: Path) -> None:
+    workspace_root = Path(__file__).resolve().parents[1]
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    for status, run_label in (
+        ("queued", "sol_pending"),
+        ("done", "sol_done"),
+        ("dead", "sol_dead"),
+    ):
+        upsert_queue_item(
+            root,
+            build_queue_item(
+                market="sol",
+                suite_name=f"sol_{status}",
+                run_label=run_label,
+                action="launch",
+                status=status,
+                track="direction_dense",
+                session_dir=session_dir,
+                program_path=program_path,
+            ),
+        )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(workspace_root / "auto_research" / "experiment_queue.py"),
+            "--root",
+            str(root),
+            "supervise-once",
+            "--max-live-runs",
+            "1",
+            "--min-available-mem-gb",
+            "32",
+            "--meminfo-path",
+            str(tmp_path / "meminfo"),
+        ],
+        cwd=workspace_root,
+        env={**os.environ, "PYTHONPATH": str(workspace_root / "src")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["queue_items"] == 1
+    assert payload["pending_queue_items"] == 1
+    assert payload["total_queue_items"] == 3
+    assert payload["queue_status_counts"] == {"dead": 1, "done": 1, "queued": 1}
+
+
 def test_upsert_queue_item_prunes_low_priority_pending_items_beyond_queue_cap(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     state = load_experiment_queue(root)
@@ -585,6 +638,123 @@ def test_reconcile_queue_with_live_workers_marks_finished_quick_screen_run_done(
 
     item = next(entry for entry in state["items"] if entry["run_label"] == "btc_run")
     assert item["status"] == "done"
+
+
+def test_dense_quick_screen_selects_one_shared_sol_xrp_run(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 4, "reversal_dense": 0}
+    payload["items"] = [
+        build_queue_item(
+            market="sol",
+            suite_name="shared_dense_suite",
+            run_label="shared_dense_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+        build_queue_item(
+            market="xrp",
+            suite_name="shared_dense_suite",
+            run_label="shared_dense_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+    ]
+
+    selected = select_launchable_queue_items(payload, max_live_runs=4, live_workers=[])
+
+    assert [item["market"] for item in selected] == ["sol"]
+
+
+def test_launch_ready_queue_items_marks_shared_sol_xrp_run_running_with_one_launch(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 4, "reversal_dense": 0}
+    payload["items"] = [
+        build_queue_item(
+            market="sol",
+            suite_name="shared_dense_suite",
+            run_label="shared_dense_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+        build_queue_item(
+            market="xrp",
+            suite_name="shared_dense_suite",
+            run_label="shared_dense_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+    ]
+    save_experiment_queue(root, payload)
+    launched: list[dict[str, object]] = []
+
+    def launcher(item: dict[str, object]) -> dict[str, object]:
+        launched.append(dict(item))
+        return {"pid": 12345}
+
+    state, launched_items = launch_ready_queue_items(
+        root,
+        live_workers=[],
+        launcher=launcher,
+        max_live_runs=4,
+    )
+
+    assert [item["market"] for item in launched] == ["sol"]
+    assert {item["market"] for item in launched_items} == {"sol", "xrp"}
+    statuses = {item["market"]: item["status"] for item in state["items"]}
+    assert statuses == {"sol": "running", "xrp": "running"}
+    assert {item["market"]: item.get("pid") for item in state["items"]} == {"sol": 12345, "xrp": 12345}
+
+
+def test_reconcile_queue_with_live_workers_keeps_shared_sol_xrp_run_running(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    for market in ("sol", "xrp"):
+        upsert_queue_item(
+            root,
+            build_queue_item(
+                market=market,
+                suite_name="shared_dense_suite",
+                run_label="shared_dense_run",
+                action="launch",
+                status="running",
+                track="direction_dense",
+                session_dir=session_dir,
+                program_path=program_path,
+            ),
+        )
+
+    state = reconcile_queue_with_live_workers(
+        root,
+        live_workers=[
+            {
+                "market": "sol",
+                "suite_name": "shared_dense_suite",
+                "run_label": "shared_dense_run",
+                "track": "direction_dense",
+            }
+        ],
+    )
+
+    assert {item["market"]: item["status"] for item in state["items"]} == {"sol": "running", "xrp": "running"}
 
 
 def test_reseed_empty_tracks_from_recent_done_repairs_recent_completed_items(tmp_path: Path) -> None:
@@ -1269,6 +1439,8 @@ def test_build_autorun_status_report_includes_queue_items(tmp_path: Path) -> Non
     assert payload["queue"]["queue_path"].endswith("experiment-queue.json")
     assert len(payload["queue"]["items"]) == 1
     assert payload["queue"]["items"][0]["run_label"] == "btc_launch"
+    assert payload["queue"]["summary"]["total_items"] == 1
+    assert payload["queue"]["summary"]["pending_items"] == 1
 
 
 def test_build_codex_cycle_prompt_includes_queue_snapshot_and_queue_instruction(tmp_path: Path) -> None:

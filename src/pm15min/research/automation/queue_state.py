@@ -21,6 +21,8 @@ DEFAULT_TRACK_SLOT_CAPS = {
     "direction_dense": 4,
     "reversal_dense": 4,
 }
+DENSE_QUICK_SCREEN_TRACKS = frozenset({"direction_dense", "reversal_dense"})
+SHARED_QUICK_SCREEN_MARKETS = frozenset({"sol", "xrp"})
 FIXED_TRACK_SLOT_CAPS_ENV = "PM15MIN_FIXED_TRACK_SLOT_CAPS_JSON"
 ALLOWED_QUEUE_MARKETS_ENV = "PM15MIN_ALLOWED_QUEUE_MARKETS"
 
@@ -205,6 +207,12 @@ def select_launchable_queue_items(
     track_slot_caps = _normalize_track_slot_caps(payload.get("track_slot_caps"))
     selected: list[dict[str, object]] = []
     selected_track_usage: dict[str, int] = {}
+    occupied_shared_quick_screen_keys = {
+        tuple(key[1:])
+        for key in occupied_fallback
+        if len(key) == 4 and key[0] == "shared_quick_screen"
+    }
+    selected_shared_quick_screen_keys: set[tuple[str, str, str]] = set()
     queue_items = [
         dict(item)
         for item in payload.get("items") or []
@@ -219,6 +227,12 @@ def select_launchable_queue_items(
         market, track = market_track
         if market in occupied_unknown_markets:
             continue
+        shared_quick_screen_key = _shared_quick_screen_key(item)
+        if shared_quick_screen_key is not None and (
+            shared_quick_screen_key in occupied_shared_quick_screen_keys
+            or shared_quick_screen_key in selected_shared_quick_screen_keys
+        ):
+            continue
         track_cap = track_slot_caps.get(track)
         if track_cap is not None:
             used = track_usage.get(track, 0) + unknown_track_usage + selected_track_usage.get(track, 0)
@@ -226,9 +240,33 @@ def select_launchable_queue_items(
                 continue
         selected.append(item)
         selected_track_usage[track] = selected_track_usage.get(track, 0) + 1
+        if shared_quick_screen_key is not None:
+            selected_shared_quick_screen_keys.add(shared_quick_screen_key)
         if len(selected) >= capacity:
             break
     return selected
+
+
+def summarize_queue_items(items: list[dict[str, object]] | object) -> dict[str, object]:
+    normalized_items = [
+        dict(item)
+        for item in (items if isinstance(items, list) else [])
+        if isinstance(item, dict)
+    ]
+    status_counts = Counter(
+        str(item.get("status") or "unknown").strip().lower() or "unknown"
+        for item in normalized_items
+    )
+    pending_count = sum(status_counts.get(status, 0) for status in ("queued", "repair"))
+    running_count = status_counts.get("running", 0)
+    return {
+        "total_items": len(normalized_items),
+        "pending_items": pending_count,
+        "running_items": running_count,
+        "done_items": status_counts.get("done", 0),
+        "dead_items": status_counts.get("dead", 0),
+        "status_counts": dict(sorted(status_counts.items())),
+    }
 
 
 def reconcile_queue_with_live_workers(
@@ -252,10 +290,14 @@ def reconcile_queue_with_live_workers(
     )
     worker_map: dict[tuple[str, str, str, str], dict[str, object]] = {}
     fallback_alive_keys: set[tuple[str, str, str]] = set()
+    shared_quick_screen_alive_keys: set[tuple[str, str, str]] = set()
     for item in live_workers or []:
         if not isinstance(item, dict):
             continue
         resolved_worker = _resolve_live_worker_metadata(item, known_items)
+        shared_quick_screen_key = _shared_quick_screen_key(resolved_worker)
+        if shared_quick_screen_key is not None:
+            shared_quick_screen_alive_keys.add(shared_quick_screen_key)
         identity_key = _resolved_identity_key(resolved_worker)
         if identity_key is not None:
             worker_map[identity_key] = resolved_worker
@@ -274,7 +316,12 @@ def reconcile_queue_with_live_workers(
             continue
         identity_key = _resolved_identity_key(item)
         fallback_key = _suite_run_market_key(item)
-        if identity_key in worker_map or (fallback_key is not None and fallback_key in fallback_alive_keys):
+        shared_quick_screen_key = _shared_quick_screen_key(item)
+        if (
+            identity_key in worker_map
+            or (fallback_key is not None and fallback_key in fallback_alive_keys)
+            or (shared_quick_screen_key is not None and shared_quick_screen_key in shared_quick_screen_alive_keys)
+        ):
             item["updated_at"] = _utc_now()
             updated_items.append(item)
             continue
@@ -504,6 +551,7 @@ def launch_ready_queue_items(
         blocked_by_id: dict[str, str] = {}
         launched_results: dict[str, dict[str, object]] = {}
         launched_ids: set[str] = set()
+        launched_shared_results: dict[tuple[str, str, str], dict[str, object]] = {}
         for item in selected:
             blocker = _launch_candidate_blocker(item)
             if blocker is not None:
@@ -517,6 +565,9 @@ def launch_ready_queue_items(
                 continue
             launched_results[item_id] = result
             launched_ids.add(item_id)
+            shared_quick_screen_key = _shared_quick_screen_key(item)
+            if shared_quick_screen_key is not None:
+                launched_shared_results[shared_quick_screen_key] = result
 
         updated_items: list[dict[str, object]] = []
         for raw_item in payload.get("items") or []:
@@ -524,23 +575,38 @@ def launch_ready_queue_items(
                 continue
             item = dict(raw_item)
             item_id = str(item.get("id") or "").strip()
+            shared_quick_screen_key = _shared_quick_screen_key(item)
             if item_id in blocked_by_id:
                 item["action"] = BLOCKED_QUEUE_ACTION
                 item["status"] = "dead"
                 item["updated_at"] = _utc_now()
                 item["last_error"] = blocked_by_id[item_id]
-            elif item_id in launched_ids:
+            elif item_id in launched_ids or (
+                shared_quick_screen_key is not None and shared_quick_screen_key in launched_shared_results
+            ):
                 if str(item.get("status") or "").strip().lower() == "repair":
                     item["action"] = "repair"
                 item["status"] = "running"
                 item["updated_at"] = _utc_now()
                 launch_result = launched_results.get(item_id, {})
+                if not launch_result and shared_quick_screen_key is not None:
+                    launch_result = launched_shared_results.get(shared_quick_screen_key, {})
                 if "pid" in launch_result:
                     item["pid"] = launch_result["pid"]
             updated_items.append(item)
         payload["items"] = updated_items
 
-        round_launched = [item for item in selected if str(item.get("id") or "").strip() in launched_ids]
+        selected_shared_keys = {
+            _shared_quick_screen_key(item)
+            for item in selected
+            if str(item.get("id") or "").strip() in launched_ids and _shared_quick_screen_key(item) is not None
+        }
+        round_launched = [
+            item
+            for item in updated_items
+            if str(item.get("id") or "").strip() in launched_ids
+            or (_shared_quick_screen_key(item) is not None and _shared_quick_screen_key(item) in selected_shared_keys)
+        ]
         if round_launched:
             launched_items.extend(round_launched)
             reserved_live_workers.extend(round_launched)
@@ -908,7 +974,24 @@ def _suite_run_market_key(item: dict[str, object]) -> tuple[str, str, str] | Non
     return (suite_name, run_label, market)
 
 
+def _shared_quick_screen_key(item: dict[str, object]) -> tuple[str, str, str] | None:
+    track = _item_track(item)
+    if track not in DENSE_QUICK_SCREEN_TRACKS:
+        return None
+    market = str(item.get("market") or "").strip().lower()
+    if market not in SHARED_QUICK_SCREEN_MARKETS:
+        return None
+    suite_name = str(item.get("suite_name") or "").strip()
+    run_label = str(item.get("run_label") or "").strip()
+    if not suite_name or not run_label:
+        return None
+    return (suite_name, run_label, track)
+
+
 def _occupancy_fallback_key(item: dict[str, object]) -> tuple[str, ...] | None:
+    shared_quick_screen_key = _shared_quick_screen_key(item)
+    if shared_quick_screen_key is not None:
+        return ("shared_quick_screen", *shared_quick_screen_key)
     suite_key = _suite_run_market_key(item)
     if suite_key is not None:
         return ("suite_run_market", *suite_key)
@@ -924,6 +1007,10 @@ def _register_occupied_item(
     occupied_exact: dict[tuple[str, str, str, str], dict[str, object]],
     occupied_fallback: dict[tuple[str, ...], dict[str, object]],
 ) -> None:
+    shared_quick_screen_key = _shared_quick_screen_key(item)
+    if shared_quick_screen_key is not None:
+        occupied_fallback.setdefault(("shared_quick_screen", *shared_quick_screen_key), item)
+        return
     identity_key = _resolved_identity_key(item)
     if identity_key is not None:
         occupied_exact.setdefault(identity_key, item)

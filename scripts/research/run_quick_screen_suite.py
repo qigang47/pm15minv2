@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 from pathlib import Path
 import sys
@@ -18,6 +19,7 @@ from pm15min.research.automation.quick_screen import (
     quick_screen_rank_tuple,
     run_bundle_quick_screen,
 )
+from pm15min.research.backtests.runtime_cache import clear_process_backtest_runtime_cache
 from pm15min.research.config import ResearchConfig
 from pm15min.research.experiments.runner import (
     _bundle_label,
@@ -27,6 +29,7 @@ from pm15min.research.experiments.runner import (
     _training_run_label,
 )
 from pm15min.research.experiments.specs import load_suite_definition
+from pm15min.research.inference.scorer import clear_process_scoring_runtime_cache
 from pm15min.research.layout import ResearchLayout
 
 
@@ -71,35 +74,40 @@ def main() -> int:
             offsets=market_spec.offsets,
             cache_key=case_key,
         )
-        train_result, bundle_result = ensure_training_and_bundle(
-            cfg=cfg,
-            market_spec=market_spec,
-            training_run_label=training_run_label,
-            bundle_label=bundle_label,
-        )
-        quick_summary, _decisions = run_bundle_quick_screen(
-            cfg=cfg,
-            bundle_dir=Path(str(bundle_result["bundle_dir"])),
-            profile=market_spec.profile,
-            target=market_spec.target,
-            decision_start=market_spec.decision_start,
-            decision_end=market_spec.decision_end,
-            parity=market_spec.parity,
-        )
-        row = {
-            "market": market_spec.market,
-            "group_name": _group_name(market_spec),
-            "run_name": _run_name(market_spec),
-            "feature_set": market_spec.feature_set,
-            "variant_label": market_spec.variant_label,
-            "training_run_label": training_run_label,
-            "bundle_label": bundle_label,
-            "training_run_dir": train_result.get("run_dir"),
-            "bundle_dir": bundle_result.get("bundle_dir"),
-            **quick_summary,
-        }
-        row["_rank_tuple"] = list(quick_screen_rank_tuple(row))
-        rows.append(row)
+        try:
+            train_result, bundle_result = ensure_training_and_bundle(
+                cfg=cfg,
+                market_spec=market_spec,
+                training_run_label=training_run_label,
+                bundle_label=bundle_label,
+            )
+            quick_summary, _decisions = run_bundle_quick_screen(
+                cfg=cfg,
+                bundle_dir=Path(str(bundle_result["bundle_dir"])),
+                profile=market_spec.profile,
+                target=market_spec.target,
+                decision_start=market_spec.decision_start,
+                decision_end=market_spec.decision_end,
+                parity=market_spec.parity,
+            )
+            row = {
+                "market": market_spec.market,
+                "group_name": _group_name(market_spec),
+                "run_name": _run_name(market_spec),
+                "feature_set": market_spec.feature_set,
+                "variant_label": market_spec.variant_label,
+                "training_run_label": training_run_label,
+                "bundle_label": bundle_label,
+                "training_run_dir": train_result.get("run_dir"),
+                "bundle_dir": bundle_result.get("bundle_dir"),
+                **quick_summary,
+            }
+            row["_rank_tuple"] = list(quick_screen_rank_tuple(row))
+            rows.append(row)
+        finally:
+            clear_process_scoring_runtime_cache()
+            clear_process_backtest_runtime_cache()
+            gc.collect()
 
     frame = pd.DataFrame(rows)
     if frame.empty:

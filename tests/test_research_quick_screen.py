@@ -350,15 +350,17 @@ def test_run_bundle_quick_screen_scopes_inputs_before_replay_build(tmp_path: Pat
 
     seen: dict[str, object] = {}
 
-    def _fake_load_feature_frame(_cfg, *, feature_set=None, columns=None):
+    def _fake_load_feature_frame(_cfg, *, feature_set=None, columns=None, filters=None):
         seen["feature_columns"] = list(columns) if columns is not None else None
+        seen["feature_filters"] = filters
         selected = features.copy()
         if columns is not None:
             selected = selected.loc[:, [column for column in columns if column in selected.columns]]
         return selected
 
-    def _fake_load_label_frame(_cfg, *, label_set=None, columns=None):
+    def _fake_load_label_frame(_cfg, *, label_set=None, columns=None, filters=None):
         seen["label_columns"] = list(columns) if columns is not None else None
+        seen["label_filters"] = filters
         selected = labels.copy()
         if columns is not None:
             selected = selected.loc[:, [column for column in columns if column in selected.columns]]
@@ -430,6 +432,10 @@ def test_run_bundle_quick_screen_scopes_inputs_before_replay_build(tmp_path: Pat
     )
 
     assert seen["feature_columns"] == ["decision_ts", "cycle_start_ts", "cycle_end_ts", "offset", "feature_a"]
+    assert seen["feature_filters"] == [
+        ("decision_ts", ">=", pd.Timestamp("2026-03-28T00:00:00Z")),
+        ("decision_ts", "<", pd.Timestamp("2026-03-29T00:00:00Z")),
+    ]
     assert seen["label_columns"] == [
         "cycle_start_ts",
         "cycle_end_ts",
@@ -439,6 +445,10 @@ def test_run_bundle_quick_screen_scopes_inputs_before_replay_build(tmp_path: Pat
         "label_source",
         "settlement_source",
         "full_truth",
+    ]
+    assert seen["label_filters"] == [
+        ("cycle_start_ts", ">=", int(pd.Timestamp("2026-03-28T00:00:00Z").timestamp())),
+        ("cycle_end_ts", "<=", int(pd.Timestamp("2026-03-28T00:30:00Z").timestamp())),
     ]
     assert summary["rows"] == 1
     assert decisions["policy_action"].tolist() == ["trade"]
