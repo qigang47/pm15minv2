@@ -11,12 +11,16 @@ import shlex
 import shutil
 import subprocess
 
+from pm15min.research.features.registry import feature_group, feature_registry
+
+from .dense_policy import classify_dense_history_route
 from .queue_state import experiment_queue_path, load_experiment_queue
 
 _AUTORESEARCH_DIRNAME = "auto_research"
 _LEGACY_AUTORESEARCH_DIR = Path("scripts") / "research"
 _AUTORESEARCH_PROGRAM_NAME = "program.md"
 _AUTORESEARCH_README_NAME = "README.md"
+_FACTOR_BACKLOG_NAME = "DEEP_OTM_BASELINE_FACTOR_BACKLOG.md"
 _PROJECT_AGENTS_CANDIDATES = (
     Path("research") / "AGENTS.md",
     Path("AGENTS.md"),
@@ -37,8 +41,9 @@ _ACTIVE_SESSION_LINE_RE = re.compile(
     r"(?im)^\s*-\s*(?:active session|new active session)\s*:\s*`?([^`\n]+/(?:session\.md|results\.tsv))`?\s*$"
 )
 _SESSION_REF_RE = re.compile(r"(sessions/[^\s`]+/(?:session\.md|results\.tsv))")
-_PROGRAM_MARKETS_RE = re.compile(r"(?im)^\s*-\s*coins\s*:\s*(.+)$")
+_PROGRAM_MARKETS_RE = re.compile(r"(?im)^\s*-\s*coins?\s*:\s*(.+)$")
 _PROGRAM_TARGET_RE = re.compile(r"(?im)^\s*-\s*target(?:\s+fixed\s+to)?\s*[: ]\s*`?(direction|reversal)`?\s*$")
+_PROGRAM_SUITE_SEED_RE = re.compile(r"(?im)^\s*-\s*suite seed\s*:\s*`?([^`\n]+)`?\s*$")
 _MARKET_TOKEN_RE = re.compile(r"(?<![a-z0-9])(btc|eth|sol|xrp)(?![a-z0-9])")
 _PROGRAM_WIDTH_LADDER_RE = re.compile(r"(?im)^\s*-\s*allowed width ladder\s*:\s*`?([^`\n]+)`?\s*$")
 _FOCUS_FEATURE_REF_RE = re.compile(r"\b(focus_[a-z0-9]+_[0-9]+_[a-z0-9_]+)\b")
@@ -172,6 +177,27 @@ _DIAGNOSIS_ADD_THEMES = (
     "market_quality",
     "junk_cheap_filter",
 )
+_DIAGNOSIS_PRIORITY_FEATURES = (
+    "minutes_left_to_settle",
+    "up_move_remaining_per_minute",
+    "up_move_remaining_z_per_minute",
+    "first_up_cross_offset",
+    "minutes_since_first_up_cross",
+    "up_hold_minutes",
+    "rel_strength_15m",
+    "btc_ret_5m",
+    "btc_vol_30m",
+    "taker_buy_ratio_change",
+    "rv_30_change",
+)
+_GLOBAL_FEATURE_GROUP_ORDER = (
+    "strike",
+    "cycle",
+    "volume",
+    "price",
+    "cross_asset",
+    "calendar",
+)
 _DIAGNOSIS_PROTECT_CORE_SET = set(_DIAGNOSIS_PROTECT_CORE)
 _DIAGNOSIS_REDUNDANT_FAMILY_MEMBERS = {
     label: tuple(columns)
@@ -183,6 +209,23 @@ _DIAGNOSIS_REDUNDANT_MEMBER_SET = {
     for column in columns
 }
 _DENSE_MAJOR_REWORK_NO_CAPTURE_STREAK = 3
+_DENSE_HEAVY_LOW_TRADE_THRESHOLD = 3
+_DENSE_HEAVY_LOW_TRADE_STREAK = 3
+_DENSE_HEAVY_STALE_BEST_STREAK = 6
+_DENSE_HEAVY_MINOR_LOOP_STREAK = 3
+_HISTORY_COMPLETED_RUNS_PER_MARKET = 8
+_HISTORY_NOTE_LIMIT = 3
+_HEAVY_ANALYSIS_PROMPT_TOKEN = "decision_mode=heavy_analysis"
+_MINOR_LOOP_NOTE_MARKERS = (
+    "same-width",
+    "same width",
+    "same-family",
+    "same family",
+    "similar branch",
+    "small tweak",
+    "cosmetic",
+    "narrow timing idea",
+)
 
 
 def _autoresearch_dir(project_root: Path) -> Path:
@@ -661,6 +704,161 @@ def find_latest_completed_experiment_runs_by_market(
     return [dict(latest_by_market[market]) for market in wanted_markets if market in latest_by_market]
 
 
+def find_recent_completed_experiment_runs_by_market(
+    project_root: Path,
+    *,
+    markets: list[str],
+    per_market_limit: int = _HISTORY_COMPLETED_RUNS_PER_MARKET,
+    context: dict[str, str | None] | None = None,
+    queue_items: list[dict[str, object]] | None = None,
+) -> dict[str, list[dict[str, object]]]:
+    root = Path(project_root).resolve()
+    runs_root = root / "research" / "experiments" / "runs"
+    wanted_markets: list[str] = []
+    seen_markets: set[str] = set()
+    for raw_market in markets:
+        market = str(raw_market or "").strip().lower()
+        if not market or market in seen_markets:
+            continue
+        seen_markets.add(market)
+        wanted_markets.append(market)
+    out = {market: [] for market in wanted_markets}
+    if not wanted_markets or not runs_root.exists():
+        return out
+
+    active_context = dict(context or {})
+    known_queue_items = [
+        dict(item)
+        for item in (queue_items or [])
+        if isinstance(item, dict)
+    ]
+    suite_target_cache: dict[str, list[str]] = {}
+
+    def _is_terminal_run(path: Path) -> bool:
+        summary_path = path / "summary.json"
+        if summary_path.exists():
+            try:
+                return _summary_is_terminal(json.loads(summary_path.read_text(encoding="utf-8")))
+            except json.JSONDecodeError:
+                return False
+        return (path / "quick_screen_summary.json").exists()
+
+    run_dirs = sorted(
+        (
+            path
+            for path in runs_root.glob("suite=*/run=*")
+            if path.is_dir() and _is_terminal_run(path)
+        ),
+        key=lambda item: (
+            (item / "summary.json").stat().st_mtime
+            if (item / "summary.json").exists()
+            else (item / "quick_screen_summary.json").stat().st_mtime
+        ),
+        reverse=True,
+    )
+    wanted_market_set = set(wanted_markets)
+    per_market_cap = max(1, int(per_market_limit))
+    for path in run_dirs:
+        summary = summarize_experiment_run(path)
+        payload = {
+            **summary,
+            "run_dir": str(path),
+            "state": "completed",
+        }
+        if active_context and not _payload_matches_dense_context(
+            root,
+            payload,
+            active_context,
+            queue_items=known_queue_items,
+            suite_target_cache=suite_target_cache,
+        ):
+            continue
+        suite_summary = _summarize_suite_variants(root, str(payload.get("suite_name") or ""))
+        payload_markets = (
+            list(suite_summary.get("markets") or [])
+            if isinstance(suite_summary, dict)
+            else _infer_markets_from_run_payload(payload)
+        )
+        for market in payload_markets:
+            if market not in wanted_market_set:
+                continue
+            if len(out[market]) >= per_market_cap:
+                continue
+            out[market].append(dict(payload))
+        if all(len(out[market]) >= per_market_cap for market in wanted_markets):
+            break
+    return out
+
+
+def find_best_completed_quick_screen_runs_by_market(
+    project_root: Path,
+    *,
+    markets: list[str],
+    context: dict[str, str | None] | None = None,
+    queue_items: list[dict[str, object]] | None = None,
+) -> dict[str, dict[str, object]]:
+    root = Path(project_root).resolve()
+    runs_root = root / "research" / "experiments" / "runs"
+    wanted_markets: list[str] = []
+    seen_markets: set[str] = set()
+    for raw_market in markets:
+        market = str(raw_market or "").strip().lower()
+        if not market or market in seen_markets:
+            continue
+        seen_markets.add(market)
+        wanted_markets.append(market)
+    out = {market: {} for market in wanted_markets}
+    if not wanted_markets or not runs_root.exists():
+        return out
+
+    active_context = dict(context or {})
+    known_queue_items = [
+        dict(item)
+        for item in (queue_items or [])
+        if isinstance(item, dict)
+    ]
+    suite_target_cache: dict[str, list[str]] = {}
+    wanted_market_set = set(wanted_markets)
+
+    run_dirs = sorted(
+        (
+            path
+            for path in runs_root.glob("suite=*/run=*")
+            if path.is_dir() and (path / "quick_screen_summary.json").exists()
+        ),
+        key=lambda item: (item / "quick_screen_summary.json").stat().st_mtime,
+        reverse=True,
+    )
+    for path in run_dirs:
+        payload = {
+            **summarize_experiment_run(path),
+            "run_dir": str(path),
+            "state": "completed",
+        }
+        if active_context and not _payload_matches_dense_context(
+            root,
+            payload,
+            active_context,
+            queue_items=known_queue_items,
+            suite_target_cache=suite_target_cache,
+        ):
+            continue
+        suite_summary = _summarize_suite_variants(root, str(payload.get("suite_name") or ""))
+        payload_markets = (
+            list(suite_summary.get("markets") or [])
+            if isinstance(suite_summary, dict)
+            else _infer_markets_from_run_payload(payload)
+        )
+        payload_sort_key = _quick_screen_history_sort_key(payload)
+        for market in payload_markets:
+            if market not in wanted_market_set:
+                continue
+            current = out.get(market) or {}
+            if not current or payload_sort_key > _quick_screen_history_sort_key(current):
+                out[market] = dict(payload)
+    return out
+
+
 def build_autorun_status_report(
     project_root: Path,
     *,
@@ -833,6 +1031,34 @@ def _infer_program_target(program_path: Path | None) -> str | None:
     return _infer_target_from_values(program, text)
 
 
+def _extract_program_suite_seed(program_path: Path | None) -> str | None:
+    if program_path is None:
+        return None
+    program = Path(program_path).resolve()
+    if not program.exists():
+        return None
+    match = _PROGRAM_SUITE_SEED_RE.search(program.read_text(encoding="utf-8"))
+    if not match:
+        return None
+    token = match.group(1).strip().strip("`").strip()
+    return token or None
+
+
+def _is_standalone_direct_launch_program(program_path: Path | None) -> bool:
+    if program_path is None:
+        return False
+    program = Path(program_path).resolve()
+    if not program.exists():
+        return False
+    text = program.read_text(encoding="utf-8").lower()
+    return (
+        "run full formal experiments only" in text
+        and "do not use the shared" in text
+        and "quick-screen queue" in text
+        and "run_one_experiment_background.sh" in text
+    )
+
+
 def _resolve_dense_context(
     *,
     status_path: Path | None = None,
@@ -841,6 +1067,7 @@ def _resolve_dense_context(
     program_path: Path | str | None = None,
 ) -> dict[str, str | None]:
     payload = dict(status_payload or {})
+    resolved_program = Path(program_path).resolve() if program_path is not None and str(program_path).strip() else None
     track = _infer_dense_track_from_values(
         status_path,
         session_dir,
@@ -850,7 +1077,6 @@ def _resolve_dense_context(
     )
     target = _DENSE_TRACK_TARGETS.get(track)
     if target is None:
-        resolved_program = Path(program_path).resolve() if program_path is not None and str(program_path).strip() else None
         target = _infer_program_target(resolved_program)
     if target is None:
         target = _infer_target_from_values(
@@ -867,6 +1093,8 @@ def _resolve_dense_context(
     return {
         "track": track,
         "target": target,
+        "suite_seed": _extract_program_suite_seed(resolved_program),
+        "standalone_direct": "1" if _is_standalone_direct_launch_program(resolved_program) else None,
     }
 
 
@@ -928,6 +1156,9 @@ def _payload_matches_dense_context(
 ) -> bool:
     current_track = _normalize_dense_track(context.get("track"))
     current_target = _normalize_target(context.get("target"))
+    suite_seed = str(context.get("suite_seed") or "").strip()
+    if suite_seed and not _payload_matches_suite_seed(payload, suite_seed):
+        return False
     if current_track is None and current_target is None:
         return True
 
@@ -956,6 +1187,17 @@ def _payload_matches_dense_context(
         return inferred_track == current_track
 
     return True
+
+
+def _payload_matches_suite_seed(payload: dict[str, object], suite_seed: str) -> bool:
+    seed = str(suite_seed or "").strip()
+    if not seed:
+        return True
+    suite_name = str(payload.get("suite_name") or "").strip()
+    if suite_name == seed or suite_name.startswith(f"{seed}_"):
+        return True
+    run_dir = str(payload.get("run_dir") or "").strip()
+    return f"suite={seed}" in run_dir or f"suite={seed}_" in run_dir
 
 
 def _filter_payloads_for_dense_context(
@@ -987,6 +1229,45 @@ def _filter_payloads_for_dense_context(
             queue_items=known_queue_items,
             suite_target_cache=suite_target_cache,
         )
+    ]
+
+
+def _session_bootstrap_run_labels(session_dir: Path) -> set[str]:
+    session = Path(session_dir).resolve()
+    bootstrap_dir = session / "bootstrap"
+    if not bootstrap_dir.exists():
+        return set()
+    return {
+        path.stem
+        for path in bootstrap_dir.glob("*.log")
+        if path.is_file() and path.stem
+    }
+
+
+def _prune_incomplete_runs_to_current_session(
+    incomplete_runs: list[dict[str, object]],
+    *,
+    session_dir: Path,
+    queue_items: list[dict[str, object]],
+    formal_workers: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    managed_run_labels = _session_bootstrap_run_labels(session_dir)
+    managed_run_labels.update(
+        str(item.get("run_label") or "").strip()
+        for item in queue_items
+        if isinstance(item, dict) and str(item.get("run_label") or "").strip()
+    )
+    managed_run_labels.update(
+        str(item.get("run_label") or "").strip()
+        for item in formal_workers
+        if isinstance(item, dict) and str(item.get("run_label") or "").strip()
+    )
+    if not managed_run_labels:
+        return []
+    return [
+        dict(payload)
+        for payload in incomplete_runs
+        if str(payload.get("run_label") or "").strip() in managed_run_labels
     ]
 
 
@@ -1500,6 +1781,7 @@ def _format_diagnosis_policy_lines() -> list[str]:
         "- diagnosis_policy: protect_core=" + ",".join(_DIAGNOSIS_PROTECT_CORE),
         "- diagnosis_policy: drop_from_first=" + ",".join(_DIAGNOSIS_DEFAULT_DROP_ORDER),
         "- diagnosis_policy: add_toward=" + ",".join(_DIAGNOSIS_ADD_THEMES),
+        "- diagnosis_policy: priority_backlog=" + ",".join(_DIAGNOSIS_PRIORITY_FEATURES),
     ]
 
 
@@ -1538,6 +1820,40 @@ def _format_feature_family_brief(project_root: Path, feature_names: list[str]) -
                 lines.append("  diagnosis_core_hits: " + ",".join(diagnosis_summary["core_hits"]))
             if diagnosis_summary["drop_bias"]:
                 lines.append("  diagnosis_drop_bias: " + ",".join(diagnosis_summary["drop_bias"]))
+    return lines
+
+
+def _format_global_factor_inventory_lines(*, max_factors_per_family: int | None = None) -> list[str]:
+    grouped: dict[str, list[str]] = {group: [] for group in _GLOBAL_FEATURE_GROUP_ORDER}
+    other: list[str] = []
+    for name in feature_registry():
+        group = feature_group(name)
+        if group in grouped:
+            grouped[str(group)].append(str(name))
+        else:
+            other.append(str(name))
+    lines: list[str] = []
+    for group in _GLOBAL_FEATURE_GROUP_ORDER:
+        items = grouped.get(group) or []
+        if not items:
+            continue
+        display_items = items
+        suffix = ""
+        if max_factors_per_family is not None and len(items) > int(max_factors_per_family):
+            display_items = items[: max(0, int(max_factors_per_family))]
+            suffix = f" / omitted={len(items) - len(display_items)}"
+        lines.append(
+            f"- family={group} / count={len(items)} / factors=" + ",".join(display_items) + suffix
+        )
+    if other:
+        display_other = other
+        suffix = ""
+        if max_factors_per_family is not None and len(other) > int(max_factors_per_family):
+            display_other = other[: max(0, int(max_factors_per_family))]
+            suffix = f" / omitted={len(other) - len(display_other)}"
+        lines.append(
+            f"- family=other / count={len(other)} / factors=" + ",".join(display_other) + suffix
+        )
     return lines
 
 
@@ -1580,6 +1896,27 @@ def _format_queue_snapshot(queue_payload: dict[str, object]) -> list[str]:
     return lines
 
 
+def _format_standalone_direct_launch_guidance(
+    *,
+    suite_seed: str | None,
+    background_script: str,
+    one_shot_script: str,
+) -> list[str]:
+    seed = str(suite_seed or "").strip()
+    suite_text = seed or "the suite seed named in the program"
+    return [
+        "Standalone direct-launch mode for this program:",
+        "- do not enqueue into the shared experiment queue; this BTC/ETH line owns its own single live formal worker",
+        "- do not use quick_screen, profitable-offset-pool screening, or dense-cache gating in this standalone line",
+        "- do not inspect or launch focus_search, dense, reversal, SOL, or XRP suites while deciding this line",
+        "- if live formal workers is 0, your first command must be the direct background launch; only analyze factor replacements after the launch returns a live pid or a concrete launch error",
+        "- do not read the factor backlog, global factor inventory, or custom feature set files before that launch",
+        f"- use only `{suite_text}` or a copied formal suite whose name starts with `{suite_text}_`",
+        f"- when no healthy worker is live, launch detached with `{background_script}` using `--launch-mode formal`, `--market`, and `--expected-concurrency 1`",
+        f"- reserve `{one_shot_script}` only for a deliberate bounded diagnostic, not for the normal continuous line",
+    ]
+
+
 def _dense_prompt_guidance(program_path: Path) -> list[str]:
     program = Path(program_path).resolve()
     if not program.exists():
@@ -1593,7 +1930,7 @@ def _dense_prompt_guidance(program_path: Path) -> list[str]:
     ):
         return []
     width_ladder_match = _PROGRAM_WIDTH_LADDER_RE.search(program.read_text(encoding="utf-8"))
-    width_ladder = width_ladder_match.group(1).strip() if width_ladder_match else "30 / 34 / 38 / 40 / 44 / 48"
+    width_ladder = width_ladder_match.group(1).strip() if width_ladder_match else "30 / 34 / 38 / 40 / 44 / 48 / 56"
     lines = [
         "Dense trade target for this session: 10-20 trades per coin per day.",
         "Frozen-window dense target: 140-280 trades per coin over the frozen window.",
@@ -1606,17 +1943,385 @@ def _dense_prompt_guidance(program_path: Path) -> list[str]:
         "Inside 140-280 trades, keep width stable and prefer family replacement before changing width again.",
         "If the same coin and track finish 3 consecutive completed fast screens with zero profitable-pool captures, treat that frontier as stuck and switch to major rework immediately.",
         "Major rework means a material family change, not another cosmetic one-factor shuffle around the same parent assumption.",
+        "If the historical digest marks `next_route=weight_search_first`, try sample-weight branches before another cosmetic factor shuffle by varying `winner_in_band_weight`, `offset_weight_overrides`, or explicit `weight_variants`.",
+        "If the historical digest marks `next_route=factor_rework_first`, switch families or width first and do not spend that cycle on a weight-only tweak.",
     ]
     if "profitable offset pool" in text or "profitable-offset-pool" in text:
         lines.extend(
             [
                 "Run the profitable-offset-pool fast-screen before spending a full formal slot.",
-                "The profitable-offset pool is coin-level, shared by both dense tracks, and fixed to 2026-04-01 through 2026-04-15 at 2usd.",
+                "The profitable-offset pool is coin-level, shared by both dense tracks, and fixed to 2026-04-01 through 2026-04-30 at 2usd.",
                 "One offset equals one exact pool window for this fast-screen.",
                 "Count a pool capture only when the candidate reaches a final tradeable winner-side entry at <= 0.30.",
                 "Prefer profitable-pool coverage before formal ROI comparisons.",
+                "When ranking quick-screen candidates, prefer profitable-pool capture quality first, then total trades, then ROI.",
+                "Do not let a reject-sparse candidate outrank a subtarget or on-target candidate only because ROI is higher.",
+                "When promoting a formal frontier, rank candidates by dense gate first, then total trades, then winner-side or capture evidence, and only then ROI.",
             ]
         )
+    return lines
+
+
+def _read_session_results_rows(session_dir: Path) -> list[dict[str, str]]:
+    path = Path(session_dir).resolve() / "results.tsv"
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        rows = [
+            {str(key): str(value or "") for key, value in row.items()}
+            for row in reader
+            if isinstance(row, dict)
+        ]
+    rows.reverse()
+    return rows
+
+
+def _read_recent_cycle_eval_payloads(session_dir: Path, *, limit: int = 6) -> list[dict[str, str]]:
+    cycles_dir = Path(session_dir).resolve() / "cycles"
+    if not cycles_dir.exists():
+        return []
+    candidates = sorted(
+        (path for path in cycles_dir.glob("*/eval-results.md") if path.is_file()),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    payloads: list[dict[str, str]] = []
+    for path in candidates[: max(1, int(limit))]:
+        payloads.append(
+            {
+                "cycle": str(path.parent.name),
+                "path": str(path),
+                "text": path.read_text(encoding="utf-8"),
+            }
+        )
+    return payloads
+
+
+def _text_mentions_market(text: object, market: str) -> bool:
+    token = str(market or "").strip().lower()
+    if not token:
+        return False
+    return token in _MARKET_TOKEN_RE.findall(str(text or "").lower())
+
+
+def _top_case_trade_count(payload: dict[str, object]) -> int | None:
+    top_case = payload.get("top_case") if isinstance(payload.get("top_case"), dict) else {}
+    return _optional_int(top_case.get("trades"))
+
+
+def _quick_screen_history_sort_key(payload: dict[str, object]) -> tuple[float, int, int, int, str]:
+    top_case = payload.get("top_case") if isinstance(payload.get("top_case"), dict) else {}
+    return (
+        _optional_float(top_case.get("profitable_pool_coverage_ratio")) or 0.0,
+        _optional_int(top_case.get("profitable_pool_capture_rows")) or 0,
+        _optional_int(top_case.get("profitable_pool_correct_side_rows")) or 0,
+        _top_case_trade_count(payload) or 0,
+        str(
+            payload.get("completed_at")
+            or payload.get("updated_at")
+            or payload.get("created_at")
+            or payload.get("run_label")
+            or ""
+        ),
+    )
+
+
+def _recent_low_trade_streak(
+    completed_runs: list[dict[str, object]],
+    *,
+    threshold: int = _DENSE_HEAVY_LOW_TRADE_THRESHOLD,
+) -> int:
+    streak = 0
+    for payload in completed_runs:
+        trades = _top_case_trade_count(payload)
+        if trades is None:
+            break
+        if int(trades) <= int(threshold):
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def _recent_startup_failure_streak(completed_runs: list[dict[str, object]]) -> int:
+    streak = 0
+    for payload in completed_runs:
+        completed_cases = _optional_int(payload.get("completed_cases")) or 0
+        failed_cases = _optional_int(payload.get("failed_cases")) or 0
+        trades = _top_case_trade_count(payload)
+        if completed_cases == 0 and failed_cases > 0 and (trades is None or int(trades) <= 0):
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def _recent_no_best_trade_refresh_streak(completed_runs: list[dict[str, object]]) -> int:
+    trades = [
+        int(value)
+        for value in (_top_case_trade_count(payload) for payload in completed_runs)
+        if value is not None
+    ]
+    if not trades:
+        return 0
+    best_trade_count = max(trades)
+    if trades[0] == best_trade_count:
+        return 0
+    for idx, trade_count in enumerate(trades):
+        if trade_count == best_trade_count:
+            return idx
+    return len(trades)
+
+
+def _extract_market_results_notes(
+    session_dir: Path,
+    *,
+    market: str,
+    limit: int = _HISTORY_NOTE_LIMIT,
+) -> list[str]:
+    notes: list[str] = []
+    for row in _read_session_results_rows(session_dir):
+        text = " ".join(
+            str(row.get(field) or "")
+            for field in ("metric", "status", "description")
+        ).strip()
+        if not text or not _text_mentions_market(text, market):
+            continue
+        description = str(row.get("description") or "").strip()
+        if description:
+            notes.append(description)
+        if len(notes) >= max(1, int(limit)):
+            break
+    return notes
+
+
+def _extract_market_eval_notes(
+    session_dir: Path,
+    *,
+    market: str,
+    limit: int = _HISTORY_NOTE_LIMIT,
+) -> list[str]:
+    notes: list[str] = []
+    for payload in _read_recent_cycle_eval_payloads(session_dir, limit=max(1, int(limit) * 2)):
+        for raw_line in str(payload.get("text") or "").splitlines():
+            line = raw_line.strip().lstrip("-").strip()
+            if not line or not _text_mentions_market(line, market):
+                continue
+            notes.append(f"cycle {payload.get('cycle')}: {line}")
+            if len(notes) >= max(1, int(limit)):
+                return notes
+    return notes
+
+
+def _recent_minor_loop_streak(notes: list[str]) -> int:
+    streak = 0
+    for note in notes:
+        lowered = str(note or "").lower()
+        if any(marker in lowered for marker in _MINOR_LOOP_NOTE_MARKERS):
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def _classify_history_problem(
+    *,
+    latest_trades: int | None,
+    latest_roi_pct: float | None,
+    startup_failure_streak: int,
+    low_trade_streak: int,
+    no_capture_streak: int,
+    no_best_refresh_streak: int,
+) -> str:
+    if startup_failure_streak > 0:
+        return "startup_or_bootstrap_failures"
+    if no_capture_streak >= _DENSE_MAJOR_REWORK_NO_CAPTURE_STREAK:
+        return "zero_capture_loop"
+    if low_trade_streak >= _DENSE_HEAVY_LOW_TRADE_STREAK:
+        return "very_low_trade_count"
+    if latest_trades is not None and int(latest_trades) <= 0:
+        return "zero_trades"
+    if latest_trades is not None and int(latest_trades) < 56:
+        if no_best_refresh_streak > 0:
+            return "sparse_and_stalled"
+        return "sparse_but_improving"
+    if latest_roi_pct is not None and float(latest_roi_pct) <= 0:
+        return "quality_below_zero"
+    return "improving_frontier"
+
+
+def _build_market_history_summary(
+    *,
+    project_root: Path,
+    session_dir: Path,
+    market: str,
+    completed_runs: list[dict[str, object]],
+    best_quick_run: dict[str, object] | None = None,
+) -> dict[str, object]:
+    recent_trades = [
+        int(value)
+        for value in (_top_case_trade_count(payload) for payload in completed_runs[:3])
+        if value is not None
+    ]
+    all_trades = [
+        int(value)
+        for value in (_top_case_trade_count(payload) for payload in completed_runs)
+        if value is not None
+    ]
+    latest_top_case = completed_runs[0].get("top_case") if completed_runs and isinstance(completed_runs[0].get("top_case"), dict) else {}
+    latest_roi_pct = _optional_float(latest_top_case.get("roi_pct"))
+    low_trade_streak = _recent_low_trade_streak(completed_runs)
+    no_capture_streak = _recent_no_capture_streak(completed_runs)
+    startup_failure_streak = _recent_startup_failure_streak(completed_runs)
+    no_best_refresh_streak = _recent_no_best_trade_refresh_streak(completed_runs)
+    results_notes = _extract_market_results_notes(session_dir, market=market)
+    eval_notes = _extract_market_eval_notes(session_dir, market=market)
+    combined_notes = [*results_notes, *eval_notes]
+    minor_loop_streak = _recent_minor_loop_streak(combined_notes)
+    latest_trades = recent_trades[0] if recent_trades else None
+    best_trades = max(all_trades) if all_trades else None
+    heavy_required = any(
+        (
+            startup_failure_streak >= 2,
+            no_capture_streak >= _DENSE_MAJOR_REWORK_NO_CAPTURE_STREAK,
+            low_trade_streak >= _DENSE_HEAVY_LOW_TRADE_STREAK,
+            no_best_refresh_streak >= _DENSE_HEAVY_STALE_BEST_STREAK,
+            minor_loop_streak >= _DENSE_HEAVY_MINOR_LOOP_STREAK,
+        )
+    )
+    recommendation = "heavy_rework" if heavy_required else "continue_incremental"
+    current_problem = _classify_history_problem(
+        latest_trades=latest_trades,
+        latest_roi_pct=latest_roi_pct,
+        startup_failure_streak=startup_failure_streak,
+        low_trade_streak=low_trade_streak,
+        no_capture_streak=no_capture_streak,
+        no_best_refresh_streak=no_best_refresh_streak,
+    )
+    best_quick_top_case = (
+        best_quick_run.get("top_case")
+        if isinstance(best_quick_run, dict) and isinstance(best_quick_run.get("top_case"), dict)
+        else {}
+    )
+    return {
+        "market": market,
+        "recommendation": recommendation,
+        "current_problem": current_problem,
+        "latest_trades": latest_trades,
+        "best_trades": best_trades,
+        "recent_trades": recent_trades,
+        "low_trade_streak": low_trade_streak,
+        "no_capture_streak": no_capture_streak,
+        "startup_failure_streak": startup_failure_streak,
+        "no_best_refresh_streak": no_best_refresh_streak,
+        "minor_loop_streak": minor_loop_streak,
+        "best_quick_feature_set": best_quick_top_case.get("feature_set"),
+        "best_quick_trades": _optional_int(best_quick_top_case.get("trades") or best_quick_top_case.get("trade_rows")),
+        "best_quick_correct_side_rows": _optional_int(best_quick_top_case.get("profitable_pool_correct_side_rows")),
+        "best_quick_capture_rows": _optional_int(best_quick_top_case.get("profitable_pool_capture_rows")),
+        "best_quick_pool_rows": _optional_int(best_quick_top_case.get("profitable_pool_rows")),
+        "best_quick_coverage_ratio": _optional_float(best_quick_top_case.get("profitable_pool_coverage_ratio")),
+        "next_route": classify_dense_history_route(
+            no_capture_streak=no_capture_streak,
+            best_quick_trade_rows=_optional_int(best_quick_top_case.get("trades") or best_quick_top_case.get("trade_rows")),
+            best_quick_correct_side_rows=_optional_int(best_quick_top_case.get("profitable_pool_correct_side_rows")),
+            best_quick_capture_rows=_optional_int(best_quick_top_case.get("profitable_pool_capture_rows")),
+        ),
+        "notes": combined_notes[: _HISTORY_NOTE_LIMIT],
+    }
+
+
+def _format_historical_decision_digest(
+    *,
+    project_root: Path,
+    session_dir: Path,
+    markets: list[str],
+    context: dict[str, str | None],
+    queue_items: list[dict[str, object]],
+) -> list[str]:
+    recent_by_market = find_recent_completed_experiment_runs_by_market(
+        project_root,
+        markets=markets,
+        per_market_limit=_HISTORY_COMPLETED_RUNS_PER_MARKET,
+        context=context,
+        queue_items=queue_items,
+    )
+    best_quick_by_market = find_best_completed_quick_screen_runs_by_market(
+        project_root,
+        markets=markets,
+        context=context,
+        queue_items=queue_items,
+    )
+    summaries = [
+        _build_market_history_summary(
+            project_root=project_root,
+            session_dir=session_dir,
+            market=market,
+            completed_runs=list(recent_by_market.get(market) or []),
+            best_quick_run=dict(best_quick_by_market.get(market) or {}),
+        )
+        for market in markets
+    ]
+    heavy_markets = [str(item["market"]) for item in summaries if item.get("recommendation") == "heavy_rework"]
+    normal_markets = [str(item["market"]) for item in summaries if item.get("recommendation") != "heavy_rework"]
+    decision_mode = "heavy_analysis" if heavy_markets else "normal"
+    lines = [
+        (
+            f"- decision_mode={decision_mode} / "
+            f"heavy_markets={','.join(heavy_markets) if heavy_markets else 'none'} / "
+            f"normal_markets={','.join(normal_markets) if normal_markets else 'none'}"
+        )
+    ]
+    for payload in summaries:
+        detail_parts = [
+            f"{payload['market']}: recommendation={payload['recommendation']}",
+            f"current_problem={payload['current_problem']}",
+        ]
+        if payload.get("best_trades") is not None:
+            detail_parts.append(f"best_trades={payload['best_trades']}")
+        best_quick_coverage = _optional_float(payload.get("best_quick_coverage_ratio"))
+        best_quick_captures = _optional_int(payload.get("best_quick_capture_rows"))
+        best_quick_pool_rows = _optional_int(payload.get("best_quick_pool_rows"))
+        if (
+            best_quick_coverage is not None
+            and best_quick_captures is not None
+            and best_quick_pool_rows is not None
+        ):
+            detail_parts.append(
+                f"best_quick={best_quick_captures}/{best_quick_pool_rows} ({best_quick_coverage:.4f})"
+            )
+        if payload.get("best_quick_trades") is not None:
+            detail_parts.append(f"best_quick_trades={payload['best_quick_trades']}")
+        if payload.get("best_quick_correct_side_rows") is not None:
+            detail_parts.append(f"best_quick_correct_side={payload['best_quick_correct_side_rows']}")
+        if payload.get("best_quick_feature_set"):
+            detail_parts.append(f"best_quick_feature_set={payload['best_quick_feature_set']}")
+        next_route = str(payload.get("next_route") or "").strip()
+        if next_route and next_route != "continue_incremental":
+            detail_parts.append(f"next_route={next_route}")
+        if payload.get("recent_trades"):
+            detail_parts.append(
+                "recent_trades=" + ",".join(str(item) for item in payload["recent_trades"])
+            )
+        if int(payload.get("low_trade_streak") or 0) > 0:
+            detail_parts.append(f"low_trade_streak={payload['low_trade_streak']}")
+        if int(payload.get("no_capture_streak") or 0) > 0:
+            detail_parts.append(f"no_capture_streak={payload['no_capture_streak']}")
+        if int(payload.get("startup_failure_streak") or 0) > 0:
+            detail_parts.append(f"startup_failure_streak={payload['startup_failure_streak']}")
+        if int(payload.get("no_best_refresh_streak") or 0) > 0:
+            detail_parts.append(f"no_best_refresh_runs={payload['no_best_refresh_streak']}")
+        if int(payload.get("minor_loop_streak") or 0) > 0:
+            detail_parts.append(f"minor_loop_streak={payload['minor_loop_streak']}")
+        lines.append("- " + " / ".join(detail_parts))
+    note_lines: list[str] = []
+    for payload in summaries:
+        for note in payload.get("notes") or []:
+            note_lines.append(f"  - {payload['market']}: {note}")
+    if note_lines:
+        lines.append("- recent_session_notes:")
+        lines.extend(note_lines[: len(markets) * _HISTORY_NOTE_LIMIT])
     return lines
 
 
@@ -1624,7 +2329,7 @@ def find_live_formal_workers(project_root: Path) -> list[dict[str, object]]:
     root = Path(project_root).resolve()
     try:
         result = subprocess.run(
-            ["ps", "-eo", "pid=,ppid=,cmd="],
+            ["ps", "-eo", "pid=,ppid=,stat=,cmd="],
             check=False,
             capture_output=True,
             text=True,
@@ -1642,15 +2347,18 @@ def find_live_formal_workers(project_root: Path) -> list[dict[str, object]]:
             and "run_quick_screen_suite.py" not in line
         ):
             continue
-        parts = line.split(None, 2)
-        if len(parts) < 3:
+        parts = line.split(None, 3)
+        if len(parts) < 4:
             continue
         try:
             pid = int(parts[0])
             ppid = int(parts[1])
         except ValueError:
             continue
-        cmd = parts[2]
+        stat = str(parts[2]).strip().upper()
+        if stat.startswith("Z"):
+            continue
+        cmd = parts[3]
         if str(root) not in cmd:
             continue
         try:
@@ -1668,13 +2376,31 @@ def find_live_formal_workers(project_root: Path) -> list[dict[str, object]]:
             "market": market,
             "cmd": cmd,
         }
-        dedupe_key = (
-            str(run_label or ""),
-            str(suite_name or ""),
-            str(market or ""),
-        )
-        existing = deduped_workers.get(dedupe_key)
-        if existing is None or int(pid) < int(existing.get("pid") or pid):
+        normalized_run = str(run_label or "")
+        normalized_suite = str(suite_name or "")
+        normalized_market = str(market or "")
+        dedupe_key = (normalized_run, normalized_suite, normalized_market)
+        matching_key = None
+        for existing_key in deduped_workers:
+            existing_run, existing_suite, existing_market = existing_key
+            if existing_run != normalized_run or existing_suite != normalized_suite:
+                continue
+            if not normalized_market or not existing_market or existing_market == normalized_market:
+                matching_key = existing_key
+                break
+        existing = deduped_workers.get(matching_key or dedupe_key)
+        if existing is None:
+            deduped_workers[dedupe_key] = payload
+            continue
+        existing_market = str(existing.get("market") or "")
+        keep_new = False
+        if normalized_market and not existing_market:
+            keep_new = True
+        elif bool(normalized_market) == bool(existing_market) and int(pid) < int(existing.get("pid") or pid):
+            keep_new = True
+        if keep_new:
+            if matching_key is not None and matching_key != dedupe_key:
+                deduped_workers.pop(matching_key, None)
             deduped_workers[dedupe_key] = payload
     return sorted(deduped_workers.values(), key=lambda item: int(item.get("pid") or 0))
 
@@ -1696,7 +2422,7 @@ def find_live_autorun_processes(
     )
     try:
         result = subprocess.run(
-            ["ps", "-eo", "pid=,ppid=,cmd="],
+            ["ps", "-eo", "pid=,ppid=,stat=,cmd="],
             check=False,
             capture_output=True,
             text=True,
@@ -1710,15 +2436,18 @@ def find_live_autorun_processes(
         line = raw_line.strip()
         if not line:
             continue
-        parts = line.split(None, 2)
-        if len(parts) < 3:
+        parts = line.split(None, 3)
+        if len(parts) < 4:
             continue
         try:
             pid = int(parts[0])
             ppid = int(parts[1])
         except ValueError:
             continue
-        cmd = parts[2]
+        stat = str(parts[2]).strip().upper()
+        if stat.startswith("Z"):
+            continue
+        cmd = parts[3]
         kind: str | None = None
         if any(str(loop_script) in cmd for loop_script in loop_scripts) and "__run_loop" in cmd:
             kind = "background_loop"
@@ -1759,15 +2488,22 @@ def build_codex_cycle_prompt(
     session_dir: Path,
     program_path: Path | None = None,
     status_path: Path | None = None,
+    prompt_budget_mode: str | None = None,
 ) -> str:
     root = Path(project_root).resolve()
     session = Path(session_dir).resolve()
     program = resolve_autoresearch_program_path(root, program_path).resolve()
+    compact_prompt = str(prompt_budget_mode or "").strip().lower() in {"compact", "cost_saver", "cost-saver"}
     queue_script = _repo_display_path(root, resolve_autoresearch_script_path(root, "experiment_queue.py"))
     background_script = _repo_display_path(root, resolve_autoresearch_script_path(root, "run_one_experiment_background.sh"))
     one_shot_script = _repo_display_path(root, resolve_autoresearch_script_path(root, "run_one_experiment.sh"))
     summarize_script = _repo_display_path(root, resolve_autoresearch_script_path(root, "summarize_experiment.py"))
-    status_report = build_autorun_status_report(root, log_tail_lines=5, max_incomplete_runs=5, status_path=status_path)
+    status_report = build_autorun_status_report(
+        root,
+        log_tail_lines=2 if compact_prompt else 5,
+        max_incomplete_runs=3 if compact_prompt else 5,
+        status_path=status_path,
+    )
     status_payload = status_report.get("status") or {}
     dense_context = _resolve_dense_context(
         status_path=status_path,
@@ -1775,6 +2511,8 @@ def build_codex_cycle_prompt(
         session_dir=session,
         program_path=program,
     )
+    standalone_direct = str(dense_context.get("standalone_direct") or "") == "1"
+    suite_seed = str(dense_context.get("suite_seed") or "").strip() or None
     queue_payload = dict(status_report.get("queue") or {})
     all_queue_items = [
         dict(item)
@@ -1800,6 +2538,22 @@ def build_codex_cycle_prompt(
     }
     current_track = _normalize_dense_track(dense_context.get("track"))
     allowed_live_runs = int(track_slot_caps.get(current_track) or queue_payload.get("max_live_runs") or 4)
+    if standalone_direct:
+        allowed_live_runs = 1
+    shared_track_cap_lines = (
+        []
+        if standalone_direct
+        else [
+            "- shared queue caps are infrastructure state, not a strategy lever",
+            (
+                "- current shared caps: "
+                f"direction_dense={int(track_slot_caps.get('direction_dense') or 0)}, "
+                f"reversal_dense={int(track_slot_caps.get('reversal_dense') or 0)}"
+            ),
+            "- do not set the sibling dense track cap to `0` in a normal decision cycle",
+            "- do not rewrite shared queue caps unless the human explicitly changes the startup configuration",
+        ]
+    )
     live_run_labels = {
         str(item.get("run_label") or "").strip()
         for item in formal_workers
@@ -1810,6 +2564,12 @@ def build_codex_cycle_prompt(
         list(status_report.get("incomplete_runs") or []),
         context=dense_context,
         queue_items=all_queue_items,
+    )
+    incomplete_runs = _prune_incomplete_runs_to_current_session(
+        incomplete_runs,
+        session_dir=session,
+        queue_items=queue_payload["items"],
+        formal_workers=formal_workers,
     )
     completed_runs = _filter_payloads_for_dense_context(
         root,
@@ -1849,6 +2609,21 @@ def build_codex_cycle_prompt(
         queue_payload=queue_payload,
         live_worker_count=len(formal_workers),
     )
+    history_digest_lines = _format_historical_decision_digest(
+        project_root=root,
+        session_dir=session,
+        markets=program_markets,
+        context=dense_context,
+        queue_items=all_queue_items,
+    )
+    if compact_prompt and any(_HEAVY_ANALYSIS_PROMPT_TOKEN in line for line in history_digest_lines):
+        return build_codex_cycle_prompt(
+            project_root=root,
+            session_dir=session,
+            program_path=program,
+            status_path=status_path,
+            prompt_budget_mode="full",
+        )
     coin_slot_lines = _format_coin_slot_snapshot(
         project_root=root,
         markets=program_markets,
@@ -1865,7 +2640,23 @@ def build_codex_cycle_prompt(
             completed_runs=completed_runs,
         ),
     )
-    queue_lines = _format_queue_snapshot(queue_payload)
+    global_factor_inventory_lines = _format_global_factor_inventory_lines(
+        max_factors_per_family=24 if compact_prompt else None
+    )
+    queue_lines = (
+        ["- standalone direct-launch mode: shared queue ignored for this program"]
+        if standalone_direct
+        else _format_queue_snapshot(queue_payload)
+    )
+    standalone_guidance_lines = (
+        _format_standalone_direct_launch_guidance(
+            suite_seed=suite_seed,
+            background_script=background_script,
+            one_shot_script=one_shot_script,
+        )
+        if standalone_direct
+        else []
+    )
     snapshot_lines: list[str] = []
     if status_payload:
         snapshot_lines.append(
@@ -1903,22 +2694,97 @@ def build_codex_cycle_prompt(
     if project_agents is not None:
         initial_files.append(f"- {project_agents}")
     initial_files.append(f"- {program}")
+    factor_backlog = root / "docs" / _FACTOR_BACKLOG_NAME
+    if factor_backlog.exists() and not standalone_direct:
+        initial_files.append(f"- {factor_backlog}")
     if latest_cycle_eval is not None:
         initial_files.append(f"- {latest_cycle_eval}")
-    else:
+    elif not compact_prompt:
         initial_files.append(f"- {session / 'session.md'}")
     dense_guidance_lines = _dense_prompt_guidance(program)
+    bounded_cycle_line = (
+        "One bounded decision cycle may launch or resume the one standalone formal worker allowed by this program."
+        if standalone_direct
+        else "One bounded decision cycle may launch multiple distinct formal runs if that is needed to refill idle coin slots or expand active same-coin branches allowed by program.md."
+    )
+    strategy_vs_capacity_line = (
+        "Use the historical decision digest for strategy direction and the machine decision summary for current worker state; if no healthy worker is live, launch or resume the next standalone formal run directly."
+        if standalone_direct
+        else "Use the historical decision digest for strategy direction and the machine decision summary for occupancy direction; if they disagree, keep healthy live workers running but queue the next strategic branch according to the digest when capacity allows."
+    )
+    digest_scope_lines = (
+        []
+        if standalone_direct
+        else [
+            "The historical digest includes each market's best quick-screen pool result; use that `best_quick=` line to judge whether the line has ever materially improved instead of relying only on the most recent run.",
+        ]
+    )
+    refill_instruction_line = (
+        "Launch or resume the single standalone formal worker first when the machine decision summary shows `refill_now` or `resume_or_replace_now`; do not detour into shared queue work."
+        if standalone_direct
+        else "Queue or resume formal work for the idle coin slots first when the machine decision summary already shows clear `refill_now` or `resume_or_replace_now` actions; after that, use any remaining live or queue headroom to stage additional same-coin follow-ups without repeating already-failed small tweaks from the historical digest."
+    )
+    heavy_rework_line = (
+        "When the historical digest marks a market as `recommendation=heavy_rework`, do not finish the cycle with only monitoring, repair, or another same-family cosmetic swap; either launch a materially different standalone formal branch or record the verified blocker."
+        if standalone_direct
+        else "When the historical digest marks a market as `recommendation=heavy_rework`, do not finish the cycle with only monitoring, repair, or another same-family cosmetic swap; either queue a materially different branch or record the verified blocker."
+    )
+    active_prepare_line = (
+        "If a healthy live formal worker already fills this program coin's standalone slot, leave it running and record the next bounded follow-up idea in the session instead of launching a second worker for the same coin. Other standalone coin sessions do not fill this slot."
+        if standalone_direct
+        else "If a healthy live formal worker already fills a coin slot but the machine decision summary marks that slot as `action=prepare_next_now`, keep the live worker running and queue the next bounded follow-up for that same coin in this same cycle."
+    )
+    zero_live_line = (
+        "If the current autorun snapshot reports `live formal workers: 0`, you are expected to directly launch or resume the one standalone formal worker unless you verify a fresh blocker from the exact current run directory."
+        if standalone_direct
+        else "If the current autorun snapshot reports `live formal workers: 0`, you are expected to queue or resume work for every coin slot that is `state=idle` or `state=checkpointed` in the coin snapshot during this same cycle unless you verify a fresh blocking issue from the exact current run directory."
+    )
+    zero_live_no_queue_line = (
+        "If live formal workers are 0, do not spend the cycle dumping full factor lists, pairwise column diffs, or broad registry comparisons before you launch or resume the next standalone formal run."
+        if standalone_direct
+        else "If live formal workers are 0 and the queue snapshot has no queued or repair items, do not spend the cycle dumping full factor lists, pairwise column diffs, or broad registry comparisons before you enqueue the next bounded branches."
+    )
+    resume_checkpoint_line = (
+        "If a current-line run is checkpointed with `live_worker=no`, resume that exact run directly before opening a new standalone branch."
+        if standalone_direct
+        else "If live formal workers are below the allowed concurrency and some current-line runs are only checkpointed with `live_worker=no`, resume as many checkpointed current-line runs as needed to fill those live slots in the same cycle before opening any new branch."
+    )
+    launch_policy_lines = (
+        [
+            f"Use `{background_script}` directly for normal standalone formal launches; keep exactly one standalone worker live for this program coin. Do not count healthy workers from other standalone coin sessions as occupying this slot.",
+            "Do not use the shared queue supervisor for this standalone line.",
+        ]
+        if standalone_direct
+        else [
+            f"Queue formal launches and repairs instead of directly filling all slots yourself; the queue supervisor is responsible for keeping up to {allowed_live_runs} live formal runs active.",
+            f"Use `{queue_script} enqueue ...` for normal formal work and reserve direct launches for deliberate bounded diagnostics only.",
+        ]
+    )
+    required_step_8 = (
+        f"8. If no healthy worker is live, use `{background_script}` to launch or resume one standalone formal run for the program coin."
+        if standalone_direct
+        else "8. Queue distinct formal runs or repairs for different idle coins first; then use any remaining headroom to add more bounded same-coin follow-ups until the allowed live and queued capacity is well supplied."
+    )
+    required_step_9 = (
+        f"9. Use `{background_script}` with `--launch-mode formal --suite ... --run-label ... --market ... --expected-concurrency 1` for normal standalone work."
+        if standalone_direct
+        else f"9. Use `{queue_script} enqueue --market ... --suite ... --run-label ... --action launch|resume|repair --reason ...` for normal formal work; let the queue supervisor consume queued items and keep occupancy near {allowed_live_runs}."
+    )
 
     return "\n".join(
         [
             "Read the repository research instructions and complete exactly one autonomous research cycle.",
-            "One bounded decision cycle may launch multiple distinct formal runs if that is needed to refill idle coin slots or expand active same-coin branches allowed by program.md.",
+            bounded_cycle_line,
             "",
             f"Project root: {root}",
             f"Program: {program}",
             f"Session dir: {session}",
             "",
+            *([*standalone_guidance_lines, ""] if standalone_guidance_lines else []),
             *([*dense_guidance_lines, ""] if dense_guidance_lines else []),
+            "Historical decision digest already collected for you:",
+            *(history_digest_lines or ["- no historical decision digest available"]),
+            "",
             "Machine decision summary already collected for you:",
             *(decision_summary_lines or ["- no machine decision summary available"]),
             "",
@@ -1926,39 +2792,51 @@ def build_codex_cycle_prompt(
             *initial_files,
             "",
             "Use repository commands sparingly. Do not scan the entire repository or the full experiment history unless the cycle is blocked.",
-            "Use the machine decision summary and current autorun snapshot first; open `results.tsv` or historical cycle eval only if you still need extra rationale after accepting the current occupancy in the summary.",
-            "Queue or resume formal work for the idle coin slots first when the machine decision summary already shows clear `refill_now` or `resume_or_replace_now` actions; after that, use any remaining live or queue headroom to stage additional same-coin follow-ups instead of delaying on extra historical reading.",
+            "Read the historical decision digest before the occupancy snapshots. Treat it as required decision input, not optional extra context.",
+            strategy_vs_capacity_line,
+            *digest_scope_lines,
+            "Open `results.tsv` or older cycle eval files only if the historical digest is still insufficient for the current decision.",
+            *shared_track_cap_lines,
+            refill_instruction_line,
             "Do not open large raw registry files like `research/experiments/custom_feature_sets.json` in the normal decision path; use the pre-extracted coin snapshot and feature-family brief below first.",
-            "If you still need exact factor columns, inspect only the exact named feature family that is missing from the brief instead of dumping broad file ranges.",
+            "Treat the feature-family brief as a shortcut, not a whitelist.",
+            "You may choose from any factor listed in the global factor inventory below even if it does not appear in the current frontier families.",
+            "If you still need exact factor columns after reading both the brief and the global inventory, inspect only the exact named feature family that is missing instead of dumping broad file ranges.",
             "Use the diagnosis-guided family policy in the brief: protect the named core skeleton features, prefer dropping from overloaded repetitive families, and add toward the listed missing-information themes before inventing broader searches.",
+            "If the historical digest marks `decision_mode=heavy_analysis`, begin from the flagged markets' repeated failure loop before touching launch decisions.",
+            heavy_rework_line,
+            "If the historical digest marks a market as `next_route=weight_search_first`, prefer a bounded weight-search branch before another same-family factor shuffle.",
+            "For `next_route=weight_search_first`, search with `winner_in_band_weight`, `offset_weight_overrides`, or named `weight_variants` instead of only replacing columns.",
+            "If the historical digest marks a market as `next_route=factor_rework_first`, prefer a materially different factor family or width move before any weight-only retry.",
             "Only a run with a live `run_one_experiment.sh` worker counts as an active occupied slot; a checkpoint-only incomplete run with `live_worker=no` is resumable but does not currently consume live concurrency.",
             "A bounded cycle refers to the Codex decision pass, not an automatic timeout for every formal worker.",
             "If `rg` is unavailable, use `find`, `grep`, `sed`, and targeted `ls`.",
-            "When the session is long, start from results.tsv plus the newest cycle eval and open the full session history only if those are insufficient.",
+            "In normal mode, use the short historical digest to avoid repeating ineffective micro-tweaks; in heavy-analysis mode, explain the root-cause hypothesis before choosing the next branch.",
             "Prefer formal experiment launches over unrelated environment or infrastructure edits.",
             "Only make code changes when they directly unblock the next formal experiment for this session.",
             "When session artifacts disagree with current run directories, trust the current run directories.",
             "Historical cycle eval notes about live workers or CPU health are not authoritative for the current cycle; only the machine-collected snapshot in this prompt plus any fresh verification you perform in this same cycle may decide current occupancy.",
             "A formal run is finished only when `completed_cases + failed_cases` reaches `cases`; if `summary.json` exists but work remains, treat it as a checkpointed resumable run rather than a finished run.",
             "If a healthy live formal worker already fills a coin slot, leave it running; a monitor-only cycle is valid when the active workers are still the right frontier.",
-            "If a healthy live formal worker already fills a coin slot but the machine decision summary marks that slot as `action=prepare_next_now`, keep the live worker running and queue the next bounded follow-up for that same coin in this same cycle.",
-            "If the active program explicitly allows multiple simultaneous formal runs and some coin slots are idle, keep launching distinct follow-ups in the same cycle until you fill every allowed idle slot that still has a clear next follow-up.",
+            active_prepare_line,
+            *([] if standalone_direct else ["If the active program explicitly allows multiple simultaneous formal runs and some coin slots are idle, keep launching distinct follow-ups in the same cycle until you fill every allowed idle slot that still has a clear next follow-up."]),
             "Do not leave an idle coin slot unfilled solely because the latest result is thin-sample, tied, or still marked `research_only`; when the frontier is unresolved but the slot is free, choose the next bounded follow-up that can strengthen or falsify that edge.",
             "Launching several distinct coin follow-ups in one decision pass still counts as one bounded cycle.",
-            "If the current autorun snapshot reports `live formal workers: 0`, you are expected to queue or resume work for every coin slot that is `state=idle` or `state=checkpointed` in the coin snapshot during this same cycle unless you verify a fresh blocking issue from the exact current run directory.",
-            "If live formal workers are 0 and the queue snapshot has no queued or repair items, do not spend the cycle dumping full factor lists, pairwise column diffs, or broad registry comparisons before you enqueue the next bounded branches.",
-            "In a normal dense cycle, avoid full 48-column dumps; when exact feature-family names already exist, record only the small add/drop rationale that justifies the branch and move on to queue mutations.",
-            "If live formal workers are below the allowed concurrency and some current-line runs are only checkpointed with `live_worker=no`, resume as many checkpointed current-line runs as needed to fill those live slots in the same cycle before opening any new branch.",
-            "For active coin slots with `action=prepare_next_now`, keep the current live frontier running and queue a bounded follow-up for that same coin and track; if live workers are still below the allowed concurrency or the queue still has room, you may queue multiple bounded queued branches for that same coin and track as long as each branch is meaningfully distinct.",
-            "If live formal workers remain below the allowed concurrency after those refill and resume steps, do not end the cycle with unused live capacity; queue enough additional distinct bounded branches to reduce the remaining gap as much as clear candidates allow, and explicitly record any unfilled slots and the exact blocker for each one.",
+            zero_live_line,
+            zero_live_no_queue_line,
+            *([] if standalone_direct else ["In a normal dense cycle, avoid full 48-column dumps; when exact feature-family names already exist, record only the small add/drop rationale that justifies the branch and move on to queue mutations."]),
+            resume_checkpoint_line,
+            *([] if standalone_direct else [
+                "For active coin slots with `action=prepare_next_now`, keep the current live frontier running and queue a bounded follow-up for that same coin and track; if live workers are still below the allowed concurrency or the queue still has room, you may queue multiple bounded queued branches for that same coin and track as long as each branch is meaningfully distinct.",
+                "If live formal workers remain below the allowed concurrency after those refill and resume steps, do not end the cycle with unused live capacity; queue enough additional distinct bounded branches to reduce the remaining gap as much as clear candidates allow, and explicitly record any unfilled slots and the exact blocker for each one.",
+            ]),
             f"If the machine summary marks a coin as `action=major_rework_now`, do not spend that cycle on another cosmetic same-parent tweak; switch to a materially different family or width branch for that coin and track in the same cycle.",
-            "Treat `queued_branches=<n>` in the machine decision summary as an informational count, not a hard cap; when capacity remains, you may continue building additional same-coin branches instead of stopping at one successor.",
+            *([] if standalone_direct else ["Treat `queued_branches=<n>` in the machine decision summary as an informational count, not a hard cap; when capacity remains, you may continue building additional same-coin branches instead of stopping at one successor."]),
             "If a feature-set name mentioned by old session artifacts is missing from the current registry, treat that as historical drift rather than a blocker; inspect the exact current suite spec or current run directory for the active coin and continue the decision instead of reconciling the full registry history.",
             f"When you need a long-lived formal worker to keep running after this cycle, launch it detached with `{background_script}` and do not add `--timeout-sec` unless you intentionally want a bounded diagnostic probe.",
             f"Reserve `{one_shot_script}` with `--timeout-sec` for deliberate bounded checkpoints, diagnostics, or stuck-run inspection.",
             "Do not stop or checkpoint a healthy live formal run merely to end the current Codex cycle.",
-            f"Queue formal launches and repairs instead of directly filling all slots yourself; the queue supervisor is responsible for keeping up to {allowed_live_runs} live formal runs active.",
-            f"Use `{queue_script} enqueue ...` for normal formal work and reserve direct launches for deliberate bounded diagnostics only.",
+            *launch_policy_lines,
             "",
             "Current autorun snapshot already collected for you:",
             *(snapshot_lines or ["- no existing autorun status snapshot found"]),
@@ -1972,22 +2850,27 @@ def build_codex_cycle_prompt(
             "Relevant feature-family brief already extracted for you:",
             *(feature_brief_lines or ["- no focused feature-family brief available"]),
             "",
+            "Global factor inventory already extracted for you:",
+            *(global_factor_inventory_lines or ["- no global factor inventory available"]),
+            "",
             "Required cycle steps:",
-            f"1. Read the machine decision summary plus {program.name} before making changes; open results.tsv plus the newest cycle eval only if you still need historical rationale after accepting the current occupancy in the summary.",
-            "2. Reconcile the active session artifacts against the current run directories before deciding what is still live, blocked, or already complete.",
-            "3. Inspect only the specific active, incomplete, or most recent completed experiment runs needed to avoid duplicates blindly and choose the next step.",
-            "4. Decide the next experiment set or code change.",
+            f"1. Read the historical decision digest plus {program.name} before making changes; open results.tsv or older cycle eval files only if the digest still leaves a strategy gap.",
+            "2. Read the machine decision summary and queue snapshot after the historical digest so you know what capacity is actually free right now.",
+            "3. Reconcile the active session artifacts against the current run directories before deciding what is still live, blocked, or already complete.",
+            "4. Inspect only the specific active, incomplete, or most recent completed experiment runs needed to avoid duplicates blindly and choose the next step.",
+            "4a. If the historical digest marks a market for heavy rework, write down the repeated failure loop and make at least one materially different strategic change for that market unless you verify an exact blocker.",
             "5. If there are idle coin slots that the active program allows you to fill, refill as many distinct idle coin slots as possible in this same cycle instead of stopping after the first new launch.",
             "5a. If there are no idle coin slots but live formal workers are still below the allowed concurrency, resume multiple checkpointed current-line runs in this same cycle until the live slots are filled or no clear resume target remains.",
             "5b. If live or queue headroom still remains after that, queue additional bounded same-coin same-track follow-ups for the strongest active frontiers instead of stopping at one successor per coin.",
-            "6. If needed, edit code or create/update a suite spec.",
-            "7. Queue distinct formal runs or repairs for different idle coins first; then use any remaining headroom to add more bounded same-coin follow-ups until the allowed live and queued capacity is well supplied.",
-            f"8. Use `{queue_script} enqueue --market ... --suite ... --run-label ... --action launch|resume|repair --reason ...` for normal formal work; let the queue supervisor consume queued items and keep occupancy near {allowed_live_runs}.",
-            f"9. Use `{one_shot_script}` only for intentionally bounded probes, checkpoints, or diagnostics.",
-            f"10. Use `{summarize_script}` for completed, failed, or intentionally checkpointed runs; do not interrupt a healthy live worker just to summarize it.",
-            f"11. Never have more than {allowed_live_runs} simultaneous formal market runs active unless program.md imposes a stricter limit.",
-            "12. Update the session artifacts under the session dir.",
-            "13. Stop after this one decision cycle and summarize what changed, what ran, what you queued, and what should happen next.",
+            "6. Decide the next experiment set or code change.",
+            "7. If needed, edit code or create/update a suite spec.",
+            required_step_8,
+            required_step_9,
+            f"10. Use `{one_shot_script}` only for intentionally bounded probes, checkpoints, or diagnostics.",
+            f"11. Use `{summarize_script}` for completed, failed, or intentionally checkpointed runs; do not interrupt a healthy live worker just to summarize it.",
+            f"12. Never have more than {allowed_live_runs} simultaneous formal market runs active unless program.md imposes a stricter limit.",
+            "13. Update the session artifacts under the session dir.",
+            "14. Stop after this one decision cycle and summarize what changed, what ran, what you queued, and what should happen next.",
             "",
             "Your Codex decision pass must end after this cycle, but any healthy formal experiment workers you started or observed may continue running after you exit.",
         ]
@@ -2049,6 +2932,8 @@ def build_codex_exec_command(
     output_path: Path,
     sandbox_mode: str,
     model: str | None = None,
+    reasoning_effort: str | None = None,
+    auto_compact_token_limit: int | None = None,
     extra_args: str | None = None,
     codex_bin: str | None = None,
 ) -> tuple[str, ...]:
@@ -2066,9 +2951,30 @@ def build_codex_exec_command(
     ]
     if model:
         command.extend(["--model", str(model)])
+    if reasoning_effort:
+        command.extend(["-c", f'model_reasoning_effort="{str(reasoning_effort).strip()}"'])
+    if auto_compact_token_limit is not None:
+        command.extend(["-c", f"model_auto_compact_token_limit={int(auto_compact_token_limit)}"])
     command.extend(build_codex_exec_extra_args(extra_args))
     command.append("-")
     return tuple(command)
+
+
+def resolve_codex_attempt_timeout_sec(
+    prompt_path: Path | str,
+    *,
+    default_timeout_sec: int,
+    heavy_analysis_timeout_sec: int,
+) -> int:
+    prompt = Path(prompt_path)
+    default_timeout = max(1, int(default_timeout_sec))
+    heavy_timeout = max(default_timeout, int(heavy_analysis_timeout_sec))
+    if not prompt.exists():
+        return default_timeout
+    text = prompt.read_text(encoding="utf-8", errors="ignore").lower()
+    if _HEAVY_ANALYSIS_PROMPT_TOKEN in text:
+        return heavy_timeout
+    return default_timeout
 
 
 def record_session_update(
@@ -2409,7 +3315,25 @@ def _pid_is_live(pid_value: object) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        state = _pid_proc_state(pid)
+        return state is None or not state.startswith("Z")
     except OSError:
         return False
-    return True
+    state = _pid_proc_state(pid)
+    return state is None or not state.startswith("Z")
+
+
+def _pid_proc_state(pid: int) -> str | None:
+    proc_stat_path = Path(f"/proc/{int(pid)}/stat")
+    if not proc_stat_path.exists():
+        return None
+    try:
+        payload = proc_stat_path.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return None
+    if not payload:
+        return None
+    parts = payload.split()
+    if len(parts) < 3:
+        return None
+    return str(parts[2]).strip().upper() or None

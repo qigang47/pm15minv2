@@ -28,15 +28,32 @@ def classification_metrics(y_true: np.ndarray, prob: np.ndarray) -> dict[str, fl
     return metrics
 
 
-def blend_weights_from_brier(*, brier_lgb: float | None, brier_lr: float | None) -> dict[str, float]:
-    if brier_lgb is None or brier_lr is None or not math.isfinite(brier_lgb) or not math.isfinite(brier_lr):
-        return {"w_lgb": 0.5, "w_lr": 0.5}
-    inv_lgb = 1.0 / max(float(brier_lgb), 1e-9)
-    inv_lr = 1.0 / max(float(brier_lr), 1e-9)
-    total = inv_lgb + inv_lr
+def blend_weights_from_brier(
+    *,
+    brier_lgb: float | None,
+    brier_lr: float | None,
+    brier_catboost: float | None = None,
+) -> dict[str, float]:
+    values = {
+        "w_lgb": brier_lgb,
+        "w_lr": brier_lr,
+    }
+    if brier_catboost is not None:
+        values["w_catboost"] = brier_catboost
+    finite_values = {
+        key: float(value)
+        for key, value in values.items()
+        if value is not None and math.isfinite(float(value))
+    }
+    if len(finite_values) < len(values):
+        equal_weight = 1.0 / max(1, len(values))
+        return {key: float(equal_weight) for key in values}
+    inverse = {key: 1.0 / max(value, 1e-9) for key, value in finite_values.items()}
+    total = sum(inverse.values())
     if total <= 0:
-        return {"w_lgb": 0.5, "w_lr": 0.5}
-    return {"w_lgb": float(inv_lgb / total), "w_lr": float(inv_lr / total)}
+        equal_weight = 1.0 / max(1, len(values))
+        return {key: float(equal_weight) for key in values}
+    return {key: float(value / total) for key, value in inverse.items()}
 
 
 def feature_schema_rows(X: pd.DataFrame) -> list[dict[str, str]]:

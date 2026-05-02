@@ -40,9 +40,12 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("show", help="Print queue JSON.")
 
     supervise = subparsers.add_parser("supervise-once", help="Reconcile queue state and fill empty slots once.")
-    supervise.add_argument("--max-live-runs", type=int, default=16)
+    supervise.add_argument("--max-live-runs", type=int, default=8)
     supervise.add_argument("--max-queued-items", type=int, default=24)
+    supervise.add_argument("--max-launches-per-pass", type=int, default=None)
     supervise.add_argument("--max-repair-attempts", type=int, default=3)
+    supervise.add_argument("--min-available-mem-gb", type=float, default=2.0)
+    supervise.add_argument("--meminfo-path", default="/proc/meminfo")
     supervise.add_argument(
         "--track-slot-caps",
         default='{"direction_dense": 2, "reversal_dense": 2}',
@@ -68,6 +71,7 @@ def _default_artifact_paths(root: Path, item: dict[str, object]) -> dict[str, st
 
 def _queue_launcher(root: Path):
     script = (root / "auto_research" / "run_one_experiment_background.sh").resolve()
+    launch_timeout_sec = max(5, int(os.environ.get("PM15MIN_QUEUE_LAUNCH_TIMEOUT_SEC") or 30))
 
     def launcher(item: dict[str, object]) -> dict[str, object]:
         if str(item.get("track") or "").strip().lower() in {"", "unknown"}:
@@ -96,13 +100,57 @@ def _queue_launcher(root: Path):
         session_dir = str(item.get("session_dir") or "").strip()
         program_path = str(item.get("program_path") or "").strip()
         track = str(item.get("track") or "").strip()
+        market = str(item.get("market") or "").strip().lower()
+        if track in {"direction_dense", "reversal_dense"} and market not in {"sol", "xrp"}:
+            raise RuntimeError(f"dense queue can only launch sol/xrp quick-screen items, got market={market!r}")
+        launch_mode = str(env.get("PM15MIN_EXPERIMENT_LAUNCH_MODE") or "").strip()
+        quick_screen_top_k = str(env.get("PM15MIN_QUICK_SCREEN_TOP_K") or "").strip()
+        quick_screen_train_parallel_workers = str(env.get("PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS") or "").strip()
+        expected_concurrency = str(env.get("PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY") or "").strip()
+        if track in {"direction_dense", "reversal_dense"}:
+            launch_mode = launch_mode or "quick_screen"
+            quick_screen_top_k = quick_screen_top_k or "1"
+            quick_screen_train_parallel_workers = quick_screen_train_parallel_workers or "2"
+            expected_concurrency = expected_concurrency or str(
+                max(1, int(os.environ.get("MAX_LIVE_RUNS") or 8))
+            )
         if session_dir:
             env["SESSION_DIR"] = session_dir
         if program_path:
             env["PROGRAM_PATH"] = program_path
         if track:
             env["EXPERIMENT_TRACK"] = track
-        result = subprocess.run(cmd, cwd=root, capture_output=True, text=True, check=False, env=env)
+        if launch_mode:
+            cmd.extend(["--launch-mode", launch_mode])
+        if quick_screen_top_k:
+            cmd.extend(["--quick-screen-top-k", quick_screen_top_k])
+        if quick_screen_train_parallel_workers:
+            cmd.extend(["--quick-screen-train-parallel-workers", quick_screen_train_parallel_workers])
+        if expected_concurrency:
+            cmd.extend(["--expected-concurrency", expected_concurrency])
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+                timeout=launch_timeout_sec,
+            )
+        except subprocess.TimeoutExpired as exc:
+            pid_path = Path(artifact_paths["pid_path"])
+            if pid_path.exists():
+                try:
+                    pid_value = int(pid_path.read_text(encoding="utf-8").strip())
+                    os.kill(pid_value, 0)
+                except Exception:
+                    pass
+                else:
+                    payload = dict(artifact_paths)
+                    payload["pid"] = pid_value
+                    return payload
+            raise RuntimeError(f"queue launch timed out after {launch_timeout_sec}s") from exc
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "queue launch failed")
         pid_value = None
@@ -153,6 +201,39 @@ def _parse_track_slot_caps(raw: str) -> dict[str, int]:
             continue
         caps[key] = int(raw_value)
     return caps
+
+
+def _read_mem_available_kb(meminfo_path: str) -> int | None:
+    path = Path(meminfo_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if not line.startswith("MemAvailable:"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return None
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _memory_gate_payload(*, min_available_mem_gb: float, meminfo_path: str) -> dict[str, object]:
+    required_kb = max(0, int(float(min_available_mem_gb) * 1024 * 1024))
+    available_kb = _read_mem_available_kb(meminfo_path)
+    state = "open"
+    if required_kb > 0 and (available_kb is None or available_kb < required_kb):
+        state = "blocked"
+    return {
+        "state": state,
+        "available_kb": available_kb,
+        "required_kb": required_kb,
+        "meminfo_path": meminfo_path,
+    }
 
 
 def main() -> int:
@@ -247,12 +328,20 @@ def main() -> int:
             root,
             live_workers=live_workers,
         )
-        queue_payload, launched_items = launch_ready_queue_items(
-            root,
-            live_workers=live_workers,
-            launcher=_queue_launcher(root),
-            max_live_runs=args.max_live_runs,
+        memory_gate = _memory_gate_payload(
+            min_available_mem_gb=args.min_available_mem_gb,
+            meminfo_path=args.meminfo_path,
         )
+        if memory_gate["state"] == "blocked":
+            launched_items = []
+        else:
+            queue_payload, launched_items = launch_ready_queue_items(
+                root,
+                live_workers=live_workers,
+                launcher=_queue_launcher(root),
+                max_live_runs=args.max_live_runs,
+                max_new_launches=args.max_launches_per_pass,
+            )
         payload = {
             "queue_path": str((root / "var" / "research" / "autorun" / "experiment-queue.json").resolve()),
             "live_workers": len(live_workers),
@@ -278,6 +367,7 @@ def main() -> int:
                 }
                 for item in reseeded_items
             ],
+            "memory_gate": memory_gate,
             "queue_items": len(queue_payload.get("items") or []),
             "status_report": build_autorun_status_report(root, log_tail_lines=0, max_incomplete_runs=5).get("status") or {},
             "reconciled_queue_items": len(reconciled.get("items") or []),

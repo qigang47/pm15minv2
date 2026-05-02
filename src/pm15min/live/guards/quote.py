@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pm15min.core.fees import expected_resolution_roi
+
 from ..profiles import LiveProfileSpec
 
 
@@ -87,7 +89,13 @@ def quote_guard_reasons(
         fee_rate = profile_spec.fee_rate(price=effective_price)
     roi_net = float_or_none(metrics.get("roi_net_vs_quote"))
     if roi_net is None and p_side is not None:
-        roi_net = float(p_side) / max(effective_price, 1e-9) - 1.0 - fee_rate
+        roi_net = expected_resolution_roi(
+            probability=float(p_side),
+            price=effective_price,
+            model=profile_spec.fee_model,
+            fee_bps=profile_spec.fee_bps,
+            fee_curve_k=profile_spec.fee_curve_k,
+        )
     roi_threshold = float_or_none(metrics.get("roi_threshold_required"))
     if roi_threshold is None:
         roi_threshold = profile_spec.roi_threshold_for(offset=offset)

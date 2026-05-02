@@ -6,7 +6,7 @@ import pandas as pd
 
 def settle_fill_frame(fills: pd.DataFrame) -> pd.DataFrame:
     if fills.empty:
-        return pd.DataFrame(columns=["decision_ts", "cycle_start_ts", "cycle_end_ts", "offset", "market_id", "condition_id", "predicted_side", "predicted_prob", "entry_price", "entry_price_source", "price_cap", "stake", "shares", "winner_side", "win", "fee_rate", "fee_paid", "payout", "pnl", "roi_pct", "fill_model", "decision_source"])
+        return pd.DataFrame(columns=["decision_ts", "cycle_start_ts", "cycle_end_ts", "offset", "market_id", "condition_id", "predicted_side", "predicted_prob", "entry_price", "entry_price_source", "price_cap", "stake", "shares", "winner_side", "win", "fee_rate", "fee_paid", "fee_collection", "payout", "pnl", "roi_pct", "fill_model", "decision_source"])
     trades = fills.copy()
     trades["winner_side"] = _string_series(trades, "winner_side").str.upper()
     trades["predicted_side"] = _string_series(trades, "predicted_side").str.upper()
@@ -15,9 +15,11 @@ def settle_fill_frame(fills: pd.DataFrame) -> pd.DataFrame:
     trades["shares"] = pd.to_numeric(trades.get("shares"), errors="coerce").fillna(0.0)
     trades["fee_rate"] = pd.to_numeric(trades.get("fee_rate"), errors="coerce").fillna(0.0)
     trades["fee_paid"] = pd.to_numeric(trades.get("fee_paid"), errors="coerce").fillna(trades["stake"] * trades["fee_rate"])
+    trades["fee_collection"] = _string_series(trades, "fee_collection").str.lower().mask(lambda s: s.eq(""), "cash")
     gross_payout = np.where(trades["win"], trades["shares"], 0.0)
-    trades["payout"] = gross_payout - np.where(trades["win"], trades["fee_paid"], 0.0)
-    trades["pnl"] = trades["payout"] - trades["stake"]
+    cash_fee_paid = np.where(trades["fee_collection"].eq("cash"), trades["fee_paid"], 0.0)
+    trades["payout"] = gross_payout
+    trades["pnl"] = trades["payout"] - trades["stake"] - cash_fee_paid
     trades["roi_pct"] = np.where(trades["stake"].gt(0.0), trades["pnl"] / trades["stake"] * 100.0, 0.0)
     keep = [
         "decision_ts",
@@ -38,6 +40,7 @@ def settle_fill_frame(fills: pd.DataFrame) -> pd.DataFrame:
         "win",
         "fee_rate",
         "fee_paid",
+        "fee_collection",
         "payout",
         "pnl",
         "roi_pct",

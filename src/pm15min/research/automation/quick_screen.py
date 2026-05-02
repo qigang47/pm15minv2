@@ -10,6 +10,7 @@ import pandas as pd
 from pm15min.data.config import DataConfig
 from pm15min.data.io import write_json_atomic
 from pm15min.data.io.parquet import read_parquet_if_exists, write_parquet_atomic
+from pm15min.research.backtests.replay_loader import build_replay_frame
 from pm15min.research.bundles.loader import read_bundle_config
 from pm15min.research.backtests.decision_engine_parity import (
     apply_decision_engine_parity,
@@ -21,6 +22,7 @@ from pm15min.research.backtests.policy import BacktestPolicyConfig, build_policy
 from pm15min.research.backtests.regime_parity import resolve_backtest_profile_spec
 from pm15min.research.bundles.builder import build_model_bundle
 from pm15min.research.bundles.loader import read_bundle_summary, read_training_run_summary
+from pm15min.research.automation.dense_policy import classify_density_bottleneck
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import ModelBundleSpec, TrainingRunSpec
 from pm15min.research.layout_helpers import slug_token
@@ -41,6 +43,8 @@ _LABEL_REQUIRED_COLUMNS = (
 _REVERSAL_ANCHOR_COLUMNS = ("ret_from_strike", "ret_from_cycle_open")
 _POOL_STATUS_ORDER = ("captured", "correct_side_no_trade", "missed", "traded_wrong_side")
 _POOL_CACHE_COLUMNS = (*_FEATURE_KEY_COLUMNS, "winner_side", "winner_entry_price")
+_PREWARM_FEATURE_COLUMNS = (*_FEATURE_KEY_COLUMNS, "market_id", "condition_id")
+_PREWARM_DEFAULT_OFFSETS = (7, 8, 9)
 
 
 def build_profitable_offset_pool_frame(
@@ -204,6 +208,15 @@ def build_quick_screen_summary(
             "profitable_pool_coverage_ratio": 0.0,
             "profitable_pool_status_counts": {status: 0 for status in _POOL_STATUS_ORDER},
             "reject_reason_counts": {},
+            "density_bottleneck": classify_density_bottleneck(
+                total_rows=0,
+                trade_rows=0,
+                profitable_pool_rows=0,
+                profitable_pool_capture_rows=0,
+                profitable_pool_correct_side_rows=0,
+                reject_reason_counts={},
+                quote_missing_rows=0,
+            ),
         }
 
     resolved = _bool_series(frame, "resolved")
@@ -253,7 +266,7 @@ def build_quick_screen_summary(
     )
     reject_counts = reject_counts[reject_counts.index != ""]
 
-    return {
+    summary = {
         "rows": int(len(frame)),
         "resolved_rows": int(resolved.sum()),
         "quote_ready_rows": int(quote_ready.sum()),
@@ -270,6 +283,16 @@ def build_quick_screen_summary(
         "profitable_pool_status_counts": profitable_pool_status_counts,
         "reject_reason_counts": {str(index): int(value) for index, value in reject_counts.items()},
     }
+    summary["density_bottleneck"] = classify_density_bottleneck(
+        total_rows=int(summary["rows"]),
+        trade_rows=int(summary["trade_rows"]),
+        profitable_pool_rows=int(summary["profitable_pool_rows"]),
+        profitable_pool_capture_rows=int(summary["profitable_pool_capture_rows"]),
+        profitable_pool_correct_side_rows=int(summary["profitable_pool_correct_side_rows"]),
+        reject_reason_counts=dict(summary["reject_reason_counts"]),
+        quote_missing_rows=int(summary.get("quote_missing_rows_surface") or 0),
+    )
+    return summary
 
 
 def quick_screen_rank_tuple(summary: dict[str, object]) -> tuple[float, int, int, int, int]:
@@ -375,6 +398,100 @@ def run_bundle_quick_screen(
     return summary, decisions
 
 
+def prewarm_profitable_offset_pool_cache(
+    *,
+    cfg: ResearchConfig,
+    profile: str,
+    decision_start: str | None,
+    decision_end: str | None,
+    stake_label: str = "2usd",
+    offsets: tuple[int, ...] = _PREWARM_DEFAULT_OFFSETS,
+) -> dict[str, object]:
+    scoped_offsets = tuple(sorted({int(value) for value in offsets}))
+    features = load_feature_frame(
+        cfg,
+        feature_set=cfg.feature_set,
+        columns=list(_PREWARM_FEATURE_COLUMNS),
+    )
+    if features.empty:
+        pool_path, manifest_path = profitable_offset_pool_cache_paths(
+            cfg=cfg,
+            profile=profile,
+            decision_start=decision_start,
+            decision_end=decision_end,
+            stake_label=stake_label,
+        )
+        return {
+            "market": cfg.asset.slug,
+            "cache_status": "missing_features",
+            "pool_rows": 0,
+            "feature_rows": 0,
+            "replay_rows": 0,
+            "quote_ready_rows": 0,
+            "data_path": str(pool_path),
+            "manifest_path": str(manifest_path),
+        }
+
+    features = _filter_quick_screen_seed_feature_frame(
+        features=features,
+        available_offsets=list(scoped_offsets),
+        decision_start=decision_start,
+        decision_end=decision_end,
+    )
+    labels = load_label_frame(
+        cfg,
+        label_set=cfg.label_set,
+        columns=["cycle_start_ts", "cycle_end_ts", "market_id", "condition_id", "winner_side", "resolved"],
+    )
+    replay, replay_summary = build_replay_frame(
+        features=features,
+        labels=labels,
+        score_frames=[],
+        available_offsets=list(scoped_offsets),
+        scoped_offsets=list(scoped_offsets),
+    )
+    replay = _filter_replay_window(
+        replay,
+        decision_start=decision_start,
+        decision_end=decision_end,
+    )
+    data_cfg = DataConfig.build(
+        market=cfg.asset.slug,
+        cycle=cfg.cycle,
+        surface=cfg.source_surface,
+        root=cfg.layout.storage.rewrite_root,
+    )
+    replay, quote_summary = attach_canonical_quote_surface(
+        replay=replay,
+        data_cfg=data_cfg,
+    )
+    profile_spec = resolve_backtest_profile_spec(
+        market=cfg.asset.slug,
+        profile=profile,
+        parity=None,
+    )
+    _pool_frame, pool_cache = resolve_profitable_offset_pool_frame(
+        cfg=cfg,
+        profile=profile,
+        decision_start=decision_start,
+        decision_end=decision_end,
+        decisions=replay,
+        entry_price_min=profile_spec.entry_price_min,
+        entry_price_max=profile_spec.entry_price_max,
+        stake_label=stake_label,
+    )
+    return {
+        "market": cfg.asset.slug,
+        "cache_status": str(pool_cache.get("cache_status") or ""),
+        "pool_rows": int(pool_cache.get("pool_rows") or 0),
+        "feature_rows": int(len(features)),
+        "replay_rows": int(replay_summary.merged_rows),
+        "quote_ready_rows": int(quote_summary.quote_ready_rows),
+        "data_path": str(pool_cache.get("data_path") or ""),
+        "manifest_path": str(pool_cache.get("manifest_path") or ""),
+    }
+
+
 def _load_quick_screen_feature_frame(
     *,
     cfg: ResearchConfig,
@@ -392,6 +509,36 @@ def _load_quick_screen_feature_frame(
     decision_ts = pd.to_datetime(features.get("decision_ts"), utc=True, errors="coerce")
     offset_values = pd.to_numeric(features.get("offset"), errors="coerce")
     mask = decision_ts.notna() & offset_values.isin([int(offset) for offset in available_offsets])
+
+    start_bound = _parse_window_bound(decision_start, is_end=False)
+    if start_bound is not None:
+        mask &= decision_ts.ge(start_bound)
+
+    end_bound = _parse_window_bound(decision_end, is_end=True)
+    if end_bound is not None:
+        if _looks_like_date_only(decision_end):
+            mask &= decision_ts.lt(end_bound)
+        else:
+            mask &= decision_ts.le(end_bound)
+
+    return features.loc[mask].reset_index(drop=True)
+
+
+def _filter_quick_screen_seed_feature_frame(
+    *,
+    features: pd.DataFrame,
+    available_offsets: list[int],
+    decision_start: str | None,
+    decision_end: str | None,
+) -> pd.DataFrame:
+    if features.empty:
+        return features.copy()
+
+    decision_ts = pd.to_datetime(features.get("decision_ts"), utc=True, errors="coerce")
+    offset_values = pd.to_numeric(features.get("offset"), errors="coerce")
+    mask = decision_ts.notna()
+    if available_offsets:
+        mask &= offset_values.isin([int(offset) for offset in available_offsets])
 
     start_bound = _parse_window_bound(decision_start, is_end=False)
     if start_bound is not None:

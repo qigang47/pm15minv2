@@ -10,6 +10,10 @@ TIMEOUT_SEC=""
 LOG_PATH=""
 STDOUT_PATH=""
 PID_PATH=""
+LAUNCH_MODE=""
+QUICK_SCREEN_TOP_K=""
+QUICK_SCREEN_TRAIN_PARALLEL_WORKERS=""
+EXPECTED_CONCURRENCY=""
 
 usage() {
   echo "usage: run_one_experiment_background.sh --suite <suite> --run-label <run-label> [--market <market>] [--timeout-sec <sec>] [--log-path <path>] [--stdout-path <path>] [--pid-path <path>]" >&2
@@ -69,6 +73,22 @@ while [[ $# -gt 0 ]]; do
       PID_PATH="$2"
       shift 2
       ;;
+    --launch-mode)
+      LAUNCH_MODE="$2"
+      shift 2
+      ;;
+    --quick-screen-top-k)
+      QUICK_SCREEN_TOP_K="$2"
+      shift 2
+      ;;
+    --quick-screen-train-parallel-workers)
+      QUICK_SCREEN_TRAIN_PARALLEL_WORKERS="$2"
+      shift 2
+      ;;
+    --expected-concurrency)
+      EXPECTED_CONCURRENCY="$2"
+      shift 2
+      ;;
     *)
       echo "unknown argument: $1" >&2
       usage
@@ -108,9 +128,25 @@ fi
 if [[ -n "$TIMEOUT_SEC" ]]; then
   cmd+=(--timeout-sec "$TIMEOUT_SEC")
 fi
+if [[ -n "$LAUNCH_MODE" ]]; then
+  cmd+=(--launch-mode "$LAUNCH_MODE")
+fi
+if [[ -n "$QUICK_SCREEN_TOP_K" ]]; then
+  cmd+=(--quick-screen-top-k "$QUICK_SCREEN_TOP_K")
+fi
+if [[ -n "$QUICK_SCREEN_TRAIN_PARALLEL_WORKERS" ]]; then
+  cmd+=(--quick-screen-train-parallel-workers "$QUICK_SCREEN_TRAIN_PARALLEL_WORKERS")
+fi
+if [[ -n "$EXPECTED_CONCURRENCY" ]]; then
+  cmd+=(--expected-concurrency "$EXPECTED_CONCURRENCY")
+fi
 cmd+=(--log-path "$LOG_PATH")
 
-nohup "${cmd[@]}" >"$STDOUT_PATH" 2>&1 &
+if command -v setsid >/dev/null 2>&1; then
+  nohup setsid "${cmd[@]}" >"$STDOUT_PATH" 2>&1 &
+else
+  nohup "${cmd[@]}" >"$STDOUT_PATH" 2>&1 &
+fi
 pid="$!"
 printf '%s\n' "$pid" > "$PID_PATH"
 echo "[run_one_experiment_background] launched pid=$pid suite=$SUITE_NAME run_label=$RUN_LABEL"

@@ -1712,7 +1712,13 @@ def _build_backtest_fill_config(*, spec: BacktestRunSpec, profile_spec) -> Backt
     return BacktestFillConfig(
         base_stake=fill_base_stake,
         max_stake=fill_max_stake,
-        fee_bps=50.0,
+        fee_bps=float(getattr(profile_spec, "fee_bps", 0.0) or 0.0),
+        stake_sizing_mode=str(getattr(profile_spec, "stake_sizing_mode", "fixed") or "fixed"),
+        kelly_fraction=float(getattr(profile_spec, "kelly_fraction", 0.25) or 0.0),
+        kelly_medium_fraction_threshold=float(getattr(profile_spec, "kelly_medium_fraction_threshold", 0.05392156862745098) or 0.0),
+        kelly_strong_fraction_threshold=float(getattr(profile_spec, "kelly_strong_fraction_threshold", 0.07843137254901962) or 0.0),
+        kelly_medium_stake_usd=float(getattr(profile_spec, "kelly_medium_stake_usd", 5.0) or 0.0),
+        kelly_strong_stake_usd=float(getattr(profile_spec, "kelly_strong_stake_usd", 10.0) or 0.0),
         raw_depth_fak_refresh_enabled=(
             True if spec.parity.raw_depth_fak_refresh_enabled is None else bool(spec.parity.raw_depth_fak_refresh_enabled)
         ),

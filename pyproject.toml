@@ -11,6 +11,7 @@ dependencies = [
   "eth-abi>=5.0",
   "eth-utils>=5.0",
   "joblib>=1.5",
+  "catboost>=1.2",
   "lightgbm>=4.0",
   "numpy>=2.0",
   "pandas>=2.0",

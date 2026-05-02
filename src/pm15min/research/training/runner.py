@@ -27,7 +27,9 @@ from pm15min.research.training.explainability import (
 from pm15min.research.training.probes import build_final_model_probe
 from pm15min.research.training.reports import render_offset_training_report, render_training_run_report
 from pm15min.research.training.trainers import (
+    CatBoostUnavailableError,
     TrainerConfig,
+    fit_catboost,
     fit_lgbm,
     fit_logreg,
     generate_oof_predictions,
@@ -342,6 +344,10 @@ def _train_single_offset(
     )
     logreg = fit_logreg(X, y, cfg=trainer_cfg, sample_weight=sample_weight)
     lgbm = fit_lgbm(X, y, cfg=trainer_cfg, sample_weight=sample_weight)
+    try:
+        catboost = fit_catboost(X, y, cfg=trainer_cfg, sample_weight=sample_weight)
+    except CatBoostUnavailableError:
+        catboost = None
 
     report_training_progress(
         reporter,
@@ -359,6 +365,8 @@ def _train_single_offset(
 
     joblib.dump(logreg, models_dir / "logreg_sigmoid.joblib")
     joblib.dump(lgbm, models_dir / "lgbm_sigmoid.joblib")
+    if catboost is not None:
+        joblib.dump(catboost, models_dir / "catboost.joblib")
     joblib.dump(list(X.columns), offset_dir / "feature_cols.joblib")
 
     feature_schema = feature_schema_rows(X)
@@ -370,40 +378,59 @@ def _train_single_offset(
     if oof.empty:
         p_lr = logreg.predict_proba(X)[:, 1].astype(float)
         p_lgb = lgbm.predict_proba(X)[:, 1].astype(float)
+        p_catboost = catboost.predict_proba(X)[:, 1].astype(float) if catboost is not None else None
         eval_y = y.to_numpy(dtype=int)
-        oof_to_write = pd.DataFrame(
-            {
-                "row_number": X.index.astype(int),
-                "fold": -1,
-                "y": eval_y,
-                "p_lgb": p_lgb,
-                "p_lr": p_lr,
-            }
-        )
+        oof_payload = {
+            "row_number": X.index.astype(int),
+            "fold": -1,
+            "y": eval_y,
+            "p_lgb": p_lgb,
+            "p_lr": p_lr,
+        }
+        if p_catboost is not None:
+            oof_payload["p_catboost"] = p_catboost
+        oof_to_write = pd.DataFrame(oof_payload)
     else:
         oof_to_write = oof.copy()
         eval_y = oof_to_write["y"].to_numpy(dtype=int)
         p_lgb = oof_to_write["p_lgb"].to_numpy(dtype=float)
         p_lr = oof_to_write["p_lr"].to_numpy(dtype=float)
+        p_catboost = (
+            oof_to_write["p_catboost"].to_numpy(dtype=float)
+            if catboost is not None and "p_catboost" in oof_to_write.columns
+            else None
+        )
 
+    lgb_metrics = classification_metrics(eval_y, p_lgb)
+    lr_metrics = classification_metrics(eval_y, p_lr)
+    catboost_metrics = classification_metrics(eval_y, p_catboost) if p_catboost is not None else None
     blend_weights = blend_weights_from_brier(
-        brier_lgb=classification_metrics(eval_y, p_lgb)["brier"],
-        brier_lr=classification_metrics(eval_y, p_lr)["brier"],
+        brier_lgb=lgb_metrics["brier"],
+        brier_lr=lr_metrics["brier"],
+        brier_catboost=None if catboost_metrics is None else catboost_metrics["brier"],
     )
     p_blend = blend_weights["w_lgb"] * p_lgb + blend_weights["w_lr"] * p_lr
+    if p_catboost is not None:
+        p_blend = p_blend + blend_weights["w_catboost"] * p_catboost
     full_p_lgb = lgbm.predict_proba(X)[:, 1].astype(float)
     full_p_lr = logreg.predict_proba(X)[:, 1].astype(float)
     full_p_blend = blend_weights["w_lgb"] * full_p_lgb + blend_weights["w_lr"] * full_p_lr
+    if catboost is not None:
+        full_p_blend = full_p_blend + blend_weights["w_catboost"] * catboost.predict_proba(X)[:, 1].astype(float)
     metrics = {
-        "lgbm": classification_metrics(eval_y, p_lgb),
-        "logreg": classification_metrics(eval_y, p_lr),
+        "lgbm": lgb_metrics,
+        "logreg": lr_metrics,
         "blend": classification_metrics(eval_y, p_blend),
     }
+    if catboost_metrics is not None:
+        metrics["catboost"] = catboost_metrics
     reliability_payload = {
         "lgbm": build_reliability_bins(eval_y, p_lgb),
         "logreg": build_reliability_bins(eval_y, p_lr),
         "blend": build_reliability_bins(eval_y, p_blend),
     }
+    if p_catboost is not None:
+        reliability_payload["catboost"] = build_reliability_bins(eval_y, p_catboost)
     probe = build_final_model_probe(
         X=X,
         y=y,
@@ -583,19 +610,24 @@ def _execute_training_offset(
 
 
 def _training_summary_row(*, offset: int, result: dict[str, object]) -> dict[str, object]:
-    return {
+    metrics = result["metrics"]
+    row = {
         "offset": int(offset),
         "rows": result["rows"],
         "positive_rate": result["positive_rate"],
         "dropped_features": result.get("dropped_features", []),
-        "brier_lgb": result["metrics"]["lgbm"]["brier"],
-        "brier_lr": result["metrics"]["logreg"]["brier"],
-        "brier_blend": result["metrics"]["blend"]["brier"],
-        "auc_lgb": result["metrics"]["lgbm"]["auc"],
-        "auc_lr": result["metrics"]["logreg"]["auc"],
-        "auc_blend": result["metrics"]["blend"]["auc"],
+        "brier_lgb": metrics["lgbm"]["brier"],
+        "brier_lr": metrics["logreg"]["brier"],
+        "brier_blend": metrics["blend"]["brier"],
+        "auc_lgb": metrics["lgbm"]["auc"],
+        "auc_lr": metrics["logreg"]["auc"],
+        "auc_blend": metrics["blend"]["auc"],
         "explainability": result["explainability"],
     }
+    if "catboost" in metrics:
+        row["brier_catboost"] = metrics["catboost"]["brier"]
+        row["auc_catboost"] = metrics["catboost"]["auc"]
+    return row
 
 
 def _trainer_cfg_for_offset(

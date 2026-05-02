@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+from pm15min.core.fees import fee_collection, resolve_fee_rate
+
 
 @dataclass(frozen=True)
 class LiveProfileSpec:
@@ -29,6 +31,12 @@ class LiveProfileSpec:
     stake_cash_refresh_seconds: float
     stake_cash_min_usd: float | None
     stake_cash_max_usd: float | None
+    stake_sizing_mode: str
+    kelly_fraction: float
+    kelly_medium_fraction_threshold: float
+    kelly_strong_fraction_threshold: float
+    kelly_medium_stake_usd: float
+    kelly_strong_stake_usd: float
     stop_trading_below_cash_usd: float
     max_trades_per_market: int
     stake_balance_step_threshold_usd: float
@@ -129,12 +137,15 @@ class LiveProfileSpec:
         return max(0.0, float(self.roi_threshold_by_offset.get(int(offset), self.roi_threshold_default)))
 
     def fee_rate(self, *, price: float) -> float:
-        model = str(self.fee_model or "flat_bps").strip().lower()
-        if model == "polymarket_curve":
-            p = max(0.0, min(float(price), 1.0))
-            k = float(self.fee_curve_k)
-            return max(0.0, k * (p * (1.0 - p)) ** 2)
-        return max(0.0, float(self.fee_bps)) / 10000.0
+        return resolve_fee_rate(
+            model=self.fee_model,
+            price=price,
+            fee_bps=self.fee_bps,
+            fee_curve_k=self.fee_curve_k,
+        )
+
+    def fee_collection(self) -> str:
+        return fee_collection(self.fee_model)
 
     def ret_30m_up_floor_for(self, market: str) -> float | None:
         return self.ret_30m_up_floor_by_asset.get(str(market).lower())

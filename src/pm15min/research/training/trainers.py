@@ -57,6 +57,9 @@ class TrainerConfig:
     lgb_num_leaves: int = 15
     lgb_learning_rate: float = 0.05
     lgb_n_estimators: int = 200
+    catboost_iterations: int = 200
+    catboost_learning_rate: float = 0.05
+    catboost_depth: int = 6
     random_seed: int = 42
     purge_minutes: int = 15
     embargo_minutes: int = 0
@@ -71,6 +74,10 @@ class TrainerConfig:
     extra_drop_columns: tuple[str, ...] = ()
     parallel_workers: int = 1
     feature_set_root: os.PathLike[str] | str | None = None
+
+
+class CatBoostUnavailableError(RuntimeError):
+    pass
 
 
 def training_features(df: pd.DataFrame) -> list[str]:
@@ -176,6 +183,32 @@ def fit_lgbm(
     return model
 
 
+def fit_catboost(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    cfg: TrainerConfig,
+    sample_weight: pd.Series | None = None,
+):
+    CatBoostClassifier = _load_catboost_classifier()
+    model = CatBoostClassifier(
+        iterations=int(cfg.catboost_iterations),
+        learning_rate=float(cfg.catboost_learning_rate),
+        depth=int(cfg.catboost_depth),
+        loss_function="Logloss",
+        eval_metric="AUC",
+        random_seed=int(cfg.random_seed),
+        thread_count=_resolve_lgb_n_jobs(cfg),
+        allow_writing_files=False,
+        verbose=False,
+    )
+    if sample_weight is None:
+        model.fit(X, y, verbose=False)
+    else:
+        model.fit(X, y, sample_weight=np.asarray(sample_weight, dtype=float), verbose=False)
+    return model
+
+
 def generate_oof_predictions(
     X: pd.DataFrame,
     y: pd.Series,
@@ -221,17 +254,20 @@ def generate_oof_predictions(
         )
         logreg = fit_logreg(X_train, y_train, cfg=cfg, sample_weight=sample_weight)
         lgbm = fit_lgbm(X_train, y_train, cfg=cfg, sample_weight=sample_weight)
-        rows.append(
-            pd.DataFrame(
-                {
-                    "row_number": X_test.index.astype(int),
-                    "fold": fold,
-                    "y": y_test.astype(int).values,
-                    "p_lgb": lgbm.predict_proba(X_test)[:, 1].astype(float),
-                    "p_lr": logreg.predict_proba(X_test)[:, 1].astype(float),
-                }
-            )
-        )
+        payload = {
+            "row_number": X_test.index.astype(int),
+            "fold": fold,
+            "y": y_test.astype(int).values,
+            "p_lgb": lgbm.predict_proba(X_test)[:, 1].astype(float),
+            "p_lr": logreg.predict_proba(X_test)[:, 1].astype(float),
+        }
+        try:
+            catboost = fit_catboost(X_train, y_train, cfg=cfg, sample_weight=sample_weight)
+        except CatBoostUnavailableError:
+            catboost = None
+        if catboost is not None:
+            payload["p_catboost"] = catboost.predict_proba(X_test)[:, 1].astype(float)
+        rows.append(pd.DataFrame(payload))
     if not rows:
         return pd.DataFrame(columns=["row_number", "fold", "y", "p_lgb", "p_lr"])
     return pd.concat(rows, ignore_index=True).sort_values(["row_number", "fold"]).reset_index(drop=True)
@@ -254,3 +290,11 @@ def _read_positive_int_env(name: str) -> int | None:
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
+
+
+def _load_catboost_classifier():
+    try:
+        from catboost import CatBoostClassifier
+    except ImportError as exc:  # pragma: no cover - depends on optional runtime package
+        raise CatBoostUnavailableError("catboost is not installed") from exc
+    return CatBoostClassifier

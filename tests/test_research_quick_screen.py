@@ -98,6 +98,75 @@ def test_build_quick_screen_summary_counts_price_band_and_trade_hits() -> None:
         "missed": 1,
         "traded_wrong_side": 0,
     }
+    assert summary["density_bottleneck"]["primary_bottleneck"] == "low_trade_density"
+    assert summary["density_bottleneck"]["recommended_route"] == "feature_width_or_family_rework"
+
+
+def test_build_quick_screen_summary_reports_density_bottleneck() -> None:
+    decisions = pd.DataFrame(
+        [
+            {
+                "resolved": True,
+                "winner_side": "UP",
+                "quote_status": "ok",
+                "quote_up_ask": 0.18,
+                "quote_down_ask": 0.82,
+                "predicted_side": "UP",
+                "policy_action": "reject",
+                "policy_reason": "direction_prob",
+            },
+            {
+                "resolved": True,
+                "winner_side": "DOWN",
+                "quote_status": "ok",
+                "quote_up_ask": 0.88,
+                "quote_down_ask": 0.16,
+                "predicted_side": "DOWN",
+                "policy_action": "reject",
+                "policy_reason": "direction_prob",
+            },
+            {
+                "resolved": True,
+                "winner_side": "UP",
+                "quote_status": "ok",
+                "quote_up_ask": 0.22,
+                "quote_down_ask": 0.79,
+                "predicted_side": "UP",
+                "policy_action": "trade",
+                "policy_reason": "trade",
+            },
+            {
+                "resolved": True,
+                "winner_side": "DOWN",
+                "quote_status": "ok",
+                "quote_up_ask": 0.73,
+                "quote_down_ask": 0.40,
+                "predicted_side": "DOWN",
+                "policy_action": "reject",
+                "policy_reason": "entry_price_max",
+            },
+        ]
+    )
+
+    summary = build_quick_screen_summary(
+        decisions,
+        entry_price_min=0.01,
+        entry_price_max=0.30,
+    )
+
+    assert summary["density_bottleneck"] == {
+        "primary_bottleneck": "probability_gate",
+        "recommended_route": "model_or_calibration_rework",
+        "sparse_density": True,
+        "dominant_reject_reason": "direction_prob",
+        "dominant_reject_rows": 2,
+        "reject_rows": 3,
+        "quote_missing_rows": 0,
+        "trade_rows": 1,
+        "profitable_pool_rows": 3,
+        "profitable_pool_capture_rows": 1,
+        "profitable_pool_correct_side_rows": 3,
+    }
 
 
 def test_build_profitable_offset_pool_frame_marks_strict_tradeable_captures() -> None:

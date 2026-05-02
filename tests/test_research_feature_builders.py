@@ -65,6 +65,32 @@ def _oscillating_klines() -> pd.DataFrame:
     return pd.DataFrame(payload)
 
 
+def _late_up_cross_klines(rows: int = 60) -> pd.DataFrame:
+    start = pd.Timestamp("2026-03-20T00:00:00Z")
+    payload: list[dict[str, object]] = []
+    for idx in range(rows):
+        open_time = start + pd.Timedelta(minutes=idx)
+        close = 99.0 + (0.02 * idx)
+        if 30 <= idx <= 39:
+            close = 99.20 - (0.02 * (idx - 30))
+        elif 40 <= idx <= 44:
+            close = 100.05 + (0.05 * (idx - 40))
+        payload.append(
+            {
+                "open_time": open_time,
+                "open": close - 0.03,
+                "high": close + 0.08,
+                "low": close - 0.08,
+                "close": close,
+                "volume": 1000.0 + idx,
+                "quote_asset_volume": 2000.0 + idx * 5.0,
+                "taker_buy_quote_volume": 900.0 + idx * 3.0,
+                "number_of_trades": 100 + idx,
+            }
+        )
+    return pd.DataFrame(payload)
+
+
 def test_build_feature_frame_preserves_legacy_auxiliary_columns_for_selected_groups() -> None:
     raw_klines = _raw_klines()
     oracle_prices = _oracle_prices()
@@ -161,3 +187,54 @@ def test_build_feature_frame_counts_strike_side_flips_within_cycle() -> None:
     )
 
     assert int(features.iloc[-1]["strike_flip_count_cycle"]) == 10
+
+
+def test_build_feature_frame_emits_time_pressure_and_hold_features_without_future_leakage() -> None:
+    oracle_prices = pd.DataFrame(
+        [
+            {
+                "cycle_start_ts": int((pd.Timestamp("2026-03-20T00:00:00Z") + pd.Timedelta(minutes=idx * 15)).timestamp()),
+                "cycle_end_ts": int((pd.Timestamp("2026-03-20T00:15:00Z") + pd.Timedelta(minutes=idx * 15)).timestamp()),
+                "price_to_beat": 100.0,
+                "final_price": 100.5,
+            }
+            for idx in range(4)
+        ]
+    )
+    features = build_feature_frame(
+        _late_up_cross_klines(),
+        feature_set="deep_otm_v1",
+        oracle_prices=oracle_prices,
+        cycle="15m",
+        requested_columns={
+            "minutes_left_to_settle",
+            "up_move_remaining_per_minute",
+            "up_move_remaining_z_per_minute",
+            "first_up_cross_offset",
+            "minutes_since_first_up_cross",
+            "up_hold_minutes",
+        },
+    )
+
+    cycle_rows = features.loc[features["cycle_start_ts"].eq(pd.Timestamp("2026-03-20T00:30:00Z"))].reset_index(drop=True)
+    before_cross = cycle_rows.loc[cycle_rows["offset"].eq(10)].iloc[0]
+    cross_row = cycle_rows.loc[cycle_rows["offset"].eq(11)].iloc[0]
+    late_row = cycle_rows.loc[cycle_rows["offset"].eq(14)].iloc[0]
+
+    assert float(before_cross["minutes_left_to_settle"]) == 5.0
+    assert pd.isna(before_cross["first_up_cross_offset"])
+    assert pd.isna(before_cross["minutes_since_first_up_cross"])
+    assert float(before_cross["up_move_remaining_per_minute"]) > 0.0
+    assert float(before_cross["up_move_remaining_z_per_minute"]) > 0.0
+
+    assert float(cross_row["minutes_left_to_settle"]) == 4.0
+    assert float(cross_row["first_up_cross_offset"]) == 11.0
+    assert float(cross_row["minutes_since_first_up_cross"]) == 0.0
+    assert float(cross_row["up_hold_minutes"]) == 1.0
+    assert float(cross_row["up_move_remaining_per_minute"]) == 0.0
+
+    assert float(late_row["minutes_left_to_settle"]) == 1.0
+    assert float(late_row["first_up_cross_offset"]) == 11.0
+    assert float(late_row["minutes_since_first_up_cross"]) == 3.0
+    assert float(late_row["up_hold_minutes"]) == 4.0
+    assert float(late_row["up_move_remaining_z_per_minute"]) == 0.0

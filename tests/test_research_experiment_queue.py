@@ -23,13 +23,64 @@ from pm15min.research.automation.queue_state import (
 )
 
 
-def test_load_experiment_queue_defaults_to_sixteen_live_runs_and_twenty_four_queued_items(tmp_path: Path) -> None:
+def test_load_experiment_queue_defaults_to_eight_live_runs_and_twenty_four_queued_items(tmp_path: Path) -> None:
     root = tmp_path / "repo"
 
     state = load_experiment_queue(root)
 
-    assert state["max_live_runs"] == 16
+    assert state["max_live_runs"] == 8
     assert state["max_queued_items"] == 24
+    assert state["track_slot_caps"] == {"direction_dense": 4, "reversal_dense": 4}
+
+
+def test_cli_supervise_once_skips_launch_when_available_memory_is_low(tmp_path: Path) -> None:
+    workspace_root = Path(__file__).resolve().parents[1]
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="sol",
+            suite_name="sol_suite",
+            run_label="sol_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(workspace_root / "auto_research" / "experiment_queue.py"),
+            "--root",
+            str(root),
+            "supervise-once",
+            "--max-live-runs",
+            "1",
+            "--min-available-mem-gb",
+            "32",
+            "--meminfo-path",
+            str(tmp_path / "meminfo"),
+        ],
+        cwd=workspace_root,
+        env={**os.environ, "PYTHONPATH": str(workspace_root / "src")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["memory_gate"]["state"] == "blocked"
+    assert payload["launched"] == []
+    assert payload["memory_gate"]["required_kb"] == 32 * 1024 * 1024
+    state = load_experiment_queue(root)
+    item = next(entry for entry in state["items"] if entry["run_label"] == "sol_run")
+    assert item["status"] == "queued"
 
 
 def test_upsert_queue_item_prunes_low_priority_pending_items_beyond_queue_cap(tmp_path: Path) -> None:
@@ -274,6 +325,94 @@ def test_select_launchable_queue_items_respects_track_slot_caps(tmp_path: Path) 
     for item in selected:
         counts[item["track"]] = counts.get(item["track"], 0) + 1
     assert counts == {"direction_dense": 2, "reversal_dense": 2}
+
+
+def test_fixed_track_slot_caps_env_overrides_queue_payload(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    monkeypatch.setenv(
+        "PM15MIN_FIXED_TRACK_SLOT_CAPS_JSON",
+        '{"direction_dense":8,"reversal_dense":8}',
+    )
+
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 16, "reversal_dense": 0}
+    save_experiment_queue(root, payload)
+
+    state = load_experiment_queue(root)
+
+    assert state["track_slot_caps"] == {"direction_dense": 8, "reversal_dense": 8}
+
+
+def test_allowed_queue_markets_env_filters_queue_items_and_blocks_disallowed_upserts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "repo"
+    monkeypatch.setenv("PM15MIN_ALLOWED_QUEUE_MARKETS", "xrp")
+
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_direction",
+            run_label="xrp_direction",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+        ),
+    )
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="sol",
+            suite_name="sol_direction",
+            run_label="sol_direction",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+        ),
+    )
+
+    payload = load_experiment_queue(root)
+
+    assert [item["market"] for item in payload["items"]] == ["xrp"]
+
+
+def test_select_launchable_queue_items_ignores_live_workers_outside_allowed_markets(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "repo"
+    monkeypatch.setenv("PM15MIN_ALLOWED_QUEUE_MARKETS", "sol,xrp")
+
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="sol",
+            suite_name="sol_direction",
+            run_label="sol_direction",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+        ),
+    )
+    payload = load_experiment_queue(root)
+    payload["max_live_runs"] = 1
+
+    selected = select_launchable_queue_items(
+        payload,
+        max_live_runs=1,
+        live_workers=[
+            {
+                "market": "btc",
+                "suite_name": "btc_formal",
+                "run_label": "btc_formal",
+                "track": "direction_midprice",
+            }
+        ],
+    )
+
+    assert [item["run_label"] for item in selected] == ["sol_direction"]
 
 
 def test_seeded_live_worker_without_explicit_track_still_counts_against_inferred_track_cap(tmp_path: Path) -> None:
@@ -1036,6 +1175,54 @@ def test_launch_ready_queue_items_marks_selected_items_running(tmp_path: Path) -
     assert launched == ["eth_repair", "btc_launch"]
     running = {item["run_label"] for item in state["items"] if item["status"] == "running"}
     assert running == {"eth_repair", "btc_launch"}
+
+
+def test_launch_ready_queue_items_can_limit_new_launches_per_pass(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="eth",
+            suite_name="eth_repair_suite",
+            run_label="eth_repair",
+            action="repair",
+            status="queued",
+            reason="repair first",
+            track="direction_dense",
+            session_dir=root / "sessions" / "direction_dense",
+            program_path=root / "auto_research" / "program_direction_dense.md",
+        ),
+    )
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="btc",
+            suite_name="btc_launch_suite",
+            run_label="btc_launch",
+            action="launch",
+            status="queued",
+            reason="launch second",
+            track="reversal_dense",
+            session_dir=root / "sessions" / "reversal_dense",
+            program_path=root / "auto_research" / "program_reversal_dense.md",
+        ),
+    )
+
+    launched: list[str] = []
+
+    state, launched_items = launch_ready_queue_items(
+        root,
+        live_workers=[],
+        launcher=lambda item: launched.append(str(item["run_label"])) or {"pid": 123},
+        max_live_runs=4,
+        max_new_launches=1,
+    )
+
+    assert [item["run_label"] for item in launched_items] == ["eth_repair"]
+    assert launched == ["eth_repair"]
+    statuses = {item["run_label"]: item["status"] for item in state["items"]}
+    assert statuses["eth_repair"] == "running"
+    assert statuses["btc_launch"] == "queued"
 
 
 def test_ensure_running_queue_items_seeds_orphan_live_workers(tmp_path: Path) -> None:

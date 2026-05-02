@@ -9,6 +9,10 @@ RUN_LABEL=""
 MARKET=""
 TIMEOUT_SEC=""
 LOG_PATH=""
+CLI_LAUNCH_MODE=""
+CLI_QUICK_SCREEN_TOP_K=""
+CLI_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS=""
+CLI_EXPECTED_CONCURRENCY=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,6 +40,22 @@ while [[ $# -gt 0 ]]; do
       LOG_PATH="$2"
       shift 2
       ;;
+    --launch-mode)
+      CLI_LAUNCH_MODE="$2"
+      shift 2
+      ;;
+    --quick-screen-top-k)
+      CLI_QUICK_SCREEN_TOP_K="$2"
+      shift 2
+      ;;
+    --quick-screen-train-parallel-workers)
+      CLI_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS="$2"
+      shift 2
+      ;;
+    --expected-concurrency)
+      CLI_EXPECTED_CONCURRENCY="$2"
+      shift 2
+      ;;
     *)
       echo "unknown argument: $1" >&2
       exit 2
@@ -57,10 +77,30 @@ pm15min_activate_python
 export PYTHONPATH="$ROOT_DIR/src"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/pm15min-mpl}"
 export PM15MIN_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES="${PM15MIN_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES:-1}"
-export PM15MIN_EXPERIMENT_LAUNCH_MODE="${PM15MIN_EXPERIMENT_LAUNCH_MODE:-formal}"
-export PM15MIN_QUICK_SCREEN_TOP_K="${PM15MIN_QUICK_SCREEN_TOP_K:-1}"
-export PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS="${PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS:-3}"
-export PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY="${PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY:-16}"
+export PM15MIN_MEMORY_GUARD_ENABLE="${PM15MIN_MEMORY_GUARD_ENABLE:-1}"
+export PM15MIN_MIN_AVAILABLE_MEM_GB="${PM15MIN_MIN_AVAILABLE_MEM_GB:-12}"
+export PM15MIN_MEMORY_GUARD_SLEEP_SEC="${PM15MIN_MEMORY_GUARD_SLEEP_SEC:-30}"
+export PM15MIN_MEMORY_GUARD_MAX_WAIT_SEC="${PM15MIN_MEMORY_GUARD_MAX_WAIT_SEC:-0}"
+if [[ -n "$CLI_LAUNCH_MODE" ]]; then
+  export PM15MIN_EXPERIMENT_LAUNCH_MODE="$CLI_LAUNCH_MODE"
+else
+  export PM15MIN_EXPERIMENT_LAUNCH_MODE="${PM15MIN_EXPERIMENT_LAUNCH_MODE:-formal}"
+fi
+if [[ -n "$CLI_QUICK_SCREEN_TOP_K" ]]; then
+  export PM15MIN_QUICK_SCREEN_TOP_K="$CLI_QUICK_SCREEN_TOP_K"
+else
+  export PM15MIN_QUICK_SCREEN_TOP_K="${PM15MIN_QUICK_SCREEN_TOP_K:-1}"
+fi
+if [[ -n "$CLI_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS" ]]; then
+  export PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS="$CLI_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS"
+else
+  export PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS="${PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS:-3}"
+fi
+if [[ -n "$CLI_EXPECTED_CONCURRENCY" ]]; then
+  export PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY="$CLI_EXPECTED_CONCURRENCY"
+else
+  export PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY="${PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY:-16}"
+fi
 export PM15MIN_EXPERIMENT_CPU_THREADS="${PM15MIN_EXPERIMENT_CPU_THREADS:-}"
 mkdir -p "$MPLCONFIGDIR"
 
@@ -98,6 +138,75 @@ if [[ -z "$LOG_PATH" ]]; then
 fi
 mkdir -p "$(dirname "$LOG_PATH")"
 
+memory_guard_required_kb() {
+  "$PYTHON_BIN" - <<'PY' "$PM15MIN_MIN_AVAILABLE_MEM_GB"
+import sys
+
+try:
+    gb = float(sys.argv[1])
+except Exception:
+    gb = 12.0
+print(max(0, int(gb * 1024 * 1024)))
+PY
+}
+
+memory_guard_available_kb() {
+  awk '/MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true
+}
+
+wait_for_memory_guard() {
+  if [[ "$PM15MIN_MEMORY_GUARD_ENABLE" != "1" ]]; then
+    echo "[run_one_experiment] memory_guard disabled"
+    return 0
+  fi
+  if [[ ! -r /proc/meminfo ]]; then
+    echo "[run_one_experiment] memory_guard skipped: /proc/meminfo unavailable"
+    return 0
+  fi
+
+  local required_kb available_kb sleep_sec max_wait_sec start_epoch now_epoch waited_sec
+  required_kb="$(memory_guard_required_kb)"
+  if [[ ! "$required_kb" =~ ^[0-9]+$ ]] || [[ "$required_kb" -le 0 ]]; then
+    echo "[run_one_experiment] memory_guard skipped: invalid reserve=${PM15MIN_MIN_AVAILABLE_MEM_GB}GB"
+    return 0
+  fi
+  sleep_sec="$PM15MIN_MEMORY_GUARD_SLEEP_SEC"
+  if [[ ! "$sleep_sec" =~ ^[0-9]+$ ]] || [[ "$sleep_sec" -lt 1 ]]; then
+    sleep_sec=30
+  fi
+  max_wait_sec="$PM15MIN_MEMORY_GUARD_MAX_WAIT_SEC"
+  if [[ ! "$max_wait_sec" =~ ^[0-9]+$ ]]; then
+    max_wait_sec=0
+  fi
+  start_epoch="$(date +%s)"
+
+  while true; do
+    available_kb="$(memory_guard_available_kb)"
+    if [[ "$available_kb" =~ ^[0-9]+$ && "$available_kb" -ge "$required_kb" ]]; then
+      echo "[run_one_experiment] memory_guard ok available_mb=$(( available_kb / 1024 )) reserve_mb=$(( required_kb / 1024 ))"
+      return 0
+    fi
+    now_epoch="$(date +%s)"
+    waited_sec="$(( now_epoch - start_epoch ))"
+    if [[ "$max_wait_sec" -gt 0 && "$waited_sec" -ge "$max_wait_sec" ]]; then
+      echo "[run_one_experiment] memory_guard timeout available_mb=$(( ${available_kb:-0} / 1024 )) reserve_mb=$(( required_kb / 1024 )) waited_sec=$waited_sec" >&2
+      return 75
+    fi
+    echo "[run_one_experiment] memory_guard waiting available_mb=$(( ${available_kb:-0} / 1024 )) reserve_mb=$(( required_kb / 1024 )) waited_sec=$waited_sec sleep_sec=$sleep_sec"
+    sleep "$sleep_sec"
+  done
+}
+
+notify_autoresearch_wake() {
+  if [[ "$LAUNCH_MODE" == "formal" ]]; then
+    if [[ -n "${PM15MIN_AUTORESEARCH_WAKE_FLAG:-}" ]]; then
+      mkdir -p "$(dirname "$PM15MIN_AUTORESEARCH_WAKE_FLAG")"
+      touch "$PM15MIN_AUTORESEARCH_WAKE_FLAG"
+      echo "[run_one_experiment] autoresearch wake flag touched path=$PM15MIN_AUTORESEARCH_WAKE_FLAG"
+    fi
+  fi
+}
+
 LAUNCH_MODE="${PM15MIN_EXPERIMENT_LAUNCH_MODE:-formal}"
 case "$LAUNCH_MODE" in
   formal)
@@ -132,16 +241,24 @@ if [[ -n "$TIMEOUT_SEC" ]]; then
   fi
 fi
 
+set +e
 {
   echo "[run_one_experiment] mode=$LAUNCH_MODE suite=$SUITE_NAME run_label=$RUN_LABEL market=${MARKET:-all}"
   echo "[run_one_experiment] cpu_threads=$PM15MIN_EXPERIMENT_CPU_THREADS expected_concurrency=$PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY"
   echo "[run_one_experiment] quick_screen_train_parallel_workers=$PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS"
+  wait_for_memory_guard || exit "$?"
   if [[ ${#TIMEOUT_PREFIX[@]} -gt 0 ]]; then
     "${TIMEOUT_PREFIX[@]}" "${CMD[@]}"
   else
     "${CMD[@]}"
   fi
 } 2>&1 | tee "$LOG_PATH"
+run_exit_code="${PIPESTATUS[0]}"
+set -e
+notify_autoresearch_wake
+if [[ "$run_exit_code" -ne 0 ]]; then
+  exit "$run_exit_code"
+fi
 
 RUN_DIR="$("$PYTHON_BIN" - <<'PY' "$ROOT_DIR" "$SUITE_NAME" "$RUN_LABEL"
 from pathlib import Path
@@ -157,3 +274,4 @@ PY
 )"
 
 echo "$RUN_DIR"
+exit "$run_exit_code"

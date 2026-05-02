@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
@@ -16,7 +17,7 @@ from pm15min.research.labels.datasets import build_label_frame_dataset
 from pm15min.research.training.reports import render_offset_training_report, render_training_run_report
 from pm15min.research.training.runner import train_research_run
 from pm15min.research.training.splits import build_purged_time_series_splits
-from pm15min.research.training.trainers import TrainerConfig, fit_lgbm, generate_oof_predictions
+from pm15min.research.training.trainers import TrainerConfig, fit_catboost, fit_lgbm, generate_oof_predictions
 from pm15min.research.training.weights import compute_sample_weights
 
 
@@ -209,13 +210,21 @@ def test_train_research_run_writes_reports_and_rich_offset_summary(tmp_path: Pat
         assert (offset_dir / "summary.json").exists()
         assert (offset_dir / "report.md").exists()
         assert (offset_dir / "feature_pruning.json").exists()
+        assert (offset_dir / "models" / "catboost.joblib").exists()
         assert (offset_dir / "logreg_coefficients.json").exists()
         assert (offset_dir / "lgb_feature_importance.json").exists()
         assert (offset_dir / "factor_direction_summary.json").exists()
         assert (offset_dir / "factor_correlations.parquet").exists()
         assert (offset_dir / "probe.json").exists()
         assert (offset_dir / "calibration" / "reliability_bins.json").exists()
+        assert (offset_dir / "calibration" / "reliability_bins_catboost.json").exists()
+        blend_weights = json.loads((offset_dir / "calibration" / "blend_weights.json").read_text(encoding="utf-8"))
+        assert blend_weights["method"] == "inverse_brier_weight"
+        assert set(blend_weights) >= {"w_lgb", "w_lr", "w_catboost"}
+        assert blend_weights["w_catboost"] > 0.0
+        assert blend_weights["w_lgb"] + blend_weights["w_lr"] + blend_weights["w_catboost"] == pytest.approx(1.0)
         summary_payload = json.loads((offset_dir / "summary.json").read_text(encoding="utf-8"))
+        assert "catboost" in summary_payload["metrics"]
         assert summary_payload["weight_summary"]["mean_weight"] is not None
         assert summary_payload["split_summary"]["folds_built"] >= summary_payload["split_summary"]["folds_used"]
         assert summary_payload["explainability"]["top_logreg_coefficients"]
@@ -352,6 +361,35 @@ def test_fit_lgbm_splits_experiment_cpu_thread_cap_across_parallel_workers(monke
     model = fit_lgbm(X, y, cfg=TrainerConfig(parallel_workers=3))
 
     assert model.get_params()["n_jobs"] == 2
+
+
+def test_fit_catboost_splits_experiment_cpu_thread_cap_across_parallel_workers(monkeypatch) -> None:
+    class FakeCatBoostClassifier:
+        def __init__(self, **params):
+            self.params = params
+            self.fit_sample_weight = None
+
+        def fit(self, X, y, *, sample_weight=None, verbose=None):
+            self.fit_sample_weight = sample_weight
+            return self
+
+        def get_params(self):
+            return self.params
+
+    monkeypatch.setattr("pm15min.research.training.trainers.os.cpu_count", lambda: 24)
+    monkeypatch.setenv("PM15MIN_EXPERIMENT_CPU_THREADS", "6")
+    monkeypatch.setattr(
+        "pm15min.research.training.trainers._load_catboost_classifier",
+        lambda: FakeCatBoostClassifier,
+    )
+    X = pd.DataFrame({"feature_a": np.linspace(0.0, 1.0, 12), "feature_b": np.linspace(1.0, 0.0, 12)})
+    y = pd.Series([0, 1] * 6, dtype=int)
+    sample_weight = pd.Series(np.linspace(1.0, 2.0, 12))
+
+    model = fit_catboost(X, y, cfg=TrainerConfig(parallel_workers=3), sample_weight=sample_weight)
+
+    assert model.get_params()["thread_count"] == 2
+    assert model.fit_sample_weight is not None
 
 
 def test_train_research_run_reports_offset_progress_and_oof_heartbeats(tmp_path: Path) -> None:

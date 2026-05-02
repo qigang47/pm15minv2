@@ -13,6 +13,7 @@ from typing import Sequence
 
 import pandas as pd
 
+from pm15min.core.fees import expected_resolution_roi, resolve_fee_rate
 from pm15min.live.profiles.spec import LiveProfileSpec
 
 
@@ -71,11 +72,12 @@ class DecisionEngineParityConfig:
         return max(0.0, float(self.roi_threshold_by_offset.get(int(offset), self.roi_threshold_default)))
 
     def fee_rate(self, *, price: float) -> float:
-        model = str(self.fee_model or "flat_bps").strip().lower()
-        if model == "polymarket_curve":
-            bounded_price = max(0.0, min(float(price), 1.0))
-            return max(0.0, float(self.fee_curve_k) * (bounded_price * (1.0 - bounded_price)) ** 2)
-        return max(0.0, float(self.fee_bps)) / 10_000.0
+        return resolve_fee_rate(
+            model=self.fee_model,
+            price=price,
+            fee_bps=self.fee_bps,
+            fee_curve_k=self.fee_curve_k,
+        )
 
 
 @dataclass(frozen=True)
@@ -191,16 +193,34 @@ def evaluate_decision_engine_side(
     slip = max(0.0, float(cfg.slippage_bps)) / 10_000.0
     c_up_eff = c_up * (1.0 + slip)
     c_down_eff = c_down * (1.0 + slip)
-    fee_up = cfg.fee_rate(price=c_up_eff)
-    fee_down = cfg.fee_rate(price=c_down_eff)
     roi_threshold = cfg.roi_threshold_for(offset=int(offset))
 
     up_edge = p_up_eff - c_up
     down_edge = p_down_eff - c_down
     roi_up = _roi(edge=up_edge, price=c_up) if in_up else float("-inf")
     roi_down = _roi(edge=down_edge, price=c_down) if in_down else float("-inf")
-    roi_up_net = _roi_net(prob=p_up_eff, effective_price=c_up_eff, fee_rate=fee_up) if in_up else float("-inf")
-    roi_down_net = _roi_net(prob=p_down_eff, effective_price=c_down_eff, fee_rate=fee_down) if in_down else float("-inf")
+    roi_up_net = (
+        expected_resolution_roi(
+            probability=p_up_eff,
+            price=c_up_eff,
+            model=cfg.fee_model,
+            fee_bps=cfg.fee_bps,
+            fee_curve_k=cfg.fee_curve_k,
+        )
+        if in_up
+        else float("-inf")
+    )
+    roi_down_net = (
+        expected_resolution_roi(
+            probability=p_down_eff,
+            price=c_down_eff,
+            model=cfg.fee_model,
+            fee_bps=cfg.fee_bps,
+            fee_curve_k=cfg.fee_curve_k,
+        )
+        if in_down
+        else float("-inf")
+    )
     min_net_edge_up = cfg.min_net_edge_for(offset=int(offset), entry_price=c_up)
     min_net_edge_down = cfg.min_net_edge_for(offset=int(offset), entry_price=c_down)
 

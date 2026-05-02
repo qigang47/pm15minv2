@@ -131,6 +131,11 @@ def _resolve_required_feature_columns(
             "strike_flip_count_cycle",
             "q_bs_up_strike",
             "q_bs_up_strike_centered",
+            "up_move_remaining_per_minute",
+            "up_move_remaining_z_per_minute",
+            "first_up_cross_offset",
+            "minutes_since_first_up_cross",
+            "up_hold_minutes",
         }
     ):
         required.update({"ret_from_cycle_open", "rv_30"})

@@ -84,9 +84,11 @@ def render_training_run_report(summary_payload: dict[str, object]) -> str:
             "dropped_features",
             "brier_lgb",
             "brier_lr",
+            "brier_catboost",
             "brier_blend",
             "auc_lgb",
             "auc_lr",
+            "auc_catboost",
             "auc_blend",
         ]
         columns = [column for column in preferred if column in frame.columns]

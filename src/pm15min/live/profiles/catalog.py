@@ -22,12 +22,18 @@ _DEFAULT_PROFILE_VALUES = {
     "slippage_bps": 0.0,
     "fee_model": "polymarket_curve",
     "fee_bps": 1.0,
-    "fee_curve_k": 0.25,
+    "fee_curve_k": 0.072,
     "stake_usd": 1.0,
     "stake_cash_pct": 0.0,
     "stake_cash_refresh_seconds": 30.0,
     "stake_cash_min_usd": 1.0,
     "stake_cash_max_usd": None,
+    "stake_sizing_mode": "fixed",
+    "kelly_fraction": 0.25,
+    "kelly_medium_fraction_threshold": 0.05392156862745098,
+    "kelly_strong_fraction_threshold": 0.07843137254901962,
+    "kelly_medium_stake_usd": 5.0,
+    "kelly_strong_stake_usd": 10.0,
     "stop_trading_below_cash_usd": 0.0,
     "max_trades_per_market": 0,
     "stake_balance_step_threshold_usd": 0.0,
@@ -247,6 +253,28 @@ DEEP_OTM_BASELINE_LIVE_PROFILE_SPEC = LiveProfileSpec(
     )
 )
 
+DEEP_OTM_MIDPRICE_DIRECTION_LIVE_PROFILE_SPEC = LiveProfileSpec(
+    **(
+        DEEP_OTM_BASELINE_LIVE_PROFILE_SPEC.to_dict()
+        | {
+            "profile": "deep_otm_midprice_direction",
+            "target": "direction",
+            "active_markets": ("btc", "eth"),
+            "entry_price_min": 0.45,
+            "entry_price_max": 0.50,
+            "min_dir_prob_default": 0.60,
+            "min_dir_prob_by_offset": {},
+            "min_net_edge_default": 0.0,
+            "min_net_edge_by_offset": {7: 0.0, 8: 0.0, 9: 0.0},
+            "stake_usd": 2.0,
+            "max_notional_usd": 10.0,
+            "stake_sizing_mode": "kelly_tiers",
+            "kelly_medium_stake_usd": 5.0,
+            "kelly_strong_stake_usd": 10.0,
+        }
+    )
+)
+
 DEEP_OTM_5M_LIVE_PROFILE_SPEC = LiveProfileSpec(
     **(
         DEEP_OTM_LIVE_PROFILE_SPEC.to_dict()
@@ -293,6 +321,7 @@ LIVE_PROFILE_SPECS = {
     "default": DEFAULT_LIVE_PROFILE_SPEC,
     "deep_otm": DEEP_OTM_LIVE_PROFILE_SPEC,
     "deep_otm_baseline": DEEP_OTM_BASELINE_LIVE_PROFILE_SPEC,
+    "deep_otm_midprice_direction": DEEP_OTM_MIDPRICE_DIRECTION_LIVE_PROFILE_SPEC,
     "deep_otm_5m": DEEP_OTM_5M_LIVE_PROFILE_SPEC,
     "deep_otm_5m_baseline": DEEP_OTM_5M_BASELINE_LIVE_PROFILE_SPEC,
 }

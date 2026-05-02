@@ -385,6 +385,7 @@ def _training_offset_preview(rows: list[dict[str, object]]) -> dict[str, object]
                 "logloss": _metrics_payload_value(metrics, "logloss"),
                 "blend_w_lgb": blend_weights.get("w_lgb"),
                 "blend_w_lr": blend_weights.get("w_lr"),
+                "blend_w_catboost": blend_weights.get("w_catboost"),
                 "bundle_ready": readiness.get("is_ready"),
                 "missing_bundle_artifacts": list(readiness.get("missing_artifacts") or []),
                 "top_logreg_feature": _first_preview_feature(explainability.get("top_logreg_coefficients")),

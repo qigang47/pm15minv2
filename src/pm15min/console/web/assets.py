@@ -1176,6 +1176,7 @@ def build_console_js() -> str:
     offsets_with_logloss: "有 Logloss 的 offset 数",
     blend_w_lgb: "LGB 混合权重",
     blend_w_lr: "LR 混合权重",
+    blend_w_catboost: "CatBoost 混合权重",
     bundle_ready: "可直接打包",
     missing_bundle_artifacts: "缺失打包产物",
     offsets_with_explainability: "有解释性产物的 offset 数",

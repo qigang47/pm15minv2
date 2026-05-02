@@ -14,6 +14,8 @@
   - operator 值班手册。
 - `DEEP_OTM_BASELINE_UP_DIAGNOSIS.md`
   - `deep_otm_baseline` 的纯诊断文档，只保留病灶、证据、因子分组和诊断边界。
+- `DEEP_OTM_BASELINE_FACTOR_BACKLOG.md`
+  - `deep_otm_baseline` 的因子缺口和优先级清单，只保留哪些该补、哪些别再堆、哪些适合优先进入自动搜索。
 - `DEEP_OTM_BASELINE_RETRAIN_PLAN.md`
   - `deep_otm_baseline` 的重训方案文档，和诊断文档分开维护；当前已经落了完整的重训框架，包括目标、基线定义、训练目标、样本口径、加权、特征方案、切分、实验矩阵、评估、通过条件和决策流程。
 

@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 import numpy as np
 import pandas as pd
 
+from pm15min.core.fees import fee_collection, max_quote_price_for_target_roi, net_shares_after_entry_fee, resolve_fee_rate
+from pm15min.core.stake_sizing import resolve_tiered_kelly_stake
 from pm15min.data.config import DataConfig
 from pm15min.live.execution.depth import build_depth_execution_plan, compute_fill_from_depth_record
 from pm15min.live.execution.utils import normalize_levels, raw_snapshot_ts_ms
@@ -21,6 +23,12 @@ class BacktestFillConfig:
     max_stake: float | None = 3.0
     high_conf_threshold: float = 0.8
     high_conf_multiplier: float = 3.0
+    stake_sizing_mode: str = "fixed"
+    kelly_fraction: float = 0.25
+    kelly_medium_fraction_threshold: float = 0.05392156862745098
+    kelly_strong_fraction_threshold: float = 0.07843137254901962
+    kelly_medium_stake_usd: float = 5.0
+    kelly_strong_stake_usd: float = 10.0
     roi_target: float = 0.05
     fee_bps: float = 100.0
     slippage_bps: float = 0.0
@@ -89,6 +97,12 @@ def build_fill_plan_frame(
     fee_bps: float = 100.0,
     high_conf_threshold: float = 0.8,
     high_conf_multiplier: float = 3.0,
+    stake_sizing_mode: str = "fixed",
+    kelly_fraction: float = 0.25,
+    kelly_medium_fraction_threshold: float = 0.05392156862745098,
+    kelly_strong_fraction_threshold: float = 0.07843137254901962,
+    kelly_medium_stake_usd: float = 5.0,
+    kelly_strong_stake_usd: float = 10.0,
     roi_target: float = 0.05,
     slippage_bps: float = 0.0,
     fill_model: str = "probability_cap_proxy",
@@ -101,6 +115,12 @@ def build_fill_plan_frame(
         fee_bps=fee_bps,
         high_conf_threshold=high_conf_threshold,
         high_conf_multiplier=high_conf_multiplier,
+        stake_sizing_mode=stake_sizing_mode,
+        kelly_fraction=kelly_fraction,
+        kelly_medium_fraction_threshold=kelly_medium_fraction_threshold,
+        kelly_strong_fraction_threshold=kelly_strong_fraction_threshold,
+        kelly_medium_stake_usd=kelly_medium_stake_usd,
+        kelly_strong_stake_usd=kelly_strong_stake_usd,
         roi_target=roi_target,
         slippage_bps=slippage_bps,
         fill_model=fill_model,
@@ -116,12 +136,17 @@ def build_fill_plan_frame(
                 "entry_price_source",
                 "price_cap",
                 "stake_base",
+                "stake_source",
+                "kelly_edge",
+                "kelly_full",
+                "kelly_fractional",
                 "stake_multiplier",
                 "stake_regime_state",
                 "stake",
                 "shares",
                 "fee_paid",
                 "fee_rate",
+                "fee_collection",
                 "fill_model",
                 "fill_valid",
                 "fill_reason",
@@ -176,7 +201,14 @@ def build_fill_plan_frame(
         frame["entry_price"],
         frame["entry_price_source"],
     )
-    frame["stake_base"] = resolve_stake(frame["predicted_prob"], config=cfg)
+    stake_base, stake_context = resolve_stake(
+        frame["predicted_prob"],
+        entry_price=frame["entry_price"],
+        config=cfg,
+    )
+    frame["stake_base"] = stake_base
+    for key, values in stake_context.items():
+        frame[key] = values
     frame["stake_regime_state"] = _resolve_stake_regime_state(frame)
     frame["stake_multiplier"] = _resolve_stake_multiplier(frame, profile_spec=cfg.profile_spec)
     frame["stake"] = _apply_stake_multiplier(
@@ -184,8 +216,28 @@ def build_fill_plan_frame(
         frame["stake_multiplier"],
         max_stake=cfg.max_stake,
     )
-    frame["shares"] = np.where(frame["entry_price"].gt(0.0), frame["stake"] / frame["entry_price"], 0.0)
-    frame["fee_rate"] = float(cfg.fee_bps) / 10_000.0
+    gross_shares = pd.Series(
+        np.where(frame["entry_price"].gt(0.0), frame["stake"] / frame["entry_price"], 0.0),
+        index=frame.index,
+        dtype=float,
+    )
+    frame["shares"] = gross_shares
+    frame["fee_rate"] = 0.0
+    frame["fee_collection"] = "cash"
+    for idx in frame.index:
+        entry_price = frame.at[idx, "entry_price"]
+        fee_rate, fee_mode = _resolve_fill_fee_terms(
+            entry_price=entry_price,
+            config=cfg,
+            profile_spec=profile_spec,
+        )
+        frame.at[idx, "fee_rate"] = fee_rate
+        frame.at[idx, "fee_collection"] = fee_mode
+        frame.at[idx, "shares"] = net_shares_after_entry_fee(
+            gross_shares=float(gross_shares.loc[idx]),
+            fee_rate=fee_rate,
+            collection=fee_mode,
+        )
     frame["fee_paid"] = frame["stake"] * frame["fee_rate"]
     frame["fill_model"] = str(cfg.fill_model)
     frame["fill_valid"] = True
@@ -257,6 +309,12 @@ def _build_fills_impl(
         fee_bps=cfg.fee_bps,
         high_conf_threshold=cfg.high_conf_threshold,
         high_conf_multiplier=cfg.high_conf_multiplier,
+        stake_sizing_mode=cfg.stake_sizing_mode,
+        kelly_fraction=cfg.kelly_fraction,
+        kelly_medium_fraction_threshold=cfg.kelly_medium_fraction_threshold,
+        kelly_strong_fraction_threshold=cfg.kelly_strong_fraction_threshold,
+        kelly_medium_stake_usd=cfg.kelly_medium_stake_usd,
+        kelly_strong_stake_usd=cfg.kelly_strong_stake_usd,
         roi_target=cfg.roi_target,
         slippage_bps=cfg.slippage_bps,
         fill_model=cfg.fill_model,
@@ -377,6 +435,21 @@ def _resolve_max_filled_trades_per_offset(config: BacktestFillConfig) -> int | N
     return resolved if resolved > 0 else None
 
 
+def _resolve_fill_fee_terms(
+    *,
+    entry_price: float | int | None,
+    config: BacktestFillConfig,
+    profile_spec: LiveProfileSpec | None = None,
+) -> tuple[float, str]:
+    resolved_profile = profile_spec or config.profile_spec
+    price = _float_or_none(entry_price)
+    if resolved_profile is not None:
+        rate = float(resolved_profile.fee_rate(price=0.0 if price is None else float(price)))
+        return rate, resolved_profile.fee_collection()
+    rate = resolve_fee_rate(model="flat_bps", price=0.0 if price is None else float(price), fee_bps=config.fee_bps)
+    return rate, fee_collection("flat_bps")
+
+
 def max_price_for_target_roi(
     predicted_prob: pd.Series,
     *,
@@ -391,14 +464,58 @@ def max_price_for_target_roi(
     return (p / max(denom, 1e-9)).clip(lower=1e-6, upper=1.0)
 
 
-def resolve_stake(predicted_prob: pd.Series, *, config: BacktestFillConfig) -> pd.Series:
+def resolve_stake(
+    predicted_prob: pd.Series,
+    *,
+    entry_price: pd.Series | None = None,
+    config: BacktestFillConfig,
+) -> tuple[pd.Series, dict[str, pd.Series]]:
     base = max(0.0, float(config.base_stake))
     cap = max(base, float(config.max_stake)) if config.max_stake is not None else float("inf")
     threshold = float(config.high_conf_threshold)
     multiplier = max(1.0, float(config.high_conf_multiplier))
     prob = pd.to_numeric(predicted_prob, errors="coerce").fillna(0.0)
-    scaled = np.where(prob >= threshold, base * multiplier, base)
-    return pd.Series(np.minimum(scaled, cap), index=prob.index, dtype=float)
+    if str(config.stake_sizing_mode or "").strip().lower() not in {"kelly", "kelly_tiers", "tiered_kelly"}:
+        scaled = np.where(prob >= threshold, base * multiplier, base)
+        stake = pd.Series(np.minimum(scaled, cap), index=prob.index, dtype=float)
+        context = {
+            "stake_source": pd.Series("fixed_profile", index=prob.index, dtype=object),
+            "kelly_edge": pd.Series(pd.NA, index=prob.index, dtype="Float64"),
+            "kelly_full": pd.Series(0.0, index=prob.index, dtype=float),
+            "kelly_fractional": pd.Series(0.0, index=prob.index, dtype=float),
+        }
+        return stake, context
+
+    prices = (
+        pd.to_numeric(entry_price, errors="coerce")
+        if entry_price is not None
+        else pd.Series(pd.NA, index=prob.index, dtype="Float64")
+    )
+    stakes: list[float] = []
+    rows: list[dict[str, object]] = []
+    for idx in prob.index:
+        stake, row = resolve_tiered_kelly_stake(
+            probability=prob.loc[idx],
+            entry_price=prices.loc[idx],
+            base_stake=base,
+            max_stake=cap,
+            enabled=True,
+            kelly_fraction=float(config.kelly_fraction),
+            medium_fraction_threshold=float(config.kelly_medium_fraction_threshold),
+            strong_fraction_threshold=float(config.kelly_strong_fraction_threshold),
+            medium_stake=float(config.kelly_medium_stake_usd),
+            strong_stake=float(config.kelly_strong_stake_usd),
+        )
+        stakes.append(float(stake))
+        rows.append(row)
+    context_frame = pd.DataFrame(rows, index=prob.index)
+    context = {
+        "stake_source": context_frame["stake_source"].astype(object),
+        "kelly_edge": pd.to_numeric(context_frame["kelly_edge"], errors="coerce"),
+        "kelly_full": pd.to_numeric(context_frame["kelly_full"], errors="coerce").fillna(0.0),
+        "kelly_fractional": pd.to_numeric(context_frame["kelly_fractional"], errors="coerce").fillna(0.0),
+    }
+    return pd.Series(stakes, index=prob.index, dtype=float), context
 
 
 def _resolve_stake_regime_state(frame: pd.DataFrame) -> pd.Series:
@@ -561,13 +678,15 @@ def _price_cap_series(
             continue
         offset = offsets.loc[idx]
         offset_value = int(offset) if pd.notna(offset) else 0
-        fee_reference_price = entry_price.loc[idx]
-        if pd.isna(fee_reference_price) or float(fee_reference_price) <= 0.0:
-            fee_reference_price = 0.5
-        fee_rate = float(profile_spec.fee_rate(price=float(fee_reference_price)))
         roi_threshold = float(profile_spec.roi_threshold_for(offset=offset_value))
-        denom = max((1.0 + roi_threshold + fee_rate) * (1.0 + slip), 1e-9)
-        out.loc[idx] = max(1e-6, min(float(prob) / denom, 1.0))
+        out.loc[idx] = max_quote_price_for_target_roi(
+            probability=float(prob),
+            roi_target=roi_threshold,
+            model=profile_spec.fee_model,
+            fee_bps=profile_spec.fee_bps,
+            fee_curve_k=profile_spec.fee_curve_k,
+            slippage_bps=float(profile_spec.slippage_bps),
+        )
     return out
 
 
@@ -584,7 +703,6 @@ def _materialize_fill_row(
     price_cap = _float_or_none(row.get("price_cap"))
     entry_price_source = str(row.get("entry_price_source") or "")
     fill_reason = str(row.get("fill_reason") or "")
-    fee_rate = float(config.fee_bps) / 10_000.0
 
     _apply_depth_diagnostics(out, None, None)
     can_attempt_depth = (
@@ -636,7 +754,7 @@ def _materialize_fill_row(
                 _build_depth_fill_values(
                     depth_fill=depth_fill,
                     entry_price=entry_price,
-                    fee_rate=fee_rate,
+                    config=config,
                     use_conservative_price=bool(raw_depth_candidates and config.raw_depth_fak_refresh_enabled),
                 )
             )
@@ -696,7 +814,7 @@ def _materialize_fill_row(
             _build_depth_fill_values(
                 depth_fill=depth_fill,
                 entry_price=entry_price,
-                fee_rate=fee_rate,
+                config=config,
                 use_conservative_price=bool(raw_depth_candidates and config.raw_depth_fak_refresh_enabled),
             )
         )
@@ -712,7 +830,6 @@ def _materialize_fill_row(
     quote_fill = _resolve_quote_fill(
         row=row,
         requested_notional=requested_notional,
-        fee_rate=fee_rate,
         config=config,
         allow_synthetic_entry_price=allow_synthetic_entry_price,
     )
@@ -799,7 +916,6 @@ def _resolve_quote_fill(
     *,
     row: Mapping[str, object],
     requested_notional: float,
-    fee_rate: float,
     config: BacktestFillConfig,
     min_fill_ratio_override: float | None = None,
     allow_synthetic_entry_price: bool = False,
@@ -856,11 +972,17 @@ def _resolve_quote_fill(
             "fill_reason": "quote_fill_ratio_below_threshold",
             "fill_model": "canonical_quote",
         }
+    fee_rate, fee_mode = _resolve_fill_fee_terms(entry_price=entry_price, config=config)
     return {
         "stake": float(total_cost),
-        "shares": float(filled_shares),
+        "shares": net_shares_after_entry_fee(
+            gross_shares=float(filled_shares),
+            fee_rate=float(fee_rate),
+            collection=fee_mode,
+        ),
         "fee_rate": float(fee_rate),
         "fee_paid": float(total_cost * fee_rate),
+        "fee_collection": fee_mode,
         "fill_ratio": float(fill_ratio),
         "fill_valid": True,
         "fill_reason": "",
@@ -1177,7 +1299,7 @@ def _build_depth_fill_values(
     *,
     depth_fill: dict[str, object],
     entry_price: float | None,
-    fee_rate: float,
+    config: BacktestFillConfig,
     use_conservative_price: bool = False,
 ) -> dict[str, object]:
     total_cost = float(depth_fill["total_cost"])
@@ -1189,12 +1311,18 @@ def _build_depth_fill_values(
     shares = float(depth_fill["filled_shares"])
     if effective_entry_price > 0.0:
         shares = float(total_cost / effective_entry_price)
+    fee_rate, fee_mode = _resolve_fill_fee_terms(entry_price=effective_entry_price, config=config)
     return {
         "entry_price": float(effective_entry_price),
         "stake": total_cost,
-        "shares": shares,
+        "shares": net_shares_after_entry_fee(
+            gross_shares=float(shares),
+            fee_rate=float(fee_rate),
+            collection=fee_mode,
+        ),
         "fee_rate": fee_rate,
         "fee_paid": total_cost * fee_rate,
+        "fee_collection": fee_mode,
         "fill_ratio": float(depth_fill["fill_ratio"]),
         "fill_model": "canonical_depth",
         "fill_reason": "",

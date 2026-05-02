@@ -11,12 +11,20 @@ STOP_FLAG="${STOP_FLAG:-$AUTORUN_DIR/stop.flag}"
 LAST_PROMPT_PATH="${LAST_PROMPT_PATH:-$AUTORUN_DIR/codex-last-prompt.md}"
 LAST_OUTPUT_PATH="${LAST_OUTPUT_PATH:-$AUTORUN_DIR/codex-last-output.txt}"
 FALLBACK_ENV_PATH="${FALLBACK_ENV_PATH:-$AUTORUN_DIR/codex-fallback.env}"
+CODEX_SHARED_FALLBACK_ENV_PATH="${CODEX_SHARED_FALLBACK_ENV_PATH:-$ROOT_DIR/var/research/autorun/codex-fallback.env}"
+WAKE_FLAG="${WAKE_FLAG:-$AUTORUN_DIR/wake.flag}"
+WAKE_POLL_SLEEP_SEC="${WAKE_POLL_SLEEP_SEC:-5}"
+WAKE_ON_IDLE_MARKET="${WAKE_ON_IDLE_MARKET:-}"
 QUEUE_SUPERVISOR_SCRIPT="$ROOT_DIR/auto_research/experiment_queue_supervisor.sh"
+START_QUEUE_SUPERVISOR="${START_QUEUE_SUPERVISOR:-1}"
 
 SESSION_DIR="${SESSION_DIR:-}"
 PROGRAM_PATH="${PROGRAM_PATH:-$ROOT_DIR/auto_research/program.md}"
-LOOP_SLEEP_SEC="${LOOP_SLEEP_SEC:-300}"
-CODEX_MODEL="${CODEX_MODEL:-}"
+LOOP_SLEEP_SEC="${LOOP_SLEEP_SEC:-1800}"
+CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
+CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-medium}"
+CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT="${CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT:-60000}"
+CODEX_PROMPT_BUDGET_MODE="${CODEX_PROMPT_BUDGET_MODE:-compact}"
 CODEX_EXTRA_ARGS="${CODEX_EXTRA_ARGS:-}"
 CODEX_SANDBOX_MODE="${CODEX_SANDBOX_MODE:-danger-full-access}"
 CODEX_HOME_MODE="${CODEX_HOME_MODE:-isolated}"
@@ -26,8 +34,12 @@ CODEX_FALLBACK_HOME_DIR="${CODEX_FALLBACK_HOME_DIR:-$AUTORUN_DIR/codex-home-fall
 CODEX_OFFICIAL_HOME_DIR="${CODEX_OFFICIAL_HOME_DIR:-$AUTORUN_DIR/codex-home-official}"
 CODEX_NETWORK_PROXY_MODE="${CODEX_NETWORK_PROXY_MODE:-direct}"
 CODEX_OFFICIAL_NETWORK_PROXY_MODE="${CODEX_OFFICIAL_NETWORK_PROXY_MODE:-$CODEX_NETWORK_PROXY_MODE}"
+CODEX_OFFICIAL_PRIORITY="${CODEX_OFFICIAL_PRIORITY:-first}"
+PM15MIN_MANAGED_PROXY_ENV_FILE="${PM15MIN_MANAGED_PROXY_ENV_FILE:-${REAL_HOME:-$HOME}/.local/state/pm15min-managed-proxy/active_proxy.env}"
 MAX_CONSECUTIVE_FAILURES="${MAX_CONSECUTIVE_FAILURES:-3}"
+CODEX_STOP_ON_CONSECUTIVE_FAILURES="${CODEX_STOP_ON_CONSECUTIVE_FAILURES:-0}"
 CODEX_ATTEMPT_TIMEOUT_SEC="${CODEX_ATTEMPT_TIMEOUT_SEC:-7200}"
+CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC="${CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC:-1800}"
 CODEX_STARTUP_TIMEOUT_SEC="${CODEX_STARTUP_TIMEOUT_SEC:-90}"
 CODEX_PROVIDER_FAILURE_ABORT_AFTER_RECONNECTS="${CODEX_PROVIDER_FAILURE_ABORT_AFTER_RECONNECTS:-3}"
 REAL_HOME="$HOME"
@@ -37,6 +49,11 @@ STARTED_ATTEMPT_PID=""
 declare -a CODEX_CMD=()
 
 mkdir -p "$AUTORUN_DIR"
+
+if [[ -f "$CODEX_SHARED_FALLBACK_ENV_PATH" ]]; then
+  # shellcheck disable=SC1090
+  source "$CODEX_SHARED_FALLBACK_ENV_PATH"
+fi
 
 if [[ -f "$FALLBACK_ENV_PATH" ]]; then
   # shellcheck disable=SC1090
@@ -61,7 +78,21 @@ print(
 PY
 }
 
+ensure_session_files() {
+  mkdir -p "$SESSION_DIR"
+  if [[ ! -f "$SESSION_DIR/results.tsv" ]]; then
+    printf '%s\n' "cycle	team	metric	status	description	files_changed	timestamp" > "$SESSION_DIR/results.tsv"
+  fi
+  if [[ ! -f "$SESSION_DIR/session.md" ]]; then
+    {
+      printf '# Autoresearch Session\n\n'
+      printf '## Cycles completed\n\n'
+    } > "$SESSION_DIR/session.md"
+  fi
+}
+
 SESSION_DIR="$(resolve_session_dir)"
+ensure_session_files
 
 CODEX_SECONDARY_BASE_URL="${CODEX_SECONDARY_BASE_URL:-}"
 CODEX_SECONDARY_API_KEY="${CODEX_SECONDARY_API_KEY:-}"
@@ -306,7 +337,7 @@ PY
 }
 
 build_prompt() {
-  PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$ROOT_DIR" "$SESSION_DIR" "$PROGRAM_PATH" "$STATUS_PATH"
+  PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$ROOT_DIR" "$SESSION_DIR" "$PROGRAM_PATH" "$STATUS_PATH" "$CODEX_PROMPT_BUDGET_MODE"
 from pathlib import Path
 import sys
 from pm15min.research.automation import build_codex_cycle_prompt
@@ -317,23 +348,45 @@ print(
         session_dir=Path(sys.argv[2]),
         program_path=Path(sys.argv[3]),
         status_path=Path(sys.argv[4]),
+        prompt_budget_mode=sys.argv[5],
+    )
+)
+PY
+}
+
+resolve_attempt_timeout() {
+  PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$LAST_PROMPT_PATH" "$CODEX_ATTEMPT_TIMEOUT_SEC" "$CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC"
+from pathlib import Path
+import sys
+from pm15min.research.automation import resolve_codex_attempt_timeout_sec
+
+print(
+    resolve_codex_attempt_timeout_sec(
+        Path(sys.argv[1]),
+        default_timeout_sec=int(sys.argv[2]),
+        heavy_analysis_timeout_sec=int(sys.argv[3]),
     )
 )
 PY
 }
 
 build_codex_command() {
-  PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$ROOT_DIR" "$LAST_OUTPUT_PATH" "$CODEX_SANDBOX_MODE" "$CODEX_MODEL" "${CODEX_EXTRA_ARGS:-}"
+  PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$ROOT_DIR" "$LAST_OUTPUT_PATH" "$CODEX_SANDBOX_MODE" "$CODEX_MODEL" "$CODEX_REASONING_EFFORT" "$CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT" "${CODEX_EXTRA_ARGS:-}"
 from pathlib import Path
 import sys
 from pm15min.research.automation import build_codex_exec_command
 
+compact_limit = None
+if str(sys.argv[6] or "").strip():
+    compact_limit = int(sys.argv[6])
 for item in build_codex_exec_command(
     project_root=Path(sys.argv[1]),
     output_path=Path(sys.argv[2]),
     sandbox_mode=sys.argv[3],
     model=sys.argv[4] or None,
-    extra_args=sys.argv[5] if len(sys.argv) > 5 else None,
+    reasoning_effort=sys.argv[5] or None,
+    auto_compact_token_limit=compact_limit,
+    extra_args=sys.argv[7] if len(sys.argv) > 7 else None,
 ):
     print(item)
 PY
@@ -363,6 +416,23 @@ build_env_prefix() {
   BUILT_ENV_PREFIX=(env)
   if [[ "$proxy_mode" == "direct" ]]; then
     BUILT_ENV_PREFIX+=(-u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy -u http_proxy -u https_proxy -u all_proxy)
+  elif [[ "$proxy_mode" == "managed" ]]; then
+    if [[ -f "$PM15MIN_MANAGED_PROXY_ENV_FILE" ]]; then
+      # shellcheck disable=SC1090
+      source "$PM15MIN_MANAGED_PROXY_ENV_FILE"
+    fi
+    if [[ -n "${HTTP_PROXY:-}" ]]; then
+      BUILT_ENV_PREFIX+=("HTTP_PROXY=$HTTP_PROXY" "http_proxy=${http_proxy:-$HTTP_PROXY}")
+    fi
+    if [[ -n "${HTTPS_PROXY:-}" ]]; then
+      BUILT_ENV_PREFIX+=("HTTPS_PROXY=$HTTPS_PROXY" "https_proxy=${https_proxy:-$HTTPS_PROXY}")
+    fi
+    if [[ -n "${ALL_PROXY:-}" ]]; then
+      BUILT_ENV_PREFIX+=("ALL_PROXY=$ALL_PROXY" "all_proxy=${all_proxy:-$ALL_PROXY}")
+    fi
+    if [[ -n "${NO_PROXY:-}" ]]; then
+      BUILT_ENV_PREFIX+=("NO_PROXY=$NO_PROXY" "no_proxy=${no_proxy:-$NO_PROXY}")
+    fi
   fi
   if [[ -n "$home_root" ]]; then
     BUILT_ENV_PREFIX+=("HOME=$home_root")
@@ -380,7 +450,7 @@ run_codex_command() {
   else
     build_env_prefix "$CODEX_NETWORK_PROXY_MODE" "$home_root"
   fi
-  exec "${BUILT_ENV_PREFIX[@]}" "${CODEX_CMD[@]}" < "$LAST_PROMPT_PATH" > "$output_log" 2>&1
+  exec "${BUILT_ENV_PREFIX[@]}" "${CODEX_CMD[@]}" < "$LAST_PROMPT_PATH" >> "$output_log" 2>&1
 }
 
 start_codex_attempt_process() {
@@ -391,7 +461,7 @@ start_codex_attempt_process() {
   else
     build_env_prefix "$CODEX_NETWORK_PROXY_MODE" "$home_root"
   fi
-  setsid "${BUILT_ENV_PREFIX[@]}" "${CODEX_CMD[@]}" < "$LAST_PROMPT_PATH" > "$output_log" 2>&1 &
+  setsid "${BUILT_ENV_PREFIX[@]}" "${CODEX_CMD[@]}" < "$LAST_PROMPT_PATH" >> "$output_log" 2>&1 &
   STARTED_ATTEMPT_PID="$!"
 }
 
@@ -407,7 +477,7 @@ terminate_attempt_process_group() {
 run_codex_attempt() {
   local home_root="$1"
   local output_log="$2"
-  local timeout_sec="${CODEX_ATTEMPT_TIMEOUT_SEC:-0}"
+  local timeout_sec="$3"
   local startup_timeout_sec="${CODEX_STARTUP_TIMEOUT_SEC:-0}"
   local start_epoch
   start_epoch="$(date +%s)"
@@ -472,6 +542,8 @@ run_once() {
   local started_at
   started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   build_prompt > "$LAST_PROMPT_PATH"
+  local resolved_attempt_timeout_sec
+  resolved_attempt_timeout_sec="$(resolve_attempt_timeout)"
   RUN_ONCE_SHOULD_STOP=0
   write_status "running" "$iteration" "None" "$started_at" "None" "${RUN_STARTED_AT:-None}" "$FAILURE_COUNT"
 
@@ -488,24 +560,38 @@ run_once() {
   local last_attempt_log="$primary_attempt_log"
 
   set +e
-  if [[ "$CODEX_HOME_MODE" == "isolated" ]]; then
+  if [[ "$CODEX_OFFICIAL_PRIORITY" == "first" ]] && official_fallback_configured; then
+    prepare_official_codex_home
+    local prepare_official_first_exit_code="$?"
+    if [[ "$prepare_official_first_exit_code" -eq 0 ]]; then
+      printf '[codex_background_loop] using attempt timeout %ss (heavy_analysis_timeout=%ss)\n' "$resolved_attempt_timeout_sec" "$CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC" >> "$primary_attempt_log"
+      printf '[codex_background_loop] trying official auth first\n' >> "$primary_attempt_log"
+      run_codex_attempt "$CODEX_OFFICIAL_HOME_DIR" "$primary_attempt_log" "$resolved_attempt_timeout_sec"
+    else
+      printf '[codex_background_loop] official first home preparation failed with exit=%s\n' "$prepare_official_first_exit_code" > "$primary_attempt_log"
+      false
+    fi
+  elif [[ "$CODEX_HOME_MODE" == "isolated" ]]; then
     prepare_isolated_codex_home
-    run_codex_attempt "$CODEX_HOME_DIR" "$primary_attempt_log"
+    printf '[codex_background_loop] using attempt timeout %ss (heavy_analysis_timeout=%ss)\n' "$resolved_attempt_timeout_sec" "$CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC" >> "$primary_attempt_log"
+    run_codex_attempt "$CODEX_HOME_DIR" "$primary_attempt_log" "$resolved_attempt_timeout_sec"
   else
-    run_codex_attempt "" "$primary_attempt_log"
+    printf '[codex_background_loop] using attempt timeout %ss (heavy_analysis_timeout=%ss)\n' "$resolved_attempt_timeout_sec" "$CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC" >> "$primary_attempt_log"
+    run_codex_attempt "" "$primary_attempt_log" "$resolved_attempt_timeout_sec"
   fi
   local exit_code="$?"
   set -e
   cat "$primary_attempt_log" >> "$LOG_PATH"
 
-  if [[ "$exit_code" -ne 0 ]] && secondary_configured && { [[ "$exit_code" -eq 74 ]] || codex_output_is_provider_failure "$primary_attempt_log" "$CODEX_SECONDARY_BASE_URL"; }; then
+  if [[ "$exit_code" -ne 0 ]] && secondary_configured && { [[ "$exit_code" -eq 74 ]] || [[ "$CODEX_OFFICIAL_PRIORITY" == "first" ]] || codex_output_is_provider_failure "$primary_attempt_log" "$CODEX_SECONDARY_BASE_URL"; }; then
     echo "[codex_background_loop] iteration=$iteration retrying with secondary fallback provider" >> "$LOG_PATH"
     : > "$secondary_attempt_log"
     set +e
     prepare_secondary_codex_home
     local prepare_secondary_exit_code="$?"
     if [[ "$prepare_secondary_exit_code" -eq 0 ]]; then
-      run_codex_attempt "$CODEX_SECONDARY_HOME_DIR" "$secondary_attempt_log"
+      printf '[codex_background_loop] using attempt timeout %ss (heavy_analysis_timeout=%ss)\n' "$resolved_attempt_timeout_sec" "$CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC" >> "$secondary_attempt_log"
+      run_codex_attempt "$CODEX_SECONDARY_HOME_DIR" "$secondary_attempt_log" "$resolved_attempt_timeout_sec"
       exit_code="$?"
     else
       printf '[codex_background_loop] secondary fallback home preparation failed with exit=%s\n' "$prepare_secondary_exit_code" > "$secondary_attempt_log"
@@ -523,7 +609,8 @@ run_once() {
     prepare_fallback_codex_home
     local prepare_exit_code="$?"
     if [[ "$prepare_exit_code" -eq 0 ]]; then
-      run_codex_attempt "$CODEX_FALLBACK_HOME_DIR" "$fallback_attempt_log"
+      printf '[codex_background_loop] using attempt timeout %ss (heavy_analysis_timeout=%ss)\n' "$resolved_attempt_timeout_sec" "$CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC" >> "$fallback_attempt_log"
+      run_codex_attempt "$CODEX_FALLBACK_HOME_DIR" "$fallback_attempt_log" "$resolved_attempt_timeout_sec"
       exit_code="$?"
     else
       printf '[codex_background_loop] fallback home preparation failed with exit=%s\n' "$prepare_exit_code" > "$fallback_attempt_log"
@@ -534,14 +621,15 @@ run_once() {
     last_attempt_log="$fallback_attempt_log"
   fi
 
-  if [[ "$exit_code" -ne 0 ]] && official_fallback_configured && { [[ "$exit_code" -eq 74 ]] || codex_output_is_provider_failure "$last_attempt_log"; }; then
+  if [[ "$exit_code" -ne 0 ]] && [[ "$CODEX_OFFICIAL_PRIORITY" != "first" ]] && official_fallback_configured && { [[ "$exit_code" -eq 74 ]] || codex_output_is_provider_failure "$last_attempt_log"; }; then
     echo "[codex_background_loop] iteration=$iteration retrying with official auth fallback" >> "$LOG_PATH"
     : > "$official_attempt_log"
     set +e
     prepare_official_codex_home
     local prepare_official_exit_code="$?"
     if [[ "$prepare_official_exit_code" -eq 0 ]]; then
-      run_codex_attempt "$CODEX_OFFICIAL_HOME_DIR" "$official_attempt_log"
+      printf '[codex_background_loop] using attempt timeout %ss (heavy_analysis_timeout=%ss)\n' "$resolved_attempt_timeout_sec" "$CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC" >> "$official_attempt_log"
+      run_codex_attempt "$CODEX_OFFICIAL_HOME_DIR" "$official_attempt_log" "$resolved_attempt_timeout_sec"
       exit_code="$?"
     else
       printf '[codex_background_loop] official fallback preparation failed with exit=%s\n' "$prepare_official_exit_code" > "$official_attempt_log"
@@ -566,6 +654,51 @@ run_once() {
   return "$exit_code"
 }
 
+sleep_until_next_cycle() {
+  local remaining="$LOOP_SLEEP_SEC"
+  local poll_sec="$WAKE_POLL_SLEEP_SEC"
+  if [[ ! "$remaining" =~ ^[0-9]+$ ]] || [[ "$remaining" -lt 1 ]]; then
+    remaining=1800
+  fi
+  if [[ ! "$poll_sec" =~ ^[0-9]+$ ]] || [[ "$poll_sec" -lt 1 ]]; then
+    poll_sec=5
+  fi
+
+  while [[ "$remaining" -gt 0 ]]; do
+    if [[ -f "$STOP_FLAG" ]]; then
+      return 0
+    fi
+    if [[ -f "$WAKE_FLAG" ]]; then
+      rm -f "$WAKE_FLAG"
+      echo "[codex_background_loop] wake flag consumed; starting next cycle early" >> "$LOG_PATH"
+      return 0
+    fi
+    if should_wake_for_idle_market; then
+      echo "[codex_background_loop] idle formal slot detected for market=$WAKE_ON_IDLE_MARKET; starting next cycle early" >> "$LOG_PATH"
+      return 0
+    fi
+    local chunk="$poll_sec"
+    if [[ "$chunk" -gt "$remaining" ]]; then
+      chunk="$remaining"
+    fi
+    sleep "$chunk"
+    remaining=$((remaining - chunk))
+  done
+}
+
+should_wake_for_idle_market() {
+  if [[ -z "$WAKE_ON_IDLE_MARKET" ]]; then
+    return 1
+  fi
+  if pgrep -f "pm15min research experiment run-suite .*--market ${WAKE_ON_IDLE_MARKET}" >/dev/null 2>&1; then
+    return 1
+  fi
+  if pgrep -f "run_one_experiment.sh .*--market ${WAKE_ON_IDLE_MARKET}" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
 loop_body() {
   echo "$$" > "$PID_PATH"
   RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -582,13 +715,13 @@ loop_body() {
     iteration=$((iteration + 1))
     if ! run_once "$iteration"; then
       echo "[codex_background_loop] iteration=$iteration failed" >> "$LOG_PATH"
-      if [[ "$RUN_ONCE_SHOULD_STOP" == "1" ]]; then
+      if [[ "$RUN_ONCE_SHOULD_STOP" == "1" && "$CODEX_STOP_ON_CONSECUTIVE_FAILURES" == "1" ]]; then
         echo "[codex_background_loop] stopping after $FAILURE_COUNT consecutive failures" >> "$LOG_PATH"
         rm -f "$PID_PATH"
         exit 1
       fi
     fi
-    sleep "$LOOP_SLEEP_SEC"
+    sleep_until_next_cycle
   done
 }
 
@@ -610,7 +743,7 @@ case "$ACTION" in
       rm -f "$PID_PATH"
     fi
     rm -f "$STOP_FLAG"
-    if [[ -x "$QUEUE_SUPERVISOR_SCRIPT" ]]; then
+    if [[ "$START_QUEUE_SUPERVISOR" == "1" && -x "$QUEUE_SUPERVISOR_SCRIPT" ]]; then
       "$QUEUE_SUPERVISOR_SCRIPT" start || true
     fi
     nohup "$SCRIPT_PATH" __run_loop >> "$LOG_PATH" 2>&1 &

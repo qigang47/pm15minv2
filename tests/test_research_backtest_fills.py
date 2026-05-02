@@ -7,14 +7,17 @@ import pytest
 
 import pm15min.research.backtests.engine as backtest_engine
 import pm15min.research.backtests.fills as fills_module
+from pm15min.core.fees import max_quote_price_for_target_roi
 from pm15min.data.config import DataConfig
 from pm15min.data.io.ndjson_zst import append_ndjson_zst
+from pm15min.live.profiles import resolve_live_profile_spec
 from pm15min.research._contracts_runs import BacktestParitySpec
+from pm15min.research.backtests.engine import _build_backtest_fill_config
 from pm15min.research.backtests.fills import BacktestFillConfig, build_canonical_fills, build_fill_plan_frame, summarize_fill_reasons
 from pm15min.research.backtests.regime_parity import resolve_backtest_profile_spec
-from pm15min.research.contracts import BacktestRunSpec
 from pm15min.research.backtests.settlement import build_equity_curve, settle_fill_frame, settlement_summary
 from pm15min.research.backtests.taxonomy import build_reject_frame, summarize_reject_reasons
+from pm15min.research.contracts import BacktestRunSpec
 
 
 def test_build_fill_plan_frame_is_fee_and_stake_aware() -> None:
@@ -123,8 +126,14 @@ def test_build_fill_plan_frame_uses_profile_price_cap_formula_when_available() -
         profile_spec=profile_spec,
     )
 
-    expected_fee_rate = profile_spec.fee_rate(price=0.20)
-    expected = 0.62 / ((1.0 + profile_spec.roi_threshold_for(offset=7) + expected_fee_rate) * (1.0 + 0.0))
+    expected = max_quote_price_for_target_roi(
+        probability=0.62,
+        roi_target=profile_spec.roi_threshold_for(offset=7),
+        model=profile_spec.fee_model,
+        fee_bps=profile_spec.fee_bps,
+        fee_curve_k=profile_spec.fee_curve_k,
+        slippage_bps=profile_spec.slippage_bps,
+    )
     assert float(out.iloc[0]["price_cap"]) == pytest.approx(expected)
 
 
@@ -180,7 +189,67 @@ def test_build_fill_plan_frame_applies_regime_stake_scale() -> None:
     assert out["stake_multiplier"].tolist() == [0.5, 0.25, 1.0]
     assert out["stake_regime_state"].tolist() == ["CAUTION", "DEFENSE", "NORMAL"]
     assert out["stake"].tolist() == [1.5, 0.75, 3.0]
-    assert out["fee_paid"].tolist() == [0.015, 0.0075, 0.03]
+    assert out["fee_paid"].tolist() == [0.0324, 0.0162, 0.0648]
+
+
+def test_build_fill_plan_frame_applies_tiered_kelly_stake_sizing() -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "offset": 7,
+                "p_up": 0.55,
+                "p_down": 0.45,
+                "quote_prob_up": 0.49,
+            },
+            {
+                "decision_ts": "2026-03-01T00:16:00Z",
+                "offset": 7,
+                "p_up": 0.625,
+                "p_down": 0.375,
+                "quote_prob_up": 0.49,
+            },
+            {
+                "decision_ts": "2026-03-01T00:31:00Z",
+                "offset": 7,
+                "p_up": 0.65,
+                "p_down": 0.35,
+                "quote_prob_up": 0.49,
+            },
+        ]
+    )
+
+    out = build_fill_plan_frame(
+        rows,
+        base_stake=2.0,
+        max_stake=10.0,
+        min_edge=0.0,
+        stake_sizing_mode="kelly_tiers",
+    )
+
+    assert out["stake_base"].tolist() == pytest.approx([2.0, 6.0, 10.0])
+    assert out["stake"].tolist() == pytest.approx([2.0, 6.0, 10.0])
+    assert out["stake_source"].tolist() == ["kelly_tier_base", "kelly_tier_scaled", "kelly_tier_strong"]
+    assert out["kelly_fractional"].is_monotonic_increasing
+
+
+def test_backtest_fill_config_inherits_tiered_kelly_profile_settings() -> None:
+    profile_spec = resolve_live_profile_spec("deep_otm_midprice_direction")
+    spec = BacktestRunSpec(
+        profile="deep_otm_midprice_direction",
+        spec_name="kelly_profile",
+        run_label="case",
+        stake_usd=2.0,
+        max_notional_usd=10.0,
+    )
+
+    fill_config = _build_backtest_fill_config(spec=spec, profile_spec=profile_spec)
+
+    assert fill_config.base_stake == 2.0
+    assert fill_config.max_stake == 10.0
+    assert fill_config.stake_sizing_mode == "kelly_tiers"
+    assert fill_config.kelly_medium_stake_usd == 5.0
+    assert fill_config.kelly_strong_stake_usd == 10.0
 
 
 def test_build_canonical_fills_materializes_mapping_rows(monkeypatch, tmp_path) -> None:
@@ -1047,7 +1116,7 @@ def test_build_canonical_fills_does_not_reuse_unchanged_raw_depth_queue(tmp_path
     assert row["depth_chain_mode"] == "single_snapshot"
     assert row["depth_queue_turnover_count"] == 0
     assert row["stake"] == pytest.approx(0.4)
-    assert row["shares"] == pytest.approx(2.0)
+    assert row["shares"] == pytest.approx(1.8848)
 
 
 def test_build_canonical_fills_keeps_partial_depth_after_queue_attrition_without_quote_completion(tmp_path) -> None:
@@ -1160,7 +1229,7 @@ def test_build_canonical_fills_keeps_partial_depth_after_queue_attrition_without
     assert row["depth_chain_mode"] == "queue_growth"
     assert row["depth_queue_turnover_count"] == 1
     assert row["stake"] == pytest.approx(0.6)
-    assert row["shares"] == pytest.approx(3.0)
+    assert row["shares"] == pytest.approx(2.8272)
 
 
 def test_build_canonical_fills_keeps_partial_depth_after_single_queue_growth_without_quote_completion(tmp_path) -> None:
@@ -1258,7 +1327,7 @@ def test_build_canonical_fills_keeps_partial_depth_after_single_queue_growth_wit
     assert row["depth_chain_mode"] == "queue_growth"
     assert row["depth_queue_turnover_count"] == 0
     assert row["stake"] == pytest.approx(0.6)
-    assert row["shares"] == pytest.approx(3.0)
+    assert row["shares"] == pytest.approx(2.8272)
 
 
 def test_build_canonical_fills_allows_same_price_after_time_turnover_gap(tmp_path) -> None:
@@ -1358,7 +1427,7 @@ def test_build_canonical_fills_allows_same_price_after_time_turnover_gap(tmp_pat
     assert row["depth_queue_turnover_count"] == 0
     assert row["depth_time_turnover_count"] == 1
     assert row["stake"] == pytest.approx(0.8)
-    assert row["shares"] == pytest.approx(4.0)
+    assert row["shares"] == pytest.approx(3.7696)
 
 
 def test_build_canonical_fills_legacy_fak_refresh_uses_later_snapshot_after_block(tmp_path) -> None:
@@ -2580,7 +2649,7 @@ def test_build_canonical_fills_keeps_partial_depth_without_quote_fallback(tmp_pa
     assert bool(row["depth_partial_fill"]) is True
     assert row["fill_ratio"] == pytest.approx(0.6)
     assert row["stake"] == pytest.approx(0.6)
-    assert row["shares"] == pytest.approx(3.0)
+    assert row["shares"] == pytest.approx(2.8272)
     assert row["entry_price"] == pytest.approx(0.2)
 
 

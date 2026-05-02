@@ -7,6 +7,8 @@ import time
 
 import pandas as pd
 
+from ..execution.utils import float_or_none
+
 
 DEFAULT_OFFSET_WINDOW_SECONDS = 60.0
 
@@ -196,9 +198,11 @@ def build_scored_signal(
         "score_reason": score_reason,
         "p_lgb": float(row.get("p_lgb", p_up)),
         "p_lr": float(row.get("p_lr", p_up)),
+        "p_catboost": float_or_none(row.get("p_catboost")),
         "p_signal": float(row.get("p_signal", p_up)),
         "w_lgb": float(row.get("w_lgb", 0.5)),
         "w_lr": float(row.get("w_lr", 0.5)),
+        "w_catboost": float_or_none(row.get("w_catboost")),
         "p_up_raw": p_up_raw,
         "p_down_raw": p_down_raw,
         "p_eff_up": p_eff_up,

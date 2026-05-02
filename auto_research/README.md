@@ -41,6 +41,10 @@ Main entrypoints:
   - repo-local dense direction instructions
 - `auto_research/program_reversal_dense.md`
   - repo-local dense reversal instructions
+- `auto_research/program_direction_midprice_btc.md`
+  - standalone BTC midprice direction autoresearch instructions
+- `auto_research/program_direction_midprice_eth.md`
+  - standalone ETH midprice direction autoresearch instructions
 - `auto_research/run_one_experiment.sh`
   - run one formal experiment suite
 - `auto_research/run_one_experiment_background.sh`
@@ -59,6 +63,12 @@ Main entrypoints:
   - start, stop, restart, or run one dense direction background instance
 - `auto_research/start_reversal_dense.sh`
   - start, stop, restart, or run one dense reversal background instance
+- `auto_research/start_direction_midprice_btc.sh`
+  - start, stop, restart, or run the standalone BTC midprice direction background instance
+- `auto_research/start_direction_midprice_eth.sh`
+  - start, stop, restart, or run the standalone ETH midprice direction background instance
+- `auto_research/start_midprice_direction_stack.sh`
+  - start, stop, restart, or inspect both standalone BTC/ETH midprice direction instances
 - `auto_research/status_autorun.sh`
   - inspect background status plus incomplete experiment runs
 - `auto_research/status_dense_autorun.sh`
@@ -97,35 +107,54 @@ Operator overrides:
   - use the operator's main `~/.codex/` directly
 - `CODEX_HOME_DIR=/custom/path`
   - choose a different isolated home root
+- `CODEX_MODEL=gpt-5.5`
+  - default background decision model; override only for deliberate special cycles
+- `CODEX_REASONING_EFFORT=high`
+  - default background reasoning level used by `codex exec`
+- `CODEX_PROMPT_BUDGET_MODE=compact`
+  - omit large prompt sections and rely on precomputed summaries unless the cycle is blocked
+- `CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT=60000`
+  - ask Codex to compact earlier instead of carrying very large context between background turns
+- `LOOP_SLEEP_SEC=1800` for BTC/ETH formal, `900` for SOL/XRP quick-screen
+  - default wrapper cadence is slower for formal lines and faster for quick-screen lines; experiment workers continue independently
+- `QUEUE_SUPERVISOR_LOOP_SLEEP_SEC=5`
+  - shared queue dispatch cadence; keep this separate from `LOOP_SLEEP_SEC` so quick-screen workers are refilled promptly
 - `CODEX_SECONDARY_BASE_URL=...`
   - background-only second provider endpoint, intended for a secondary Nimabo key before the normal fallback provider
 - `CODEX_SECONDARY_API_KEY=...`
   - matching API key for the secondary provider endpoint
 - `FALLBACK_ENV_PATH=/custom/path/codex-fallback.env`
   - load background-only fallback provider settings from a local env file
+- `CODEX_SHARED_FALLBACK_ENV_PATH=var/research/autorun/codex-fallback.env`
+  - shared background fallback settings loaded before the per-track fallback env, useful for newly split autorun tracks
 - `CODEX_FALLBACK_BASE_URL=...`
   - backup responses endpoint used only when the primary background provider fails transiently
 - `CODEX_FALLBACK_API_KEY=...`
   - matching API key for the backup endpoint
-- `CODEX_NETWORK_PROXY_MODE=direct|inherit`
+- `CODEX_NETWORK_PROXY_MODE=direct|inherit|managed`
   - choose whether the primary provider path clears proxy env vars or inherits them
-- `CODEX_OFFICIAL_NETWORK_PROXY_MODE=direct|inherit`
-  - choose the network mode for the official auth fallback separately from the primary provider path
+- `CODEX_OFFICIAL_NETWORK_PROXY_MODE=direct|inherit|managed`
+  - choose the network mode for the official auth path separately from the primary provider path
+- `CODEX_OFFICIAL_PRIORITY=first|fallback`
+  - choose whether official ChatGPT auth runs before external providers or only after they fail
 - `MAX_CONSECUTIVE_FAILURES=5`
-  - change the background stop threshold
+  - change the consecutive failure threshold recorded in status
+- `CODEX_STOP_ON_CONSECUTIVE_FAILURES=0|1`
+  - when `0`, provider outages are recorded but the background loop keeps waiting for the next cycle
 
-Background retry order:
+Default background retry order:
 
-- primary Nimabo provider from the normal Codex home
+- official login from `CODEX_OFFICIAL_AUTH_PATH`
 - secondary Nimabo key from `CODEX_SECONDARY_BASE_URL` + `CODEX_SECONDARY_API_KEY`
-- `ai.changyou.club` from `CODEX_FALLBACK_BASE_URL` + `CODEX_FALLBACK_API_KEY`
-- official login fallback from `CODEX_OFFICIAL_AUTH_PATH`
+- optional backup provider from `CODEX_FALLBACK_BASE_URL` + `CODEX_FALLBACK_API_KEY`
+- when `CODEX_OFFICIAL_PRIORITY=fallback`, official login moves to the final fallback position
 
 Dense wrapper defaults:
 
 - `start_direction_dense.sh` and `start_reversal_dense.sh` pin `CODEX_OFFICIAL_AUTH_PATH` to the shared `var/research/autorun/codex-official-auth.json`
 - the dense wrappers keep `CODEX_NETWORK_PROXY_MODE=direct` unless you override it
-- the dense wrappers keep `CODEX_OFFICIAL_NETWORK_PROXY_MODE=inherit` unless you override it
+- the dense wrappers keep `CODEX_OFFICIAL_NETWORK_PROXY_MODE=managed` unless you override it, so official auth uses the managed proxy env file
+- the dense wrappers keep `CODEX_OFFICIAL_PRIORITY=first` unless you override it
 
 ## Runtime Flow
 
@@ -238,9 +267,11 @@ In practice the moving parts are:
    - it reconciles queue state against actual live workers
    - it launches or resumes work until it reaches the configured caps
    - current defaults are:
-     - `MAX_LIVE_RUNS=16`
-     - `TRACK_SLOT_CAPS_JSON={"direction_dense":8,"reversal_dense":8}`
+     - `MAX_LIVE_RUNS=8`
+     - `TRACK_SLOT_CAPS_JSON={"direction_dense":4,"reversal_dense":4}`
+     - `MIN_AVAILABLE_MEM_GB=2`
      - `MAX_QUEUED_ITEMS=24`
+     - `QUEUE_SUPERVISOR_LOOP_SLEEP_SEC=5`
 
 5. A launched experiment goes through `auto_research/run_one_experiment.sh`.
    - that wrapper is the single experiment entry surface
@@ -313,6 +344,18 @@ Dense instance commands:
 ./auto_research/start_direction_dense.sh stop
 ./auto_research/start_reversal_dense.sh stop
 ```
+
+Standalone BTC/ETH midprice direction commands:
+
+```bash
+./auto_research/start_midprice_direction_stack.sh start
+./auto_research/start_midprice_direction_stack.sh status
+./auto_research/start_midprice_direction_stack.sh stop
+```
+
+These BTC/ETH lines intentionally do not use the shared SOL/XRP quick-screen
+queue. Each coin has its own Codex background loop, its own session, and one
+full formal midprice-direction experiment live at a time.
 
 Queue one formal follow-up instead of launching it immediately:
 

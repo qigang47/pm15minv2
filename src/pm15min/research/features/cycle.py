@@ -59,8 +59,11 @@ def append_cycle_features(
     out["cycle_start_ts"] = cycle_start
     out["cycle_end_ts"] = cycle_end
     out["offset"] = minute_in_cycle
+    if needs("minutes_left_to_settle"):
+        out["minutes_left_to_settle"] = ((cycle_end - decision_ts).dt.total_seconds() / 60.0).clip(lower=0.0)
 
     if not needs(
+        "minutes_left_to_settle",
         "ret_from_cycle_open",
         "pullback_from_cycle_high",
         "rebound_from_cycle_low",

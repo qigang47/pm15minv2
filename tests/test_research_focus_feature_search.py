@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pm15min.research.features.registry import feature_group
 from pm15min.research.automation.focus_feature_search import (
+    available_unused_baseline_features,
     build_market_focus_feature_sets,
     rank_focus_features,
     rank_focus_features_by_offset,
@@ -286,3 +287,21 @@ def test_build_market_focus_feature_sets_balances_feature_families_within_range(
     assert groups.count("volume") >= 6
     assert groups.count("price") >= 8
     assert groups.count("calendar") + groups.count("cross_asset") <= 4
+
+
+def test_available_unused_baseline_features_prioritizes_new_time_pressure_and_selection_helpers() -> None:
+    ranked = available_unused_baseline_features()
+
+    assert ranked[:11] == [
+        "minutes_left_to_settle",
+        "up_move_remaining_per_minute",
+        "up_move_remaining_z_per_minute",
+        "first_up_cross_offset",
+        "minutes_since_first_up_cross",
+        "up_hold_minutes",
+        "rel_strength_15m",
+        "btc_ret_5m",
+        "btc_vol_30m",
+        "taker_buy_ratio_change",
+        "rv_30_change",
+    ]

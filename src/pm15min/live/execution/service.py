@@ -4,6 +4,7 @@ import os
 import time
 from typing import Any
 
+from pm15min.core.fees import max_quote_price_for_target_roi
 from pm15min.data.config import DataConfig
 
 
@@ -119,9 +120,15 @@ def build_execution_snapshot(
     }
     ask_size_1 = float_or_none_fn(quote_row.get("quote_up_ask_size_1") if side == "UP" else quote_row.get("quote_down_ask_size_1"))
     bid_price = float_or_none_fn(quote_row.get("quote_up_bid") if side == "UP" else quote_row.get("quote_down_bid"))
+    p_side = resolve_side_probability_fn(selected_row=selected_row, side=side)
     regime_state = decision_payload.get("regime_state") or {}
     stake_multiplier = resolve_regime_stake_multiplier_fn(spec=spec, regime_state=regime_state)
-    requested_notional_base, stake_context = resolve_dynamic_stake_base_fn(spec=spec, account_summary=account_summary)
+    requested_notional_base, stake_context = resolve_dynamic_stake_base_fn(
+        spec=spec,
+        account_summary=account_summary,
+        signal_probability=p_side,
+        entry_price=entry_price,
+    )
     requested_notional = min(float(requested_notional_base) * float(stake_multiplier), float(spec.max_notional_usd))
     if requested_notional <= 0.0:
         payload["execution"] = build_execution_record_fn(
@@ -136,6 +143,15 @@ def build_execution_snapshot(
                 "stake_multiplier": float(stake_multiplier),
                 "stake_regime_state": str(regime_state.get("state") or "NORMAL"),
                 "stake_source": stake_context.get("stake_source"),
+                "stake_base_source": stake_context.get("stake_base_source"),
+                "stake_sizing_mode": stake_context.get("stake_sizing_mode"),
+                "kelly_enabled": stake_context.get("kelly_enabled"),
+                "kelly_probability": stake_context.get("kelly_probability"),
+                "kelly_entry_price": stake_context.get("kelly_entry_price"),
+                "kelly_edge": stake_context.get("kelly_edge"),
+                "kelly_full": stake_context.get("kelly_full"),
+                "kelly_fractional": stake_context.get("kelly_fractional"),
+                "kelly_fraction": stake_context.get("kelly_fraction"),
                 "cash_balance_usd": stake_context.get("cash_balance_usd"),
                 "cash_balance_available": stake_context.get("cash_balance_available"),
                 "requested_notional_usd": requested_notional,
@@ -154,7 +170,6 @@ def build_execution_snapshot(
     else:
         execution_reasons.append("l1_ask_size_missing")
 
-    p_side = resolve_side_probability_fn(selected_row=selected_row, side=side)
     fee_rate = float_or_none_fn(quote_metrics.get("fee_rate")) or spec.fee_rate(price=entry_price)
     slippage_bps = float_or_none_fn(quote_metrics.get("slippage_bps"))
     if slippage_bps is None:
@@ -163,8 +178,14 @@ def build_execution_snapshot(
     slip = max(0.0, float(slippage_bps)) / 10000.0
     p_cap = None
     if p_side is not None:
-        denom = max((1.0 + float(roi_threshold) + float(fee_rate)) * (1.0 + slip), 1e-9)
-        p_cap = max(1e-6, min(float(p_side) / denom, 1.0))
+        p_cap = max_quote_price_for_target_roi(
+            probability=float(p_side),
+            roi_target=float(roi_threshold),
+            model=spec.fee_model,
+            fee_bps=spec.fee_bps,
+            fee_curve_k=spec.fee_curve_k,
+            slippage_bps=float(slippage_bps),
+        )
 
     reused_depth_plan = False
     depth_plan = None
@@ -237,6 +258,15 @@ def build_execution_snapshot(
             "stake_multiplier": float(stake_multiplier),
             "stake_regime_state": str(regime_state.get("state") or "NORMAL"),
             "stake_source": stake_context.get("stake_source"),
+            "stake_base_source": stake_context.get("stake_base_source"),
+            "stake_sizing_mode": stake_context.get("stake_sizing_mode"),
+            "kelly_enabled": stake_context.get("kelly_enabled"),
+            "kelly_probability": stake_context.get("kelly_probability"),
+            "kelly_entry_price": stake_context.get("kelly_entry_price"),
+            "kelly_edge": stake_context.get("kelly_edge"),
+            "kelly_full": stake_context.get("kelly_full"),
+            "kelly_fractional": stake_context.get("kelly_fractional"),
+            "kelly_fraction": stake_context.get("kelly_fraction"),
             "cash_balance_usd": stake_context.get("cash_balance_usd"),
             "cash_balance_available": stake_context.get("cash_balance_available"),
             "stake_step_levels": stake_context.get("stake_step_levels"),

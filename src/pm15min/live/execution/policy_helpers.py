@@ -4,6 +4,9 @@ from pathlib import Path
 import math
 from typing import Any
 
+from pm15min.core.fees import expected_resolution_roi
+from pm15min.core.stake_sizing import resolve_tiered_kelly_stake
+
 from .utils import (
     float_or_none,
     minutes_left_to_market_end,
@@ -85,6 +88,8 @@ def resolve_dynamic_stake_base(
     *,
     spec,
     account_summary: dict[str, Any] | None,
+    signal_probability: object | None = None,
+    entry_price: object | None = None,
 ) -> tuple[float, dict[str, Any]]:
     max_notional = max(0.0, float(getattr(spec, "max_notional_usd", 0.0) or 0.0))
     fixed_stake = min(max(0.0, float(getattr(spec, "stake_usd", 0.0) or 0.0)), max_notional)
@@ -95,7 +100,14 @@ def resolve_dynamic_stake_base(
         "stake_source": "fixed_profile",
     }
     if cash_balance is None:
-        return fixed_stake, context
+        return _apply_signal_stake_sizing(
+            spec=spec,
+            base_stake=fixed_stake,
+            max_notional=max_notional,
+            signal_probability=signal_probability,
+            entry_price=entry_price,
+            context=context,
+        )
 
     pct = max(0.0, float(getattr(spec, "stake_cash_pct", 0.0) or 0.0))
     step_threshold = float(getattr(spec, "stake_balance_step_threshold_usd", 0.0) or 0.0)
@@ -120,7 +132,14 @@ def resolve_dynamic_stake_base(
         context["stake_source"] = "cash_balance_pct"
 
     if dynamic_stake is None:
-        return fixed_stake, context
+        return _apply_signal_stake_sizing(
+            spec=spec,
+            base_stake=fixed_stake,
+            max_notional=max_notional,
+            signal_probability=signal_probability,
+            entry_price=entry_price,
+            context=context,
+        )
 
     min_stake = float_or_none(getattr(spec, "stake_cash_min_usd", None))
     if min_stake is not None:
@@ -130,7 +149,47 @@ def resolve_dynamic_stake_base(
         dynamic_stake = min(dynamic_stake, float(max_stake))
     dynamic_stake = min(dynamic_stake, max_notional)
     dynamic_stake = round(max(0.0, dynamic_stake), 2)
-    return dynamic_stake, context
+    return _apply_signal_stake_sizing(
+        spec=spec,
+        base_stake=dynamic_stake,
+        max_notional=max_notional,
+        signal_probability=signal_probability,
+        entry_price=entry_price,
+        context=context,
+    )
+
+
+def _apply_signal_stake_sizing(
+    *,
+    spec,
+    base_stake: float,
+    max_notional: float,
+    signal_probability: object | None,
+    entry_price: object | None,
+    context: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    mode = str(getattr(spec, "stake_sizing_mode", "fixed") or "fixed").strip().lower()
+    enabled = mode in {"kelly", "kelly_tiers", "tiered_kelly"}
+    context["stake_sizing_mode"] = mode
+    context["kelly_enabled"] = bool(enabled)
+    if not enabled:
+        return float(base_stake), context
+
+    context["stake_base_source"] = context.get("stake_source")
+    stake, sizing_context = resolve_tiered_kelly_stake(
+        probability=signal_probability,
+        entry_price=entry_price,
+        base_stake=float(base_stake),
+        max_stake=float(max_notional),
+        enabled=True,
+        kelly_fraction=float(getattr(spec, "kelly_fraction", 0.25) or 0.0),
+        medium_fraction_threshold=float(getattr(spec, "kelly_medium_fraction_threshold", 0.05392156862745098) or 0.0),
+        strong_fraction_threshold=float(getattr(spec, "kelly_strong_fraction_threshold", 0.07843137254901962) or 0.0),
+        medium_stake=float(getattr(spec, "kelly_medium_stake_usd", 5.0) or 0.0),
+        strong_stake=float(getattr(spec, "kelly_strong_stake_usd", 10.0) or 0.0),
+    )
+    context.update(sizing_context)
+    return float(stake), context
 
 
 def match_open_orders(
@@ -175,7 +234,17 @@ def repriced_order_guard(
     effective_price = float(repriced_entry_price) * (1.0 + slip)
     fee_rate = spec.fee_rate(price=effective_price)
     roi_threshold = spec.roi_threshold_for(offset=offset)
-    roi_net = None if p_side is None else float(p_side) / max(effective_price, 1e-9) - 1.0 - fee_rate
+    roi_net = (
+        None
+        if p_side is None
+        else expected_resolution_roi(
+            probability=float(p_side),
+            price=effective_price,
+            model=spec.fee_model,
+            fee_bps=spec.fee_bps,
+            fee_curve_k=spec.fee_curve_k,
+        )
+    )
     raw_edge = None if p_side is None else float(p_side) - float(repriced_entry_price)
     min_net_edge = spec.min_net_edge_for(offset=offset, entry_price=repriced_entry_price)
 

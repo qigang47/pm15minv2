@@ -19,6 +19,11 @@ STRIKE_FEATURE_COLUMNS = frozenset(
         "strike_flip_count_cycle",
         "q_bs_up_strike",
         "q_bs_up_strike_centered",
+        "up_move_remaining_per_minute",
+        "up_move_remaining_z_per_minute",
+        "first_up_cross_offset",
+        "minutes_since_first_up_cross",
+        "up_hold_minutes",
     }
 )
 
@@ -125,23 +130,65 @@ def _append_strike_feature_columns(
         "strike_flip_count_cycle",
         "q_bs_up_strike",
         "q_bs_up_strike_centered",
+        "up_move_remaining_per_minute",
+        "up_move_remaining_z_per_minute",
+        "first_up_cross_offset",
+        "minutes_since_first_up_cross",
+        "up_hold_minutes",
     ):
         out["ret_from_strike"] = ((1.0 + ret_cycle) * (1.0 + basis_ratio.fillna(0.0)) - 1.0).astype(float)
     if needs("move_z_strike"):
         out["move_z_strike"] = out["ret_from_strike"] / pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
     if needs("strike_abs_z"):
         out["strike_abs_z"] = out["ret_from_strike"].abs() / pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
+    cycle_key = pd.to_datetime(out["cycle_start_ts"], utc=True, errors="coerce")
+    entity_key = _strike_entity_key(out, strike=strike)
     if needs("strike_flip_count_cycle"):
         strike_side = pd.Series(np.nan, index=out.index, dtype=float)
         strike_ret = pd.to_numeric(out["ret_from_strike"], errors="coerce")
         strike_side.loc[strike_ret.gt(0.0)] = 1.0
         strike_side.loc[strike_ret.lt(0.0)] = -1.0
-        cycle_key = pd.to_datetime(out["cycle_start_ts"], utc=True, errors="coerce")
-        entity_key = _strike_entity_key(out, strike=strike)
         active_side = strike_side.groupby([cycle_key, entity_key]).ffill()
         previous_side = active_side.groupby([cycle_key, entity_key]).shift(1)
         flipped = active_side.notna() & previous_side.notna() & active_side.ne(previous_side)
         out["strike_flip_count_cycle"] = flipped.astype(int).groupby([cycle_key, entity_key]).cumsum().astype(float)
+    if needs(
+        "up_move_remaining_per_minute",
+        "up_move_remaining_z_per_minute",
+        "first_up_cross_offset",
+        "minutes_since_first_up_cross",
+        "up_hold_minutes",
+    ):
+        decision_ts = pd.to_datetime(out["decision_ts"], utc=True, errors="coerce")
+        if "cycle_end_ts" in out.columns:
+            cycle_end = pd.to_datetime(out["cycle_end_ts"], utc=True, errors="coerce")
+        else:
+            cycle_end = decision_ts.dt.floor(_pandas_cycle_freq(cycle)) + pd.Timedelta(_pandas_cycle_freq(cycle))
+        minutes_left = ((cycle_end - decision_ts).dt.total_seconds() / 60.0).clip(lower=0.0)
+        strike_ret = pd.to_numeric(out["ret_from_strike"], errors="coerce")
+        valid_strike = valid.fillna(False)
+        up_gap = (-strike_ret).clip(lower=0.0).where(valid_strike)
+        if needs("up_move_remaining_per_minute", "up_move_remaining_z_per_minute"):
+            up_gap_per_minute = up_gap / minutes_left.replace(0.0, np.nan)
+            if needs("up_move_remaining_per_minute"):
+                out["up_move_remaining_per_minute"] = up_gap_per_minute.astype(float)
+            if needs("up_move_remaining_z_per_minute"):
+                out["up_move_remaining_z_per_minute"] = (
+                    up_gap_per_minute / pd.to_numeric(out["rv_30"], errors="coerce").replace(0.0, np.nan)
+                ).astype(float)
+        positive_side = valid_strike & strike_ret.gt(0.0)
+        minute_in_cycle = pd.to_numeric(out.get("offset"), errors="coerce")
+        first_cross_offset = minute_in_cycle.where(positive_side)
+        first_cross_offset = first_cross_offset.groupby([cycle_key, entity_key]).cummin()
+        first_cross_offset = first_cross_offset.groupby([cycle_key, entity_key]).ffill()
+        if needs("first_up_cross_offset"):
+            out["first_up_cross_offset"] = first_cross_offset.astype(float)
+        if needs("minutes_since_first_up_cross"):
+            out["minutes_since_first_up_cross"] = (minute_in_cycle - first_cross_offset).where(first_cross_offset.notna()).astype(float)
+        if needs("up_hold_minutes"):
+            reset_counter = (~positive_side).astype(int).groupby([cycle_key, entity_key]).cumsum()
+            hold_counts = positive_side.astype(int).groupby([cycle_key, entity_key, reset_counter]).cumsum().astype(float)
+            out["up_hold_minutes"] = hold_counts.where(positive_side, 0.0)
 
     if needs("q_bs_up_strike", "q_bs_up_strike_centered"):
         decision_ts = pd.to_datetime(out["decision_ts"], utc=True, errors="coerce")

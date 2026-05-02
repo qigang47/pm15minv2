@@ -22,6 +22,7 @@ from pm15min.research.bundles.builder import build_model_bundle
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import BacktestRunSpec, ModelBundleSpec, TrainingRunSpec
 from pm15min.research.datasets.feature_frames import build_feature_frame_dataset
+from pm15min.research.inference.scorer import clear_process_scoring_runtime_cache
 from pm15min.research.labels.datasets import build_label_frame_dataset
 from pm15min.research.manifests import build_manifest, write_manifest
 from pm15min.research.training.runner import train_research_run
@@ -105,6 +106,17 @@ def run_experiment_suite(
         rewrite_root=str(cfg.layout.storage.rewrite_root),
     )
     prepared_datasets.update(set(shared_cache.prepared_datasets.keys()))
+    prepared_at_by_key = _seed_prepared_dataset_timestamps(
+        rows=run_state.training_rows(),
+        cycle=suite.cycle,
+        rewrite_root=str(cfg.layout.storage.rewrite_root),
+    )
+    prepared_at_by_key.update(
+        {
+            key: _parse_cache_timestamp(record.get("prepared_at"))
+            for key, record in shared_cache.prepared_datasets.items()
+        }
+    )
     training_cache = _seed_shared_training_cache(shared_cache)
     training_cache.update(_seed_training_cache(run_state.training_rows()))
     bundle_cache = _seed_shared_bundle_cache(shared_cache)
@@ -317,7 +329,11 @@ def run_experiment_suite(
                 )
 
                 failure_stage = "prepare_datasets"
-                datasets_reused = _ensure_market_datasets(market_cfg=market_cfg, prepared_datasets=prepared_datasets)
+                datasets_reused = _ensure_market_datasets(
+                    market_cfg=market_cfg,
+                    prepared_datasets=prepared_datasets,
+                    prepared_at_by_key=prepared_at_by_key,
+                )
                 _emit_case_progress(
                     reporter,
                     case_position=case_position,
@@ -380,6 +396,7 @@ def run_experiment_suite(
                     secondary_datasets_reused = _ensure_market_datasets(
                         market_cfg=secondary_cfg,
                         prepared_datasets=prepared_datasets,
+                        prepared_at_by_key=prepared_at_by_key,
                     )
                     _emit_case_progress(
                         reporter,
@@ -680,6 +697,7 @@ def run_experiment_suite(
                 case_key=str(first_context["case_key"]),
                 case_row_prefix=first_context["case_row_prefix"],
                 prepared_datasets=prepared_datasets,
+                prepared_at_by_key=prepared_at_by_key,
                 training_cache=training_cache,
                 bundle_cache=bundle_cache,
                 reporter=reporter,
@@ -738,6 +756,7 @@ def run_experiment_suite(
                             case_key=str(context["case_key"]),
                             case_row_prefix=context["case_row_prefix"],
                             prepared_datasets=prepared_datasets,
+                            prepared_at_by_key=prepared_at_by_key,
                             training_cache=training_cache,
                             bundle_cache=bundle_cache,
                             reporter=reporter,
@@ -861,6 +880,7 @@ def _execute_experiment_case(
     case_key: str,
     case_row_prefix: dict[str, object],
     prepared_datasets: set[str],
+    prepared_at_by_key: dict[tuple[str, ...], float | None] | None = None,
     training_cache: dict[str, dict[str, object]],
     bundle_cache: dict[str, dict[str, object]],
     reporter: ExperimentReporter | None,
@@ -892,7 +912,11 @@ def _execute_experiment_case(
             target=market_spec.target,
         )
         failure_stage = "prepare_datasets"
-        datasets_reused = _ensure_market_datasets(market_cfg=market_cfg, prepared_datasets=prepared_datasets)
+        datasets_reused = _ensure_market_datasets(
+            market_cfg=market_cfg,
+            prepared_datasets=prepared_datasets,
+            prepared_at_by_key=prepared_at_by_key,
+        )
         _emit_case_progress(
             reporter,
             case_position=case_position,
@@ -955,6 +979,7 @@ def _execute_experiment_case(
             secondary_datasets_reused = _ensure_market_datasets(
                 market_cfg=secondary_cfg,
                 prepared_datasets=prepared_datasets,
+                prepared_at_by_key=prepared_at_by_key,
             )
             _emit_case_progress(
                 reporter,
@@ -1267,6 +1292,7 @@ def _emit_experiment_progress(
 
 def _release_execution_group_memory() -> None:
     clear_process_backtest_runtime_cache()
+    clear_process_scoring_runtime_cache()
     gc.collect()
 
 
@@ -1541,6 +1567,26 @@ def _seed_prepared_datasets(
     return prepared
 
 
+def _seed_prepared_dataset_timestamps(
+    *,
+    rows,
+    cycle: str,
+    rewrite_root: str,
+) -> dict[tuple[str, ...], float | None]:
+    prepared: dict[tuple[str, ...], float | None] = {}
+    for row in rows:
+        market = str(row.get("market") or "").strip()
+        profile = str(row.get("profile") or "").strip()
+        feature_set = str(row.get("feature_set") or "").strip()
+        label_set = str(row.get("label_set") or "").strip()
+        if not market or not profile or not feature_set or not label_set:
+            continue
+        prepared[(market, cycle, profile, feature_set, label_set, rewrite_root)] = _parse_cache_timestamp(
+            row.get("prepared_at")
+        )
+    return prepared
+
+
 def _seed_training_cache(rows) -> dict[str, dict[str, object]]:
     cache: dict[str, dict[str, object]] = {}
     for row in rows:
@@ -1600,7 +1646,12 @@ def _seed_bundle_cache(rows) -> dict[str, dict[str, object]]:
     return cache
 
 
-def _ensure_market_datasets(*, market_cfg: ResearchConfig, prepared_datasets: set[tuple[str, ...]]) -> bool:
+def _ensure_market_datasets(
+    *,
+    market_cfg: ResearchConfig,
+    prepared_datasets: set[tuple[str, ...]],
+    prepared_at_by_key: dict[tuple[str, ...], float | None] | None = None,
+) -> bool:
     key = (
         market_cfg.asset.slug,
         market_cfg.cycle,
@@ -1609,12 +1660,41 @@ def _ensure_market_datasets(*, market_cfg: ResearchConfig, prepared_datasets: se
         market_cfg.label_set,
         str(market_cfg.layout.storage.rewrite_root),
     )
-    if key in prepared_datasets:
+    prepared_at = None if prepared_at_by_key is None else prepared_at_by_key.get(key)
+    if key in prepared_datasets and not _market_dataset_artifacts_newer_than_cache(market_cfg, prepared_at):
         return True
     build_feature_frame_dataset(market_cfg)
     build_label_frame_dataset(market_cfg)
     prepared_datasets.add(key)
+    if prepared_at_by_key is not None:
+        prepared_at_by_key[key] = datetime.now(timezone.utc).timestamp()
     return False
+
+
+def _market_dataset_artifacts_newer_than_cache(market_cfg: ResearchConfig, prepared_at: float | None) -> bool:
+    if prepared_at is None:
+        return True
+    artifact_paths = (
+        market_cfg.layout.feature_frame_path(market_cfg.feature_set, source_surface=market_cfg.source_surface),
+        market_cfg.layout.label_frame_path(market_cfg.label_set),
+    )
+    for path in artifact_paths:
+        try:
+            if path.exists() and path.stat().st_mtime > float(prepared_at):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _parse_cache_timestamp(value: object) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 def _normalize_offsets(raw: object) -> tuple[int, ...]:

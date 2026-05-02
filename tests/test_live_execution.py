@@ -4,8 +4,10 @@ from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from pm15min.core.config import LiveConfig
+from pm15min.core.fees import max_quote_price_for_target_roi
 from pm15min.data.config import DataConfig
 from pm15min.data.io.ndjson_zst import append_ndjson_zst
 from pm15min.data.io.json_files import write_json_atomic
@@ -18,6 +20,22 @@ def _patch_v2_roots(monkeypatch, root: Path) -> None:
     monkeypatch.setattr("pm15min.core.layout.rewrite_root", lambda: root)
     monkeypatch.setattr("pm15min.data.layout.rewrite_root", lambda: root)
     monkeypatch.setattr("pm15min.research.layout.rewrite_root", lambda: root)
+
+
+def _deep_otm_price_cap(probability: float) -> float:
+    spec = resolve_live_profile_spec("deep_otm")
+    return max_quote_price_for_target_roi(
+        probability=probability,
+        roi_target=0.0,
+        model=spec.fee_model,
+        fee_bps=spec.fee_bps,
+        fee_curve_k=spec.fee_curve_k,
+        slippage_bps=spec.slippage_bps,
+    )
+
+
+def _deep_otm_fee_rate(price: float) -> float:
+    return resolve_live_profile_spec("deep_otm").fee_rate(price=price)
 
 
 def test_execution_snapshot_no_action_when_decision_rejects(tmp_path: Path, monkeypatch) -> None:
@@ -114,7 +132,7 @@ def test_execution_snapshot_reuses_precomputed_depth_plan(tmp_path: Path, monkey
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
-    price_cap = 0.8 / 1.01
+    price_cap = _deep_otm_price_cap(0.8)
     def _should_not_run(*args, **kwargs):
         raise AssertionError("depth plan should be reused from decision payload")
 
@@ -137,7 +155,7 @@ def test_execution_snapshot_reuses_precomputed_depth_plan(tmp_path: Path, monkey
                 "quote_metrics": {
                     "entry_side": "UP",
                     "entry_price": 0.2005,
-                    "fee_rate": 0.01,
+                    "fee_rate": _deep_otm_fee_rate(0.2005),
                     "slippage_bps": 0.0,
                     "roi_net_vs_quote": 0.20,
                     "depth_enforced": True,
@@ -153,7 +171,7 @@ def test_execution_snapshot_reuses_precomputed_depth_plan(tmp_path: Path, monkey
                     "repriced_metrics": {
                         "repriced_entry_price": 0.2005,
                         "repriced_effective_price": 0.2005,
-                        "repriced_fee_rate": 0.01,
+                        "repriced_fee_rate": _deep_otm_fee_rate(0.2005),
                         "repriced_raw_edge": 0.5995,
                         "repriced_min_net_edge_required": 0.01,
                         "repriced_roi_net": 2.99002493765586,
@@ -182,14 +200,14 @@ def test_execution_snapshot_reuses_precomputed_depth_plan(tmp_path: Path, monkey
     assert out["execution"]["depth_plan"]["status"] == "ok"
     assert out["execution"]["depth_plan_reused"] is True
     assert out["execution"]["repriced_metrics"]["repriced_entry_price"] == 0.2005
-    assert out["execution"]["repriced_metrics"]["repriced_fee_rate"] == 0.01
+    assert out["execution"]["repriced_metrics"]["repriced_fee_rate"] == _deep_otm_fee_rate(0.2005)
 
 
 def test_execution_snapshot_does_not_recheck_repriced_guard_when_reusing_depth_plan(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "v2"
     _patch_v2_roots(monkeypatch, root)
     cfg = LiveConfig.build(market="sol", profile="deep_otm", cycle_minutes=15)
-    price_cap = 0.8 / 1.01
+    price_cap = _deep_otm_price_cap(0.8)
 
     def _should_not_run(*args, **kwargs):
         raise AssertionError("depth plan should be reused from decision payload")
@@ -213,7 +231,7 @@ def test_execution_snapshot_does_not_recheck_repriced_guard_when_reusing_depth_p
                 "quote_metrics": {
                     "entry_side": "UP",
                     "entry_price": 0.2005,
-                    "fee_rate": 0.01,
+                    "fee_rate": _deep_otm_fee_rate(0.2005),
                     "slippage_bps": 0.0,
                     "roi_net_vs_quote": 0.20,
                     "depth_enforced": True,
@@ -229,7 +247,7 @@ def test_execution_snapshot_does_not_recheck_repriced_guard_when_reusing_depth_p
                     "repriced_metrics": {
                         "repriced_entry_price": 0.2005,
                         "repriced_effective_price": 0.2005,
-                        "repriced_fee_rate": 0.01,
+                        "repriced_fee_rate": _deep_otm_fee_rate(0.2005),
                         "repriced_raw_edge": 0.5995,
                         "repriced_min_net_edge_required": 0.01,
                         "repriced_roi_net": 2.99002493765586,
@@ -301,7 +319,7 @@ def test_execution_snapshot_recomputes_when_cached_depth_plan_is_blocked(tmp_pat
                     "roi_net_vs_quote": 0.20,
                     "depth_enforced": True,
                     "requested_notional_usd": 1.0,
-                    "price_cap": 0.8 / 1.01,
+                    "price_cap": _deep_otm_price_cap(0.8),
                     "depth_reason": "depth_fill_unavailable",
                     "depth_plan": {
                         "status": "blocked",
@@ -369,7 +387,7 @@ def test_execution_snapshot_reuses_cached_depth_plan_when_live_depth_is_preferre
                     "roi_net_vs_quote": 0.20,
                     "depth_enforced": True,
                     "requested_notional_usd": 1.0,
-                    "price_cap": 0.8 / 1.01,
+                    "price_cap": _deep_otm_price_cap(0.8),
                     "depth_reason": None,
                     "depth_plan": {
                         "status": "ok",
@@ -841,6 +859,83 @@ def test_execution_snapshot_uses_cash_balance_step_stake(tmp_path: Path, monkeyp
     assert out["execution"]["stake_step_levels"] == 2
     assert out["execution"]["requested_notional_usd"] == 2.0
     assert out["execution"]["requested_shares"] == 10.0
+
+
+def test_execution_snapshot_applies_tiered_kelly_stake_sizing(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    _patch_v2_roots(monkeypatch, root)
+    cfg = LiveConfig.build(market="btc", profile="deep_otm_midprice_direction", cycle_minutes=15)
+    data_cfg = DataConfig.build(market="btc", cycle="15m", surface="live", root=root)
+    captured_ts_ms = int(pd.Timestamp("2026-04-20T00:08:30Z").timestamp() * 1000)
+    append_ndjson_zst(
+        data_cfg.layout.orderbook_depth_path("2026-04-20"),
+        [
+            {
+                "market_id": "market-1",
+                "token_id": "token-up",
+                "side": "up",
+                "logged_at": "2026-04-20T00:08:30+00:00",
+                "asks": [[0.49, 30.0]],
+                "bids": [[0.48, 2.0]],
+            }
+        ],
+    )
+    profile_spec = replace(
+        resolve_live_profile_spec("deep_otm_midprice_direction"),
+        stake_sizing_mode="kelly_tiers",
+        stake_usd=2.0,
+        max_notional_usd=10.0,
+        stake_cash_pct=0.0,
+        stake_balance_step_threshold_usd=0.0,
+        stake_balance_step_usd=0.0,
+        stake_balance_base_usd=0.0,
+        stake_balance_increment_usd=0.0,
+    )
+    monkeypatch.setattr("pm15min.live.execution.resolve_live_profile_spec", lambda profile: profile_spec)
+
+    payload = {
+        "market": "btc",
+        "profile": "deep_otm_midprice_direction",
+        "cycle": "15m",
+        "target": "direction",
+        "snapshot_ts": "2026-04-20T00-00-00Z",
+        "decision": {"status": "accept", "selected_offset": 7, "selected_side": "UP"},
+        "accepted_offsets": [
+            {
+                "offset": 7,
+                "recommended_side": "UP",
+                "decision_ts": "2026-04-20T00:08:00+00:00",
+                "p_up": 0.60,
+                "confidence": 0.60,
+                "quote_metrics": {
+                    "entry_price": 0.49,
+                    "fee_rate": profile_spec.fee_rate(price=0.49),
+                    "slippage_bps": 0.0,
+                    "roi_net_vs_quote": 0.20,
+                },
+                "quote_row": {
+                    "market_id": "market-1",
+                    "condition_id": "cond-1",
+                    "cycle_end_ts": "2026-04-20T00:15:00+00:00",
+                    "question": "test",
+                    "token_up": "token-up",
+                    "token_down": "token-down",
+                    "decision_ts": "2026-04-20T00:08:00+00:00",
+                    "quote_up_ask": 0.49,
+                    "quote_up_bid": 0.48,
+                    "quote_up_ask_size_1": 30.0,
+                    "quote_captured_ts_ms_up": captured_ts_ms,
+                },
+            }
+        ],
+    }
+
+    out = build_execution_snapshot(cfg, payload)
+
+    assert out["execution"]["status"] == "plan"
+    assert out["execution"]["stake_base_usd"] == pytest.approx(2.0)
+    assert out["execution"]["stake_source"] == "kelly_tier_base"
+    assert out["execution"]["requested_notional_usd"] == pytest.approx(2.0)
 
 
 def test_execution_snapshot_does_not_block_when_depth_max_price_exceeds_original_entry_band(tmp_path: Path, monkeypatch) -> None:

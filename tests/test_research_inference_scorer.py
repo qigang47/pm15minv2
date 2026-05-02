@@ -138,6 +138,55 @@ def test_score_bundle_offset_uses_conservative_reliability_probabilities(tmp_pat
     assert out.iloc[0]["probability_mode"] == "conservative_reliability_bin"
 
 
+def test_score_bundle_offset_uses_catboost_when_present_in_blend(tmp_path) -> None:
+    bundle_dir = tmp_path / "bundle=test"
+    offset_dir = bundle_dir / "offsets" / "offset=7"
+    (offset_dir / "models").mkdir(parents=True, exist_ok=True)
+    (offset_dir / "calibration").mkdir(parents=True, exist_ok=True)
+
+    (offset_dir / "bundle_config.json").write_text(
+        json.dumps(
+            {
+                "feature_columns": ["ret_1m"],
+                "signal_target": "direction",
+                "allowed_blacklist_columns": [],
+                "missing_feature_fill_value": 0.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    joblib.dump(FixedProbabilityModel(0.90), offset_dir / "models" / "lgbm_sigmoid.joblib")
+    joblib.dump(FixedProbabilityModel(0.70), offset_dir / "models" / "logreg_sigmoid.joblib")
+    joblib.dump(FixedProbabilityModel(0.20), offset_dir / "models" / "catboost.joblib")
+    (offset_dir / "calibration" / "blend_weights.json").write_text(
+        json.dumps({"w_lgb": 0.2, "w_lr": 0.3, "w_catboost": 0.5}),
+        encoding="utf-8",
+    )
+
+    features = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-20T00:08:00+00:00",
+                "cycle_start_ts": "2026-03-20T00:00:00+00:00",
+                "cycle_end_ts": "2026-03-20T00:15:00+00:00",
+                "offset": 7,
+                "ret_1m": 0.01,
+            }
+        ]
+    )
+
+    out = score_bundle_offset(bundle_dir, features, offset=7)
+
+    assert len(out) == 1
+    assert out.iloc[0]["p_lgb"] == pytest.approx(0.9)
+    assert out.iloc[0]["p_lr"] == pytest.approx(0.7)
+    assert out.iloc[0]["p_catboost"] == pytest.approx(0.2)
+    assert out.iloc[0]["w_lgb"] == pytest.approx(0.2)
+    assert out.iloc[0]["w_lr"] == pytest.approx(0.3)
+    assert out.iloc[0]["w_catboost"] == pytest.approx(0.5)
+    assert out.iloc[0]["p_signal"] == pytest.approx(0.49)
+
+
 def test_load_offset_model_context_falls_back_to_models_when_diagnostics_missing(tmp_path) -> None:
     bundle_dir = tmp_path / "bundle=test"
     offset_dir = bundle_dir / "offsets" / "offset=7"

@@ -25,6 +25,27 @@ _FAMILY_LIMITS = {
     "price_vol": (8, 12),
     "context": (0, 4),
 }
+_PRIORITY_UNUSED_BASELINE_FEATURES = (
+    "minutes_left_to_settle",
+    "up_move_remaining_per_minute",
+    "up_move_remaining_z_per_minute",
+    "first_up_cross_offset",
+    "minutes_since_first_up_cross",
+    "up_hold_minutes",
+    "rel_strength_15m",
+    "btc_ret_5m",
+    "btc_vol_30m",
+    "taker_buy_ratio_change",
+    "rv_30_change",
+    "q_bs_up_strike_centered",
+    "move_z_strike",
+    "strike_abs_z",
+    "strike_flip_count_cycle",
+)
+_PRIORITY_UNUSED_BASELINE_RANK = {
+    name: idx
+    for idx, name in enumerate(_PRIORITY_UNUSED_BASELINE_FEATURES)
+}
 
 
 def rank_focus_features(summary_payloads: list[dict[str, Any]]) -> list[str]:
@@ -151,7 +172,13 @@ def load_baseline_direction_summary_payloads(market: str) -> list[dict[str, Any]
 
 def available_unused_baseline_features() -> list[str]:
     baseline = set(feature_set_columns("bs_q_replace_direction"))
-    return sorted(feature for feature in feature_registry() if feature not in baseline)
+    return sorted(
+        (feature for feature in feature_registry() if feature not in baseline),
+        key=lambda item: (
+            _PRIORITY_UNUSED_BASELINE_RANK.get(item, len(_PRIORITY_UNUSED_BASELINE_RANK)),
+            str(item),
+        ),
+    )
 
 
 def _dedupe_keep_order(features: list[str], *, known_features: set[str]) -> list[str]:

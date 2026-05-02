@@ -26,8 +26,10 @@ class _OffsetScoringRuntime:
     signal_target: str
     model_lgb: object
     model_lr: object
+    model_catboost: object | None
     w_lgb: float
     w_lr: float
+    w_catboost: float
     reliability_bins: tuple[dict[str, float | int], ...]
 
 
@@ -375,9 +377,11 @@ def score_bundle_offset(
                 "offset",
                 "p_lgb",
                 "p_lr",
+                "p_catboost",
                 "p_signal",
                 "w_lgb",
                 "w_lr",
+                "w_catboost",
                 "p_up",
                 "p_down",
                 "probability_mode",
@@ -400,7 +404,14 @@ def score_bundle_offset(
 
     p_lgb = runtime.model_lgb.predict_proba(X)[:, 1].astype(float)
     p_lr = runtime.model_lr.predict_proba(X)[:, 1].astype(float)
+    p_catboost = (
+        runtime.model_catboost.predict_proba(X)[:, 1].astype(float)
+        if runtime.model_catboost is not None
+        else np.full(len(rows), np.nan, dtype=float)
+    )
     p_signal = runtime.w_lgb * p_lgb + runtime.w_lr * p_lr
+    if runtime.model_catboost is not None:
+        p_signal = p_signal + runtime.w_catboost * p_catboost
 
     signal_target = runtime.signal_target
     if signal_target == "reversal":
@@ -424,9 +435,11 @@ def score_bundle_offset(
         "offset": rows["offset"].astype(int),
         "p_lgb": p_lgb,
         "p_lr": p_lr,
+        "p_catboost": p_catboost,
         "p_signal": p_signal,
         "w_lgb": [runtime.w_lgb] * len(rows),
         "w_lr": [runtime.w_lr] * len(rows),
+        "w_catboost": [runtime.w_catboost] * len(rows),
         "p_up_raw": p_up_raw,
         "p_down_raw": p_down_raw,
         "p_eff_up": p_up,
@@ -449,6 +462,11 @@ def _load_offset_scoring_runtime(offset_dir: Path) -> _OffsetScoringRuntime:
     return _load_offset_scoring_runtime_cached(str(Path(offset_dir)), signature)
 
 
+def clear_process_scoring_runtime_cache() -> None:
+    _load_offset_model_context_cached.cache_clear()
+    _load_offset_scoring_runtime_cached.cache_clear()
+
+
 @lru_cache(maxsize=256)
 def _load_offset_scoring_runtime_cached(
     offset_dir_str: str,
@@ -468,14 +486,20 @@ def _load_offset_scoring_runtime_cached(
 
     model_lgb = _apply_sklearn_compat_shims(joblib.load(offset_dir / "models" / "lgbm_sigmoid.joblib"))
     model_lr = _apply_sklearn_compat_shims(joblib.load(offset_dir / "models" / "logreg_sigmoid.joblib"))
+    catboost_path = offset_dir / "models" / "catboost.joblib"
+    model_catboost = _apply_sklearn_compat_shims(joblib.load(catboost_path)) if catboost_path.exists() else None
     weights = json.loads((offset_dir / "calibration" / "blend_weights.json").read_text(encoding="utf-8"))
     w_lgb = float(weights.get("w_lgb", 0.5))
     w_lr = float(weights.get("w_lr", 0.5))
-    total = w_lgb + w_lr
+    w_catboost = float(weights.get("w_catboost", 0.0)) if model_catboost is not None else 0.0
+    total = w_lgb + w_lr + w_catboost
     if total <= 0:
-        w_lgb, w_lr = 0.5, 0.5
+        if model_catboost is None:
+            w_lgb, w_lr, w_catboost = 0.5, 0.5, 0.0
+        else:
+            w_lgb, w_lr, w_catboost = 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0
     else:
-        w_lgb, w_lr = w_lgb / total, w_lr / total
+        w_lgb, w_lr, w_catboost = w_lgb / total, w_lr / total, w_catboost / total
     reliability_bins = tuple(_resolve_blend_reliability_bins(offset_dir, w_lgb=w_lgb, w_lr=w_lr))
 
     return _OffsetScoringRuntime(
@@ -486,8 +510,10 @@ def _load_offset_scoring_runtime_cached(
         signal_target=signal_target,
         model_lgb=model_lgb,
         model_lr=model_lr,
+        model_catboost=model_catboost,
         w_lgb=float(w_lgb),
         w_lr=float(w_lr),
+        w_catboost=float(w_catboost),
         reliability_bins=reliability_bins,
     )
 
@@ -497,6 +523,7 @@ def _offset_scoring_runtime_signature(offset_dir: Path) -> tuple[tuple[str, int 
         offset_dir / "bundle_config.json",
         offset_dir / "models" / "lgbm_sigmoid.joblib",
         offset_dir / "models" / "logreg_sigmoid.joblib",
+        offset_dir / "models" / "catboost.joblib",
         offset_dir / "calibration" / "blend_weights.json",
         offset_dir / "calibration" / "reliability_bins_blend.json",
         offset_dir / "calibration" / "reliability_bins_blend_weighted.json",

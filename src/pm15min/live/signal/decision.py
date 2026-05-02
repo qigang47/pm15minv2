@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from pm15min.core.fees import expected_resolution_roi, max_quote_price_for_target_roi
 from pm15min.data.config import DataConfig
 from pm15min.data.layout import utc_snapshot_label
 from ..guards import evaluate_signal_guard_reasons
@@ -176,9 +177,11 @@ def build_decision_snapshot(
             "selected_p_up_ucb": float_or_none(best.get("p_up_ucb")) if best else None,
             "selected_p_lgb": float_or_none(best.get("p_lgb")) if best else None,
             "selected_p_lr": float_or_none(best.get("p_lr")) if best else None,
+            "selected_p_catboost": float_or_none(best.get("p_catboost")) if best else None,
             "selected_p_signal": float_or_none(best.get("p_signal")) if best else None,
             "selected_w_lgb": float_or_none(best.get("w_lgb")) if best else None,
             "selected_w_lr": float_or_none(best.get("w_lr")) if best else None,
+            "selected_w_catboost": float_or_none(best.get("w_catboost")) if best else None,
             "selected_probability_mode": best.get("probability_mode") if best else None,
         },
         "accepted_offsets": accepted,
@@ -334,6 +337,8 @@ def _build_decision_quote_metrics(
     requested_notional_base, stake_context = resolve_dynamic_stake_base(
         spec=profile_spec,
         account_summary=account_summary,
+        signal_probability=p_side,
+        entry_price=entry_price_l1,
     )
     requested_notional = min(
         float(requested_notional_base) * float(stake_multiplier),
@@ -343,6 +348,15 @@ def _build_decision_quote_metrics(
     metrics["stake_multiplier"] = float(stake_multiplier)
     metrics["requested_notional_usd"] = float(requested_notional)
     metrics["stake_source"] = stake_context.get("stake_source")
+    metrics["stake_base_source"] = stake_context.get("stake_base_source")
+    metrics["stake_sizing_mode"] = stake_context.get("stake_sizing_mode")
+    metrics["kelly_enabled"] = stake_context.get("kelly_enabled")
+    metrics["kelly_probability"] = stake_context.get("kelly_probability")
+    metrics["kelly_entry_price"] = stake_context.get("kelly_entry_price")
+    metrics["kelly_edge"] = stake_context.get("kelly_edge")
+    metrics["kelly_full"] = stake_context.get("kelly_full")
+    metrics["kelly_fractional"] = stake_context.get("kelly_fractional")
+    metrics["kelly_fraction"] = stake_context.get("kelly_fraction")
     metrics["cash_balance_usd"] = stake_context.get("cash_balance_usd")
     metrics["cash_balance_available"] = stake_context.get("cash_balance_available")
     metrics["depth_enforced"] = False
@@ -353,7 +367,17 @@ def _build_decision_quote_metrics(
         fee_rate = profile_spec.fee_rate(price=effective_price)
         raw_edge = None if p_side is None else float(p_side) - float(entry_price_l1)
         min_net_edge = profile_spec.min_net_edge_for(offset=int(signal_row["offset"]), entry_price=entry_price_l1)
-        roi_net = None if p_side is None else float(p_side) / max(effective_price, 1e-9) - 1.0 - fee_rate
+        roi_net = (
+            None
+            if p_side is None
+            else expected_resolution_roi(
+                probability=float(p_side),
+                price=effective_price,
+                model=profile_spec.fee_model,
+                fee_bps=profile_spec.fee_bps,
+                fee_curve_k=profile_spec.fee_curve_k,
+            )
+        )
         roi_threshold = profile_spec.roi_threshold_for(offset=int(signal_row["offset"]))
         metrics["fee_rate"] = fee_rate
         metrics["effective_entry_price"] = effective_price
@@ -382,14 +406,15 @@ def _build_decision_quote_metrics(
             surface="live",
         )
 
-    fee_reference_price = entry_price_l1
-    if fee_reference_price is None or fee_reference_price <= 0.0:
-        fee_reference_price = 0.5
-    fee_rate = profile_spec.fee_rate(price=float(fee_reference_price))
-    slip = max(0.0, float(profile_spec.slippage_bps)) / 10000.0
     roi_threshold = profile_spec.roi_threshold_for(offset=int(signal_row["offset"]))
-    denom = max((1.0 + float(roi_threshold) + float(fee_rate)) * (1.0 + slip), 1e-9)
-    p_cap = max(1e-6, min(float(p_side) / denom, 1.0))
+    p_cap = max_quote_price_for_target_roi(
+        probability=float(p_side),
+        roi_target=float(roi_threshold),
+        model=profile_spec.fee_model,
+        fee_bps=profile_spec.fee_bps,
+        fee_curve_k=profile_spec.fee_curve_k,
+        slippage_bps=float(profile_spec.slippage_bps),
+    )
     metrics["price_cap"] = p_cap
     if not _decision_depth_enforced():
         return metrics

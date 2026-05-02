@@ -15,6 +15,7 @@ from pm15min.research.experiments.orchestration import build_execution_groups
 from pm15min.research.experiments.runner import (
     _backtest_run_label,
     _case_key,
+    _ensure_market_datasets,
     _seed_bundle_cache,
     _seed_training_cache,
     run_experiment_suite,
@@ -333,13 +334,17 @@ def test_run_experiment_suite_releases_backtest_memory_after_each_group(monkeypa
         lambda: release_trace.append("clear"),
     )
     monkeypatch.setattr(
+        "pm15min.research.experiments.runner.clear_process_scoring_runtime_cache",
+        lambda: release_trace.append("clear_scoring"),
+    )
+    monkeypatch.setattr(
         "pm15min.research.experiments.runner.gc.collect",
         lambda: release_trace.append("gc") or 0,
     )
 
     run_experiment_suite(cfg=cfg, suite_name="memory_release_suite", run_label="memory-release-exp")
 
-    assert release_trace == ["clear", "gc", "clear", "gc"]
+    assert release_trace == ["clear", "clear_scoring", "gc", "clear", "clear_scoring", "gc"]
 
 
 def test_build_execution_groups_groups_stake_matrix_cases_by_parent_run_name_and_stake() -> None:
@@ -666,6 +671,47 @@ def test_run_experiment_suite_reruns_completed_cases_when_runtime_policy_request
     assert training_runs["bundle_reused"].tolist() == [True, True]
     assert training_runs["resumed_from_existing"].tolist() == [False, False]
     assert backtest_runs["resumed_from_existing"].tolist() == [False, False]
+
+
+def test_ensure_market_datasets_rebuilds_when_label_frame_newer_than_prepared_cache(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "v2"
+    cfg = _build_cfg(root)
+    feature_path = cfg.layout.feature_frame_path(cfg.feature_set, source_surface=cfg.source_surface)
+    label_path = cfg.layout.label_frame_path(cfg.label_set)
+    feature_path.parent.mkdir(parents=True, exist_ok=True)
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    feature_path.write_text("features", encoding="utf-8")
+    label_path.write_text("labels", encoding="utf-8")
+
+    prepared_key = (
+        cfg.asset.slug,
+        cfg.cycle,
+        cfg.profile,
+        cfg.feature_set,
+        cfg.label_set,
+        str(cfg.layout.storage.rewrite_root),
+    )
+    prepared = {prepared_key}
+    calls = {"feature": 0, "label": 0}
+    monkeypatch.setattr(
+        "pm15min.research.experiments.runner.build_feature_frame_dataset",
+        lambda cfg: calls.__setitem__("feature", calls["feature"] + 1) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        "pm15min.research.experiments.runner.build_label_frame_dataset",
+        lambda cfg: calls.__setitem__("label", calls["label"] + 1) or {"ok": True},
+    )
+
+    assert _ensure_market_datasets(
+        market_cfg=cfg,
+        prepared_datasets=prepared,
+        prepared_at_by_key={prepared_key: 1.0},
+    ) is False
+
+    assert calls == {"feature": 1, "label": 1}
 
 
 def test_run_experiment_suite_captures_failed_cases_and_reruns_only_failures(monkeypatch, tmp_path: Path) -> None:
