@@ -1,0 +1,77 @@
+{
+  "suite_name": "deep_otm_baseline_4m_grid_train0327_backtest0328_20260404",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "label_set": "truth",
+  "target": "direction",
+  "offsets": [7, 8, 9],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-27"
+  },
+  "decision_start": "2026-03-28",
+  "decision_end": "2026-04-03",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "feature_set": "bs_q_replace_direction",
+  "stakes": [1, 3, 5, 10, 20],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 4
+  },
+  "tags": ["baseline_freeze", "orderbook_locked", "stake_grid", "max_trades_grid", "noret30"],
+  "markets": {
+    "btc": {
+      "groups": {
+        "baseline_grid": {
+          "runs": [
+            {
+              "run_name": "baseline",
+              "max_trades_per_market_values": [1, 3, 5, "unlimited"]
+            }
+          ]
+        }
+      }
+    },
+    "eth": {
+      "groups": {
+        "baseline_grid": {
+          "runs": [
+            {
+              "run_name": "baseline",
+              "max_trades_per_market_values": [1, 3, 5, "unlimited"]
+            }
+          ]
+        }
+      }
+    },
+    "sol": {
+      "groups": {
+        "baseline_grid": {
+          "runs": [
+            {
+              "run_name": "baseline",
+              "max_trades_per_market_values": [1, 3, 5, "unlimited"]
+            }
+          ]
+        }
+      }
+    },
+    "xrp": {
+      "groups": {
+        "baseline_grid": {
+          "runs": [
+            {
+              "run_name": "baseline",
+              "max_trades_per_market_values": [1, 3, 5, "unlimited"]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -362,7 +362,8 @@ def _module_family_dependency_paths(
     fallback_paths: list[Path] | None = None,
 ) -> list[Path]:
     paths: dict[str, Path] = {}
-    for module_name, module in sys.modules.items():
+    module_items = list(sys.modules.copy().items())
+    for module_name, module in module_items:
         if module_name != package_prefix and not module_name.startswith(f"{package_prefix}."):
             continue
         file_name = getattr(module, "__file__", None)

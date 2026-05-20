@@ -22,11 +22,15 @@ def build_reject_summary_frame(rejects: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["decision_source", "reason", "count"])
     source_col = "decision_source" if "decision_source" in rejects.columns else "model_source"
     reason_col = "reason" if "reason" in rejects.columns else "policy_reason"
-    frame = (
-        rejects.assign(
-            decision_source=rejects.get(source_col, "primary").astype(str),
-            reason=rejects[reason_col].astype(str),
-        )
+    frame = pd.DataFrame(
+        {
+            "decision_source": _string_column(rejects, source_col, default="primary"),
+            "reason": _string_column(rejects, reason_col, default=""),
+        },
+        index=rejects.index,
+    )
+    return (
+        frame
         .groupby(["decision_source", "reason"], dropna=False)
         .size()
         .rename("count")
@@ -34,19 +38,23 @@ def build_reject_summary_frame(rejects: pd.DataFrame) -> pd.DataFrame:
         .sort_values(["count", "decision_source", "reason"], ascending=[False, True, True])
         .reset_index(drop=True)
     )
-    return frame
 
 
 def build_policy_breakdown_frame(scored: pd.DataFrame) -> pd.DataFrame:
     if scored.empty:
         return pd.DataFrame(columns=["decision_source", "policy_action", "policy_reason", "count"])
     source_col = "decision_source" if "decision_source" in scored.columns else "model_source"
-    frame = (
-        scored.assign(
-            decision_source=scored.get(source_col, "primary").astype(str),
-            policy_action=scored.get("policy_action", "unknown").astype(str),
-            policy_reason=scored.get("policy_reason", scored.get("reject_reason", "")).astype(str),
-        )
+    reason_col = "policy_reason" if "policy_reason" in scored.columns else "reject_reason"
+    frame = pd.DataFrame(
+        {
+            "decision_source": _string_column(scored, source_col, default="primary"),
+            "policy_action": _string_column(scored, "policy_action", default="unknown"),
+            "policy_reason": _string_column(scored, reason_col, default=""),
+        },
+        index=scored.index,
+    )
+    return (
+        frame
         .groupby(["decision_source", "policy_action", "policy_reason"], dropna=False)
         .size()
         .rename("count")
@@ -54,7 +62,6 @@ def build_policy_breakdown_frame(scored: pd.DataFrame) -> pd.DataFrame:
         .sort_values(["count", "decision_source", "policy_action", "policy_reason"], ascending=[False, True, True, True])
         .reset_index(drop=True)
     )
-    return frame
 
 
 def build_backtest_summary(
@@ -743,6 +750,11 @@ def build_orderbook_preflight_gap_summary(
 def _numeric_series(frame: pd.DataFrame, column: str) -> pd.Series:
     values = frame[column] if column in frame.columns else pd.Series(0.0, index=frame.index, dtype=float)
     return pd.to_numeric(values, errors="coerce")
+
+
+def _string_column(frame: pd.DataFrame, column: str, *, default: str) -> pd.Series:
+    values = frame[column] if column in frame.columns else pd.Series(default, index=frame.index, dtype="string")
+    return values.astype("string").fillna(default).astype(str)
 
 
 def _int_or_none(value: object) -> int | None:

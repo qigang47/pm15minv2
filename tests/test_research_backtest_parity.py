@@ -15,7 +15,10 @@ from pm15min.research.backtests.fills import BacktestFillConfig, build_proxy_fil
 from pm15min.research.backtests.hybrid import apply_hybrid_score_fallback
 from pm15min.research.backtests.policy import build_policy_decisions, split_policy_decisions
 from pm15min.research.backtests.replay_loader import build_replay_frame
-from pm15min.research.backtests.runtime_cache import clear_process_backtest_runtime_cache
+from pm15min.research.backtests.runtime_cache import (
+    clear_process_backtest_runtime_cache,
+    process_backtest_surface_runtime_cache,
+)
 from pm15min.research.backtests.settlement import settle_trade_fills
 from pm15min.research.bundles.builder import build_model_bundle
 from pm15min.research.config import ResearchConfig
@@ -663,6 +666,9 @@ def test_run_research_backtest_reuses_shared_runtime_for_stake_matrix_cases(monk
     monkeypatch.setattr(backtest_engine, "build_raw_depth_replay_frame", _count_depth_replay)
     monkeypatch.setattr(backtest_engine, "_attach_replay_runtime_surface", _count_runtime_surface)
 
+    surface_cache = process_backtest_surface_runtime_cache()
+    original_surface_cache_entries = surface_cache._max_entries
+    surface_cache._max_entries = 2
     clear_process_backtest_runtime_cache()
     try:
         first = run_research_backtest(
@@ -691,11 +697,12 @@ def test_run_research_backtest_reuses_shared_runtime_for_stake_matrix_cases(monk
         )
     finally:
         clear_process_backtest_runtime_cache()
+        surface_cache._max_entries = original_surface_cache_entries
 
-    assert stage_counts == {"bundle_replay": 1, "depth_replay": 1, "runtime_surface": 1}
+    assert stage_counts == {"bundle_replay": 2, "depth_replay": 1, "runtime_surface": 1}
     assert Path(first["run_dir"]) != Path(second["run_dir"])
     assert first["shared_runtime_cache_status"] == "built"
-    assert second["shared_runtime_cache_status"] == "reused"
+    assert second["shared_runtime_cache_status"] == "surface_reused"
     first_summary = json.loads((Path(first["run_dir"]) / "summary.json").read_text(encoding="utf-8"))
     second_summary = json.loads((Path(second["run_dir"]) / "summary.json").read_text(encoding="utf-8"))
     assert first_summary["stake_usd"] == 1.0
@@ -703,7 +710,210 @@ def test_run_research_backtest_reuses_shared_runtime_for_stake_matrix_cases(monk
     assert first_summary["shared_runtime_cache_status"] == "built"
     assert second_summary["stake_usd"] == 5.0
     assert second_summary["max_notional_usd"] == 8.0
-    assert second_summary["shared_runtime_cache_status"] == "reused"
+    assert second_summary["shared_runtime_cache_status"] == "surface_reused"
     second_log = (Path(second["run_dir"]) / "logs" / "backtest.jsonl").read_text(encoding="utf-8")
     assert '"event": "backtest_runtime_resolved"' in second_log
-    assert '"shared_runtime_cache_status": "reused"' in second_log
+    assert '"shared_runtime_cache_status": "surface_reused"' in second_log
+
+
+def test_run_research_backtest_reuses_surface_runtime_across_bundles(monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    btc_cfg = DataConfig.build(market="btc", cycle="15m", surface="backtest", root=root)
+
+    write_parquet_atomic(
+        _sample_klines("SOLUSDT", start="2026-03-01T00:00:00Z", periods=480, price_base=120.0),
+        data_cfg.layout.binance_klines_path(),
+    )
+    write_parquet_atomic(
+        _sample_klines("BTCUSDT", start="2026-03-01T00:00:00Z", periods=480, price_base=50_000.0),
+        btc_cfg.layout.binance_klines_path(),
+    )
+    write_parquet_atomic(
+        _sample_oracle_prices("sol", cycle_start_ts=1_772_323_200, n_cycles=32, price_base=120.0),
+        data_cfg.layout.oracle_prices_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "asset": "sol",
+                    "cycle_start_ts": 1_772_323_200 + idx * 900,
+                    "cycle_end_ts": 1_772_324_100 + idx * 900,
+                    "market_id": f"market-{idx}",
+                    "condition_id": f"cond-{idx}",
+                    "winner_side": "UP" if idx % 2 == 0 else "DOWN",
+                    "label_updown": "UP" if idx % 2 == 0 else "DOWN",
+                    "resolved": True,
+                    "truth_source": "settlement_truth",
+                    "full_truth": True,
+                }
+                for idx in range(32)
+            ]
+        ),
+        data_cfg.layout.truth_table_path,
+    )
+    _write_market_catalog_and_depth(
+        data_cfg,
+        asset="sol",
+        cycle_start_ts=1_772_323_200,
+        n_cycles=32,
+    )
+    write_parquet_atomic(
+        _sample_oracle_prices("sol", cycle_start_ts=1_772_323_200, n_cycles=32, price_base=120.0),
+        data_cfg.layout.oracle_prices_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "asset": "sol",
+                    "cycle_start_ts": 1_772_323_200 + idx * 900,
+                    "cycle_end_ts": 1_772_324_100 + idx * 900,
+                    "market_id": f"market-{idx}",
+                    "condition_id": f"cond-{idx}",
+                    "winner_side": "UP" if idx % 2 == 0 else "DOWN",
+                    "label_updown": "UP" if idx % 2 == 0 else "DOWN",
+                    "resolved": True,
+                    "truth_source": "settlement_truth",
+                    "full_truth": True,
+                }
+                for idx in range(32)
+            ]
+        ),
+        data_cfg.layout.truth_table_path,
+    )
+
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm",
+        source_surface="backtest",
+        feature_set="deep_otm_v1",
+        label_set="truth",
+        target="direction",
+        model_family="deep_otm",
+        root=root,
+    )
+    build_feature_frame_dataset(cfg, skip_freshness=True)
+    build_label_frame_dataset(cfg, skip_freshness=True)
+    for offset in (7, 8):
+        build_training_set_dataset(
+            cfg,
+            TrainingSetSpec(
+                feature_set="deep_otm_v1",
+                label_set="truth",
+                target="direction",
+                window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+                offset=offset,
+            ),
+        )
+    train_research_run(
+        cfg,
+        TrainingRunSpec(
+            model_family="deep_otm",
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+            run_label="bt-surface-source-a",
+            offsets=(7, 8),
+        ),
+    )
+    train_research_run(
+        cfg,
+        TrainingRunSpec(
+            model_family="deep_otm",
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+            run_label="bt-surface-source-b",
+            offsets=(7, 8),
+            balance_classes=False,
+            weight_by_vol=False,
+            inverse_vol=False,
+        ),
+    )
+    build_model_bundle(
+        cfg,
+        ModelBundleSpec(
+            profile="deep_otm",
+            target="direction",
+            bundle_label="bt-surface-bundle-a",
+            offsets=(7, 8),
+            source_training_run="bt-surface-source-a",
+        ),
+    )
+    build_model_bundle(
+        cfg,
+        ModelBundleSpec(
+            profile="deep_otm",
+            target="direction",
+            bundle_label="bt-surface-bundle-b",
+            offsets=(7, 8),
+            source_training_run="bt-surface-source-b",
+        ),
+    )
+
+    stage_counts = {"bundle_replay": 0, "depth_replay": 0, "runtime_surface": 0}
+    original_build_bundle_replay = backtest_engine._build_bundle_replay
+    original_build_depth_replay = backtest_engine.build_raw_depth_replay_frame
+    original_attach_runtime_surface = backtest_engine._attach_replay_runtime_surface
+
+    def _count_bundle_replay(*args, **kwargs):
+        stage_counts["bundle_replay"] += 1
+        return original_build_bundle_replay(*args, **kwargs)
+
+    def _count_depth_replay(*args, **kwargs):
+        stage_counts["depth_replay"] += 1
+        return original_build_depth_replay(*args, **kwargs)
+
+    def _count_runtime_surface(*args, **kwargs):
+        stage_counts["runtime_surface"] += 1
+        return original_attach_runtime_surface(*args, **kwargs)
+
+    monkeypatch.setattr(backtest_engine, "_build_bundle_replay", _count_bundle_replay)
+    monkeypatch.setattr(backtest_engine, "build_raw_depth_replay_frame", _count_depth_replay)
+    monkeypatch.setattr(backtest_engine, "_attach_replay_runtime_surface", _count_runtime_surface)
+
+    surface_cache = process_backtest_surface_runtime_cache()
+    original_surface_cache_entries = surface_cache._max_entries
+    surface_cache._max_entries = 2
+    clear_process_backtest_runtime_cache()
+    try:
+        first = run_research_backtest(
+            cfg,
+            BacktestRunSpec(
+                profile="deep_otm",
+                spec_name="baseline_truth",
+                run_label="bt-surface-run-1",
+                target="direction",
+                bundle_label="bt-surface-bundle-a",
+                stake_usd=5.0,
+                max_notional_usd=8.0,
+            ),
+        )
+        second = run_research_backtest(
+            cfg,
+            BacktestRunSpec(
+                profile="deep_otm",
+                spec_name="baseline_truth",
+                run_label="bt-surface-run-2",
+                target="direction",
+                bundle_label="bt-surface-bundle-b",
+                stake_usd=5.0,
+                max_notional_usd=8.0,
+            ),
+        )
+    finally:
+        clear_process_backtest_runtime_cache()
+        surface_cache._max_entries = original_surface_cache_entries
+
+    assert stage_counts == {"bundle_replay": 2, "depth_replay": 1, "runtime_surface": 1}
+    assert first["shared_runtime_cache_status"] == "built"
+    assert second["shared_runtime_cache_status"] == "surface_reused"
+    second_summary = json.loads((Path(second["run_dir"]) / "summary.json").read_text(encoding="utf-8"))
+    assert second_summary["shared_runtime_cache_status"] == "surface_reused"
+    second_log = (Path(second["run_dir"]) / "logs" / "backtest.jsonl").read_text(encoding="utf-8")
+    assert '"shared_runtime_cache_status": "surface_reused"' in second_log

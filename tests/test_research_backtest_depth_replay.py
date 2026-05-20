@@ -833,3 +833,89 @@ def test_build_raw_depth_replay_frame_falls_back_to_orderbook_index_when_raw_dep
     assert summary.raw_records_scanned == 2
     assert summary.snapshot_rows == 1
     assert summary.replay_rows_with_snapshots == 1
+
+
+def test_build_raw_depth_replay_frame_scopes_corrupt_depth_index_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    depth_path = data_cfg.layout.orderbook_depth_path("2026-03-01")
+    depth_path.parent.mkdir(parents=True, exist_ok=True)
+    depth_path.write_bytes(b"corrupt")
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "captured_ts_ms": int(pd.Timestamp("2026-03-01T00:05:20Z").timestamp() * 1000),
+                    "market_id": "m-idx",
+                    "token_id": "tok-up-idx",
+                    "side": "up",
+                    "best_ask": 0.31,
+                    "ask_size_1": 9.0,
+                    "huge_unused_payload": "x" * 10_000,
+                },
+                {
+                    "captured_ts_ms": int(pd.Timestamp("2026-03-01T00:05:20Z").timestamp() * 1000),
+                    "market_id": "m-idx",
+                    "token_id": "tok-down-idx",
+                    "side": "down",
+                    "best_ask": 0.69,
+                    "ask_size_1": 8.0,
+                    "huge_unused_payload": "y" * 10_000,
+                },
+                {
+                    "captured_ts_ms": int(pd.Timestamp("2026-03-01T00:05:20Z").timestamp() * 1000),
+                    "market_id": "m-unrelated",
+                    "token_id": "tok-other",
+                    "side": "up",
+                    "best_ask": 0.99,
+                    "ask_size_1": 1.0,
+                    "huge_unused_payload": "z" * 10_000,
+                },
+            ]
+        ),
+        data_cfg.layout.orderbook_index_path("2026-03-01"),
+    )
+
+    original_iter = depth_replay_module.iter_ndjson_zst
+    original_iter_orderbook_index_record_batches = depth_replay_module.iter_orderbook_index_record_batches
+    calls: list[dict[str, object]] = []
+
+    def _corrupting_iter(path: Path):
+        if path == depth_path:
+            raise RuntimeError("synthetic zstd corruption")
+        yield from original_iter(path)
+
+    def _capturing_iter_orderbook_index_record_batches(**kwargs):
+        calls.append({"columns": kwargs.get("columns"), "filters": kwargs.get("filters")})
+        yield from original_iter_orderbook_index_record_batches(**kwargs)
+
+    monkeypatch.setattr(depth_replay_module, "iter_ndjson_zst", _corrupting_iter)
+    monkeypatch.setattr(depth_replay_module, "iter_orderbook_index_record_batches", _capturing_iter_orderbook_index_record_batches)
+
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:05:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "window_start_ts": "2026-03-01T00:05:00Z",
+                "window_end_ts": "2026-03-01T00:06:00Z",
+                "offset": 7,
+                "market_id": "m-idx",
+                "token_up": "tok-up-idx",
+                "token_down": "tok-down-idx",
+            }
+        ]
+    )
+
+    out, summary = build_raw_depth_replay_frame(
+        replay=replay,
+        data_cfg=data_cfg,
+        snapshot_tolerance_ms=60_000,
+    )
+
+    assert len(out) == 1
+    assert summary.raw_records_scanned == 2
+    assert calls
+    assert "huge_unused_payload" not in set(calls[0]["columns"] or [])
+    assert ("market_id", "in", ["m-idx"]) in (calls[0]["filters"] or [])

@@ -10,12 +10,29 @@ import pm15min.research.backtests.fills as fills_module
 import pm15min.research.backtests.orderbook_surface as orderbook_surface_module
 from pm15min.research.backtests.depth_replay import DepthReplaySummary
 from pm15min.research.backtests.engine import (
+    _compact_runtime_surface_frame,
+    _compact_replay_for_runtime,
+    _factor_source_frame,
     _load_scoped_backtest_feature_frame,
+    _narrow_depth_runtime_to_accepted_decisions,
+    _narrow_factor_source_to_accepted_decisions,
+    _merge_factor_columns_for_traded_decisions,
     _load_scoped_backtest_label_frame,
+    _merge_cached_runtime_surface,
+    _serialize_decision_frame,
+    _release_decision_depth_runtime_after_fill_resolution,
     _scope_backtest_klines,
+    _surface_input_signature,
 )
+from pm15min.research.backtests.decision_engine_parity import (
+    DecisionEngineParityConfig,
+    apply_decision_engine_parity,
+)
+from pm15min.research.backtests.retry_contract import attach_pre_submit_orderbook_retry_contract
+from pm15min.live.profiles import resolve_live_profile_spec
 from pm15min.research.config import ResearchConfig
 from pm15min.research.datasets.loaders import load_feature_frame
+from pm15min.research.labels.alignment import merge_feature_and_label_frames
 
 
 def _research_cfg(root: Path, *, target: str = "reversal") -> ResearchConfig:
@@ -123,6 +140,257 @@ def test_load_scoped_backtest_feature_frame_limits_columns_offsets_and_window(
     ]
     assert scoped["offset"].tolist() == [7]
     assert scoped["decision_ts"].tolist() == ["2026-03-28T00:01:00Z"]
+
+
+def test_compact_runtime_surface_frame_drops_score_columns_but_keeps_reusable_surface() -> None:
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-28T00:07:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+                "p_up": 0.71,
+                "p_down": 0.29,
+                "feature_a": 123.0,
+                "quote_status": "ok",
+                "liquidity_status": "ok",
+            }
+        ]
+    )
+
+    compact = _compact_runtime_surface_frame(replay)
+    merged = _merge_cached_runtime_surface(
+        replay.assign(p_up=0.62, p_down=0.38, quote_status="stale", liquidity_status="stale"),
+        compact,
+    )
+
+    assert set(compact.columns) == {
+        "decision_ts",
+        "cycle_start_ts",
+        "cycle_end_ts",
+        "offset",
+        "market_id",
+        "condition_id",
+        "quote_status",
+        "liquidity_status",
+    }
+    assert "p_up" not in compact.columns
+    assert "feature_a" not in compact.columns
+    assert merged.loc[0, "p_up"] == 0.62
+    assert merged.loc[0, "quote_status"] == "ok"
+    assert merged.loc[0, "liquidity_status"] == "ok"
+
+
+def test_compact_replay_for_runtime_drops_bulk_factors_but_preserves_factor_source() -> None:
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-28T00:07:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+                "resolved": True,
+                "winner_side": "UP",
+                "p_up": 0.71,
+                "p_down": 0.29,
+                "score_valid": True,
+                "score_present": True,
+                "bundle_offset_available": True,
+                "ret_1m": 0.01,
+                "feature_blob": "x" * 100,
+            }
+        ]
+    )
+
+    factor_source = _factor_source_frame(replay, factor_columns=("ret_1m", "feature_blob"))
+    compact = _compact_replay_for_runtime(replay)
+    decisions = compact.assign(policy_action=["trade"], decision_source=["primary"])
+    factor_decisions = _merge_factor_columns_for_traded_decisions(
+        decisions,
+        factor_source_frame=factor_source,
+    )
+
+    assert "p_up" in compact.columns
+    assert "winner_side" in compact.columns
+    assert "ret_1m" not in compact.columns
+    assert "feature_blob" not in compact.columns
+    assert factor_source["ret_1m"].tolist() == [0.01]
+    assert factor_decisions["ret_1m"].tolist() == [0.01]
+    assert factor_decisions["feature_blob"].tolist() == ["x" * 100]
+
+
+def test_serialize_decision_frame_uses_shallow_copy(monkeypatch) -> None:
+    decisions = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-28T00:07:00Z",
+                "guard_reasons": ["quote_missing"],
+                "quote_metrics": {"ask": 0.42},
+                "bulk_payload": "x" * 10_000,
+            }
+        ]
+    )
+    original_copy = pd.DataFrame.copy
+    calls: list[bool | None] = []
+
+    def _track_copy(self, *args, **kwargs):
+        calls.append(kwargs.get("deep"))
+        if kwargs.get("deep", True) is not False and "bulk_payload" in self.columns:
+            raise AssertionError("decision serialization should not deep-copy bulk columns")
+        return original_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "copy", _track_copy)
+
+    serialized = _serialize_decision_frame(decisions)
+
+    assert calls == [False]
+    assert serialized.loc[0, "guard_reasons"] == '["quote_missing"]'
+    assert serialized.loc[0, "quote_metrics"] == '{"ask": 0.42}'
+    assert decisions.loc[0, "guard_reasons"] == ["quote_missing"]
+
+
+def test_decision_surface_helpers_use_shallow_copy(monkeypatch) -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                "offset": 7,
+                "p_up": 0.72,
+                "p_down": 0.28,
+                "quote_up_ask": 0.42,
+                "quote_down_ask": 0.58,
+                "decision_engine_reason": "orderbook_limit_reject",
+                "bulk_payload": "x" * 10_000,
+            }
+        ]
+    )
+    original_copy = pd.DataFrame.copy
+    calls: list[bool | None] = []
+
+    def _track_copy(self, *args, **kwargs):
+        calls.append(kwargs.get("deep"))
+        if kwargs.get("deep", True) is not False and "bulk_payload" in self.columns:
+            raise AssertionError("decision helpers should not deep-copy bulk columns")
+        return original_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "copy", _track_copy)
+
+    parity = apply_decision_engine_parity(rows, config=DecisionEngineParityConfig(min_dir_prob_default=0.55))
+    retry = attach_pre_submit_orderbook_retry_contract(
+        rows,
+        spec=resolve_live_profile_spec("deep_otm_baseline"),
+    )
+
+    assert calls == [False, False]
+    assert parity.loc[0, "decision_engine_action"] == "trade"
+    assert bool(retry.loc[0, "pre_submit_orderbook_retry_armed"]) is True
+
+
+def test_build_bundle_replay_uses_single_label_merge(tmp_path: Path, monkeypatch) -> None:
+    bundle_dir = tmp_path / "bundle"
+    (bundle_dir / "offsets" / "offset=7").mkdir(parents=True)
+    features = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:07:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "ret_1m": 0.1,
+            }
+        ]
+    )
+    labels = pd.DataFrame(
+        [
+            {
+                "asset": "eth",
+                "cycle_start_ts": 1_772_323_200,
+                "cycle_end_ts": 1_772_324_100,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+                "label_set": "truth",
+                "resolved": True,
+                "winner_side": "UP",
+            }
+        ]
+    )
+    merge_calls = {"count": 0}
+
+    def _count_merge(feature_frame, label_frame):
+        merge_calls["count"] += 1
+        return merge_feature_and_label_frames(feature_frame, label_frame)
+
+    def _fake_score_bundle_offset(_bundle_dir: Path, feature_frame: pd.DataFrame, *, offset: int) -> pd.DataFrame:
+        assert "market_id" in feature_frame.columns
+        assert offset == 7
+        return pd.DataFrame(
+            [
+                {
+                    "decision_ts": "2026-03-01T00:07:00Z",
+                    "cycle_start_ts": "2026-03-01T00:00:00Z",
+                    "cycle_end_ts": "2026-03-01T00:15:00Z",
+                    "offset": 7,
+                    "market_id": "m-1",
+                    "condition_id": "c-1",
+                    "p_up": 0.72,
+                    "p_down": 0.28,
+                    "score_valid": True,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(backtest_engine_module, "merge_feature_and_label_frames", _count_merge)
+    monkeypatch.setattr("pm15min.research.backtests.replay_loader.merge_feature_and_label_frames", _count_merge)
+    monkeypatch.setattr(backtest_engine_module, "score_bundle_offset", _fake_score_bundle_offset)
+
+    replay, summary, available_offsets = backtest_engine_module._build_bundle_replay(
+        bundle_dir=bundle_dir,
+        features=features,
+        labels=labels,
+    )
+
+    assert merge_calls["count"] == 1
+    assert available_offsets == [7]
+    assert replay["market_id"].tolist() == ["m-1"]
+    assert summary.feature_rows == 1
+
+
+def test_surface_input_signature_avoids_materializing_csv(monkeypatch) -> None:
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-28T00:07:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+            },
+            {
+                "decision_ts": "2026-03-28T00:08:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 8,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+            },
+        ]
+    )
+
+    def _fail_to_csv(self, *args, **kwargs):
+        raise AssertionError("surface signature should not materialize a CSV copy")
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", _fail_to_csv)
+
+    first = _surface_input_signature(replay)
+    second = _surface_input_signature(replay.iloc[::-1].reset_index(drop=True))
+
+    assert first == second
+    assert '"rows": 2' in first
 
 
 def test_load_feature_frame_applies_timestamp_filters_to_timestamp_columns(tmp_path: Path) -> None:
@@ -610,6 +878,155 @@ def test_resolve_fill_depth_runtime_reuses_decision_depth_runtime(monkeypatch) -
     assert called["value"] is False
     assert fill_depth_replay is decision_depth_replay
     assert fill_lookup is decision_lookup
+
+
+def test_narrow_depth_runtime_to_accepted_decisions_drops_unaccepted_snapshots() -> None:
+    accepted = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-28T00:01:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 7,
+            }
+        ]
+    )
+    decision_depth_replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-28T00:01:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 7,
+                "depth_snapshot_rank": 1,
+            },
+            {
+                "decision_ts": "2026-03-28T00:02:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 8,
+                "depth_snapshot_rank": 1,
+            },
+        ]
+    )
+
+    narrowed_depth, narrowed_lookup = _narrow_depth_runtime_to_accepted_decisions(
+        accepted=accepted,
+        decision_depth_replay=decision_depth_replay,
+    )
+
+    assert len(narrowed_depth) == 1
+    assert narrowed_depth["offset"].tolist() == [7]
+    assert len(narrowed_lookup) == 1
+    assert narrowed_lookup.get(
+        ("2026-03-28T00:01:00+00:00", "2026-03-28T00:00:00+00:00", "2026-03-28T00:15:00+00:00", 7)
+    ) == [
+        {
+            "decision_ts": "2026-03-28T00:01:00Z",
+            "cycle_start_ts": "2026-03-28T00:00:00Z",
+            "cycle_end_ts": "2026-03-28T00:15:00Z",
+            "offset": 7,
+            "depth_snapshot_rank": 1,
+        }
+    ]
+
+
+def test_release_decision_depth_runtime_after_fill_resolution_drops_full_depth_when_narrowed() -> None:
+    full_depth_replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-28T00:01:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 7,
+            },
+            {
+                "decision_ts": "2026-03-28T00:02:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 8,
+            },
+        ]
+    )
+    narrowed_depth_replay = full_depth_replay.iloc[[0]].reset_index(drop=True)
+    decision_lookup = fills_module.build_depth_candidate_lookup(full_depth_replay)
+
+    released_depth, released_lookup = _release_decision_depth_runtime_after_fill_resolution(
+        decision_depth_replay=full_depth_replay,
+        decision_depth_candidate_lookup=decision_lookup,
+        fill_depth_replay=narrowed_depth_replay,
+    )
+
+    assert released_depth.empty
+    assert released_lookup is None
+
+
+def test_release_decision_depth_runtime_after_fill_resolution_keeps_shared_depth_when_reused() -> None:
+    full_depth_replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-28T00:01:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 7,
+            },
+        ]
+    )
+    decision_lookup = fills_module.build_depth_candidate_lookup(full_depth_replay)
+
+    kept_depth, kept_lookup = _release_decision_depth_runtime_after_fill_resolution(
+        decision_depth_replay=full_depth_replay,
+        decision_depth_candidate_lookup=decision_lookup,
+        fill_depth_replay=full_depth_replay,
+    )
+
+    assert kept_depth is full_depth_replay
+    assert kept_lookup is decision_lookup
+
+
+def test_narrow_factor_source_to_accepted_decisions_drops_untraded_rows() -> None:
+    accepted = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-28T00:01:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+            }
+        ]
+    )
+    factor_source = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-28T00:01:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-1",
+                "condition_id": "c-1",
+                "feature_a": 1.0,
+            },
+            {
+                "decision_ts": "2026-03-28T00:02:00Z",
+                "cycle_start_ts": "2026-03-28T00:00:00Z",
+                "cycle_end_ts": "2026-03-28T00:15:00Z",
+                "offset": 8,
+                "market_id": "m-2",
+                "condition_id": "c-2",
+                "feature_a": 2.0,
+            },
+        ]
+    )
+
+    narrowed = _narrow_factor_source_to_accepted_decisions(
+        factor_source_frame=factor_source,
+        accepted=accepted,
+    )
+
+    assert len(narrowed) == 1
+    assert narrowed["feature_a"].tolist() == [1.0]
 
 
 def test_build_canonical_fills_preserves_materialized_columns_when_all_rows_reject(tmp_path: Path) -> None:

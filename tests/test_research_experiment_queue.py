@@ -12,6 +12,7 @@ from pm15min.research.automation import build_autorun_status_report, build_codex
 from pm15min.research.automation.queue_state import (
     build_queue_item,
     ensure_running_queue_items,
+    launch_ready_queue_item_batches,
     launch_ready_queue_items,
     load_experiment_queue,
     reconcile_queue_with_live_workers,
@@ -23,14 +24,238 @@ from pm15min.research.automation.queue_state import (
 )
 
 
-def test_load_experiment_queue_defaults_to_eight_live_runs_and_twenty_four_queued_items(tmp_path: Path) -> None:
+def _load_experiment_queue_cli_module():
+    import importlib.util
+
+    workspace_root = Path(__file__).resolve().parents[1]
+    module_path = workspace_root / "auto_research" / "experiment_queue.py"
+    spec = importlib.util.spec_from_file_location("experiment_queue_cli_under_test", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_quick_screen_pool_launcher_sets_shared_surface_env_and_pool_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_cli = _load_experiment_queue_cli_module()
+    root = tmp_path / "repo"
+    (root / "auto_research").mkdir(parents=True)
+    (root / "auto_research" / "run_quick_screen_pool.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    item = build_queue_item(
+        market="sol",
+        suite_name="sol_suite",
+        run_label="sol_run",
+        action="launch",
+        status="queued",
+        track="direction_dense",
+        session_dir=root / "sessions" / "direction_dense",
+        program_path=root / "auto_research" / "program_direction_dense.md",
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        pid = 24680
+        returncode = None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="pool", timeout=timeout or 0)
+
+    def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = dict(kwargs.get("env") or {})
+        captured["cwd"] = kwargs.get("cwd")
+        return _FakeProcess()
+
+    monkeypatch.setattr(queue_cli.subprocess, "Popen", _fake_popen)
+
+    result = queue_cli._queue_pool_launcher(root)([item])
+
+    assert result["pid"] == 24680
+    assert result["batch_id"].startswith("quick_screen_pool_direction_dense_")
+    assert captured["cwd"] == root
+    assert captured["cmd"][0] == str(root / "auto_research" / "run_quick_screen_pool.sh")
+    env = captured["env"]
+    assert env["PM15MIN_QUICK_SCREEN_SHARED_SURFACES"] == "1"
+    assert env["PM15MIN_QUICK_SCREEN_POOL_WORKERS"] == "1"
+
+
+def test_load_experiment_queue_defaults_to_ten_live_runs_and_twenty_four_queued_items(tmp_path: Path) -> None:
     root = tmp_path / "repo"
 
     state = load_experiment_queue(root)
 
-    assert state["max_live_runs"] == 8
+    assert state["max_live_runs"] == 10
     assert state["max_queued_items"] == 24
-    assert state["track_slot_caps"] == {"direction_dense": 4, "reversal_dense": 4}
+    assert state["track_slot_caps"] == {"direction_dense": 5, "reversal_dense": 5}
+
+
+def test_memory_gate_reserves_system_memory_and_live_worker_ramp_budget(tmp_path: Path) -> None:
+    queue_cli = _load_experiment_queue_cli_module()
+    meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_text(
+        "\n".join(
+            [
+                "MemTotal:       67108864 kB",
+                "MemAvailable:  37748736 kB",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    gate = queue_cli._memory_gate_payload(
+        min_available_mem_gb=4,
+        meminfo_path=str(meminfo_path),
+        live_workers=[{"pid": 100, "track": "direction_dense", "rss_kb": 4 * 1024 * 1024}],
+        launch_mem_gb=16,
+    )
+
+    assert gate["state"] == "open"
+    assert gate["required_kb"] == 4 * 1024 * 1024
+    assert gate["launch_budget_kb"] == 16 * 1024 * 1024
+    assert gate["live_worker_reservation_gap_kb"] == 12 * 1024 * 1024
+    assert gate["launch_capacity"] == 1
+
+
+def test_memory_gate_deduplicates_batch_workers_by_pid(tmp_path: Path) -> None:
+    queue_cli = _load_experiment_queue_cli_module()
+    meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_text(
+        "\n".join(
+            [
+                "MemTotal:       67108864 kB",
+                "MemAvailable:  37748736 kB",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    gate = queue_cli._memory_gate_payload(
+        min_available_mem_gb=4,
+        meminfo_path=str(meminfo_path),
+        live_workers=[
+            {
+                "pid": 100,
+                "batch_id": "batch-a",
+                "track": "direction_dense",
+                "rss_kb": 4 * 1024 * 1024,
+                "run_label": "sol",
+            },
+            {
+                "pid": 100,
+                "batch_id": "batch-a",
+                "track": "direction_dense",
+                "rss_kb": 4 * 1024 * 1024,
+                "run_label": "xrp",
+            },
+        ],
+        launch_mem_gb=16,
+    )
+
+    assert gate["live_worker_count_for_budget"] == 1
+    assert gate["live_worker_reservation_gap_kb"] == 12 * 1024 * 1024
+    assert gate["launch_capacity"] == 1
+
+
+def test_memory_gate_counts_new_worker_budget_in_capacity(tmp_path: Path) -> None:
+    queue_cli = _load_experiment_queue_cli_module()
+    meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_text(
+        "\n".join(
+            [
+                "MemTotal:       67108864 kB",
+                "MemAvailable:  10485760 kB",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    gate = queue_cli._memory_gate_payload(
+        min_available_mem_gb=1,
+        meminfo_path=str(meminfo_path),
+        live_workers=[],
+        launch_mem_gb=12,
+    )
+
+    assert gate["state"] == "blocked"
+    assert gate["launch_capacity"] == 0
+    assert gate["required_with_next_launch_kb"] == 13 * 1024 * 1024
+
+
+def test_supervise_once_default_worker_budget_allows_quick_screen_during_two_formals(
+    tmp_path: Path,
+) -> None:
+    queue_cli = _load_experiment_queue_cli_module()
+    args = queue_cli._build_parser().parse_args(["supervise-once"])
+    meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_text(
+        "\n".join(
+            [
+                "MemTotal:       67108864 kB",
+                "MemAvailable:  55574528 kB",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    gate = queue_cli._memory_gate_payload(
+        min_available_mem_gb=args.min_available_mem_gb,
+        meminfo_path=str(meminfo_path),
+        live_workers=[
+            {"pid": 100, "rss_kb": 2 * 1024 * 1024, "run_label": "btc_formal"},
+            {"pid": 200, "rss_kb": 2 * 1024 * 1024, "run_label": "eth_formal"},
+        ],
+        launch_mem_gb=args.quick_screen_worker_mem_gb,
+    )
+
+    assert args.quick_screen_worker_mem_gb == 16.0
+    assert gate["state"] == "open"
+    assert gate["live_worker_count_for_budget"] == 0
+    assert gate["live_worker_reservation_gap_kb"] == 0
+    assert gate["launch_capacity"] == 3
+
+
+def test_memory_gate_reserves_ramp_budget_only_for_quick_screen_workers(tmp_path: Path) -> None:
+    queue_cli = _load_experiment_queue_cli_module()
+    meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_text(
+        "\n".join(
+            [
+                "MemTotal:       67108864 kB",
+                "MemAvailable:  55574528 kB",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    gate = queue_cli._memory_gate_payload(
+        min_available_mem_gb=1,
+        meminfo_path=str(meminfo_path),
+        live_workers=[
+            {"pid": 100, "rss_kb": 2 * 1024 * 1024, "run_label": "btc_formal"},
+            {"pid": 200, "rss_kb": 2 * 1024 * 1024, "run_label": "eth_formal"},
+            {
+                "pid": 300,
+                "batch_id": "batch-a",
+                "track": "reversal_dense",
+                "rss_kb": 4 * 1024 * 1024,
+                "run_label": "sol_reversal",
+            },
+        ],
+        launch_mem_gb=24,
+    )
+
+    assert gate["live_worker_count_for_budget"] == 1
+    assert gate["live_worker_reservation_gap_kb"] == 20 * 1024 * 1024
+    assert gate["launch_capacity"] == 1
 
 
 def test_cli_supervise_once_skips_launch_when_available_memory_is_low(tmp_path: Path) -> None:
@@ -81,6 +306,83 @@ def test_cli_supervise_once_skips_launch_when_available_memory_is_low(tmp_path: 
     state = load_experiment_queue(root)
     item = next(entry for entry in state["items"] if entry["run_label"] == "sol_run")
     assert item["status"] == "queued"
+
+
+def test_cli_supervise_once_marks_unsupported_feature_set_dead_before_launch(tmp_path: Path) -> None:
+    workspace_root = Path(__file__).resolve().parents[1]
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "reversal_dense"
+    program_path = root / "auto_research" / "program_reversal_dense.md"
+    suite_dir = root / "research" / "experiments" / "suite_specs"
+    suite_dir.mkdir(parents=True, exist_ok=True)
+    (suite_dir / "bad_suite.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "bad_suite",
+                "profile": "deep_otm",
+                "model_family": "deep_otm",
+                "feature_set": "missing_feature_set",
+                "label_set": "truth",
+                "target": "reversal",
+                "offsets": [7, 8, 9],
+                "window": {"start": "2026-04-01", "end": "2026-04-02"},
+                "markets": ["sol"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "meminfo").write_text(
+        "MemTotal:       67108864 kB\nMemAvailable:  62914560 kB\n",
+        encoding="utf-8",
+    )
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="sol",
+            suite_name="bad_suite",
+            run_label="bad_run",
+            action="repair",
+            status="repair",
+            track="reversal_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(workspace_root / "auto_research" / "experiment_queue.py"),
+            "--root",
+            str(root),
+            "supervise-once",
+            "--max-live-runs",
+            "8",
+            "--max-launches-per-pass",
+            "8",
+            "--min-available-mem-gb",
+            "4",
+            "--quick-screen-worker-mem-gb",
+            "16",
+            "--meminfo-path",
+            str(tmp_path / "meminfo"),
+        ],
+        cwd=workspace_root,
+        env={**os.environ, "PYTHONPATH": str(workspace_root / "src")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["launched"] == []
+    state = load_experiment_queue(root)
+    item = next(entry for entry in state["items"] if entry["run_label"] == "bad_run")
+    assert item["status"] == "dead"
+    assert item["action"] == "blocked"
+    assert item["reason"] == "launch_preflight_failed"
+    assert "Unsupported feature_set" in item["last_error"]
 
 
 def test_cli_supervise_once_reports_pending_queue_separately_from_history(tmp_path: Path) -> None:
@@ -380,6 +682,117 @@ def test_select_launchable_queue_items_respects_track_slot_caps(tmp_path: Path) 
     assert counts == {"direction_dense": 2, "reversal_dense": 2}
 
 
+def test_select_launchable_queue_items_does_not_let_cross_track_shared_runs_block_market(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "dense"
+    direction_program = root / "auto_research" / "program_direction_dense_sol_xrp.md"
+    reversal_program = root / "auto_research" / "program_reversal_dense_sol_xrp.md"
+    payload = load_experiment_queue(root)
+    payload["max_live_runs"] = 10
+    payload["track_slot_caps"] = {"direction_dense": 5, "reversal_dense": 5}
+    payload["items"] = [
+        build_queue_item(
+            market="sol",
+            suite_name="sol_reversal_running",
+            run_label="sol_reversal_running",
+            action="repair",
+            status="running",
+            track="reversal_dense",
+            session_dir=session_dir,
+            program_path=reversal_program,
+        ),
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_reversal_running",
+            run_label="xrp_reversal_running",
+            action="repair",
+            status="running",
+            track="reversal_dense",
+            session_dir=session_dir,
+            program_path=reversal_program,
+        ),
+        build_queue_item(
+            market="sol",
+            suite_name="sol_direction_queued",
+            run_label="sol_direction_queued",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=direction_program,
+        ),
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_direction_queued",
+            run_label="xrp_direction_queued",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=direction_program,
+        ),
+    ]
+
+    selected = select_launchable_queue_items(payload, max_live_runs=10, live_workers=[])
+
+    assert [item["run_label"] for item in selected] == [
+        "sol_direction_queued",
+        "xrp_direction_queued",
+    ]
+
+
+def test_select_launchable_queue_items_allows_distinct_same_market_branches_when_track_has_room(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "dense"
+    program_path = root / "auto_research" / "program_direction_dense_sol_xrp.md"
+    payload = load_experiment_queue(root)
+    payload["max_live_runs"] = 10
+    payload["track_slot_caps"] = {"direction_dense": 5, "reversal_dense": 5}
+    payload["items"] = [
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_direction_running",
+            run_label="xrp_direction_running",
+            action="launch",
+            status="running",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_direction_followup_a",
+            run_label="xrp_direction_followup_a",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_direction_followup_b",
+            run_label="xrp_direction_followup_b",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+    ]
+
+    selected = select_launchable_queue_items(payload, max_live_runs=10, live_workers=[])
+
+    assert [item["run_label"] for item in selected] == [
+        "xrp_direction_followup_a",
+        "xrp_direction_followup_b",
+    ]
+
+
 def test_fixed_track_slot_caps_env_overrides_queue_payload(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "repo"
     monkeypatch.setenv(
@@ -640,7 +1053,7 @@ def test_reconcile_queue_with_live_workers_marks_finished_quick_screen_run_done(
     assert item["status"] == "done"
 
 
-def test_dense_quick_screen_selects_one_shared_sol_xrp_run(tmp_path: Path) -> None:
+def test_dense_quick_screen_selects_sol_xrp_runs_independently(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     session_dir = root / "sessions" / "direction_dense"
     program_path = root / "auto_research" / "program_direction_dense.md"
@@ -671,10 +1084,10 @@ def test_dense_quick_screen_selects_one_shared_sol_xrp_run(tmp_path: Path) -> No
 
     selected = select_launchable_queue_items(payload, max_live_runs=4, live_workers=[])
 
-    assert [item["market"] for item in selected] == ["sol"]
+    assert [item["market"] for item in selected] == ["sol", "xrp"]
 
 
-def test_launch_ready_queue_items_marks_shared_sol_xrp_run_running_with_one_launch(tmp_path: Path) -> None:
+def test_launch_ready_queue_items_launches_sol_xrp_runs_independently(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     session_dir = root / "sessions" / "direction_dense"
     program_path = root / "auto_research" / "program_direction_dense.md"
@@ -716,14 +1129,106 @@ def test_launch_ready_queue_items_marks_shared_sol_xrp_run_running_with_one_laun
         max_live_runs=4,
     )
 
-    assert [item["market"] for item in launched] == ["sol"]
+    assert [item["market"] for item in launched] == ["sol", "xrp"]
     assert {item["market"] for item in launched_items} == {"sol", "xrp"}
     statuses = {item["market"]: item["status"] for item in state["items"]}
     assert statuses == {"sol": "running", "xrp": "running"}
     assert {item["market"]: item.get("pid") for item in state["items"]} == {"sol": 12345, "xrp": 12345}
 
 
-def test_reconcile_queue_with_live_workers_keeps_shared_sol_xrp_run_running(tmp_path: Path) -> None:
+def test_launch_ready_queue_item_batches_marks_dense_candidates_running_with_one_process(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 5, "reversal_dense": 0}
+    payload["items"] = [
+        build_queue_item(
+            market=market,
+            suite_name=f"{market}_suite_{index}",
+            run_label=f"{market}_run_{index}",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        )
+        for index, market in enumerate(("sol", "xrp", "sol"), start=1)
+    ]
+    save_experiment_queue(root, payload)
+    launched_batches: list[list[dict[str, object]]] = []
+
+    def batch_launcher(items: list[dict[str, object]]) -> dict[str, object]:
+        launched_batches.append([dict(item) for item in items])
+        return {"pid": 12345, "batch_id": "batch-abc", "manifest_path": str(root / "manifest.json")}
+
+    state, launched_items = launch_ready_queue_item_batches(
+        root,
+        live_workers=[],
+        batch_launcher=batch_launcher,
+        max_live_runs=5,
+        max_new_launches=1,
+        quick_screen_batch_size=3,
+    )
+
+    assert {item["run_label"] for batch in launched_batches for item in batch} == {
+        "sol_run_1",
+        "xrp_run_2",
+        "sol_run_3",
+    }
+    assert {item["run_label"] for item in launched_items} == {"sol_run_1", "xrp_run_2", "sol_run_3"}
+    assert {item["status"] for item in state["items"]} == {"running"}
+    assert {item.get("pid") for item in state["items"]} == {12345}
+    assert {item.get("batch_id") for item in state["items"]} == {"batch-abc"}
+    assert {item.get("batch_manifest_path") for item in state["items"]} == {str(root / "manifest.json")}
+
+
+def test_launch_ready_queue_item_batches_ignores_disallowed_btc_eth_live_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    monkeypatch.setenv("PM15MIN_ALLOWED_QUEUE_MARKETS", "sol,xrp")
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 5, "reversal_dense": 0}
+    payload["items"] = [
+        build_queue_item(
+            market="sol",
+            suite_name="sol_suite",
+            run_label="sol_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        )
+    ]
+    save_experiment_queue(root, payload)
+    launched_batches: list[list[dict[str, object]]] = []
+
+    def batch_launcher(items: list[dict[str, object]]) -> dict[str, object]:
+        launched_batches.append([dict(item) for item in items])
+        return {"pid": 12345, "batch_id": "batch-sol"}
+
+    _state, launched_items = launch_ready_queue_item_batches(
+        root,
+        live_workers=[
+            {"market": "btc", "suite_name": "btc_suite", "run_label": "btc_run", "track": "direction_dense"},
+            {"market": "eth", "suite_name": "eth_suite", "run_label": "eth_run", "track": "direction_dense"},
+        ],
+        batch_launcher=batch_launcher,
+        max_live_runs=2,
+        max_new_launches=1,
+        quick_screen_batch_size=5,
+    )
+
+    assert [item["run_label"] for batch in launched_batches for item in batch] == ["sol_run"]
+    assert [item["run_label"] for item in launched_items] == ["sol_run"]
+
+
+def test_reconcile_queue_with_live_workers_reconciles_sol_xrp_runs_independently(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     session_dir = root / "sessions" / "direction_dense"
     program_path = root / "auto_research" / "program_direction_dense.md"
@@ -754,7 +1259,369 @@ def test_reconcile_queue_with_live_workers_keeps_shared_sol_xrp_run_running(tmp_
         ],
     )
 
-    assert {item["market"]: item["status"] for item in state["items"]} == {"sol": "running", "xrp": "running"}
+    assert {item["market"]: item["status"] for item in state["items"]} == {"sol": "running", "xrp": "repair"}
+
+
+def test_reconcile_queue_with_live_workers_keeps_batch_items_running(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    for index, market in enumerate(("sol", "xrp"), start=1):
+        item = build_queue_item(
+            market=market,
+            suite_name=f"{market}_suite_{index}",
+            run_label=f"{market}_run_{index}",
+            action="launch",
+            status="running",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        )
+        item["batch_id"] = "batch-abc"
+        upsert_queue_item(root, item)
+
+    state = reconcile_queue_with_live_workers(
+        root,
+        live_workers=[
+            {
+                "suite_name": "sol_suite_1",
+                "run_label": "sol_run_1",
+                "market": "sol",
+                "track": "direction_dense",
+                "batch_id": "batch-abc",
+            }
+        ],
+    )
+
+    assert {item["run_label"]: item["status"] for item in state["items"]} == {
+        "sol_run_1": "running",
+        "xrp_run_2": "running",
+    }
+
+
+def test_batch_selection_skips_live_batch_item_but_fills_remaining_track_capacity(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "reversal_dense"
+    program_path = root / "auto_research" / "program_reversal_dense.md"
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 0, "reversal_dense": 4}
+    payload["items"] = [
+        build_queue_item(
+            market="sol",
+            suite_name="sol_repair_suite",
+            run_label="sol_repair_run",
+            action="repair",
+            status="repair",
+            track="reversal_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_fresh_suite",
+            run_label="xrp_fresh_run",
+            action="launch",
+            status="queued",
+            track="reversal_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+    ]
+    payload["items"][0]["batch_id"] = "batch-live"
+    save_experiment_queue(root, payload)
+    launched_batches: list[list[dict[str, object]]] = []
+
+    def batch_launcher(items: list[dict[str, object]]) -> dict[str, object]:
+        launched_batches.append([dict(item) for item in items])
+        return {"pid": 22222, "batch_id": "batch-new"}
+
+    _state, launched_items = launch_ready_queue_item_batches(
+        root,
+        live_workers=[
+            {
+                "batch_id": "batch-live",
+                "market": "sol",
+                "suite_name": "sol_repair_suite",
+                "run_label": "sol_repair_run",
+                "track": "reversal_dense",
+            }
+        ],
+        batch_launcher=batch_launcher,
+        max_live_runs=4,
+        max_new_launches=1,
+        quick_screen_batch_size=4,
+    )
+
+    assert [[item["run_label"] for item in batch] for batch in launched_batches] == [["xrp_fresh_run"]]
+    assert [item["run_label"] for item in launched_items] == ["xrp_fresh_run"]
+    statuses = {item["run_label"]: item["status"] for item in _state["items"]}
+    assert statuses == {"sol_repair_run": "repair", "xrp_fresh_run": "running"}
+
+
+def test_batch_selection_allows_dense_track_to_fill_remaining_batch_slots(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "reversal_dense"
+    program_path = root / "auto_research" / "program_reversal_dense.md"
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 0, "reversal_dense": 4}
+    payload["items"] = [
+        build_queue_item(
+            market="sol",
+            suite_name="sol_live_suite",
+            run_label="sol_live_run",
+            action="repair",
+            status="running",
+            track="reversal_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_wait_suite",
+            run_label="xrp_wait_run",
+            action="launch",
+            status="queued",
+            track="reversal_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+    ]
+    payload["items"][0]["batch_id"] = "batch-live"
+    save_experiment_queue(root, payload)
+    launched_batches: list[list[dict[str, object]]] = []
+
+    def batch_launcher(items: list[dict[str, object]]) -> dict[str, object]:
+        launched_batches.append([dict(item) for item in items])
+        return {"pid": 22222, "batch_id": "batch-new"}
+
+    _state, launched_items = launch_ready_queue_item_batches(
+        root,
+        live_workers=[
+            {
+                "batch_id": "batch-live",
+                "market": "sol",
+                "suite_name": "sol_live_suite",
+                "run_label": "sol_live_run",
+                "track": "reversal_dense",
+            }
+        ],
+        batch_launcher=batch_launcher,
+        max_live_runs=4,
+        max_new_launches=1,
+        quick_screen_batch_size=4,
+    )
+
+    assert [[item["run_label"] for item in batch] for batch in launched_batches] == [["xrp_wait_run"]]
+    assert [item["run_label"] for item in launched_items] == ["xrp_wait_run"]
+    statuses = {item["run_label"]: item["status"] for item in _state["items"]}
+    assert statuses == {"sol_live_run": "running", "xrp_wait_run": "running"}
+
+
+def test_pool_mode_allows_other_market_pool_when_same_track_pool_is_live(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 5, "reversal_dense": 5}
+    payload["items"] = [
+        build_queue_item(
+            market="sol",
+            suite_name="sol_live_suite",
+            run_label="sol_live_run",
+            action="launch",
+            status="running",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_wait_suite",
+            run_label="xrp_wait_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_reversal_suite",
+            run_label="xrp_reversal_run",
+            action="launch",
+            status="queued",
+            track="reversal_dense",
+            session_dir=root / "sessions" / "reversal_dense",
+            program_path=root / "auto_research" / "program_reversal_dense.md",
+        ),
+    ]
+    payload["items"][0]["batch_id"] = "direction-pool-live"
+    save_experiment_queue(root, payload)
+    launched_batches: list[list[dict[str, object]]] = []
+
+    def batch_launcher(items: list[dict[str, object]]) -> dict[str, object]:
+        launched_batches.append([dict(item) for item in items])
+        return {"pid": 22222, "batch_id": "reversal-pool-new"}
+
+    _state, launched_items = launch_ready_queue_item_batches(
+        root,
+        live_workers=[
+            {
+                "batch_id": "direction-pool-live",
+                "market": "sol",
+                "suite_name": "sol_live_suite",
+                "run_label": "sol_live_run",
+                "track": "direction_dense",
+                "cmd": "python scripts/research/run_quick_screen_pool.py --batch-id direction-pool-live",
+            }
+        ],
+        batch_launcher=batch_launcher,
+        max_live_runs=10,
+        max_new_launches=10,
+        quick_screen_batch_size=10,
+        single_pool_per_track=True,
+    )
+
+    assert [[item["run_label"] for item in batch] for batch in launched_batches] == [
+        ["xrp_reversal_run"],
+        ["xrp_wait_run"],
+    ]
+    assert [item["run_label"] for item in launched_items] == ["xrp_reversal_run", "xrp_wait_run"]
+    statuses = {item["run_label"]: item["status"] for item in _state["items"]}
+    assert statuses["sol_live_run"] == "running"
+    assert statuses["xrp_wait_run"] == "running"
+    assert statuses["xrp_reversal_run"] == "running"
+
+
+def test_pool_mode_isolates_sol_xrp_batches_by_market(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 5, "reversal_dense": 0}
+    payload["items"] = [
+        build_queue_item(
+            market=market,
+            suite_name=f"{market}_suite_{index}",
+            run_label=f"{market}_run_{index}",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        )
+        for index, market in enumerate(("sol", "xrp", "sol", "xrp"), start=1)
+    ]
+    save_experiment_queue(root, payload)
+    launched_batches: list[list[dict[str, object]]] = []
+
+    def batch_launcher(items: list[dict[str, object]]) -> dict[str, object]:
+        launched_batches.append([dict(item) for item in items])
+        market = str(items[0]["market"])
+        return {
+            "pid": 10000 + len(launched_batches),
+            "batch_id": f"quick_screen_pool_direction_dense_{market}",
+            "manifest_path": str(root / f"{market}.manifest.json"),
+        }
+
+    state, launched_items = launch_ready_queue_item_batches(
+        root,
+        live_workers=[],
+        batch_launcher=batch_launcher,
+        max_live_runs=10,
+        max_new_launches=10,
+        quick_screen_batch_size=10,
+        single_pool_per_track=True,
+    )
+
+    assert [[item["market"] for item in batch] for batch in launched_batches] == [
+        ["sol", "sol"],
+        ["xrp", "xrp"],
+    ]
+    assert {item["run_label"] for item in launched_items} == {
+        "sol_run_1",
+        "sol_run_3",
+        "xrp_run_2",
+        "xrp_run_4",
+    }
+    items_by_label = {str(item["run_label"]): item for item in state["items"]}
+    assert items_by_label["sol_run_1"]["batch_id"] == "quick_screen_pool_direction_dense_sol"
+    assert items_by_label["sol_run_3"]["batch_id"] == "quick_screen_pool_direction_dense_sol"
+    assert items_by_label["xrp_run_2"]["batch_id"] == "quick_screen_pool_direction_dense_xrp"
+    assert items_by_label["xrp_run_4"]["batch_id"] == "quick_screen_pool_direction_dense_xrp"
+
+
+def test_pool_mode_allows_other_market_when_same_track_market_pool_is_live(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 5, "reversal_dense": 0}
+    payload["items"] = [
+        build_queue_item(
+            market="sol",
+            suite_name="sol_live_suite",
+            run_label="sol_live_run",
+            action="launch",
+            status="running",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+        build_queue_item(
+            market="sol",
+            suite_name="sol_wait_suite",
+            run_label="sol_wait_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_wait_suite",
+            run_label="xrp_wait_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+    ]
+    payload["items"][0]["batch_id"] = "quick_screen_pool_direction_dense_sol"
+    save_experiment_queue(root, payload)
+    launched_batches: list[list[dict[str, object]]] = []
+
+    def batch_launcher(items: list[dict[str, object]]) -> dict[str, object]:
+        launched_batches.append([dict(item) for item in items])
+        return {"pid": 22222, "batch_id": "quick_screen_pool_direction_dense_xrp"}
+
+    _state, launched_items = launch_ready_queue_item_batches(
+        root,
+        live_workers=[
+            {
+                "batch_id": "quick_screen_pool_direction_dense_sol",
+                "market": "sol",
+                "suite_name": "sol_live_suite",
+                "run_label": "sol_live_run",
+                "track": "direction_dense",
+                "cmd": "python scripts/research/run_quick_screen_pool.py --batch-id quick_screen_pool_direction_dense_sol",
+            }
+        ],
+        batch_launcher=batch_launcher,
+        max_live_runs=10,
+        max_new_launches=10,
+        quick_screen_batch_size=10,
+        single_pool_per_track=True,
+    )
+
+    assert [[item["run_label"] for item in batch] for batch in launched_batches] == [["xrp_wait_run"]]
+    assert [item["run_label"] for item in launched_items] == ["xrp_wait_run"]
+    statuses = {item["run_label"]: item["status"] for item in _state["items"]}
+    assert statuses["sol_live_run"] == "running"
+    assert statuses["sol_wait_run"] == "queued"
+    assert statuses["xrp_wait_run"] == "running"
 
 
 def test_reseed_empty_tracks_from_recent_done_repairs_recent_completed_items(tmp_path: Path) -> None:
@@ -829,6 +1696,196 @@ def test_reseed_empty_tracks_from_recent_done_repairs_recent_completed_items(tmp
     assert statuses["btc_run_new"] == "repair"
     assert statuses["eth_run_new"] == "repair"
     assert statuses["btc_run_old"] == "done"
+
+
+def test_reseed_empty_tracks_from_recent_done_skips_completed_auto_refill_repairs(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 1, "reversal_dense": 0}
+    item = build_queue_item(
+        market="sol",
+        suite_name="sol_suite",
+        run_label="sol_run",
+        action="repair",
+        status="done",
+        reason="auto_refill_underfilled_track_from_recent_done",
+        track="direction_dense",
+        session_dir=session_dir,
+        program_path=program_path,
+    )
+    payload["items"] = [item]
+    save_experiment_queue(root, payload)
+
+    run_dir = root / "research" / "experiments" / "runs" / "suite=sol_suite" / "run=sol_run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "quick_screen_summary.json").write_text(
+        '{"suite_name":"sol_suite","run_label":"sol_run","rows":4,"selected_rows":1,"markets":["sol"]}',
+        encoding="utf-8",
+    )
+
+    state, reseeded = reseed_empty_tracks_from_recent_done(root, live_workers=[])
+
+    assert reseeded == []
+    saved_item = next(entry for entry in state["items"] if entry["run_label"] == "sol_run")
+    assert saved_item["status"] == "done"
+
+
+def test_reseed_empty_tracks_from_recent_done_skips_sparse_recent_failures(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    payload = load_experiment_queue(root)
+    payload["track_slot_caps"] = {"direction_dense": 1, "reversal_dense": 0}
+    item = build_queue_item(
+        market="sol",
+        suite_name="sol_sparse_suite",
+        run_label="sol_sparse_run",
+        action="launch",
+        status="done",
+        reason="reject_sparse_9_trades_below_dense_floor_width_move_required",
+        track="direction_dense",
+        session_dir=session_dir,
+        program_path=program_path,
+    )
+    item["research_meta"] = {
+        "feature_width": "56",
+        "primary_lever": "factor_family_rework",
+        "model_family": "deep_otm",
+    }
+    payload["items"] = [item]
+    save_experiment_queue(root, payload)
+
+    state, reseeded = reseed_empty_tracks_from_recent_done(
+        root,
+        live_workers=[],
+        inspect_run=lambda _run_dir: {"state": "completed", "top_case": {"trades": 9}},
+    )
+
+    assert reseeded == []
+    saved_item = next(entry for entry in state["items"] if entry["run_label"] == "sol_sparse_run")
+    assert saved_item["status"] == "done"
+
+
+def test_upsert_queue_item_blocks_same_route_after_repeated_sparse_attempts(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    session_dir = root / "sessions" / "direction_dense"
+    program_path = root / "auto_research" / "program_direction_dense.md"
+    suite_dir = root / "research" / "experiments" / "suite_specs"
+    run_root = root / "research" / "experiments" / "runs"
+    suite_dir.mkdir(parents=True, exist_ok=True)
+    custom_sets = root / "research" / "experiments" / "custom_feature_sets.json"
+    custom_sets.parent.mkdir(parents=True, exist_ok=True)
+    custom_sets.write_text(
+        json.dumps(
+            {
+                "focus_xrp_40_old": {
+                    "width": 40,
+                    "columns": ["ret_from_cycle_open", "ret_from_strike", "move_z"],
+                },
+                "focus_xrp_40_new": {
+                    "width": 40,
+                    "columns": ["ret_from_cycle_open", "ret_from_strike", "move_z"],
+                },
+                "focus_xrp_44_new": {
+                    "width": 44,
+                    "columns": ["ret_from_cycle_open", "ret_from_strike", "move_z", "basis_bp"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def write_suite(suite_name: str, feature_set: str) -> None:
+        (suite_dir / f"{suite_name}.json").write_text(
+            json.dumps(
+                {
+                    "suite_name": suite_name,
+                    "window": {"start": "2025-10-27", "end": "2026-04-15"},
+                    "decision_start": "2026-04-15",
+                    "decision_end": "2026-05-07",
+                    "markets": {
+                        "xrp": {
+                            "groups": {
+                                "direction": {
+                                    "runs": [
+                                        {
+                                            "run_name": "xrp",
+                                            "target": "direction",
+                                            "model_family": "deep_otm",
+                                            "feature_set_variants": [
+                                                {"label": "candidate", "feature_set": feature_set}
+                                            ],
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def write_completed_run(index: int) -> None:
+        suite_name = f"xrp_sparse_{index}"
+        run_label = f"xrp_sparse_run_{index}"
+        write_suite(suite_name, "focus_xrp_40_old")
+        run_dir = run_root / f"suite={suite_name}" / f"run={run_label}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "quick_screen_summary.json").write_text(
+            json.dumps({"suite_name": suite_name, "run_label": run_label, "rows": 1, "markets": ["xrp"]}),
+            encoding="utf-8",
+        )
+        (run_dir / "quick_screen_leaderboard.csv").write_text(
+            "feature_set,trades,profitable_pool_capture_rows,profitable_pool_correct_side_rows,density_bottleneck\n"
+            'focus_xrp_40_old,18,0,2,"{""primary_bottleneck"": ""low_trade_density""}"\n',
+            encoding="utf-8",
+        )
+        stamp = 1_800_000_000 + index
+        os.utime(run_dir / "quick_screen_summary.json", (stamp, stamp))
+
+    for index in range(3):
+        write_completed_run(index)
+
+    write_suite("xrp_same_route", "focus_xrp_40_new")
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_same_route",
+            run_label="xrp_same_route_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+    )
+    state = load_experiment_queue(root)
+    blocked = next(item for item in state["items"] if item["run_label"] == "xrp_same_route_run")
+    assert blocked["status"] == "dead"
+    assert blocked["action"] == "blocked"
+    assert "required feature_width" in str(blocked["last_error"])
+
+    write_suite("xrp_wider_route", "focus_xrp_44_new")
+    upsert_queue_item(
+        root,
+        build_queue_item(
+            market="xrp",
+            suite_name="xrp_wider_route",
+            run_label="xrp_wider_route_run",
+            action="launch",
+            status="queued",
+            track="direction_dense",
+            session_dir=session_dir,
+            program_path=program_path,
+        ),
+    )
+    state = load_experiment_queue(root)
+    allowed = next(item for item in state["items"] if item["run_label"] == "xrp_wider_route_run")
+    assert allowed["status"] == "queued"
 
 
 def test_reseed_empty_tracks_from_recent_done_skips_track_with_pending_or_live_work(tmp_path: Path) -> None:

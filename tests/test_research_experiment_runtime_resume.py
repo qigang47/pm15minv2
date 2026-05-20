@@ -305,7 +305,7 @@ def test_run_experiment_suite_reports_progress(monkeypatch, tmp_path: Path) -> N
     assert events[-1]["progress_pct"] == 100
 
 
-def test_run_experiment_suite_releases_backtest_memory_after_each_group(monkeypatch, tmp_path: Path) -> None:
+def test_run_experiment_suite_releases_backtest_memory_after_each_case_and_group(monkeypatch, tmp_path: Path) -> None:
     root = tmp_path / "v2"
     cfg = _build_cfg(root)
     suite = _Suite(
@@ -341,10 +341,31 @@ def test_run_experiment_suite_releases_backtest_memory_after_each_group(monkeypa
         "pm15min.research.experiments.runner.gc.collect",
         lambda: release_trace.append("gc") or 0,
     )
+    monkeypatch.setattr(
+        "pm15min.research.experiments.runner.trim_process_memory",
+        lambda: release_trace.append("trim") or True,
+    )
 
     run_experiment_suite(cfg=cfg, suite_name="memory_release_suite", run_label="memory-release-exp")
 
-    assert release_trace == ["clear", "clear_scoring", "gc", "clear", "clear_scoring", "gc"]
+    assert release_trace == [
+        "clear",
+        "clear_scoring",
+        "gc",
+        "trim",
+        "clear",
+        "clear_scoring",
+        "gc",
+        "trim",
+        "clear",
+        "clear_scoring",
+        "gc",
+        "trim",
+        "clear",
+        "clear_scoring",
+        "gc",
+        "trim",
+    ]
 
 
 def test_build_execution_groups_groups_stake_matrix_cases_by_parent_run_name_and_stake() -> None:
@@ -380,6 +401,43 @@ def test_build_execution_groups_groups_stake_matrix_cases_by_parent_run_name_and
     assert [spec.run_name for spec in groups[0].market_specs] == ["run-a__stake_1usd", "run-a__stake_5usd"]
     assert [spec.stake_usd for spec in groups[0].market_specs] == [1.0, 5.0]
     assert groups[1].group_label == "sol/core/run-b/alt"
+
+
+def test_build_execution_groups_keeps_weight_variants_together_for_surface_reuse() -> None:
+    groups = build_execution_groups(
+        (
+            _MarketSpec(
+                market="xrp",
+                group_name="focus_search",
+                run_name="fs40__w_current_default",
+                weight_variant_label="current_default",
+            ),
+            _MarketSpec(
+                market="xrp",
+                group_name="focus_search",
+                run_name="fs40__w_offset_reversal_mild",
+                weight_variant_label="offset_reversal_mild",
+                weight_by_vol=False,
+                contrarian_weight=1.5,
+            ),
+            _MarketSpec(
+                market="xrp",
+                group_name="focus_search",
+                run_name="fs40__w_offset_reversal_strong",
+                weight_variant_label="offset_reversal_strong",
+                weight_by_vol=False,
+                contrarian_weight=2.0,
+            ),
+        )
+    )
+
+    assert len(groups) == 1
+    assert groups[0].group_label == "xrp/focus_search/fs40"
+    assert [spec.weight_variant_label for spec in groups[0].market_specs] == [
+        "current_default",
+        "offset_reversal_mild",
+        "offset_reversal_strong",
+    ]
 
 
 def test_seed_reuse_caches_strip_partition_prefixes_from_training_and_bundle_dirs() -> None:
@@ -712,6 +770,50 @@ def test_ensure_market_datasets_rebuilds_when_label_frame_newer_than_prepared_ca
     ) is False
 
     assert calls == {"feature": 1, "label": 1}
+
+
+def test_ensure_market_datasets_reuses_fresh_artifacts_without_cache_record(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "v2"
+    cfg = _build_cfg(root)
+    feature_path = cfg.layout.feature_frame_path(cfg.feature_set, source_surface=cfg.source_surface)
+    label_path = cfg.layout.label_frame_path(cfg.label_set)
+    feature_path.parent.mkdir(parents=True, exist_ok=True)
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    feature_path.write_text("features", encoding="utf-8")
+    label_path.write_text("labels", encoding="utf-8")
+
+    calls = {"feature": 0, "label": 0}
+    monkeypatch.setattr(
+        "pm15min.research.experiments.runner.build_feature_frame_dataset",
+        lambda cfg: calls.__setitem__("feature", calls["feature"] + 1) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        "pm15min.research.experiments.runner.build_label_frame_dataset",
+        lambda cfg: calls.__setitem__("label", calls["label"] + 1) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        "pm15min.research.experiments.runner.inspect_research_artifacts_freshness",
+        lambda cfg, *, feature_set, label_set: {
+            "feature_frame": {"status": "fresh", "path": str(feature_path), "reasons": []},
+            "label_frame": {"status": "fresh", "path": str(label_path), "reasons": []},
+        },
+    )
+
+    prepared: set[tuple[str, ...]] = set()
+    prepared_at_by_key: dict[tuple[str, ...], float | None] = {}
+
+    assert _ensure_market_datasets(
+        market_cfg=cfg,
+        prepared_datasets=prepared,
+        prepared_at_by_key=prepared_at_by_key,
+    ) is True
+
+    assert calls == {"feature": 0, "label": 0}
+    assert prepared
+    assert next(iter(prepared_at_by_key.values())) is not None
 
 
 def test_run_experiment_suite_captures_failed_cases_and_reruns_only_failures(monkeypatch, tmp_path: Path) -> None:

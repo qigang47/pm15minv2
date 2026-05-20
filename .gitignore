@@ -9,6 +9,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+*.egg-info/
 
 # Local env files inside v2/
 .env
@@ -26,6 +27,7 @@ research/training_runs/
 research/model_bundles/
 research/backtests/
 research/evaluations/
+research/experiments/cache/
 research/experiments/runs/
 research/active_bundles/
 

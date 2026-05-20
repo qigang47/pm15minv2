@@ -1,0 +1,72 @@
+{
+  "suite_name": "baseline_focus_feature_search_xrp_reversal_40bridge_20260407",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "feature_set": "focus_xrp_40_v2",
+  "label_set": "truth",
+  "target": "reversal",
+  "offsets": [
+    7,
+    8,
+    9
+  ],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-27"
+  },
+  "decision_start": "2026-03-28",
+  "decision_end": "2026-04-03",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "stakes": [
+    1.0
+  ],
+  "max_notional_usd": 3.0,
+  "max_trades_per_market_values": [
+    3
+  ],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 2
+  },
+  "tags": [
+    "factor_search",
+    "focus_feature_search",
+    "reversal",
+    "latest7d",
+    "orderbook_locked",
+    "noret30",
+    "40factor",
+    "xrp_followup",
+    "40bridge"
+  ],
+  "markets": {
+    "xrp": {
+      "groups": {
+        "focus_search": {
+          "runs": [
+            {
+              "run_name": "focus_search",
+              "feature_set_variants": [
+                {
+                  "label": "control_40_v2",
+                  "feature_set": "focus_xrp_40_v2",
+                  "notes": "control: current XRP 40-line zero-trade baseline"
+                },
+                {
+                  "label": "swap_atr_14_for_vwap_gap_20",
+                  "feature_set": "focus_xrp_40_v5_swap_atr_14_for_vwap_gap_20",
+                  "notes": "bridge the XRP 40-line with the earlier higher-backed-winner vwap gap swap"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

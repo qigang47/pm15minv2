@@ -37,6 +37,16 @@ QUOTE_SURFACE_COLUMNS = [
 ]
 
 QUOTE_SURFACE_HEARTBEAT_INTERVAL_ROWS = 1_000
+QUOTE_SURFACE_INDEX_COLUMNS = [
+    "captured_ts_ms",
+    "market_id",
+    "token_id",
+    "side",
+    "best_ask",
+    "best_bid",
+    "ask_size_1",
+    "bid_size_1",
+]
 
 
 @dataclass(frozen=True)
@@ -75,7 +85,8 @@ def attach_canonical_quote_surface(
 
     market_table = _prepare_market_table(load_market_catalog_with_fallback(data_cfg))
     frame = _attach_market_metadata(replay.copy(), market_table)
-    orderbook_cache: dict[str, tuple[str, pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]] = {}
+    scopes = _quote_surface_date_scopes(frame)
+    orderbook_cache: dict[tuple[str, tuple[str, ...]], tuple[str, pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]] = {}
     total_rows = len(frame)
     if heartbeat is not None:
         heartbeat(f"Attaching quote surface: 0/{total_rows:,} rows")
@@ -86,6 +97,7 @@ def attach_canonical_quote_surface(
                 frame.iloc[idx],
                 data_cfg=data_cfg,
                 orderbook_cache=orderbook_cache,
+                scopes=scopes,
             )
         )
         row_index = idx + 1
@@ -181,7 +193,8 @@ def _build_quote_surface_row(
     row: pd.Series,
     *,
     data_cfg: DataConfig,
-    orderbook_cache: dict[str, tuple[str, pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]],
+    orderbook_cache: dict[tuple[str, tuple[str, ...]], tuple[str, pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]],
+    scopes: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, object]:
     decision_ts = pd.to_datetime(row.get("decision_ts"), utc=True, errors="coerce")
     market_id = str(row.get("market_id") or "").strip()
@@ -195,6 +208,7 @@ def _build_quote_surface_row(
         data_cfg=data_cfg,
         date_str=date_str,
         orderbook_cache=orderbook_cache,
+        scope={} if scopes is None else scopes.get(date_str, {}),
     )
     if index_frame.empty:
         return _empty_quote_surface(
@@ -259,17 +273,57 @@ def _load_orderbook_cache_entry(
     *,
     data_cfg: DataConfig,
     date_str: str,
-    orderbook_cache: dict[str, tuple[str, pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]],
+    orderbook_cache: dict[tuple[str, tuple[str, ...]], tuple[str, pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]],
+    scope: dict[str, object] | None = None,
 ) -> tuple[str, pd.DataFrame, dict[tuple[str, str, str], tuple[int, ...]], dict[tuple[str, str], tuple[int, ...]]]:
-    cached = orderbook_cache.get(date_str)
+    market_ids = tuple(sorted(str(value) for value in (scope or {}).get("market_ids", set()) if str(value)))
+    cache_key = (date_str, market_ids)
+    cached = orderbook_cache.get(cache_key)
     if cached is not None:
         return cached
     index_path = ensure_orderbook_index_path(data_cfg, date_str)
-    index_frame = load_orderbook_index_frame(index_path=index_path)
+    filters = _orderbook_scope_filters(market_ids=market_ids)
+    index_frame = load_orderbook_index_frame(
+        index_path=index_path,
+        columns=QUOTE_SURFACE_INDEX_COLUMNS,
+        filters=filters,
+    )
     prepared_frame, token_lookup, market_side_lookup = _prepare_orderbook_lookup(index_frame)
     payload = (str(index_path), prepared_frame, token_lookup, market_side_lookup)
-    orderbook_cache[date_str] = payload
+    orderbook_cache[cache_key] = payload
     return payload
+
+
+def _quote_surface_date_scopes(frame: pd.DataFrame) -> dict[str, dict[str, object]]:
+    scopes: dict[str, dict[str, object]] = {}
+    if frame.empty or "decision_ts" not in frame.columns:
+        return scopes
+    for row in frame.itertuples(index=False):
+        decision_ts = pd.to_datetime(getattr(row, "decision_ts", None), utc=True, errors="coerce")
+        if decision_ts is None or pd.isna(decision_ts):
+            continue
+        market_id = str(getattr(row, "market_id", "") or "").strip()
+        if not market_id:
+            continue
+        date_str = pd.Timestamp(decision_ts).strftime("%Y-%m-%d")
+        entry = scopes.setdefault(
+            date_str,
+            {
+                "market_ids": set(),
+            },
+        )
+        entry["market_ids"].add(market_id)
+    return scopes
+
+
+def _orderbook_scope_filters(
+    *,
+    market_ids: tuple[str, ...],
+) -> list[tuple[str, str, object]] | None:
+    filters: list[tuple[str, str, object]] = []
+    if market_ids:
+        filters.append(("market_id", "in", list(market_ids)))
+    return filters or None
 
 
 def _prepare_orderbook_lookup(

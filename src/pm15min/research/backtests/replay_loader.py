@@ -96,6 +96,24 @@ def build_replay_frame(
 ) -> tuple[pd.DataFrame, ReplayLoadSummary]:
     scoped_feature_frame = _scope_frame_to_offsets(features, scoped_offsets)
     merged, alignment_metadata = merge_feature_and_label_frames(scoped_feature_frame, labels)
+    return build_replay_frame_from_merged(
+        merged=merged,
+        alignment_metadata=alignment_metadata,
+        score_frames=score_frames,
+        available_offsets=available_offsets,
+        scoped_offsets=None,
+    )
+
+
+def build_replay_frame_from_merged(
+    *,
+    merged: pd.DataFrame,
+    alignment_metadata: dict[str, object],
+    score_frames: list[pd.DataFrame],
+    available_offsets: list[int],
+    scoped_offsets: list[int] | None = None,
+) -> tuple[pd.DataFrame, ReplayLoadSummary]:
+    merged = _scope_frame_to_offsets(merged, scoped_offsets)
     score_frame = _scope_frame_to_offsets(build_score_frame(score_frames), scoped_offsets)
     replay = merged.merge(score_frame, on=_replay_merge_columns(merged, score_frame), how="left")
     replay["bundle_offset_available"] = pd.to_numeric(replay["offset"], errors="coerce").isin(
@@ -116,8 +134,8 @@ def build_replay_frame(
         & replay["winner_side"].isin(["UP", "DOWN"])
     )
     summary = ReplayLoadSummary(
-        feature_rows=int(alignment_metadata.get("feature_rows", len(features))),
-        label_rows=int(alignment_metadata.get("label_rows", len(labels))),
+        feature_rows=int(len(merged)),
+        label_rows=int(alignment_metadata.get("label_rows", 0)),
         merged_rows=int(len(replay)),
         score_rows=int(len(score_frame)),
         score_covered_rows=int(replay["score_present"].sum()),

@@ -1,0 +1,110 @@
+{
+  "suite_name": "baseline_reversal_weight_search_eth_2usd_3max_20260408",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "label_set": "truth",
+  "target": "reversal",
+  "feature_set": "focus_eth_30_v4",
+  "offsets": [7, 8, 9],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-27"
+  },
+  "decision_start": "2026-03-28",
+  "decision_end": "2026-04-06",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "stakes": [2.0],
+  "max_notional_usd": 2.0,
+  "max_trades_per_market_values": [3],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 2
+  },
+  "tags": [
+    "reversal_weight_search",
+    "offset_weight_search",
+    "focus_feature_search",
+    "window_scan_fixed",
+    "noret30",
+    "decision_0328_0406",
+    "stake_2usd",
+    "per_offset_max3"
+  ],
+  "markets": {
+    "eth": {
+      "groups": {
+        "reversal_weight_search": {
+          "runs": [
+            {
+              "run_name": "reversal_weight_focus",
+              "feature_set_variants": [
+                {
+                  "label": "fs30",
+                  "feature_set": "focus_eth_30_v4",
+                  "notes": "eth reversal quick-screen winner from round 1"
+                },
+                {
+                  "label": "fs34",
+                  "feature_set": "focus_eth_34_v4",
+                  "notes": "eth reversal quick-screen runner-up from round 1"
+                }
+              ],
+              "weight_variants": [
+                {
+                  "label": "current_default",
+                  "notes": "shared default weights"
+                },
+                {
+                  "label": "no_vol_weight",
+                  "notes": "disable volatility weighting for a conservative control",
+                  "weight_by_vol": false
+                },
+                {
+                  "label": "offset_reversal_mild",
+                  "notes": "mild offset-specific contrarian emphasis for 7/8/9",
+                  "offset_weight_overrides": {
+                    "7": {
+                      "contrarian_weight": 1.25,
+                      "contrarian_quantile": 0.8
+                    },
+                    "8": {
+                      "contrarian_weight": 1.75,
+                      "contrarian_quantile": 0.75
+                    },
+                    "9": {
+                      "contrarian_weight": 2.25,
+                      "contrarian_quantile": 0.7
+                    }
+                  }
+                },
+                {
+                  "label": "offset_reversal_strong",
+                  "notes": "stronger offset-specific contrarian emphasis for 7/8/9",
+                  "offset_weight_overrides": {
+                    "7": {
+                      "contrarian_weight": 1.5,
+                      "contrarian_quantile": 0.8
+                    },
+                    "8": {
+                      "contrarian_weight": 2.25,
+                      "contrarian_quantile": 0.75
+                    },
+                    "9": {
+                      "contrarian_weight": 3.0,
+                      "contrarian_quantile": 0.7
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

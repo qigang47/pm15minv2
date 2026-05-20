@@ -1,0 +1,106 @@
+{
+  "suite_name": "baseline_focus_feature_search_eth_reversal_drop30_20260406",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "feature_set": "focus_eth_30_v4",
+  "label_set": "truth",
+  "target": "reversal",
+  "offsets": [
+    7,
+    8,
+    9
+  ],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-27"
+  },
+  "decision_start": "2026-03-28",
+  "decision_end": "2026-04-03",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "stakes": [
+    1.0
+  ],
+  "max_notional_usd": 3.0,
+  "max_trades_per_market_values": [
+    3
+  ],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 2
+  },
+  "tags": [
+    "factor_search",
+    "focus_feature_search",
+    "reversal",
+    "latest7d",
+    "orderbook_locked",
+    "noret30",
+    "eth_followup",
+    "drop30"
+  ],
+  "markets": {
+    "eth": {
+      "groups": {
+        "focus_search": {
+          "runs": [
+            {
+              "run_name": "focus_search",
+              "feature_set_variants": [
+                {
+                  "label": "base30",
+                  "feature_set": "focus_eth_30_v4",
+                  "notes": "control: current best ETH reversal width from weight-search round"
+                },
+                {
+                  "label": "drop_atr_14",
+                  "feature_set": "focus_eth_29_v5_drop_atr_14",
+                  "notes": "remove atr_14 from focus_eth_30_v4"
+                },
+                {
+                  "label": "drop_ema_gap_12",
+                  "feature_set": "focus_eth_29_v5_drop_ema_gap_12",
+                  "notes": "remove ema_gap_12 from focus_eth_30_v4"
+                },
+                {
+                  "label": "drop_ma_gap_15",
+                  "feature_set": "focus_eth_29_v5_drop_ma_gap_15",
+                  "notes": "remove ma_gap_15 from focus_eth_30_v4"
+                },
+                {
+                  "label": "drop_ma_gap_5",
+                  "feature_set": "focus_eth_29_v5_drop_ma_gap_5",
+                  "notes": "remove ma_gap_5 from focus_eth_30_v4"
+                }
+              ],
+              "weight_variants": [
+                {
+                  "label": "offset_reversal_mild",
+                  "notes": "hold the best current ETH weight setting fixed while isolating feature removals",
+                  "offset_weight_overrides": {
+                    "7": {
+                      "contrarian_weight": 1.25,
+                      "contrarian_quantile": 0.8
+                    },
+                    "8": {
+                      "contrarian_weight": 1.75,
+                      "contrarian_quantile": 0.75
+                    },
+                    "9": {
+                      "contrarian_weight": 2.25,
+                      "contrarian_quantile": 0.7
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

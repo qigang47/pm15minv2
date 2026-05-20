@@ -11,6 +11,7 @@ from typing import Protocol
 
 import pandas as pd
 
+from pm15min.core.process_memory import trim_process_memory
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.research._contracts_training import (
     normalize_offset_weight_overrides,
@@ -22,6 +23,7 @@ from pm15min.research.bundles.builder import build_model_bundle
 from pm15min.research.config import ResearchConfig
 from pm15min.research.contracts import BacktestRunSpec, ModelBundleSpec, TrainingRunSpec
 from pm15min.research.datasets.feature_frames import build_feature_frame_dataset
+from pm15min.research.freshness import inspect_research_artifacts_freshness
 from pm15min.research.inference.scorer import clear_process_scoring_runtime_cache
 from pm15min.research.labels.datasets import build_label_frame_dataset
 from pm15min.research.manifests import build_manifest, write_manifest
@@ -643,6 +645,7 @@ def run_experiment_suite(
                 ),
                 case_progress=1.0,
             )
+            _release_execution_group_memory()
         if queued_case_contexts:
             first_context, *remaining_contexts = queued_case_contexts
             _append_suite_log(
@@ -1265,6 +1268,7 @@ def _apply_experiment_case_result(
         ),
         case_progress=1.0,
     )
+    _release_execution_group_memory()
     return new_completed_cases
 
 
@@ -1294,6 +1298,7 @@ def _release_execution_group_memory() -> None:
     clear_process_backtest_runtime_cache()
     clear_process_scoring_runtime_cache()
     gc.collect()
+    trim_process_memory()
 
 
 def _suite_progress_pct(current: int, total: int) -> int:
@@ -1661,8 +1666,23 @@ def _ensure_market_datasets(
         str(market_cfg.layout.storage.rewrite_root),
     )
     prepared_at = None if prepared_at_by_key is None else prepared_at_by_key.get(key)
-    if key in prepared_datasets and not _market_dataset_artifacts_newer_than_cache(market_cfg, prepared_at):
-        return True
+    key_is_prepared = key in prepared_datasets
+    if key_is_prepared:
+        if not _market_dataset_artifacts_newer_than_cache(market_cfg, prepared_at):
+            return True
+    else:
+        freshness = inspect_research_artifacts_freshness(
+            market_cfg,
+            feature_set=market_cfg.feature_set,
+            label_set=market_cfg.label_set,
+        )
+        feature_status = str(((freshness.get("feature_frame") or {}).get("status")) or "")
+        label_status = str(((freshness.get("label_frame") or {}).get("status")) or "")
+        if feature_status == "fresh" and label_status == "fresh":
+            prepared_datasets.add(key)
+            if prepared_at_by_key is not None:
+                prepared_at_by_key[key] = datetime.now(timezone.utc).timestamp()
+            return True
     build_feature_frame_dataset(market_cfg)
     build_label_frame_dataset(market_cfg)
     prepared_datasets.add(key)
@@ -2260,7 +2280,7 @@ def _backtest_run_label(*, run_label: str, market_spec, case_key: str) -> str:
     if variant and variant != "default":
         tokens.append(variant)
     tokens.extend(["backtest", case_key[:8]])
-    return _slug("-".join(tokens))
+    return _bounded_slug("-".join(tokens), suffix=case_key[:8])
 
 
 def _offset_label(offsets: tuple[int, ...]) -> str:
@@ -2278,3 +2298,14 @@ def _slug(value: str) -> str:
         chars.append(char if char.isalnum() or char in {"-", "_"} else "-")
     token = "".join(chars).strip("-")
     return token or "planned"
+
+
+def _bounded_slug(value: str, *, suffix: str, max_length: int = 120) -> str:
+    token = _slug(value)
+    if len(token) <= max_length:
+        return token
+    suffix_token = _slug(suffix)
+    digest = hashlib.sha1(token.encode("utf-8")).hexdigest()[:10]
+    tail = f"-{digest}-{suffix_token}" if suffix_token else f"-{digest}"
+    head_length = max(1, int(max_length) - len(tail))
+    return f"{token[:head_length].rstrip('-_')}{tail}"

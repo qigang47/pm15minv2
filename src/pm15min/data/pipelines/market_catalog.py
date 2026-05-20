@@ -42,6 +42,10 @@ def _frame_from_records(records) -> pd.DataFrame:
     return df.sort_values(["cycle_start_ts", "market_id"]).reset_index(drop=True)
 
 
+def _series_slug_for_active_events(*, asset: str, cycle: str) -> str:
+    return f"{asset.strip().lower()}-up-or-down-{cycle}"
+
+
 def _write_market_catalog_snapshot(
     *,
     cfg: DataConfig,
@@ -112,6 +116,23 @@ def sync_market_catalog(
         )
         source_mode = "gamma_active_markets"
         fetched_rows = len(markets)
+        if not records:
+            events = client.fetch_active_events(
+                start_ts=start_ts,
+                end_ts=end_ts,
+                limit=cfg.gamma_limit,
+                max_pages=cfg.max_pages,
+                sleep_sec=cfg.sleep_sec,
+                series_slug=_series_slug_for_active_events(asset=cfg.asset.slug, cycle=cfg.cycle),
+            )
+            records = build_market_catalog_records(
+                events=events,
+                asset=cfg.asset.slug,
+                cycle=cfg.cycle,
+                snapshot_ts=snapshot_ts,
+            )
+            source_mode = "gamma_active_events"
+            fetched_rows = len(events)
     else:
         events = client.fetch_closed_events(
             start_ts=start_ts,
@@ -160,7 +181,7 @@ def backfill_market_catalog_from_closed_markets(
     base_now = now or datetime.now(timezone.utc)
 
     while cursor <= int(end_ts):
-        window_end = min(int(end_ts), cursor + step - 1)
+        window_end = min(int(end_ts), cursor + step)
         snapshot_ts = f"{utc_snapshot_label(base_now)}_{int(cursor)}_{int(window_end)}"
         markets = client.fetch_closed_markets(
             start_ts=cursor,

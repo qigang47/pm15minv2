@@ -73,6 +73,10 @@ class TrainerConfig:
     apply_shared_blacklist: bool = False
     extra_drop_columns: tuple[str, ...] = ()
     parallel_workers: int = 1
+    include_catboost: bool = False
+    matrix_float_dtype: str = "float32"
+    catboost_thread_divisor: int = 2
+    catboost_used_ram_limit: str | None = "12gb"
     feature_set_root: os.PathLike[str] | str | None = None
 
 
@@ -130,8 +134,11 @@ def prepare_training_matrix(
     )
     X = df[list(pruning_plan.kept_columns)].copy()
     for column in X.columns:
-        X[column] = pd.to_numeric(X[column], errors="coerce")
+        X[column] = pd.to_numeric(X[column], errors="coerce", downcast="float")
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    dtype = str(cfg.matrix_float_dtype if cfg is not None else TrainerConfig.matrix_float_dtype).strip().lower()
+    if dtype in {"float32", "float64"}:
+        X = X.astype(dtype, copy=False)
     y = pd.to_numeric(df["y"], errors="coerce").astype(int)
     return X, y, pruning_plan
 
@@ -198,7 +205,8 @@ def fit_catboost(
         loss_function="Logloss",
         eval_metric="AUC",
         random_seed=int(cfg.random_seed),
-        thread_count=_resolve_lgb_n_jobs(cfg),
+        thread_count=_resolve_catboost_thread_count(cfg),
+        used_ram_limit=_resolve_catboost_used_ram_limit(cfg),
         allow_writing_files=False,
         verbose=False,
     )
@@ -261,10 +269,12 @@ def generate_oof_predictions(
             "p_lgb": lgbm.predict_proba(X_test)[:, 1].astype(float),
             "p_lr": logreg.predict_proba(X_test)[:, 1].astype(float),
         }
-        try:
-            catboost = fit_catboost(X_train, y_train, cfg=cfg, sample_weight=sample_weight)
-        except CatBoostUnavailableError:
-            catboost = None
+        catboost = None
+        if cfg.include_catboost:
+            try:
+                catboost = fit_catboost(X_train, y_train, cfg=cfg, sample_weight=sample_weight)
+            except CatBoostUnavailableError:
+                catboost = None
         if catboost is not None:
             payload["p_catboost"] = catboost.predict_proba(X_test)[:, 1].astype(float)
         rows.append(pd.DataFrame(payload))
@@ -279,6 +289,23 @@ def _resolve_lgb_n_jobs(cfg: TrainerConfig) -> int:
     thread_cap = _read_positive_int_env("PM15MIN_EXPERIMENT_CPU_THREADS")
     thread_budget = cpu_count if thread_cap is None else min(cpu_count, thread_cap)
     return max(1, thread_budget // parallel_workers)
+
+
+def _resolve_catboost_thread_count(cfg: TrainerConfig) -> int:
+    threads = _resolve_lgb_n_jobs(cfg)
+    divisor = max(1, int(cfg.catboost_thread_divisor or 1))
+    return max(1, threads // divisor)
+
+
+def _resolve_catboost_used_ram_limit(cfg: TrainerConfig) -> str | None:
+    raw = str(os.environ.get("PM15MIN_CATBOOST_USED_RAM_LIMIT", "") or "").strip()
+    if raw:
+        return raw
+    configured = cfg.catboost_used_ram_limit
+    if configured is None:
+        return None
+    text = str(configured).strip()
+    return text or None
 
 
 def _read_positive_int_env(name: str) -> int | None:

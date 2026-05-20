@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ import joblib
 import pandas as pd
 import numpy as np
 
+from pm15min.core.process_memory import trim_process_memory
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.data.queries.loaders import load_binance_klines_1m
@@ -33,11 +35,11 @@ from pm15min.research.backtests.data_surface_fallback import preflight_orderbook
 from pm15min.research.backtests.fills import BacktestFillConfig, build_canonical_fills, build_depth_candidate_lookup
 from pm15min.research.backtests.guard_parity import GuardParitySummary
 from pm15min.research.backtests.hybrid import apply_hybrid_fallback
-from pm15min.research.backtests.live_state_parity import attach_live_state_parity
-from pm15min.research.backtests.orderbook_surface import attach_canonical_quote_surface
+from pm15min.research.backtests.live_state_parity import LIVE_STATE_PARITY_COLUMNS, attach_live_state_parity
+from pm15min.research.backtests.orderbook_surface import QUOTE_SURFACE_COLUMNS, attach_canonical_quote_surface
 from pm15min.research.backtests.policy import BacktestPolicyConfig, build_policy_decisions, build_policy_reject_frame
 from pm15min.research.backtests.regime_parity import resolve_backtest_profile_spec
-from pm15min.research.backtests.replay_loader import build_replay_frame
+from pm15min.research.backtests.replay_loader import REPLAY_KEY_COLUMNS, build_replay_frame, build_replay_frame_from_merged
 from pm15min.research.backtests.retry_contract import (
     attach_pre_submit_orderbook_retry_contract,
     build_backtest_retry_contract,
@@ -45,7 +47,10 @@ from pm15min.research.backtests.retry_contract import (
 from pm15min.research.backtests.runtime_cache import (
     BacktestPreparedRuntime,
     BacktestSharedRuntimeKey,
+    BacktestSurfaceRuntime,
+    BacktestSurfaceRuntimeKey,
     process_backtest_runtime_cache,
+    process_backtest_surface_runtime_cache,
     snapshot_source_mtimes,
 )
 from pm15min.research.backtests.reports import (
@@ -283,84 +288,136 @@ def run_research_backtest(
             decision_end=spec.decision_end,
             heartbeat=progress.heartbeat(stage_index=preflight_stage_index, stage_name=preflight_stage_name),
         )
-        depth_stage_index, depth_stage_name = _start_stage("depth_replay", "Replaying raw depth snapshots")
-        depth_replay, depth_replay_summary, depth_candidate_lookup = _build_decision_depth_runtime(
-            replay=replay,
-            data_cfg=data_cfg,
-            fill_config=fill_config,
-            heartbeat=progress.heartbeat(stage_index=depth_stage_index, stage_name=depth_stage_name),
+        surface_runtime = (
+            _load_cached_surface_runtime(
+                cfg=cfg,
+                spec=spec,
+                feature_set=feature_set,
+                label_set=label_set,
+                profile_spec=profile_spec,
+                liquidity_proxy_mode=liquidity_proxy_mode,
+                fill_config=fill_config,
+                available_offsets=available_offsets,
+                replay=replay,
+            )
+            if process_backtest_surface_runtime_cache().enabled
+            else None
         )
-        quote_stage_index, quote_stage_name = _start_stage("quote_surface", "Attaching quote surface")
-        live_state_stage_index, live_state_stage_name = _start_stage("live_state_surface", "Attaching live state parity")
-        runtime_replay, quote_summary, state_summary = _attach_replay_runtime_surface(
-            replay=replay,
-            data_cfg=data_cfg,
-            market=cfg.asset.slug,
-            raw_klines=raw_klines,
-            profile_spec=profile_spec,
-            liquidity_proxy_mode=liquidity_proxy_mode,
-            quote_heartbeat=progress.heartbeat(stage_index=quote_stage_index, stage_name=quote_stage_name),
-            live_state_heartbeat=progress.heartbeat(stage_index=live_state_stage_index, stage_name=live_state_stage_name),
-        )
-        prepared_runtime = _store_primary_runtime(
+        if surface_runtime is not None:
+            runtime_cache_status = "surface_reused"
+            _start_stage("depth_replay", "Reusing cached depth replay")
+            _start_stage("quote_surface", "Reusing cached quote surface")
+            _start_stage("live_state_surface", "Reusing cached live state parity")
+            depth_replay = surface_runtime.depth_replay
+            depth_replay_summary = surface_runtime.depth_replay_summary
+            depth_candidate_lookup = surface_runtime.depth_candidate_lookup
+            runtime_replay = _merge_cached_runtime_surface(replay, surface_runtime.runtime_replay)
+            quote_summary = surface_runtime.quote_summary
+            state_summary = surface_runtime.state_summary
+        else:
+            depth_stage_index, depth_stage_name = _start_stage("depth_replay", "Replaying raw depth snapshots")
+            depth_replay, depth_replay_summary, depth_candidate_lookup = _build_decision_depth_runtime(
+                replay=replay,
+                data_cfg=data_cfg,
+                fill_config=fill_config,
+                heartbeat=progress.heartbeat(stage_index=depth_stage_index, stage_name=depth_stage_name),
+            )
+            quote_stage_index, quote_stage_name = _start_stage("quote_surface", "Attaching quote surface")
+            live_state_stage_index, live_state_stage_name = _start_stage("live_state_surface", "Attaching live state parity")
+            runtime_replay, quote_summary, state_summary = _attach_replay_runtime_surface(
+                replay=replay,
+                data_cfg=data_cfg,
+                market=cfg.asset.slug,
+                raw_klines=raw_klines,
+                profile_spec=profile_spec,
+                liquidity_proxy_mode=liquidity_proxy_mode,
+                quote_heartbeat=progress.heartbeat(stage_index=quote_stage_index, stage_name=quote_stage_name),
+                live_state_heartbeat=progress.heartbeat(stage_index=live_state_stage_index, stage_name=live_state_stage_name),
+            )
+            if process_backtest_surface_runtime_cache().enabled:
+                _store_surface_runtime(
+                    cfg=cfg,
+                    spec=spec,
+                    feature_set=feature_set,
+                    label_set=label_set,
+                    profile_spec=profile_spec,
+                    liquidity_proxy_mode=liquidity_proxy_mode,
+                    fill_config=fill_config,
+                    available_offsets=available_offsets,
+                    replay=replay,
+                    prepared=BacktestSurfaceRuntime(
+                        depth_replay=depth_replay,
+                        depth_replay_summary=depth_replay_summary,
+                        depth_candidate_lookup=depth_candidate_lookup,
+                        runtime_replay=_compact_runtime_surface_frame(runtime_replay),
+                        quote_summary=quote_summary,
+                        state_summary=state_summary,
+                        source_mtimes=snapshot_source_mtimes(
+                            _surface_runtime_source_paths(
+                                cfg=cfg,
+                                data_cfg=data_cfg,
+                                feature_set=feature_set,
+                                label_set=label_set,
+                                depth_replay=depth_replay,
+                                runtime_replay=runtime_replay,
+                            )
+                        ),
+                    ),
+                )
+        prepared_runtime = _maybe_store_primary_runtime(
             cfg=cfg,
             spec=spec,
+            data_cfg=data_cfg,
             bundle_dir=bundle_dir,
             feature_set=feature_set,
             label_set=label_set,
             profile_spec=profile_spec,
             liquidity_proxy_mode=liquidity_proxy_mode,
-            prepared=BacktestPreparedRuntime(
-                bundle_dir=str(bundle_dir),
-                feature_set=feature_set,
-                label_set=label_set,
-                features=features,
-                labels=labels,
-                raw_klines=raw_klines,
-                available_offsets=tuple(int(value) for value in available_offsets),
-                replay=replay,
-                replay_summary=replay_summary,
-                depth_replay=depth_replay,
-                depth_replay_summary=depth_replay_summary,
-                depth_candidate_lookup=depth_candidate_lookup,
-                runtime_replay=runtime_replay,
-                quote_summary=quote_summary,
-                state_summary=state_summary,
-                source_mtimes=snapshot_source_mtimes(
-                    _prepared_runtime_source_paths(
-                        cfg=cfg,
-                        data_cfg=data_cfg,
-                        bundle_dir=bundle_dir,
-                        feature_set=feature_set,
-                        label_set=label_set,
-                        depth_replay=depth_replay,
-                        runtime_replay=runtime_replay,
-                    )
-                ),
-            ),
+            features=features,
+            labels=labels,
+            raw_klines=raw_klines,
+            available_offsets=available_offsets,
+            replay=replay,
+            replay_summary=replay_summary,
+            depth_replay=depth_replay,
+            depth_replay_summary=depth_replay_summary,
+            depth_candidate_lookup=depth_candidate_lookup,
+            runtime_replay=runtime_replay,
+            quote_summary=quote_summary,
+            state_summary=state_summary,
         )
+        replay = runtime_replay
     else:
         _start_stage("bundle_replay", "Reusing cached bundle replay")
         _start_stage("depth_replay", "Reusing cached depth replay")
         _start_stage("quote_surface", "Reusing cached quote surface")
         _start_stage("live_state_surface", "Reusing cached live state parity")
-    features = prepared_runtime.features
-    labels = prepared_runtime.labels
-    raw_klines = prepared_runtime.raw_klines
-    replay = prepared_runtime.runtime_replay
-    replay_summary = prepared_runtime.replay_summary
-    available_offsets = list(prepared_runtime.available_offsets)
-    depth_replay = prepared_runtime.depth_replay
-    depth_replay_summary = prepared_runtime.depth_replay_summary
-    depth_candidate_lookup = prepared_runtime.depth_candidate_lookup
-    quote_summary = prepared_runtime.quote_summary
-    state_summary = prepared_runtime.state_summary
+        features = prepared_runtime.features
+        labels = prepared_runtime.labels
+        raw_klines = prepared_runtime.raw_klines
+        replay = prepared_runtime.runtime_replay
+        replay_summary = prepared_runtime.replay_summary
+        available_offsets = list(prepared_runtime.available_offsets)
+        depth_replay = prepared_runtime.depth_replay
+        depth_replay_summary = prepared_runtime.depth_replay_summary
+        depth_candidate_lookup = prepared_runtime.depth_candidate_lookup
+        quote_summary = prepared_runtime.quote_summary
+        state_summary = prepared_runtime.state_summary
 
     replay = _filter_replay_window(
         replay.copy(deep=False),
         decision_start=spec.decision_start,
         decision_end=spec.decision_end,
     )
+    factor_source_frame = _factor_source_frame(replay, factor_columns=_bundle_feature_columns(bundle_dir))
+    replay = _compact_replay_for_runtime(replay, extra_columns=_runtime_extra_columns_for_target(spec.target))
+    if not spec.secondary_bundle_label:
+        features = pd.DataFrame()
+        labels = pd.DataFrame()
+        raw_klines = pd.DataFrame()
+    if prepared_runtime is not None and not process_backtest_runtime_cache().enabled:
+        prepared_runtime = None
+    _trim_backtest_memory()
     _ensure_replay_labels_resolved(replay)
     if orderbook_preflight_summary is None:
         preflight_stage_index, preflight_stage_name = _start_stage("orderbook_preflight", "Preflighting orderbook coverage")
@@ -420,6 +477,8 @@ def run_research_backtest(
             secondary_decisions,
             fallback_reasons=spec.fallback_reasons or ("direction_prob", "policy_low_confidence"),
         )
+        del secondary_replay, secondary_decisions, _secondary_quote_summary, _secondary_state_summary, _secondary_decision_quote_summary
+        _trim_backtest_memory()
     fills_stage_index, fills_stage_name = _start_stage("fills_materialization", "Materializing canonical fills")
     policy_rejects = build_policy_reject_frame(decisions)
     accepted = decisions.loc[decisions["policy_action"].eq("trade")].copy()
@@ -430,6 +489,12 @@ def run_research_backtest(
         data_cfg=data_cfg,
         heartbeat=progress.heartbeat(stage_index=fills_stage_index, stage_name=fills_stage_name),
     )
+    depth_replay, depth_candidate_lookup = _release_decision_depth_runtime_after_fill_resolution(
+        decision_depth_replay=depth_replay,
+        decision_depth_candidate_lookup=depth_candidate_lookup,
+        fill_depth_replay=fill_depth_replay,
+    )
+    _trim_backtest_memory()
     fills, fill_rejects = build_canonical_fills(
         accepted,
         data_cfg=data_cfg,
@@ -439,9 +504,13 @@ def run_research_backtest(
         depth_candidate_lookup=fill_depth_candidate_lookup,
         heartbeat=progress.heartbeat(stage_index=fills_stage_index, stage_name=fills_stage_name),
     )
+    del fill_depth_replay, fill_depth_candidate_lookup
+    _trim_backtest_memory()
     _start_stage("settlement_summary", "Settling fills and building summaries")
     trades = settle_trade_fills(fills)
+    del fills
     rejects = pd.concat([policy_rejects, fill_rejects], ignore_index=True, sort=False).reset_index(drop=True)
+    del policy_rejects, fill_rejects
     markets = build_market_summary(trades)
     equity_curve = build_equity_curve(trades)
 
@@ -513,11 +582,22 @@ def run_research_backtest(
         rejects=rejects,
         available_offsets=available_offsets,
     )
-    factor_pnl = build_factor_pnl_frame(
-        decisions=decisions,
-        trades=trades,
-        factor_columns=_bundle_feature_columns(bundle_dir),
+    factor_columns = _factor_columns_from_frame(factor_source_frame)
+    factor_decisions = _merge_factor_columns_for_traded_decisions(
+        decisions,
+        factor_source_frame=_narrow_factor_source_to_accepted_decisions(
+            factor_source_frame=factor_source_frame,
+            accepted=accepted,
+        ),
     )
+    del factor_source_frame
+    factor_pnl = build_factor_pnl_frame(
+        decisions=factor_decisions,
+        trades=trades,
+        factor_columns=factor_columns,
+    )
+    del factor_columns, factor_decisions, accepted
+    _trim_backtest_memory()
     write_parquet_atomic(stake_sweep, stake_sweep_path)
     write_parquet_atomic(offset_summary, offset_summary_path)
     write_parquet_atomic(factor_pnl, factor_pnl_path)
@@ -594,8 +674,7 @@ def run_research_backtest(
     )
     write_manifest(run_dir / "manifest.json", manifest)
     progress.complete(summary="Backtest completed")
-
-    return {
+    result = {
         "dataset": "backtest_run",
         "market": cfg.asset.slug,
         "cycle": cfg.cycle,
@@ -621,6 +700,10 @@ def run_research_backtest(
         "report_path": str(report_path),
         "manifest_path": str(run_dir / "manifest.json"),
     }
+    del decisions, trades, rejects, markets, equity_curve, stake_sweep, offset_summary, factor_pnl
+    del replay, depth_replay, depth_candidate_lookup
+    _trim_backtest_memory()
+    return result
 
 
 def _backtest_stage_total(*, spec: BacktestRunSpec) -> int:
@@ -692,13 +775,76 @@ def _resolve_fill_depth_runtime(
         empty_depth_replay, _summary, empty_lookup = _build_empty_depth_runtime()
         return empty_depth_replay, empty_lookup
     if decision_depth_replay is not None and not decision_depth_replay.empty:
-        return decision_depth_replay, decision_depth_candidate_lookup
+        return _narrow_depth_runtime_to_accepted_decisions(
+            accepted=accepted,
+            decision_depth_replay=decision_depth_replay,
+            decision_depth_candidate_lookup=decision_depth_candidate_lookup,
+        )
     fill_depth_replay, _summary, fill_depth_candidate_lookup = _build_fill_depth_runtime(
         accepted=accepted,
         data_cfg=data_cfg,
         heartbeat=heartbeat,
     )
     return fill_depth_replay, fill_depth_candidate_lookup
+
+
+def _narrow_depth_runtime_to_accepted_decisions(
+    *,
+    accepted: pd.DataFrame,
+    decision_depth_replay: pd.DataFrame,
+    decision_depth_candidate_lookup: object | None = None,
+) -> tuple[pd.DataFrame, object]:
+    if accepted.empty:
+        empty_depth_replay, _summary, empty_lookup = _build_empty_depth_runtime()
+        return empty_depth_replay, empty_lookup
+    if decision_depth_replay is None or decision_depth_replay.empty:
+        return decision_depth_replay, build_depth_candidate_lookup(decision_depth_replay)
+    if not _has_replay_key_columns(accepted) or not _has_replay_key_columns(decision_depth_replay):
+        return decision_depth_replay, decision_depth_candidate_lookup or build_depth_candidate_lookup(decision_depth_replay)
+
+    accepted_keys = _normalized_replay_key_frame(accepted).dropna().drop_duplicates().reset_index(drop=True)
+    if accepted_keys.empty:
+        return decision_depth_replay, decision_depth_candidate_lookup or build_depth_candidate_lookup(decision_depth_replay)
+
+    depth_keys = _normalized_replay_key_frame(decision_depth_replay)
+    keep_mask = pd.MultiIndex.from_frame(depth_keys).isin(pd.MultiIndex.from_frame(accepted_keys))
+    if bool(keep_mask.all()):
+        return decision_depth_replay, decision_depth_candidate_lookup or build_depth_candidate_lookup(decision_depth_replay)
+
+    narrowed_depth_replay = decision_depth_replay.loc[keep_mask].reset_index(drop=True)
+    return narrowed_depth_replay, build_depth_candidate_lookup(narrowed_depth_replay)
+
+
+def _release_decision_depth_runtime_after_fill_resolution(
+    *,
+    decision_depth_replay: pd.DataFrame,
+    decision_depth_candidate_lookup: object | None,
+    fill_depth_replay: pd.DataFrame,
+) -> tuple[pd.DataFrame, object | None]:
+    if fill_depth_replay is decision_depth_replay:
+        return decision_depth_replay, decision_depth_candidate_lookup
+    return pd.DataFrame(), None
+
+
+def _has_replay_key_columns(frame: pd.DataFrame) -> bool:
+    return all(column in frame.columns for column in REPLAY_KEY_COLUMNS)
+
+
+def _normalized_replay_key_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    return _normalized_join_key_frame(frame, join_columns=REPLAY_KEY_COLUMNS)
+
+
+def _normalized_join_key_frame(frame: pd.DataFrame, *, join_columns: list[str] | tuple[str, ...]) -> pd.DataFrame:
+    out = pd.DataFrame(index=frame.index)
+    for column in join_columns:
+        if column == "offset":
+            out[column] = pd.to_numeric(frame[column], errors="coerce").astype("Int64")
+            continue
+        if column in {"decision_ts", "cycle_start_ts", "cycle_end_ts"}:
+            out[column] = pd.to_datetime(frame[column], utc=True, errors="coerce")
+            continue
+        out[column] = frame[column].astype("string").fillna("")
+    return out
 
 
 def _build_orderbook_preflight_summary(
@@ -1211,6 +1357,123 @@ def _store_primary_runtime(
     return process_backtest_runtime_cache().put(cache_key, prepared)
 
 
+def _maybe_store_primary_runtime(
+    *,
+    cfg: ResearchConfig,
+    spec: BacktestRunSpec,
+    data_cfg: DataConfig,
+    bundle_dir: Path,
+    feature_set: str,
+    label_set: str,
+    profile_spec,
+    liquidity_proxy_mode: str,
+    features: pd.DataFrame,
+    labels: pd.DataFrame,
+    raw_klines: pd.DataFrame,
+    available_offsets: list[int],
+    replay: pd.DataFrame,
+    replay_summary,
+    depth_replay: pd.DataFrame,
+    depth_replay_summary,
+    depth_candidate_lookup,
+    runtime_replay: pd.DataFrame,
+    quote_summary,
+    state_summary,
+) -> BacktestPreparedRuntime | None:
+    if not process_backtest_runtime_cache().enabled:
+        return None
+    return _store_primary_runtime(
+        cfg=cfg,
+        spec=spec,
+        bundle_dir=bundle_dir,
+        feature_set=feature_set,
+        label_set=label_set,
+        profile_spec=profile_spec,
+        liquidity_proxy_mode=liquidity_proxy_mode,
+        prepared=BacktestPreparedRuntime(
+            bundle_dir=str(bundle_dir),
+            feature_set=feature_set,
+            label_set=label_set,
+            features=features,
+            labels=labels,
+            raw_klines=raw_klines,
+            available_offsets=tuple(int(value) for value in available_offsets),
+            replay=replay,
+            replay_summary=replay_summary,
+            depth_replay=depth_replay,
+            depth_replay_summary=depth_replay_summary,
+            depth_candidate_lookup=depth_candidate_lookup,
+            runtime_replay=runtime_replay,
+            quote_summary=quote_summary,
+            state_summary=state_summary,
+            source_mtimes=snapshot_source_mtimes(
+                _prepared_runtime_source_paths(
+                    cfg=cfg,
+                    data_cfg=data_cfg,
+                    bundle_dir=bundle_dir,
+                    feature_set=feature_set,
+                    label_set=label_set,
+                    depth_replay=depth_replay,
+                    runtime_replay=runtime_replay,
+                )
+            ),
+        ),
+    )
+
+
+def _load_cached_surface_runtime(
+    *,
+    cfg: ResearchConfig,
+    spec: BacktestRunSpec,
+    feature_set: str,
+    label_set: str,
+    profile_spec,
+    liquidity_proxy_mode: str,
+    fill_config: BacktestFillConfig,
+    available_offsets: list[int],
+    replay: pd.DataFrame,
+) -> BacktestSurfaceRuntime | None:
+    cache_key = _backtest_surface_runtime_cache_key(
+        cfg=cfg,
+        spec=spec,
+        feature_set=feature_set,
+        label_set=label_set,
+        profile_spec=profile_spec,
+        liquidity_proxy_mode=liquidity_proxy_mode,
+        fill_config=fill_config,
+        available_offsets=available_offsets,
+        replay=replay,
+    )
+    return process_backtest_surface_runtime_cache().get(cache_key)
+
+
+def _store_surface_runtime(
+    *,
+    cfg: ResearchConfig,
+    spec: BacktestRunSpec,
+    feature_set: str,
+    label_set: str,
+    profile_spec,
+    liquidity_proxy_mode: str,
+    fill_config: BacktestFillConfig,
+    available_offsets: list[int],
+    replay: pd.DataFrame,
+    prepared: BacktestSurfaceRuntime,
+) -> BacktestSurfaceRuntime:
+    cache_key = _backtest_surface_runtime_cache_key(
+        cfg=cfg,
+        spec=spec,
+        feature_set=feature_set,
+        label_set=label_set,
+        profile_spec=profile_spec,
+        liquidity_proxy_mode=liquidity_proxy_mode,
+        fill_config=fill_config,
+        available_offsets=available_offsets,
+        replay=replay,
+    )
+    return process_backtest_surface_runtime_cache().put(cache_key, prepared)
+
+
 def _backtest_runtime_cache_key(
     *,
     cfg: ResearchConfig,
@@ -1233,6 +1496,35 @@ def _backtest_runtime_cache_key(
         liquidity_proxy_mode=str(liquidity_proxy_mode or ""),
         decision_start=str(spec.decision_start or ""),
         decision_end=str(spec.decision_end or ""),
+    )
+
+
+def _backtest_surface_runtime_cache_key(
+    *,
+    cfg: ResearchConfig,
+    spec: BacktestRunSpec,
+    feature_set: str,
+    label_set: str,
+    profile_spec,
+    liquidity_proxy_mode: str,
+    fill_config: BacktestFillConfig,
+    available_offsets: list[int],
+    replay: pd.DataFrame,
+) -> BacktestSurfaceRuntimeKey:
+    return BacktestSurfaceRuntimeKey(
+        rewrite_root=str(cfg.layout.storage.rewrite_root),
+        market=cfg.asset.slug,
+        cycle=cfg.cycle,
+        source_surface=cfg.source_surface,
+        feature_set=feature_set,
+        label_set=label_set,
+        profile_spec_key=_json_text(profile_spec.to_dict() if hasattr(profile_spec, "to_dict") else profile_spec),
+        liquidity_proxy_mode=str(liquidity_proxy_mode or ""),
+        raw_depth_fak_refresh_enabled=bool(fill_config.raw_depth_fak_refresh_enabled),
+        decision_start=str(spec.decision_start or ""),
+        decision_end=str(spec.decision_end or ""),
+        available_offsets=tuple(sorted({int(value) for value in available_offsets})),
+        surface_input_signature=_surface_input_signature(replay),
     )
 
 
@@ -1261,6 +1553,29 @@ def _prepared_runtime_source_paths(
     return paths
 
 
+def _surface_runtime_source_paths(
+    *,
+    cfg: ResearchConfig,
+    data_cfg: DataConfig,
+    feature_set: str,
+    label_set: str,
+    depth_replay: pd.DataFrame,
+    runtime_replay: pd.DataFrame,
+) -> list[Path]:
+    paths = [
+        cfg.layout.feature_frame_path(feature_set, source_surface=cfg.source_surface),
+        cfg.layout.label_frame_path(label_set),
+        data_cfg.layout.binance_klines_path(),
+    ]
+    for column in ("depth_source_path", "quote_source_path"):
+        if column not in depth_replay.columns and column not in runtime_replay.columns:
+            continue
+        frame = depth_replay if column in depth_replay.columns else runtime_replay
+        values = frame[column].dropna().astype(str).tolist()
+        paths.extend(Path(value) for value in values if value)
+    return paths
+
+
 def _build_bundle_replay(
     *,
     bundle_dir: Path,
@@ -1269,7 +1584,9 @@ def _build_bundle_replay(
 ) -> tuple[pd.DataFrame, object, list[int]]:
     available_offsets = _bundle_offsets(bundle_dir)
     aligned_features, _alignment_metadata = merge_feature_and_label_frames(features, labels)
-    score_frames = [score_bundle_offset(bundle_dir, aligned_features, offset=offset) for offset in available_offsets]
+    score_frames: list[pd.DataFrame] = []
+    for offset in available_offsets:
+        score_frames.append(score_bundle_offset(bundle_dir, aligned_features, offset=offset))
     scores = (
         pd.concat(score_frames, ignore_index=True, sort=False)
         if score_frames
@@ -1277,13 +1594,16 @@ def _build_bundle_replay(
             columns=["decision_ts", "offset", "p_lgb", "p_lr", "p_signal", "p_up", "p_down", "score_valid", "score_reason"]
         )
     )
-    replay, replay_summary = build_replay_frame(
-        features=features,
-        labels=labels,
+    del score_frames
+    replay, replay_summary = build_replay_frame_from_merged(
+        merged=aligned_features,
+        alignment_metadata=_alignment_metadata,
         score_frames=[scores] if not scores.empty else [],
         available_offsets=available_offsets,
         scoped_offsets=available_offsets,
     )
+    del aligned_features, scores
+    _trim_backtest_memory()
     return replay, replay_summary, available_offsets
 
 
@@ -1312,6 +1632,232 @@ def _attach_replay_runtime_surface(
         heartbeat=live_state_heartbeat,
     )
     return replay, quote_summary, state_summary
+
+
+_SURFACE_JOIN_COLUMNS = (
+    "decision_ts",
+    "cycle_start_ts",
+    "cycle_end_ts",
+    "offset",
+    "market_id",
+    "condition_id",
+)
+_SURFACE_REUSE_COLUMNS = tuple(dict.fromkeys([*QUOTE_SURFACE_COLUMNS, *LIVE_STATE_PARITY_COLUMNS]))
+
+
+def _compact_runtime_surface_frame(runtime_replay: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        column
+        for column in (*_SURFACE_JOIN_COLUMNS, *_SURFACE_REUSE_COLUMNS)
+        if column in runtime_replay.columns
+    ]
+    if not columns:
+        return pd.DataFrame(index=runtime_replay.index)
+    return runtime_replay.loc[:, list(dict.fromkeys(columns))].copy(deep=False)
+
+
+_RUNTIME_REPLAY_BASE_COLUMNS = (
+    "decision_ts",
+    "cycle_start_ts",
+    "cycle_end_ts",
+    "offset",
+    "asset",
+    "market_id",
+    "condition_id",
+    "label_set",
+    "settlement_source",
+    "label_source",
+    "resolved",
+    "price_to_beat",
+    "final_price",
+    "winner_side",
+    "direction_up",
+    "full_truth",
+    "label_alignment_mode",
+    "label_alignment_status",
+    "label_alignment_gap_seconds",
+    "window_start_ts",
+    "window_end_ts",
+    "window_duration_seconds",
+    "p_lgb",
+    "p_lr",
+    "p_catboost",
+    "p_signal",
+    "w_lgb",
+    "w_lr",
+    "w_catboost",
+    "p_up_raw",
+    "p_down_raw",
+    "p_eff_up",
+    "p_eff_down",
+    "p_up",
+    "p_down",
+    "probability_mode",
+    "model_context",
+    "score_valid",
+    "score_reason",
+    "bundle_offset_available",
+    "score_present",
+)
+_RUNTIME_REVERSAL_COLUMNS = (
+    "signal_target",
+    "current_up",
+    "ret_from_strike",
+    "ret_from_cycle_open",
+)
+_FACTOR_JOIN_COLUMNS = (
+    "decision_ts",
+    "cycle_start_ts",
+    "cycle_end_ts",
+    "offset",
+    "market_id",
+    "condition_id",
+)
+
+
+def _compact_replay_for_runtime(
+    replay: pd.DataFrame,
+    *,
+    extra_columns: tuple[str, ...] = (),
+) -> pd.DataFrame:
+    columns = [
+        column
+        for column in (*_RUNTIME_REPLAY_BASE_COLUMNS, *extra_columns, *_SURFACE_REUSE_COLUMNS)
+        if column in replay.columns
+    ]
+    if not columns:
+        return replay.copy(deep=False)
+    return replay.loc[:, list(dict.fromkeys(columns))].copy(deep=False)
+
+
+def _runtime_extra_columns_for_target(target: str) -> tuple[str, ...]:
+    if str(target or "").strip().lower() == "reversal":
+        return _RUNTIME_REVERSAL_COLUMNS
+    return ()
+
+
+def _factor_source_frame(replay: pd.DataFrame, *, factor_columns: tuple[str, ...]) -> pd.DataFrame:
+    selected_factors = [column for column in factor_columns if column in replay.columns]
+    join_columns = [column for column in _FACTOR_JOIN_COLUMNS if column in replay.columns]
+    if not selected_factors or not join_columns:
+        return pd.DataFrame(columns=[*join_columns, *selected_factors])
+    return replay.loc[:, list(dict.fromkeys([*join_columns, *selected_factors]))].copy(deep=False)
+
+
+def _narrow_factor_source_to_accepted_decisions(
+    *,
+    factor_source_frame: pd.DataFrame,
+    accepted: pd.DataFrame,
+) -> pd.DataFrame:
+    if factor_source_frame.empty or accepted.empty:
+        return factor_source_frame.iloc[0:0].copy() if accepted.empty else factor_source_frame
+    join_columns = [
+        column
+        for column in _FACTOR_JOIN_COLUMNS
+        if column in factor_source_frame.columns and column in accepted.columns
+    ]
+    if not join_columns:
+        return factor_source_frame
+    accepted_keys = _normalized_join_key_frame(accepted, join_columns=join_columns).dropna().drop_duplicates().reset_index(drop=True)
+    if accepted_keys.empty:
+        return factor_source_frame.iloc[0:0].copy()
+    factor_keys = _normalized_join_key_frame(factor_source_frame, join_columns=join_columns)
+    keep_mask = pd.MultiIndex.from_frame(factor_keys).isin(pd.MultiIndex.from_frame(accepted_keys))
+    if bool(keep_mask.all()):
+        return factor_source_frame
+    return factor_source_frame.loc[keep_mask].reset_index(drop=True)
+
+
+def _factor_columns_from_frame(frame: pd.DataFrame) -> tuple[str, ...]:
+    join_columns = set(_FACTOR_JOIN_COLUMNS)
+    return tuple(column for column in frame.columns if column not in join_columns)
+
+
+def _merge_factor_columns_for_traded_decisions(
+    decisions: pd.DataFrame,
+    *,
+    factor_source_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    if decisions.empty or factor_source_frame.empty:
+        return decisions
+    join_columns = [
+        column
+        for column in _FACTOR_JOIN_COLUMNS
+        if column in decisions.columns and column in factor_source_frame.columns
+    ]
+    factor_columns = _factor_columns_from_frame(factor_source_frame)
+    if not join_columns or not factor_columns:
+        return decisions
+    trade_mask = decisions.get("policy_action", pd.Series("", index=decisions.index)).astype(str).eq("trade")
+    if not bool(trade_mask.any()):
+        return decisions
+    traded = decisions.loc[trade_mask].merge(
+        factor_source_frame.loc[:, list(dict.fromkeys([*join_columns, *factor_columns]))],
+        on=join_columns,
+        how="left",
+        sort=False,
+    )
+    return traded
+
+
+def _trim_backtest_memory() -> None:
+    import gc
+
+    gc.collect()
+    trim_process_memory()
+
+
+def _merge_cached_runtime_surface(replay: pd.DataFrame, cached_runtime_replay: pd.DataFrame) -> pd.DataFrame:
+    if replay.empty:
+        out = replay.copy()
+        for column in _SURFACE_REUSE_COLUMNS:
+            if column not in out.columns and column in cached_runtime_replay.columns:
+                out[column] = pd.Series(dtype=cached_runtime_replay[column].dtype)
+        return out
+    join_columns = [column for column in _SURFACE_JOIN_COLUMNS if column in replay.columns and column in cached_runtime_replay.columns]
+    surface_columns = [column for column in _SURFACE_REUSE_COLUMNS if column in cached_runtime_replay.columns]
+    if not join_columns or not surface_columns:
+        return replay.copy(deep=False)
+
+    left = _normalize_surface_join_columns(replay.copy(deep=False), join_columns)
+    right = _normalize_surface_join_columns(
+        cached_runtime_replay.loc[:, [*join_columns, *surface_columns]].copy(deep=False),
+        join_columns,
+    )
+    right = right.drop_duplicates(subset=join_columns, keep="last")
+    left = left.drop(columns=[column for column in surface_columns if column in left.columns])
+    return left.merge(right, on=join_columns, how="left", sort=False)
+
+
+def _surface_input_signature(replay: pd.DataFrame) -> str:
+    if replay.empty:
+        return "empty"
+    columns = [column for column in _SURFACE_JOIN_COLUMNS if column in replay.columns]
+    if not columns:
+        return f"rows={len(replay)}"
+    frame = _normalize_surface_join_columns(replay.loc[:, columns].copy(deep=False), columns)
+    frame = frame.sort_values(columns).reset_index(drop=True)
+    digest_builder = hashlib.sha256()
+    for column in columns:
+        digest_builder.update(str(column).encode("utf-8"))
+        digest_builder.update(b"\0")
+    row_hashes = pd.util.hash_pandas_object(frame, index=False).to_numpy(dtype="uint64", copy=False)
+    digest_builder.update(row_hashes.tobytes())
+    digest = digest_builder.hexdigest()
+    return _json_text({"columns": columns, "rows": len(frame), "sha256": digest})
+
+
+def _normalize_surface_join_columns(frame: pd.DataFrame, join_columns: list[str]) -> pd.DataFrame:
+    out = frame.copy(deep=False)
+    for column in join_columns:
+        if column in {"decision_ts", "cycle_start_ts", "cycle_end_ts"}:
+            out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
+            continue
+        if column == "offset":
+            out[column] = pd.to_numeric(out[column], errors="coerce").astype("Int64")
+            continue
+        out[column] = out[column].astype("string").fillna("")
+    return out
 
 
 def _build_guarded_policy_decisions(
@@ -1440,7 +1986,7 @@ def _append_backtest_log(path: Path, event: dict[str, object]) -> None:
 
 
 def _serialize_decision_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    out = frame.copy()
+    out = frame.copy(deep=False)
     for column in (
         "guard_reasons",
         "quote_metrics",

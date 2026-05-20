@@ -11,12 +11,79 @@ from pm15min.research.automation import quick_screen as quick_screen_module
 from pm15min.research.automation.quick_screen import (
     build_profitable_offset_pool_frame,
     build_quick_screen_summary,
+    compact_quick_screen_artifacts,
     ensure_training_and_bundle,
     profitable_offset_pool_cache_paths,
+    resolve_profitable_offset_pool_frame,
+    quick_screen_artifact_retention_decision,
     quick_screen_rank_tuple,
     run_bundle_quick_screen,
 )
 from pm15min.research.config import ResearchConfig
+
+
+def _patch_formal_quick_screen_runtime(monkeypatch) -> None:
+    def _fake_build_decision_depth_runtime(*, replay, data_cfg, fill_config):
+        return (
+            pd.DataFrame(),
+            SimpleNamespace(
+                snapshot_rows=0,
+                replay_rows_with_snapshots=0,
+                replay_rows_without_snapshots=len(replay),
+            ),
+            {},
+        )
+
+    def _fake_build_guarded_policy_decisions(
+        *,
+        replay,
+        market,
+        profile,
+        profile_spec,
+        model_source,
+        depth_replay,
+        fill_config,
+    ):
+        decisions = replay.copy()
+        decisions["predicted_side"] = "UP"
+        decisions["policy_action"] = "trade"
+        decisions["policy_reason"] = "trade"
+        if "quote_status" not in decisions.columns:
+            decisions["quote_status"] = "ok"
+        if "quote_up_ask" not in decisions.columns:
+            decisions["quote_up_ask"] = 0.12
+        if "quote_down_ask" not in decisions.columns:
+            decisions["quote_down_ask"] = 0.88
+        return decisions, SimpleNamespace(), SimpleNamespace(raw_depth_rows=0)
+
+    monkeypatch.setattr(
+        quick_screen_module,
+        "_build_decision_depth_runtime",
+        _fake_build_decision_depth_runtime,
+    )
+    monkeypatch.setattr(
+        quick_screen_module,
+        "_build_guarded_policy_decisions",
+        _fake_build_guarded_policy_decisions,
+    )
+    monkeypatch.setattr(
+        quick_screen_module,
+        "_resolve_fill_depth_runtime",
+        lambda **_kwargs: (pd.DataFrame(), {}),
+    )
+    monkeypatch.setattr(
+        quick_screen_module,
+        "build_canonical_fills",
+        lambda accepted, **_kwargs: (
+            accepted.assign(fill_valid=True, fill_reason="filled").reset_index(drop=True),
+            pd.DataFrame(columns=["reason"]),
+        ),
+    )
+    monkeypatch.setattr(
+        quick_screen_module,
+        "settle_trade_fills",
+        lambda fills: fills.copy().reset_index(drop=True),
+    )
 
 
 def test_build_quick_screen_summary_counts_price_band_and_trade_hits() -> None:
@@ -81,6 +148,8 @@ def test_build_quick_screen_summary_counts_price_band_and_trade_hits() -> None:
     assert summary["winner_in_band_rows"] == 2
     assert summary["backed_winner_rows"] == 2
     assert summary["trade_rows"] == 2
+    assert summary["signal_trade_rows"] == 2
+    assert summary["metric_semantics"]["trade_rows"] == "quick_screen_policy_signal_rows"
     assert summary["traded_winner_rows"] == 2
     assert summary["backed_winner_in_band_rows"] == 1
     assert summary["traded_winner_in_band_rows"] == 1
@@ -100,6 +169,148 @@ def test_build_quick_screen_summary_counts_price_band_and_trade_hits() -> None:
     }
     assert summary["density_bottleneck"]["primary_bottleneck"] == "low_trade_density"
     assert summary["density_bottleneck"]["recommended_route"] == "feature_width_or_family_rework"
+
+
+def test_build_quick_screen_summary_uses_final_fills_when_available() -> None:
+    decisions = pd.DataFrame(
+        [
+            {
+                "decision_ts": f"2026-04-01T00:{minute:02d}:00Z",
+                "cycle_start_ts": "2026-04-01T00:00:00Z",
+                "cycle_end_ts": "2026-04-01T00:15:00Z",
+                "offset": 7,
+                "resolved": True,
+                "winner_side": "UP",
+                "quote_status": "ok",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.82,
+                "predicted_side": "UP",
+                "policy_action": "trade",
+                "policy_reason": "trade",
+            }
+            for minute in range(10)
+        ]
+    )
+    trades = decisions.iloc[[0, 1]].copy()
+    rejects = pd.DataFrame(
+        [
+            {
+                "decision_ts": f"2026-04-01T00:{minute:02d}:00Z",
+                "cycle_start_ts": "2026-04-01T00:00:00Z",
+                "cycle_end_ts": "2026-04-01T00:15:00Z",
+                "offset": 7,
+                "reason": "repriced_entry_price_max",
+            }
+            for minute in range(2, 10)
+        ]
+    )
+
+    summary = build_quick_screen_summary(
+        decisions,
+        entry_price_min=0.01,
+        entry_price_max=0.30,
+        final_trades=trades,
+        rejects=rejects,
+    )
+
+    assert summary["signal_trade_rows"] == 10
+    assert summary["trade_rows"] == 2
+    assert summary["profitable_pool_capture_rows"] == 2
+    assert summary["metric_semantics"]["trade_rows"] == "quick_screen_formal_filled_trade_rows"
+    assert summary["reject_reason_counts"] == {"repriced_entry_price_max": 8}
+
+
+def test_build_quick_screen_summary_uses_final_fills_for_pool_statuses() -> None:
+    decisions = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-04-01T00:07:00Z",
+                "cycle_start_ts": "2026-04-01T00:00:00Z",
+                "cycle_end_ts": "2026-04-01T00:15:00Z",
+                "offset": 7,
+                "resolved": True,
+                "winner_side": "UP",
+                "quote_status": "ok",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.82,
+                "predicted_side": "UP",
+                "policy_action": "trade",
+                "policy_reason": "trade",
+            },
+            {
+                "decision_ts": "2026-04-01T00:08:00Z",
+                "cycle_start_ts": "2026-04-01T00:00:00Z",
+                "cycle_end_ts": "2026-04-01T00:15:00Z",
+                "offset": 8,
+                "resolved": True,
+                "winner_side": "DOWN",
+                "quote_status": "ok",
+                "quote_up_ask": 0.78,
+                "quote_down_ask": 0.18,
+                "predicted_side": "UP",
+                "policy_action": "trade",
+                "policy_reason": "trade",
+            },
+        ]
+    )
+    trades = decisions.iloc[[0]].copy()
+
+    summary = build_quick_screen_summary(
+        decisions,
+        entry_price_min=0.01,
+        entry_price_max=0.30,
+        final_trades=trades,
+        rejects=pd.DataFrame(columns=["reason"]),
+    )
+
+    assert summary["signal_trade_rows"] == 2
+    assert summary["trade_rows"] == 1
+    assert summary["profitable_pool_capture_rows"] == 1
+    assert summary["profitable_pool_status_counts"] == {
+        "captured": 1,
+        "correct_side_no_trade": 0,
+        "missed": 1,
+        "traded_wrong_side": 0,
+    }
+
+
+def test_build_quick_screen_summary_does_not_copy_full_decisions_frame(monkeypatch) -> None:
+    decisions = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-04-01T00:07:00Z",
+                "cycle_start_ts": "2026-04-01T00:00:00Z",
+                "cycle_end_ts": "2026-04-01T00:15:00Z",
+                "offset": 7,
+                "resolved": True,
+                "winner_side": "UP",
+                "quote_status": "ok",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.82,
+                "predicted_side": "UP",
+                "policy_action": "trade",
+                "policy_reason": "trade",
+            },
+        ]
+    )
+    original_copy = pd.DataFrame.copy
+
+    def _guard_decision_copy(self, *args, **kwargs):
+        if self is decisions:
+            raise AssertionError("quick-screen summary should not copy the full decisions frame")
+        return original_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "copy", _guard_decision_copy)
+
+    summary = build_quick_screen_summary(
+        decisions,
+        entry_price_min=0.01,
+        entry_price_max=0.30,
+        rejects=pd.DataFrame(columns=["reason"]),
+    )
+
+    assert summary["trade_rows"] == 1
+    assert "profitable_pool_status" not in decisions.columns
 
 
 def test_build_quick_screen_summary_reports_density_bottleneck() -> None:
@@ -232,6 +443,56 @@ def test_build_profitable_offset_pool_frame_marks_strict_tradeable_captures() ->
     ]
 
 
+def test_apply_final_trade_captures_updates_cached_pool_statuses() -> None:
+    decisions = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-04-01T00:07:00Z",
+                "cycle_start_ts": "2026-04-01T00:00:00Z",
+                "cycle_end_ts": "2026-04-01T00:15:00Z",
+                "offset": 7,
+                "resolved": True,
+                "winner_side": "UP",
+                "quote_status": "ok",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.82,
+                "predicted_side": "UP",
+                "policy_action": "trade",
+                "policy_reason": "trade",
+            },
+            {
+                "decision_ts": "2026-04-01T00:08:00Z",
+                "cycle_start_ts": "2026-04-01T00:00:00Z",
+                "cycle_end_ts": "2026-04-01T00:15:00Z",
+                "offset": 8,
+                "resolved": True,
+                "winner_side": "DOWN",
+                "quote_status": "ok",
+                "quote_up_ask": 0.78,
+                "quote_down_ask": 0.18,
+                "predicted_side": "UP",
+                "policy_action": "trade",
+                "policy_reason": "trade",
+            },
+        ]
+    )
+    pool = build_profitable_offset_pool_frame(
+        decisions,
+        entry_price_min=0.01,
+        entry_price_max=0.30,
+    )
+    trades = decisions.iloc[[0]].copy()
+
+    updated = quick_screen_module._apply_final_trade_captures(
+        profitable_pool_frame=pool,
+        decisions=decisions,
+        final_trades=trades,
+    )
+
+    assert updated["profitable_pool_capture"].tolist() == [True, False]
+    assert updated["profitable_pool_status"].tolist() == ["captured", "missed"]
+
+
 def test_quick_screen_rank_tuple_prefers_tradeable_band_hits() -> None:
     better = {
         "profitable_pool_coverage_ratio": 0.70,
@@ -257,6 +518,269 @@ def test_quick_screen_rank_tuple_prefers_tradeable_band_hits() -> None:
     }
 
     assert quick_screen_rank_tuple(better) > quick_screen_rank_tuple(worse)
+
+
+def test_quick_screen_artifact_retention_compacts_sparse_candidates() -> None:
+    decision = quick_screen_artifact_retention_decision(
+        {
+            "trade_rows": 12,
+            "profitable_pool_capture_rows": 0,
+            "density_bottleneck": {"sparse_density": True},
+        },
+        mode="compact_rejects",
+        retain_min_trades=56,
+    )
+
+    assert decision["artifacts_retained"] is False
+    assert decision["retention_reason"] == "below_trade_floor"
+    assert decision["trade_rows"] == 12
+
+
+def test_quick_screen_artifact_retention_keeps_dense_candidates() -> None:
+    decision = quick_screen_artifact_retention_decision(
+        {
+            "trade_rows": 56,
+            "profitable_pool_capture_rows": 0,
+            "density_bottleneck": {"sparse_density": False},
+        },
+        mode="compact_rejects",
+        retain_min_trades=56,
+    )
+
+    assert decision["artifacts_retained"] is True
+    assert decision["retention_reason"] == "trade_floor_met"
+
+
+def test_compact_quick_screen_artifacts_removes_sparse_candidate_outputs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("PM15MIN_QUICK_SCREEN_ARTIFACT_RETENTION", "compact_rejects")
+    monkeypatch.setenv("PM15MIN_QUICK_SCREEN_CLEAN_FEATURE_FRAMES", "1")
+    monkeypatch.setenv("PM15MIN_QUICK_SCREEN_CLEAN_TRAINING_SETS", "1")
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm_baseline",
+        source_surface="backtest",
+        feature_set="candidate_sparse",
+        label_set="truth",
+        target="direction",
+        model_family="deep_otm",
+        root=tmp_path,
+    )
+    market_spec = SimpleNamespace(
+        feature_set="candidate_sparse",
+        label_set="truth",
+        target="direction",
+        window=SimpleNamespace(label="2026-03-01_2026-03-31"),
+        offsets=(7, 8),
+    )
+    training_run_dir = cfg.layout.training_run_dir(
+        model_family="deep_otm",
+        target="direction",
+        run_label_text="candidate-train",
+    )
+    bundle_dir = cfg.layout.bundle_dir(
+        profile="deep_otm_baseline",
+        target="direction",
+        bundle_label_text="candidate-bundle",
+    )
+    feature_frame_dir = cfg.layout.feature_frame_dir("candidate_sparse", source_surface="backtest")
+    training_set_dirs = [
+        cfg.layout.training_set_dir(
+            feature_set="candidate_sparse",
+            label_set="truth",
+            target="direction",
+            window="2026-03-01_2026-03-31",
+            offset=offset,
+        )
+        for offset in (7, 8)
+    ]
+    for path in [training_run_dir, bundle_dir, feature_frame_dir, *training_set_dirs]:
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "sentinel.txt").write_text("keep until compacted", encoding="utf-8")
+
+    cleanup = compact_quick_screen_artifacts(
+        cfg=cfg,
+        market_spec=market_spec,
+        train_result={"run_dir": str(training_run_dir)},
+        bundle_result={"bundle_dir": str(bundle_dir)},
+        quick_summary={
+            "trade_rows": 3,
+            "profitable_pool_capture_rows": 0,
+            "density_bottleneck": {"sparse_density": True},
+        },
+    )
+
+    assert cleanup["artifacts_retained"] is False
+    assert not training_run_dir.exists()
+    assert not bundle_dir.exists()
+    assert not feature_frame_dir.exists()
+    assert all(not path.exists() for path in training_set_dirs)
+    assert cleanup["removed_path_count"] == 5
+
+
+def test_compact_quick_screen_artifacts_keeps_dense_candidate_outputs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("PM15MIN_QUICK_SCREEN_ARTIFACT_RETENTION", "compact_rejects")
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm_baseline",
+        source_surface="backtest",
+        feature_set="candidate_dense",
+        label_set="truth",
+        target="direction",
+        model_family="deep_otm",
+        root=tmp_path,
+    )
+    market_spec = SimpleNamespace(
+        feature_set="candidate_dense",
+        label_set="truth",
+        target="direction",
+        window=SimpleNamespace(label="2026-03-01_2026-03-31"),
+        offsets=(7,),
+    )
+    training_run_dir = cfg.layout.training_run_dir(
+        model_family="deep_otm",
+        target="direction",
+        run_label_text="candidate-train",
+    )
+    bundle_dir = cfg.layout.bundle_dir(
+        profile="deep_otm_baseline",
+        target="direction",
+        bundle_label_text="candidate-bundle",
+    )
+    for path in (training_run_dir, bundle_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    cleanup = compact_quick_screen_artifacts(
+        cfg=cfg,
+        market_spec=market_spec,
+        train_result={"run_dir": str(training_run_dir)},
+        bundle_result={"bundle_dir": str(bundle_dir)},
+        quick_summary={
+            "trade_rows": 80,
+            "profitable_pool_capture_rows": 0,
+            "density_bottleneck": {"sparse_density": False},
+        },
+    )
+
+    assert cleanup["artifacts_retained"] is True
+    assert training_run_dir.exists()
+    assert bundle_dir.exists()
+
+
+def test_compact_quick_screen_artifacts_dry_run_reports_without_removing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("PM15MIN_QUICK_SCREEN_ARTIFACT_RETENTION", "compact_rejects")
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm_baseline",
+        source_surface="backtest",
+        feature_set="candidate_sparse",
+        label_set="truth",
+        target="direction",
+        model_family="deep_otm",
+        root=tmp_path,
+    )
+    market_spec = SimpleNamespace(
+        feature_set="candidate_sparse",
+        label_set="truth",
+        target="direction",
+        window=SimpleNamespace(label="2026-03-01_2026-03-31"),
+        offsets=(7,),
+    )
+    training_run_dir = cfg.layout.training_run_dir(
+        model_family="deep_otm",
+        target="direction",
+        run_label_text="candidate-train",
+    )
+    bundle_dir = cfg.layout.bundle_dir(
+        profile="deep_otm_baseline",
+        target="direction",
+        bundle_label_text="candidate-bundle",
+    )
+    for path in (training_run_dir, bundle_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    cleanup = compact_quick_screen_artifacts(
+        cfg=cfg,
+        market_spec=market_spec,
+        train_result={"run_dir": str(training_run_dir)},
+        bundle_result={"bundle_dir": str(bundle_dir)},
+        quick_summary={"trade_rows": 1, "profitable_pool_capture_rows": 0},
+        apply=False,
+    )
+
+    assert cleanup["artifacts_retained"] is False
+    assert cleanup["removed_path_count"] == 0
+    assert cleanup["would_remove_path_count"] >= 2
+    assert training_run_dir.exists()
+    assert bundle_dir.exists()
+
+
+def test_resolve_profitable_offset_pool_frame_reuses_freshly_built_pool_without_second_merge(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = ResearchConfig.build(
+        market="sol",
+        cycle="15m",
+        profile="deep_otm_baseline",
+        source_surface="backtest",
+        feature_set="candidate_sparse",
+        label_set="truth",
+        target="direction",
+        model_family="deep_otm",
+        root=tmp_path,
+    )
+    decisions = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-04-01T00:07:00Z",
+                "cycle_start_ts": "2026-04-01T00:00:00Z",
+                "cycle_end_ts": "2026-04-01T00:15:00Z",
+                "offset": 7,
+                "resolved": True,
+                "winner_side": "UP",
+                "quote_status": "ok",
+                "quote_up_ask": 0.20,
+                "quote_down_ask": 0.82,
+                "predicted_side": "UP",
+                "policy_action": "trade",
+                "policy_reason": "trade",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(
+        quick_screen_module,
+        "_apply_cached_profitable_pool",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("freshly built pool should not be merged a second time")
+        ),
+    )
+
+    pool_frame, pool_cache = resolve_profitable_offset_pool_frame(
+        cfg=cfg,
+        profile="deep_otm_baseline",
+        decision_start="2026-04-01",
+        decision_end="2026-04-15",
+        decisions=decisions,
+        entry_price_min=0.01,
+        entry_price_max=0.30,
+        stake_label="2usd",
+    )
+
+    assert pool_cache["cache_status"] == "built"
+    assert pool_frame["profitable_pool_capture"].tolist() == [True]
 
 
 def test_run_bundle_quick_screen_scopes_inputs_before_replay_build(tmp_path: Path, monkeypatch) -> None:
@@ -388,6 +912,7 @@ def test_run_bundle_quick_screen_scopes_inputs_before_replay_build(tmp_path: Pat
     monkeypatch.setattr(quick_screen_module, "load_feature_frame", _fake_load_feature_frame)
     monkeypatch.setattr(quick_screen_module, "load_label_frame", _fake_load_label_frame)
     monkeypatch.setattr(quick_screen_module, "_build_bundle_replay", _fake_build_bundle_replay)
+    _patch_formal_quick_screen_runtime(monkeypatch)
     monkeypatch.setattr(
         quick_screen_module,
         "attach_canonical_quote_surface",
@@ -527,6 +1052,7 @@ def test_run_bundle_quick_screen_writes_profitable_pool_cache(tmp_path: Path, mo
             [7],
         ),
     )
+    _patch_formal_quick_screen_runtime(monkeypatch)
     monkeypatch.setattr(
         quick_screen_module,
         "attach_canonical_quote_surface",
@@ -556,7 +1082,7 @@ def test_run_bundle_quick_screen_writes_profitable_pool_cache(tmp_path: Path, mo
         lambda decisions, config, model_source: decisions.assign(policy_action="trade", policy_reason="trade"),
     )
 
-    summary, _decisions = run_bundle_quick_screen(
+    summary, decisions = run_bundle_quick_screen(
         cfg=cfg,
         bundle_dir=bundle_dir,
         profile="deep_otm_baseline",
@@ -564,6 +1090,7 @@ def test_run_bundle_quick_screen_writes_profitable_pool_cache(tmp_path: Path, mo
         decision_start="2026-04-01",
         decision_end="2026-04-15",
         parity=SimpleNamespace(),
+        return_decisions=False,
     )
 
     data_path, manifest_path = profitable_offset_pool_cache_paths(
@@ -579,6 +1106,7 @@ def test_run_bundle_quick_screen_writes_profitable_pool_cache(tmp_path: Path, mo
     assert len(cached) == 1
     assert summary["profitable_pool_rows"] == 1
     assert summary["profitable_pool_capture_rows"] == 1
+    assert decisions.empty
 
 
 def test_ensure_training_and_bundle_defaults_to_parallel_offset_quick_screen_training(
@@ -724,6 +1252,7 @@ def test_run_bundle_quick_screen_reuses_cached_profitable_pool(tmp_path: Path, m
             [7],
         ),
     )
+    _patch_formal_quick_screen_runtime(monkeypatch)
     monkeypatch.setattr(
         quick_screen_module,
         "attach_canonical_quote_surface",

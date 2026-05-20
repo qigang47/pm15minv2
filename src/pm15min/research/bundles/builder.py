@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -166,13 +167,15 @@ def _copy_offset_bundle(
     for source_model in sorted((source_dir / "models").glob("*.joblib")):
         shutil.copy2(source_model, models_dir / source_model.name)
 
-    copied_optional = _copy_optional_offset_artifacts(source_dir=source_dir, dest_dir=dest_dir)
-    copied_optional.extend(
-        _copy_optional_calibration_artifacts(
-            source_calibration_dir=source_dir / "calibration",
-            dest_calibration_dir=calibration_dir,
+    copied_optional: list[str] = []
+    if _copy_bundle_diagnostics_enabled():
+        copied_optional = _copy_optional_offset_artifacts(source_dir=source_dir, dest_dir=dest_dir)
+        copied_optional.extend(
+            _copy_optional_calibration_artifacts(
+                source_calibration_dir=source_dir / "calibration",
+                dest_calibration_dir=calibration_dir,
+            )
         )
-    )
 
     feature_columns = joblib.load(source_dir / "feature_cols.joblib")
     allowed_blacklist_columns = _load_allowed_blacklist_columns(source_dir / "feature_pruning.json")
@@ -212,6 +215,13 @@ def _copy_optional_offset_artifacts(*, source_dir: Path, dest_dir: Path) -> list
         shutil.copy2(source_path, dest_path)
         copied.append(relative_dest)
     return copied
+
+
+def _copy_bundle_diagnostics_enabled() -> bool:
+    raw = os.environ.get("PM15MIN_MODEL_BUNDLE_COPY_DIAGNOSTICS")
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", "none"}
 
 
 def _load_allowed_blacklist_columns(path: Path) -> list[str]:

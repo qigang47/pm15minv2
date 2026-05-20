@@ -92,7 +92,7 @@ def attach_pre_submit_orderbook_retry_contract(
     spec: LiveProfileSpec,
     reject_reason_column: str = "decision_engine_reason",
 ) -> pd.DataFrame:
-    out = rows.copy()
+    out = rows.copy(deep=False)
     contract = build_backtest_retry_contract(spec)
     reason = (
         out.get(reject_reason_column, pd.Series("", index=out.index, dtype="string"))

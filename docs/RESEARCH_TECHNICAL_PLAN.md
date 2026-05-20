@@ -169,6 +169,24 @@ PYTHONPATH=src python -m pm15min research backtest run --market sol --profile de
 
 更细的子命令以 `PYTHONPATH=src python -m pm15min research --help` 为准。
 
+## 6. 快筛内存边界
+
+SOL/XRP 快筛的长期目标是 10 个逻辑任务持续补满，但不能让每个任务都重复加载一整份大盘口和特征数据。
+
+当前运行边界：
+
+- 默认旧模式仍然是 queue batch，可以回退。
+- 打开 `PM15MIN_QUICK_SCREEN_USE_POOL=1` 后，调度器走 pool 入口。
+- pool 入口默认打开 `PM15MIN_QUICK_SCREEN_SHARED_SURFACES=1`，用于承接后续共享 surface。
+- `scripts/monitoring/report_quick_screen_memory.py` 用 PSS/独占内存观察真实内存，而不是只看 RSS。
+- orderbook index fallback 已经改成分批读取，避免一次性把大 index 全读进内存。
+
+回退命令：
+
+```bash
+PM15MIN_QUICK_SCREEN_USE_POOL=0 auto_research/start_dense_stack.sh
+```
+
 其中几条长期规则值得单独记住：
 
 - `show-active-bundle` / `activate-bundle`

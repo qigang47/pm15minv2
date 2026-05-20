@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import types
 from pathlib import Path
 
 import pandas as pd
@@ -11,6 +13,7 @@ from pm15min.research.config import ResearchConfig
 from pm15min.research.freshness import (
     ensure_research_artifacts_aligned,
     inspect_research_artifacts_freshness,
+    _module_family_dependency_paths,
     prepare_research_artifacts,
 )
 
@@ -19,6 +22,31 @@ def _patch_v2_roots(monkeypatch, root: Path) -> None:
     monkeypatch.setattr("pm15min.core.layout.rewrite_root", lambda: root)
     monkeypatch.setattr("pm15min.data.layout.rewrite_root", lambda: root)
     monkeypatch.setattr("pm15min.research.layout.rewrite_root", lambda: root)
+
+
+def test_module_family_dependency_paths_tolerates_concurrent_module_imports(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    helper_path = tmp_path / "dynamic_feature.py"
+    helper_path.write_text("x = 1\n", encoding="utf-8")
+
+    class MutatingModules(dict):
+        def items(self):
+            for index, pair in enumerate(super().items()):
+                if index == 0:
+                    sys.modules["pm15min.research.features.dynamic_thread_import"] = types.SimpleNamespace(
+                        __file__=str(helper_path)
+                    )
+                yield pair
+
+    fake_module = types.SimpleNamespace(__file__=str(helper_path))
+    fake_modules = MutatingModules({"pm15min.research.features.static_helper": fake_module})
+    monkeypatch.setattr(sys, "modules", fake_modules)
+
+    paths = _module_family_dependency_paths(package_prefix="pm15min.research.features")
+
+    assert helper_path.resolve() in paths
 
 
 def test_ensure_research_artifacts_aligned_rebuilds_stale_chain(tmp_path: Path, monkeypatch) -> None:

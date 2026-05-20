@@ -1,0 +1,100 @@
+{
+  "suite_name": "baseline_direction_offset_weight_btc_20260404_backfill0404_0406_20260408",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "label_set": "truth",
+  "target": "direction",
+  "feature_set": "bs_q_replace_direction",
+  "offsets": [
+    7,
+    8,
+    9
+  ],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-27"
+  },
+  "decision_start": "2026-04-04",
+  "decision_end": "2026-04-06",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "stakes": [
+    1.0
+  ],
+  "max_notional_usd": 3.0,
+  "max_trades_per_market_values": [
+    3
+  ],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 2
+  },
+  "tags": [
+    "direction_rescue",
+    "offset_weight_search",
+    "latest7d",
+    "orderbook_locked",
+    "noret30",
+    "backfill_window",
+    "decision_0404_0406"
+  ],
+  "markets": {
+    "btc": {
+      "groups": {
+        "weight_search": {
+          "runs": [
+            {
+              "run_name": "direction_offset_weight",
+              "weight_variants": [
+                {
+                  "label": "current_default",
+                  "notes": "current direction baseline with shared default weights"
+                },
+                {
+                  "label": "offset_reversal_mild",
+                  "notes": "mild offset-specific contrarian emphasis for 7/8/9",
+                  "offset_weight_overrides": {
+                    "7": {
+                      "contrarian_weight": 1.25,
+                      "contrarian_quantile": 0.8
+                    },
+                    "8": {
+                      "contrarian_weight": 1.75,
+                      "contrarian_quantile": 0.75
+                    },
+                    "9": {
+                      "contrarian_weight": 2.25,
+                      "contrarian_quantile": 0.7
+                    }
+                  }
+                },
+                {
+                  "label": "offset_reversal_strong",
+                  "notes": "stronger offset-specific contrarian emphasis for 7/8/9",
+                  "offset_weight_overrides": {
+                    "7": {
+                      "contrarian_weight": 1.5,
+                      "contrarian_quantile": 0.8
+                    },
+                    "8": {
+                      "contrarian_weight": 2.25,
+                      "contrarian_quantile": 0.75
+                    },
+                    "9": {
+                      "contrarian_weight": 3.0,
+                      "contrarian_quantile": 0.7
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

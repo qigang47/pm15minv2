@@ -328,6 +328,44 @@ class GammaEventsClient:
                 time.sleep(float(sleep_sec))
         return rows
 
+    def fetch_active_events(
+        self,
+        *,
+        start_ts: int,
+        end_ts: int,
+        limit: int,
+        max_pages: int | None,
+        sleep_sec: float,
+        series_slug: str | None = None,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        limit = max(1, int(limit))
+        page = 0
+        page_cap = None if max_pages is None else max(1, int(max_pages))
+        while page_cap is None or page < page_cap:
+            params = {
+                "active": "true",
+                "closed": "false",
+                "end_date_min": _iso(start_ts),
+                "end_date_max": _iso(end_ts),
+                "limit": limit,
+                "offset": page * limit,
+            }
+            if series_slug:
+                params["series_slug"] = str(series_slug)
+            resp = self.session.get(self.base_url, params=params, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, list) or not payload:
+                break
+            rows.extend(item for item in payload if isinstance(item, dict))
+            if len(payload) < limit:
+                break
+            page += 1
+            if sleep_sec > 0:
+                time.sleep(float(sleep_sec))
+        return rows
+
     def fetch_markets_by_ids(
         self,
         market_ids: list[str],

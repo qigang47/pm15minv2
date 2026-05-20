@@ -14,7 +14,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from pm15min.core.process_memory import trim_process_memory
 from pm15min.research.automation.quick_screen import (
+    compact_quick_screen_artifacts,
     ensure_training_and_bundle,
     quick_screen_rank_tuple,
     run_bundle_quick_screen,
@@ -33,17 +35,18 @@ from pm15min.research.inference.scorer import clear_process_scoring_runtime_cach
 from pm15min.research.layout import ResearchLayout
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Run fast factor quick-screen over a suite without full backtests")
-    parser.add_argument("--suite", required=True)
-    parser.add_argument("--run-label", required=True)
-    parser.add_argument("--top-k", type=int, default=2)
-    args = parser.parse_args()
+def run_quick_screen_suite(
+    *,
+    suite_name: str,
+    run_label: str,
+    top_k: int = 2,
+    cleanup_between_cases: bool = True,
+) -> dict[str, object]:
 
     layout = ResearchLayout.discover(ROOT)
-    suite_path = layout.suite_spec_path(args.suite)
+    suite_path = layout.suite_spec_path(suite_name)
     suite = load_suite_definition(suite_path)
-    run_dir = layout.experiment_run_dir(suite.suite_name, args.run_label)
+    run_dir = layout.experiment_run_dir(suite.suite_name, run_label)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, object]] = []
@@ -61,14 +64,14 @@ def main() -> int:
         )
         case_key = _case_key(market_spec)
         training_run_label = _training_run_label(
-            run_label=args.run_label,
+            run_label=run_label,
             market=market_spec.market,
             target=market_spec.target,
             offsets=market_spec.offsets,
             cache_key=case_key,
         )
         bundle_label = _bundle_label(
-            run_label=args.run_label,
+            run_label=run_label,
             market=market_spec.market,
             target=market_spec.target,
             offsets=market_spec.offsets,
@@ -89,6 +92,17 @@ def main() -> int:
                 decision_start=market_spec.decision_start,
                 decision_end=market_spec.decision_end,
                 parity=market_spec.parity,
+                stake_label=str(getattr(market_spec, "matrix_stake_label", "") or ""),
+                stake_usd=getattr(market_spec, "stake_usd", None),
+                max_notional_usd=getattr(market_spec, "max_notional_usd", None),
+                return_decisions=False,
+            )
+            cleanup_summary = compact_quick_screen_artifacts(
+                cfg=cfg,
+                market_spec=market_spec,
+                train_result=train_result,
+                bundle_result=bundle_result,
+                quick_summary=quick_summary,
             )
             row = {
                 "market": market_spec.market,
@@ -101,13 +115,19 @@ def main() -> int:
                 "training_run_dir": train_result.get("run_dir"),
                 "bundle_dir": bundle_result.get("bundle_dir"),
                 **quick_summary,
+                "artifact_retention_mode": cleanup_summary.get("artifact_retention_mode"),
+                "artifacts_retained": cleanup_summary.get("artifacts_retained"),
+                "artifact_retention_reason": cleanup_summary.get("retention_reason"),
+                "artifact_removed_path_count": cleanup_summary.get("removed_path_count"),
             }
             row["_rank_tuple"] = list(quick_screen_rank_tuple(row))
             rows.append(row)
         finally:
-            clear_process_scoring_runtime_cache()
-            clear_process_backtest_runtime_cache()
-            gc.collect()
+            if cleanup_between_cases:
+                clear_process_scoring_runtime_cache()
+                clear_process_backtest_runtime_cache()
+                gc.collect()
+                trim_process_memory()
 
     frame = pd.DataFrame(rows)
     if frame.empty:
@@ -121,7 +141,7 @@ def main() -> int:
         kind="stable",
     ).reset_index(drop=True)
     frame["rank"] = frame.groupby("market").cumcount() + 1
-    frame["selected_for_formal"] = frame["rank"] <= max(1, int(args.top_k))
+    frame["selected_for_formal"] = frame["rank"] <= max(1, int(top_k))
 
     output_frame = frame.drop(columns=["_sort_key"])
     leaderboard_path = run_dir / "quick_screen_leaderboard.csv"
@@ -129,8 +149,8 @@ def main() -> int:
 
     summary_payload = {
         "suite_name": suite.suite_name,
-        "run_label": args.run_label,
-        "top_k": int(args.top_k),
+        "run_label": run_label,
+        "top_k": int(top_k),
         "markets": sorted({str(value) for value in output_frame["market"].tolist()}),
         "rows": int(len(output_frame)),
         "selected_rows": int(output_frame["selected_for_formal"].sum()),
@@ -143,8 +163,8 @@ def main() -> int:
         "# Quick Screen Summary",
         "",
         f"- suite_name: `{suite.suite_name}`",
-        f"- run_label: `{args.run_label}`",
-        f"- top_k: `{int(args.top_k)}`",
+        f"- run_label: `{run_label}`",
+        f"- top_k: `{int(top_k)}`",
         "",
         "## Leaderboard",
         "",
@@ -154,9 +174,23 @@ def main() -> int:
     report_path = run_dir / "quick_screen_report.md"
     report_path.write_text("\n".join(report_lines), encoding="utf-8")
 
-    print(f"leaderboard_path={leaderboard_path}")
-    print(f"summary_path={summary_path}")
-    print(f"report_path={report_path}")
+    return {
+        **summary_payload,
+        "report_path": str(report_path),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run fast factor quick-screen over a suite without full backtests")
+    parser.add_argument("--suite", required=True)
+    parser.add_argument("--run-label", required=True)
+    parser.add_argument("--top-k", type=int, default=2)
+    args = parser.parse_args()
+
+    summary = run_quick_screen_suite(suite_name=args.suite, run_label=args.run_label, top_k=args.top_k)
+    print(f"leaderboard_path={summary['leaderboard_path']}")
+    print(f"summary_path={Path(str(summary['leaderboard_path'])).with_name('quick_screen_summary.json')}")
+    print(f"report_path={summary['report_path']}")
     return 0
 
 def _render_markdown_table(frame: pd.DataFrame) -> str:

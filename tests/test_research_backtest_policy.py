@@ -49,6 +49,46 @@ def test_apply_decision_policy_marks_trades_and_rejects() -> None:
     assert rejects["policy_reason"].tolist() == ["missing_reversal_anchor"]
 
 
+def test_build_policy_reject_frame_does_not_copy_bulk_decision_columns(monkeypatch) -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "policy_action": "reject",
+                "policy_reason": "policy_low_confidence",
+                "decision_source": "primary",
+                "bulk_payload": "x" * 10_000,
+            },
+            {
+                "decision_ts": "2026-03-01T00:02:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 8,
+                "policy_action": "trade",
+                "policy_reason": "trade",
+                "decision_source": "primary",
+                "bulk_payload": "y" * 10_000,
+            },
+        ]
+    )
+    original_copy = pd.DataFrame.copy
+
+    def _fail_copy_bulk(self, *args, **kwargs):
+        if "bulk_payload" in self.columns:
+            raise AssertionError("reject frame should not copy bulk decision columns")
+        return original_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "copy", _fail_copy_bulk)
+
+    rejects = build_policy_reject_frame(rows)
+
+    assert rejects["policy_reason"].tolist() == ["policy_low_confidence"]
+    assert "bulk_payload" not in rejects.columns
+
+
 def test_apply_hybrid_fallback_uses_secondary_trade() -> None:
     primary = pd.DataFrame(
         [
@@ -87,6 +127,50 @@ def test_apply_hybrid_fallback_uses_secondary_trade() -> None:
     assert out.loc[0, "policy_reason"] == "hybrid_fallback_trade"
     assert out.loc[0, "decision_source"] == "secondary"
     assert out.loc[0, "predicted_side"] == "DOWN"
+
+
+def test_report_groupings_do_not_assign_bulk_columns(monkeypatch) -> None:
+    scored = pd.DataFrame(
+        [
+            {
+                "decision_source": "primary",
+                "policy_action": "reject",
+                "policy_reason": "policy_low_confidence",
+                "bulk_payload": "x" * 10_000,
+            },
+            {
+                "decision_source": "primary",
+                "policy_action": "trade",
+                "policy_reason": "trade",
+                "bulk_payload": "y" * 10_000,
+            },
+        ]
+    )
+    rejects = pd.DataFrame(
+        [
+            {
+                "decision_source": "primary",
+                "reason": "policy_low_confidence",
+                "bulk_payload": "z" * 10_000,
+            }
+        ]
+    )
+    original_assign = pd.DataFrame.assign
+
+    def _fail_assign_bulk(self, *args, **kwargs):
+        if "bulk_payload" in self.columns:
+            raise AssertionError("summary grouping should not assign on bulk frames")
+        return original_assign(self, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "assign", _fail_assign_bulk)
+
+    reject_summary = build_reject_summary_frame(rejects)
+    policy_breakdown = build_policy_breakdown_frame(scored)
+
+    assert reject_summary["count"].tolist() == [1]
+    assert policy_breakdown["count"].sum() == 2
+    assert "bulk_payload" not in reject_summary.columns
+    assert "bulk_payload" not in policy_breakdown.columns
 
 
 def test_apply_decision_policy_uses_decision_engine_side_and_reject_reason() -> None:

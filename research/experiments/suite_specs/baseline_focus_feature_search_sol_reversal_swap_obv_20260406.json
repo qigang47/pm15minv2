@@ -1,0 +1,76 @@
+{
+  "suite_name": "baseline_focus_feature_search_sol_reversal_swap_obv_20260406",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "feature_set": "focus_sol_34_v4",
+  "label_set": "truth",
+  "target": "reversal",
+  "offsets": [
+    7,
+    8,
+    9
+  ],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-27"
+  },
+  "decision_start": "2026-03-28",
+  "decision_end": "2026-04-03",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "stakes": [
+    1.0
+  ],
+  "max_notional_usd": 3.0,
+  "max_trades_per_market_values": [
+    3
+  ],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 2
+  },
+  "tags": [
+    "factor_search",
+    "focus_feature_search",
+    "reversal",
+    "latest7d",
+    "orderbook_locked",
+    "noret30",
+    "sol_followup",
+    "swap_obv_z"
+  ],
+  "markets": {
+    "sol": {
+      "groups": {
+        "focus_search": {
+          "runs": [
+            {
+              "run_name": "focus_search",
+              "feature_set_variants": [
+                {
+                  "label": "base34",
+                  "feature_set": "focus_sol_34_v4",
+                  "notes": "control: pre-follow-up SOL width leader"
+                },
+                {
+                  "label": "drop_dow_sin",
+                  "feature_set": "focus_sol_33_v5_drop_dow_sin",
+                  "notes": "current best SOL removal from the prior batch"
+                },
+                {
+                  "label": "swap_dow_sin_for_obv_z",
+                  "feature_set": "focus_sol_34_v6_swap_dow_sin_for_obv_z",
+                  "notes": "test whether obv_z helps more than leaving dow_sin out"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

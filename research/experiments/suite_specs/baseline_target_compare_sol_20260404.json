@@ -1,0 +1,48 @@
+{
+  "suite_name": "baseline_target_compare_sol_20260404",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "label_set": "truth",
+  "feature_set": "bs_q_replace_direction",
+  "offsets": [7, 8, 9],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-27"
+  },
+  "decision_start": "2026-03-28",
+  "decision_end": "2026-04-03",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "stakes": [1.0],
+  "max_notional_usd": 3.0,
+  "max_trades_per_market_values": [3],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 2
+  },
+  "tags": ["target_compare", "latest7d", "baseline_stage1", "noret30"],
+  "markets": {
+    "sol": {
+      "groups": {
+        "target_compare": {
+          "runs": [
+            {
+              "run_name": "direction",
+              "target": "direction",
+              "weight_variant_label": "current_default"
+            },
+            {
+              "run_name": "reversal",
+              "target": "reversal",
+              "weight_variant_label": "current_default"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

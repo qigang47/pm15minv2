@@ -11,13 +11,16 @@ import requests
 from pm15min.data.config import DataConfig
 from pm15min.data.io.parquet import write_parquet_atomic
 from pm15min.data.pipelines.binance_klines import _fetch_coinbase_klines_batch, sync_binance_klines_1m
-from pm15min.data.pipelines.market_catalog import sync_market_catalog
+from pm15min.data.pipelines.market_catalog import backfill_market_catalog_from_closed_markets, sync_market_catalog
 from pm15min.data.pipelines.orderbook_recording import _select_markets, record_orderbooks_once
 from pm15min.data.pipelines.orderbook_recent import update_recent_orderbook_index
 from pm15min.live.quotes.orderbook import load_orderbook_index_frame
 
 
 class _FakeGammaClient:
+    def __init__(self) -> None:
+        self.closed_market_calls: list[tuple[int, int]] = []
+
     def fetch_closed_events(self, *, start_ts: int, end_ts: int, limit: int, max_pages: int, sleep_sec: float):
         return [
             {
@@ -62,6 +65,68 @@ class _FakeGammaClient:
                         "title": "Solana Up or Down 15m",
                         "seriesSlug": "sol-up-or-down-15m",
                         "resolutionSource": "https://data.chain.link/streams/sol-usd",
+                    }
+                ],
+            }
+        ]
+
+    def fetch_active_events(
+        self,
+        *,
+        start_ts: int,
+        end_ts: int,
+        limit: int,
+        max_pages: int,
+        sleep_sec: float,
+        series_slug: str | None = None,
+    ):
+        return [
+            {
+                "id": "event-live-1",
+                "slug": "sol-updown-15m-1772374800",
+                "title": "Solana Up or Down - March 9, 9:00AM-9:15AM ET",
+                "seriesSlug": series_slug or "sol-up-or-down-15m",
+                "resolutionSource": "https://data.chain.link/streams/sol-usd",
+                "markets": [
+                    {
+                        "id": "market-live-event-1",
+                        "conditionId": "cond-live-event-1",
+                        "slug": "sol-updown-15m-1772374800",
+                        "question": "Solana Up or Down - March 9, 9:00AM-9:15AM ET",
+                        "resolutionSource": "https://data.chain.link/streams/sol-usd",
+                        "endDate": "2026-03-09T13:15:00Z",
+                        "outcomes": ["Up", "Down"],
+                        "clobTokenIds": ["token-up", "token-down"],
+                        "active": True,
+                        "closed": False,
+                    }
+                ],
+            }
+        ]
+
+    def fetch_closed_markets(self, *, start_ts: int, end_ts: int, limit: int, max_pages: int, sleep_sec: float):
+        self.closed_market_calls.append((int(start_ts), int(end_ts)))
+        if start_ts >= end_ts:
+            raise AssertionError("empty backfill windows must not be requested")
+        return [
+            {
+                "id": f"market-{start_ts}",
+                "conditionId": f"cond-{start_ts}",
+                "slug": f"btc-updown-15m-{start_ts}",
+                "question": "Bitcoin Up or Down",
+                "resolutionSource": "https://data.chain.link/streams/btc-usd",
+                "endDate": datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "closedTime": datetime.fromtimestamp(end_ts + 30, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "outcomes": ["Up", "Down"],
+                "clobTokenIds": ["token-up", "token-down"],
+                "closed": True,
+                "events": [
+                    {
+                        "id": f"event-{start_ts}",
+                        "slug": f"btc-up-or-down-15m-{start_ts}",
+                        "title": "Bitcoin Up or Down 15m",
+                        "seriesSlug": "btc-up-or-down-15m",
+                        "resolutionSource": "https://data.chain.link/streams/btc-usd",
                     }
                 ],
             }
@@ -149,6 +214,24 @@ def test_sync_market_catalog_writes_snapshot_and_canonical(tmp_path: Path) -> No
     assert len(canonical) == 1
     assert canonical.iloc[0]["market_id"] == "market-1"
     assert canonical.iloc[0]["token_up"] == "token-up"
+
+
+def test_backfill_market_catalog_skips_empty_terminal_window(tmp_path: Path) -> None:
+    cfg = DataConfig.build(market="btc", cycle="15m", surface="backtest", root=tmp_path / "v2")
+    client = _FakeGammaClient()
+
+    summary = backfill_market_catalog_from_closed_markets(
+        cfg,
+        start_ts=1_778_112_000,
+        end_ts=1_778_198_400,
+        window_days=1,
+        client=client,
+        now=datetime(2026, 5, 9, 9, 0, tzinfo=timezone.utc),
+    )
+
+    assert summary["windows_processed"] == 1
+    assert summary["snapshot_rows"] == 1
+    assert client.closed_market_calls == [(1_778_112_000, 1_778_198_400)]
 
 
 def test_record_orderbooks_once_writes_depth_and_index(tmp_path: Path) -> None:
@@ -766,6 +849,53 @@ def test_sync_market_catalog_live_uses_active_markets(tmp_path: Path) -> None:
     assert len(canonical) == 1
     assert canonical.iloc[0]["market_id"] == "market-live-1"
     assert canonical.iloc[0]["token_up"] == "token-up"
+
+
+def test_sync_market_catalog_live_falls_back_to_active_series_events(tmp_path: Path) -> None:
+    class EmptyActiveMarketsClient(_FakeGammaClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.event_series_calls: list[str | None] = []
+
+        def fetch_active_markets(self, *, start_ts: int, end_ts: int, limit: int, max_pages: int, sleep_sec: float):
+            return []
+
+        def fetch_active_events(
+            self,
+            *,
+            start_ts: int,
+            end_ts: int,
+            limit: int,
+            max_pages: int,
+            sleep_sec: float,
+            series_slug: str | None = None,
+        ):
+            self.event_series_calls.append(series_slug)
+            return super().fetch_active_events(
+                start_ts=start_ts,
+                end_ts=end_ts,
+                limit=limit,
+                max_pages=max_pages,
+                sleep_sec=sleep_sec,
+                series_slug=series_slug,
+            )
+
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
+    client = EmptyActiveMarketsClient()
+
+    summary = sync_market_catalog(
+        cfg,
+        start_ts=1_772_374_800,
+        end_ts=1_772_461_200,
+        client=client,
+        now=datetime(2026, 3, 19, 9, 0, tzinfo=timezone.utc),
+    )
+
+    canonical = pd.read_parquet(Path(summary["canonical_path"]))
+    assert summary["source_mode"] == "gamma_active_events"
+    assert summary["snapshot_rows"] == 1
+    assert client.event_series_calls == ["sol-up-or-down-15m"]
+    assert canonical.iloc[0]["market_id"] == "market-live-event-1"
 
 
 def test_sync_market_catalog_backtest_can_force_active_markets(tmp_path: Path) -> None:

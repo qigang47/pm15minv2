@@ -1,0 +1,110 @@
+{
+  "suite_name": "baseline_focus_feature_search_btc_reversal_40plus_2usd_5max_20260409",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "feature_set": "focus_btc_40_v5_swap_macd_z_for_strike_flip_count_cycle",
+  "label_set": "truth",
+  "target": "reversal",
+  "offsets": [7, 8, 9],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-31"
+  },
+  "decision_start": "2026-04-01",
+  "decision_end": "2026-04-23",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "stakes": [2.0],
+  "max_notional_usd": 10.0,
+  "max_trades_per_market_values": [5],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 1
+  },
+  "tags": [
+    "factor_search",
+    "focus_feature_search",
+    "reversal",
+    "noret30",
+    "40factor",
+    "2usd",
+    "max5",
+    "btc_seed_refresh"
+  ],
+  "markets": {
+    "btc": {
+      "groups": {
+        "focus_search": {
+          "runs": [
+            {
+              "run_name": "focus_search",
+              "feature_set_variants": [
+                {
+                  "label": "40_v5_bridge",
+                  "feature_set": "focus_btc_40_v5_swap_macd_z_for_strike_flip_count_cycle",
+                  "notes": "BTC bridge seed from the prior near-40 line"
+                },
+                {
+                  "label": "40_v4",
+                  "feature_set": "focus_btc_40_v4",
+                  "notes": "BTC near-40 control"
+                },
+                {
+                  "label": "40_v2",
+                  "feature_set": "focus_btc_40_v2",
+                  "notes": "BTC stability control"
+                }
+              ],
+              "weight_variants": [
+                {
+                  "label": "current_default",
+                  "notes": "shared default weights"
+                },
+                {
+                  "label": "offset_reversal_mild",
+                  "notes": "mild offset-specific contrarian emphasis for 7/8/9",
+                  "offset_weight_overrides": {
+                    "7": {
+                      "contrarian_weight": 1.25,
+                      "contrarian_quantile": 0.8
+                    },
+                    "8": {
+                      "contrarian_weight": 1.75,
+                      "contrarian_quantile": 0.75
+                    },
+                    "9": {
+                      "contrarian_weight": 2.25,
+                      "contrarian_quantile": 0.7
+                    }
+                  }
+                },
+                {
+                  "label": "offset_reversal_strong",
+                  "notes": "stronger offset-specific contrarian emphasis for 7/8/9",
+                  "offset_weight_overrides": {
+                    "7": {
+                      "contrarian_weight": 1.5,
+                      "contrarian_quantile": 0.8
+                    },
+                    "8": {
+                      "contrarian_weight": 2.25,
+                      "contrarian_quantile": 0.75
+                    },
+                    "9": {
+                      "contrarian_weight": 3.0,
+                      "contrarian_quantile": 0.7
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

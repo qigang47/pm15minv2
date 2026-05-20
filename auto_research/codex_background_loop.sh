@@ -22,7 +22,7 @@ SESSION_DIR="${SESSION_DIR:-}"
 PROGRAM_PATH="${PROGRAM_PATH:-$ROOT_DIR/auto_research/program.md}"
 LOOP_SLEEP_SEC="${LOOP_SLEEP_SEC:-1800}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
-CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-medium}"
+CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}"
 CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT="${CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT:-60000}"
 CODEX_PROMPT_BUDGET_MODE="${CODEX_PROMPT_BUDGET_MODE:-compact}"
 CODEX_EXTRA_ARGS="${CODEX_EXTRA_ARGS:-}"
@@ -34,14 +34,25 @@ CODEX_FALLBACK_HOME_DIR="${CODEX_FALLBACK_HOME_DIR:-$AUTORUN_DIR/codex-home-fall
 CODEX_OFFICIAL_HOME_DIR="${CODEX_OFFICIAL_HOME_DIR:-$AUTORUN_DIR/codex-home-official}"
 CODEX_NETWORK_PROXY_MODE="${CODEX_NETWORK_PROXY_MODE:-direct}"
 CODEX_OFFICIAL_NETWORK_PROXY_MODE="${CODEX_OFFICIAL_NETWORK_PROXY_MODE:-$CODEX_NETWORK_PROXY_MODE}"
-CODEX_OFFICIAL_PRIORITY="${CODEX_OFFICIAL_PRIORITY:-first}"
+CODEX_OFFICIAL_PRIORITY="${CODEX_OFFICIAL_PRIORITY:-disabled}"
 PM15MIN_MANAGED_PROXY_ENV_FILE="${PM15MIN_MANAGED_PROXY_ENV_FILE:-${REAL_HOME:-$HOME}/.local/state/pm15min-managed-proxy/active_proxy.env}"
+PM15MIN_MANAGED_EXPERIMENT_TRACK="${PM15MIN_MANAGED_EXPERIMENT_TRACK:-}"
 MAX_CONSECUTIVE_FAILURES="${MAX_CONSECUTIVE_FAILURES:-3}"
 CODEX_STOP_ON_CONSECUTIVE_FAILURES="${CODEX_STOP_ON_CONSECUTIVE_FAILURES:-0}"
 CODEX_ATTEMPT_TIMEOUT_SEC="${CODEX_ATTEMPT_TIMEOUT_SEC:-7200}"
 CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC="${CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC:-1800}"
 CODEX_STARTUP_TIMEOUT_SEC="${CODEX_STARTUP_TIMEOUT_SEC:-90}"
 CODEX_PROVIDER_FAILURE_ABORT_AFTER_RECONNECTS="${CODEX_PROVIDER_FAILURE_ABORT_AFTER_RECONNECTS:-3}"
+FACTOR_SCOUT_ENABLE="${FACTOR_SCOUT_ENABLE:-1}"
+FACTOR_SCOUT_MIN_INTERVAL_SEC="${FACTOR_SCOUT_MIN_INTERVAL_SEC:-21600}"
+FACTOR_SCOUT_TIMEOUT_SEC="${FACTOR_SCOUT_TIMEOUT_SEC:-900}"
+FACTOR_SCOUT_LOCK_STALE_SEC="${FACTOR_SCOUT_LOCK_STALE_SEC:-3600}"
+FACTOR_SCOUT_MAX_CANDIDATES="${FACTOR_SCOUT_MAX_CANDIDATES:-6}"
+FACTOR_SCOUT_STAMP_PATH="${FACTOR_SCOUT_STAMP_PATH:-$ROOT_DIR/var/research/autorun/factor-scout.last-success}"
+FACTOR_SCOUT_LOCK_DIR="${FACTOR_SCOUT_LOCK_DIR:-$ROOT_DIR/var/research/autorun/factor-scout.lock}"
+FACTOR_SCOUT_PROMPT_PATH="${FACTOR_SCOUT_PROMPT_PATH:-$AUTORUN_DIR/factor-scout-last-prompt.md}"
+FACTOR_SCOUT_OUTPUT_PATH="${FACTOR_SCOUT_OUTPUT_PATH:-$AUTORUN_DIR/factor-scout-last-output.txt}"
+FACTOR_SCOUT_LOG_PATH="${FACTOR_SCOUT_LOG_PATH:-$AUTORUN_DIR/factor-scout.log}"
 REAL_HOME="$HOME"
 FAILURE_COUNT=0
 RUN_ONCE_SHOULD_STOP=0
@@ -197,7 +208,7 @@ fallback_configured() {
 }
 
 official_fallback_configured() {
-  [[ -f "$CODEX_OFFICIAL_AUTH_PATH" ]]
+  [[ "$CODEX_OFFICIAL_PRIORITY" != "disabled" && -f "$CODEX_OFFICIAL_AUTH_PATH" ]]
 }
 
 list_live_autorun_pids() {
@@ -238,6 +249,49 @@ terminate_live_autorun_processes() {
       kill -9 "$pid" >/dev/null 2>&1 || true
     fi
 done
+}
+
+list_scoped_experiment_worker_pids() {
+  PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$ROOT_DIR" "${PM15MIN_ALLOWED_QUEUE_MARKETS:-}" "${PM15MIN_MANAGED_EXPERIMENT_TRACK:-}"
+from pathlib import Path
+import sys
+from pm15min.research.automation.control_plane import find_scoped_experiment_worker_pids
+
+markets = [
+    token.strip().lower()
+    for token in str(sys.argv[2] or "").split(",")
+    if token.strip()
+]
+for pid in find_scoped_experiment_worker_pids(
+    Path(sys.argv[1]),
+    allowed_markets=markets,
+    track=sys.argv[3] or None,
+):
+    print(int(pid))
+PY
+}
+
+terminate_scoped_experiment_workers() {
+  local -a worker_pids=()
+  mapfile -t worker_pids < <(list_scoped_experiment_worker_pids)
+  if [[ "${#worker_pids[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  local pid
+  for pid in "${worker_pids[@]}"; do
+    [[ -n "$pid" ]] || continue
+    if [[ "$pid" == "$$" ]]; then
+      continue
+    fi
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+  sleep 2
+  for pid in "${worker_pids[@]}"; do
+    [[ -n "$pid" ]] || continue
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    fi
+  done
 }
 
 list_child_pids() {
@@ -371,7 +425,8 @@ PY
 }
 
 build_codex_command() {
-  PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$ROOT_DIR" "$LAST_OUTPUT_PATH" "$CODEX_SANDBOX_MODE" "$CODEX_MODEL" "$CODEX_REASONING_EFFORT" "$CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT" "${CODEX_EXTRA_ARGS:-}"
+  local output_path="${1:-$LAST_OUTPUT_PATH}"
+  PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$ROOT_DIR" "$output_path" "$CODEX_SANDBOX_MODE" "$CODEX_MODEL" "$CODEX_REASONING_EFFORT" "$CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT" "${CODEX_EXTRA_ARGS:-}"
 from pathlib import Path
 import sys
 from pm15min.research.automation import build_codex_exec_command
@@ -537,10 +592,163 @@ run_codex_attempt() {
   return "$attempt_exit_code"
 }
 
+factor_scout_decision_field() {
+  PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$ROOT_DIR" "$FACTOR_SCOUT_STAMP_PATH" "$FACTOR_SCOUT_MIN_INTERVAL_SEC" "$(_program_target_or_default)" "$(_program_markets_or_default)" "$1"
+from pathlib import Path
+import sys
+from pm15min.research.automation import should_refresh_factor_scout_backlog
+
+payload = should_refresh_factor_scout_backlog(
+    Path(sys.argv[1]),
+    stamp_path=Path(sys.argv[2]),
+    min_interval_sec=int(sys.argv[3]),
+    target=sys.argv[4],
+    markets=[item.strip() for item in sys.argv[5].split(",") if item.strip()],
+)
+value = payload.get(sys.argv[6])
+if isinstance(value, bool):
+    print("1" if value else "0")
+elif value is None:
+    print("")
+else:
+    print(value)
+PY
+}
+
+build_factor_scout_prompt_file() {
+  PYTHONPATH="$ROOT_DIR/src" python3 "$ROOT_DIR/auto_research/factor_scout.py" \
+    --root "$ROOT_DIR" \
+    prompt \
+    --target "$(_program_target_or_default)" \
+    --markets "$(_program_markets_or_default)" \
+    --max-candidates "$FACTOR_SCOUT_MAX_CANDIDATES" \
+    --output "$FACTOR_SCOUT_PROMPT_PATH" >/dev/null
+}
+
+_program_target_or_default() {
+  PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$PROGRAM_PATH"
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
+match = re.search(r"(?im)^\s*-\s*target(?:\s+fixed\s+to)?\s*[: ]\s*`?(direction|reversal)`?", text)
+if match:
+    print(match.group(1).lower())
+elif "direction" in path.stem.lower():
+    print("direction")
+elif "reversal" in path.stem.lower():
+    print("reversal")
+else:
+    print("reversal")
+PY
+}
+
+_program_markets_or_default() {
+  PYTHONPATH="$ROOT_DIR/src" python3 - <<'PY' "$PROGRAM_PATH" "${PM15MIN_ALLOWED_QUEUE_MARKETS:-}"
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+allowed = sys.argv[2].strip()
+text = path.read_text(encoding="utf-8", errors="ignore").lower() if path.exists() else ""
+match = re.search(r"(?im)^\s*-\s*coins?\s*:\s*(.+)$", text)
+source = match.group(1) if match else allowed
+markets = []
+seen = set()
+for item in re.findall(r"(?<![a-z0-9])(btc|eth|sol|xrp)(?![a-z0-9])", source.lower()):
+    if item not in seen:
+        seen.add(item)
+        markets.append(item)
+print(",".join(markets or ["btc", "eth", "sol", "xrp"]))
+PY
+}
+
+maybe_clear_stale_factor_scout_lock() {
+  if [[ ! -d "$FACTOR_SCOUT_LOCK_DIR" ]]; then
+    return 0
+  fi
+  local stale_sec="$FACTOR_SCOUT_LOCK_STALE_SEC"
+  if [[ ! "$stale_sec" =~ ^[0-9]+$ ]] || [[ "$stale_sec" -lt 1 ]]; then
+    stale_sec=3600
+  fi
+  local lock_mtime now age
+  lock_mtime="$(stat -c %Y "$FACTOR_SCOUT_LOCK_DIR" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  age=$((now - lock_mtime))
+  if [[ "$lock_mtime" -gt 0 && "$age" -ge "$stale_sec" ]]; then
+    rm -rf "$FACTOR_SCOUT_LOCK_DIR"
+    echo "[factor_scout] stale_lock_removed lock=$FACTOR_SCOUT_LOCK_DIR age_sec=$age stale_sec=$stale_sec" >> "$FACTOR_SCOUT_LOG_PATH"
+  fi
+}
+
+run_factor_scout_if_due() {
+  local LAST_PROMPT_PATH="$FACTOR_SCOUT_PROMPT_PATH"
+  if [[ "$FACTOR_SCOUT_ENABLE" != "1" ]]; then
+    return 0
+  fi
+
+  local should_refresh reason
+  should_refresh="$(factor_scout_decision_field should_refresh)"
+  reason="$(factor_scout_decision_field reason)"
+  if [[ "$should_refresh" != "1" ]]; then
+    echo "[factor_scout] skip reason=${reason:-unknown}" >> "$FACTOR_SCOUT_LOG_PATH"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$FACTOR_SCOUT_PROMPT_PATH")" "$(dirname "$FACTOR_SCOUT_OUTPUT_PATH")" "$(dirname "$FACTOR_SCOUT_STAMP_PATH")"
+  maybe_clear_stale_factor_scout_lock
+  if ! mkdir "$FACTOR_SCOUT_LOCK_DIR" >/dev/null 2>&1; then
+    echo "[factor_scout] skip reason=lock_held lock=$FACTOR_SCOUT_LOCK_DIR" >> "$FACTOR_SCOUT_LOG_PATH"
+    return 0
+  fi
+  trap 'rmdir "$FACTOR_SCOUT_LOCK_DIR" >/dev/null 2>&1 || true' RETURN
+  build_factor_scout_prompt_file
+  : > "$FACTOR_SCOUT_OUTPUT_PATH"
+  echo "[factor_scout] start reason=${reason:-unknown} prompt=$FACTOR_SCOUT_PROMPT_PATH" >> "$FACTOR_SCOUT_LOG_PATH"
+
+  local scout_timeout="$FACTOR_SCOUT_TIMEOUT_SEC"
+  if [[ ! "$scout_timeout" =~ ^[0-9]+$ ]] || [[ "$scout_timeout" -lt 1 ]]; then
+    scout_timeout=900
+  fi
+
+  mapfile -t CODEX_CMD < <(build_codex_command "$FACTOR_SCOUT_OUTPUT_PATH")
+  set +e
+  local scout_exit_code=1
+  if secondary_configured && prepare_secondary_codex_home; then
+    run_codex_attempt "$CODEX_SECONDARY_HOME_DIR" "$FACTOR_SCOUT_OUTPUT_PATH" "$scout_timeout"
+    scout_exit_code="$?"
+  elif fallback_configured && prepare_fallback_codex_home; then
+    run_codex_attempt "$CODEX_FALLBACK_HOME_DIR" "$FACTOR_SCOUT_OUTPUT_PATH" "$scout_timeout"
+    scout_exit_code="$?"
+  elif official_fallback_configured && prepare_official_codex_home; then
+    run_codex_attempt "$CODEX_OFFICIAL_HOME_DIR" "$FACTOR_SCOUT_OUTPUT_PATH" "$scout_timeout"
+    scout_exit_code="$?"
+  elif [[ "$CODEX_HOME_MODE" == "isolated" ]] && prepare_isolated_codex_home; then
+    run_codex_attempt "$CODEX_HOME_DIR" "$FACTOR_SCOUT_OUTPUT_PATH" "$scout_timeout"
+    scout_exit_code="$?"
+  else
+    run_codex_attempt "" "$FACTOR_SCOUT_OUTPUT_PATH" "$scout_timeout"
+    scout_exit_code="$?"
+  fi
+  set -e
+  if [[ "$scout_exit_code" -eq 0 ]]; then
+    date +%s > "$FACTOR_SCOUT_STAMP_PATH"
+    echo "[factor_scout] completed exit=0" >> "$FACTOR_SCOUT_LOG_PATH"
+  else
+    date +%s > "$FACTOR_SCOUT_STAMP_PATH"
+    echo "[factor_scout] failed exit=$scout_exit_code" >> "$FACTOR_SCOUT_LOG_PATH"
+  fi
+  return 0
+}
+
 run_once() {
   local iteration="$1"
   local started_at
   started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  run_factor_scout_if_due
   build_prompt > "$LAST_PROMPT_PATH"
   local resolved_attempt_timeout_sec
   resolved_attempt_timeout_sec="$(resolve_attempt_timeout)"
@@ -558,9 +766,23 @@ run_once() {
   rm -f "$fallback_attempt_log"
   rm -f "$official_attempt_log"
   local last_attempt_log="$primary_attempt_log"
+  local primary_provider="default"
 
   set +e
-  if [[ "$CODEX_OFFICIAL_PRIORITY" == "first" ]] && official_fallback_configured; then
+  if secondary_configured && [[ "$CODEX_OFFICIAL_PRIORITY" != "first" ]]; then
+    primary_provider="secondary"
+    prepare_secondary_codex_home
+    local prepare_secondary_first_exit_code="$?"
+    if [[ "$prepare_secondary_first_exit_code" -eq 0 ]]; then
+      printf '[codex_background_loop] using attempt timeout %ss (heavy_analysis_timeout=%ss)\n' "$resolved_attempt_timeout_sec" "$CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC" >> "$primary_attempt_log"
+      printf '[codex_background_loop] trying secondary provider first\n' >> "$primary_attempt_log"
+      run_codex_attempt "$CODEX_SECONDARY_HOME_DIR" "$primary_attempt_log" "$resolved_attempt_timeout_sec"
+    else
+      printf '[codex_background_loop] secondary first home preparation failed with exit=%s\n' "$prepare_secondary_first_exit_code" > "$primary_attempt_log"
+      false
+    fi
+  elif [[ "$CODEX_OFFICIAL_PRIORITY" == "first" ]] && official_fallback_configured; then
+    primary_provider="official"
     prepare_official_codex_home
     local prepare_official_first_exit_code="$?"
     if [[ "$prepare_official_first_exit_code" -eq 0 ]]; then
@@ -583,7 +805,7 @@ run_once() {
   set -e
   cat "$primary_attempt_log" >> "$LOG_PATH"
 
-  if [[ "$exit_code" -ne 0 ]] && secondary_configured && { [[ "$exit_code" -eq 74 ]] || [[ "$CODEX_OFFICIAL_PRIORITY" == "first" ]] || codex_output_is_provider_failure "$primary_attempt_log" "$CODEX_SECONDARY_BASE_URL"; }; then
+  if [[ "$exit_code" -ne 0 ]] && [[ "$primary_provider" != "secondary" ]] && secondary_configured && { [[ "$exit_code" -eq 74 ]] || [[ "$CODEX_OFFICIAL_PRIORITY" == "first" ]] || codex_output_is_provider_failure "$primary_attempt_log" "$CODEX_SECONDARY_BASE_URL"; }; then
     echo "[codex_background_loop] iteration=$iteration retrying with secondary fallback provider" >> "$LOG_PATH"
     : > "$secondary_attempt_log"
     set +e
@@ -674,7 +896,7 @@ sleep_until_next_cycle() {
       return 0
     fi
     if should_wake_for_idle_market; then
-      echo "[codex_background_loop] idle formal slot detected for market=$WAKE_ON_IDLE_MARKET; starting next cycle early" >> "$LOG_PATH"
+      echo "[codex_background_loop] open formal slot detected for market=$WAKE_ON_IDLE_MARKET; starting next cycle early" >> "$LOG_PATH"
       return 0
     fi
     local chunk="$poll_sec"
@@ -686,17 +908,80 @@ sleep_until_next_cycle() {
   done
 }
 
+count_live_market_workers() {
+  if [[ -z "$WAKE_ON_IDLE_MARKET" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  python3 - <<'PY' "$WAKE_ON_IDLE_MARKET"
+from __future__ import annotations
+
+import os
+import re
+import sys
+from pathlib import Path
+
+market = str(sys.argv[1]).strip().lower()
+
+
+def _read_cmdline(pid: str) -> str:
+    try:
+        raw = Path("/proc") / pid / "cmdline"
+        return raw.read_bytes().replace(b"\0", b" ").decode("utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def _arg_value(command: str, name: str) -> str | None:
+    match = re.search(rf"(?:^|\s){re.escape(name)}(?:=|\s+)(\S+)", command)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def count_live_market_worker_groups() -> int:
+    run_labels: set[str] = set()
+    wrapper_pids_without_run_label: set[str] = set()
+    proc_dir = Path("/proc")
+    for entry in proc_dir.iterdir():
+        if not entry.name.isdigit() or entry.name == str(os.getpid()):
+            continue
+        command = _read_cmdline(entry.name)
+        if not command:
+            continue
+        if f"--market {market}" not in command and f"--market={market}" not in command:
+            continue
+        is_wrapper = "run_one_experiment.sh" in command
+        is_run_suite = "pm15min research experiment run-suite" in command
+        if not is_wrapper and not is_run_suite:
+            continue
+        label = _arg_value(command, "--run-label")
+        if label:
+            run_labels.add(label)
+        elif is_wrapper:
+            wrapper_pids_without_run_label.add(entry.name)
+    print(len(run_labels) + len(wrapper_pids_without_run_label))
+
+
+count_live_market_worker_groups()
+PY
+}
+
 should_wake_for_idle_market() {
   if [[ -z "$WAKE_ON_IDLE_MARKET" ]]; then
     return 1
   fi
-  if pgrep -f "pm15min research experiment run-suite .*--market ${WAKE_ON_IDLE_MARKET}" >/dev/null 2>&1; then
+  local target="${MAX_LIVE_RUNS:-1}"
+  if [[ ! "$target" =~ ^[0-9]+$ ]] || [[ "$target" -lt 1 ]]; then
+    target=1
+  fi
+  local live_count
+  live_count="$(count_live_market_workers)"
+  if [[ "$live_count" -lt "$target" ]]; then
+    return 0
+  else
     return 1
   fi
-  if pgrep -f "run_one_experiment.sh .*--market ${WAKE_ON_IDLE_MARKET}" >/dev/null 2>&1; then
-    return 1
-  fi
-  return 0
 }
 
 loop_body() {
@@ -758,6 +1043,7 @@ case "$ACTION" in
       pid="$(cat "$PID_PATH")"
       terminate_current_instance_processes "$pid"
     fi
+    terminate_scoped_experiment_workers
     rm -f "$PID_PATH"
     echo "Stop requested"
     ;;

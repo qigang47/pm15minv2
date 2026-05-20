@@ -1,0 +1,78 @@
+{
+  "suite_name": "baseline_focus_feature_search_eth_20260406",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "feature_set": "bs_q_replace_direction",
+  "label_set": "truth",
+  "target": "direction",
+  "offsets": [
+    7,
+    8,
+    9
+  ],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-27"
+  },
+  "decision_start": "2026-03-28",
+  "decision_end": "2026-04-03",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "stakes": [
+    1.0
+  ],
+  "max_notional_usd": 3.0,
+  "max_trades_per_market_values": [
+    3
+  ],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 2
+  },
+  "tags": [
+    "factor_search",
+    "focus_feature_search",
+    "latest7d",
+    "orderbook_locked",
+    "noret30"
+  ],
+  "markets": {
+    "eth": {
+      "groups": {
+        "focus_search": {
+          "runs": [
+            {
+              "run_name": "focus_search",
+              "feature_set_variants": [
+                {
+                  "label": "12",
+                  "feature_set": "focus_eth_12_v1",
+                  "notes": "focus search width=12 built from shared core plus eth tilt"
+                },
+                {
+                  "label": "18",
+                  "feature_set": "focus_eth_18_v1",
+                  "notes": "focus search width=18 built from shared core plus eth tilt"
+                },
+                {
+                  "label": "24",
+                  "feature_set": "focus_eth_24_v1",
+                  "notes": "focus search width=24 built from shared core plus eth tilt"
+                },
+                {
+                  "label": "32",
+                  "feature_set": "focus_eth_32_v1",
+                  "notes": "focus search width=32 built from shared core plus eth tilt"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

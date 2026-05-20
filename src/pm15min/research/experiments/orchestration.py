@@ -299,7 +299,7 @@ def _execution_group_key(market_spec) -> str:
     payload = {
         "market": str(getattr(market_spec, "market", "") or ""),
         "group_name": _group_name(market_spec),
-        "run_name": _matrix_parent_run_name(market_spec) or _run_name(market_spec),
+        "run_name": _surface_reuse_group_run_name(market_spec),
         "profile": str(getattr(market_spec, "profile", "") or ""),
         "model_family": str(getattr(market_spec, "model_family", "") or ""),
         "feature_set": str(getattr(market_spec, "feature_set", "") or ""),
@@ -325,7 +325,7 @@ def _execution_group_key(market_spec) -> str:
 def _execution_group_label(market_spec) -> str:
     tokens = [str(getattr(market_spec, "market", "") or "")]
     group_name = _group_name(market_spec)
-    run_name = _matrix_parent_run_name(market_spec) or _run_name(market_spec)
+    run_name = _surface_reuse_group_run_name(market_spec)
     variant_label = str(getattr(market_spec, "variant_label", "") or "")
     if group_name:
         tokens.append(group_name)
@@ -340,10 +340,61 @@ def _execution_group_sort_key(market_spec) -> tuple[object, ...]:
     return (
         str(getattr(market_spec, "market", "") or ""),
         _group_name(market_spec),
-        _matrix_parent_run_name(market_spec) or _run_name(market_spec),
+        _surface_reuse_group_run_name(market_spec),
         str(getattr(market_spec, "variant_label", "") or ""),
         str(getattr(market_spec, "target", "") or ""),
         -1.0 if _stake_usd(market_spec) is None else float(_stake_usd(market_spec)),
         -1.0 if _max_notional_usd(market_spec) is None else float(_max_notional_usd(market_spec)),
         _run_name(market_spec),
     )
+
+
+def _surface_reuse_group_run_name(market_spec) -> str:
+    matrix_parent = _matrix_parent_run_name(market_spec)
+    if matrix_parent:
+        return _strip_weight_variant_token(matrix_parent, market_spec)
+    run_name = _run_name(market_spec)
+    if str(getattr(market_spec, "weight_variant_label", "") or "default") != "default":
+        return _strip_weight_variant_token(run_name, market_spec)
+    if _has_weight_override(market_spec):
+        return _strip_weight_variant_token(run_name, market_spec)
+    return run_name
+
+
+def _strip_weight_variant_token(run_name: str, market_spec) -> str:
+    token = str(run_name or "")
+    if not token:
+        return ""
+    weight_label = str(getattr(market_spec, "weight_variant_label", "") or "").strip()
+    candidates = [weight_label] if weight_label else []
+    candidates.extend(_weight_labels_from_tags(market_spec))
+    for label in sorted({candidate for candidate in candidates if candidate}, key=len, reverse=True):
+        marker = f"__w_{label}"
+        if marker in token:
+            token = token.replace(marker, "")
+    return token
+
+
+def _has_weight_override(market_spec) -> bool:
+    for field_name in (
+        "balance_classes",
+        "weight_by_vol",
+        "inverse_vol",
+        "contrarian_weight",
+        "contrarian_quantile",
+        "contrarian_return_col",
+        "winner_in_band_weight",
+    ):
+        value = getattr(market_spec, field_name, None)
+        if value not in {None, ""}:
+            return True
+    return bool(getattr(market_spec, "offset_weight_overrides", None))
+
+
+def _weight_labels_from_tags(market_spec) -> tuple[str, ...]:
+    labels: list[str] = []
+    for tag in getattr(market_spec, "tags", ()) or ():
+        text = str(tag or "")
+        if text.startswith("weight_variant:"):
+            labels.append(text.split(":", 1)[1])
+    return tuple(labels)

@@ -1,0 +1,69 @@
+{
+  "suite_name": "baseline_factor_width_xrp_20260405",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "label_set": "truth",
+  "target": "direction",
+  "offsets": [7, 8, 9],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-27"
+  },
+  "decision_start": "2026-03-28",
+  "decision_end": "2026-04-03",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "feature_set": "bs_q_replace_direction",
+  "feature_set_variants": [
+    {
+      "label": "wide64",
+      "feature_set": "bs_q_replace_direction",
+      "notes": "current baseline wide feature set"
+    },
+    {
+      "label": "mid41",
+      "feature_set": "alpha_search_direction_live",
+      "notes": "middle-width candidate"
+    },
+    {
+      "label": "core31",
+      "feature_set": "v6_user_core",
+      "notes": "core live feature set"
+    },
+    {
+      "label": "otm21",
+      "feature_set": "deep_otm_v1",
+      "notes": "narrow otm-focused set"
+    },
+    {
+      "label": "trim30",
+      "feature_set": "baseline_trim30_v1",
+      "notes": "manual trim30 candidate from baseline diagnosis"
+    }
+  ],
+  "stakes": [1.0],
+  "max_notional_usd": 3.0,
+  "max_trades_per_market_values": [3],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 2
+  },
+  "tags": ["factor_search", "phase2_feature_table", "latest7d", "orderbook_locked", "noret30"],
+  "markets": {
+    "xrp": {
+      "groups": {
+        "factor_search": {
+          "runs": [
+            {
+              "run_name": "factor_width"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

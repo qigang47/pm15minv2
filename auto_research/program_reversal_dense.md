@@ -12,9 +12,10 @@ This is the canonical dense autoresearch entry for the `deep_otm_baseline`
 
 ## Frozen Dense Window
 
-- frozen decision / backtest window from `2026-04-01` through `2026-04-23`
+- training window ends at `2026-04-15`
+- decision / backtest window is `2026-04-15` through `2026-05-07`
 - dense goal: 10-20 trades per coin per day
-- target band over `2026-04-01` through `2026-04-23`: `150-300` trades per coin
+- target band over `2026-04-15` through `2026-05-07`: `110-220` trades per coin
 
 ## Dense Reversal Objective
 
@@ -43,7 +44,7 @@ This is the canonical dense autoresearch entry for the `deep_otm_baseline`
 ## Profitable Offset Pool Gate
 
 - profitable offset pool is coin-level and shared by both dense tracks
-- profitable offset pool window is `2026-04-01` through `2026-04-23` at `2usd`
+- profitable offset pool window is `2026-04-15` through `2026-05-07` at `2usd`
 - one `offset` equals one exact window
 - count a capture only when the candidate reaches a final tradeable winner-side entry at `<= 0.30`
 - target about `70%` profitable-pool coverage before spending a full formal slot

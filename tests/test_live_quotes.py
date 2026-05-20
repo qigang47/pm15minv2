@@ -1815,9 +1815,9 @@ def test_quote_snapshot_loads_index_once_per_iteration(tmp_path: Path, monkeypat
     original_loader = orderbook_index_module.load_orderbook_index_frame
     calls = {"count": 0}
 
-    def _counting_loader(*, index_path, recent_path=None):
+    def _counting_loader(*, index_path, recent_path=None, columns=None, filters=None):
         calls["count"] += 1
-        return original_loader(index_path=index_path, recent_path=recent_path)
+        return original_loader(index_path=index_path, recent_path=recent_path, columns=columns, filters=filters)
 
     monkeypatch.setattr(orderbook_index_module, "load_orderbook_index_frame", _counting_loader)
 

@@ -105,9 +105,9 @@ def test_attach_canonical_quote_surface_reads_orderbook_index_once_per_date(tmp_
     load_count = {"value": 0}
     original_loader = orderbook_surface_module.load_orderbook_index_frame
 
-    def _counting_loader(*, index_path, recent_path=None):
+    def _counting_loader(*, index_path, recent_path=None, columns=None, filters=None):
         load_count["value"] += 1
-        return original_loader(index_path=index_path, recent_path=recent_path)
+        return original_loader(index_path=index_path, recent_path=recent_path, columns=columns, filters=filters)
 
     monkeypatch.setattr(orderbook_surface_module, "load_orderbook_index_frame", _counting_loader)
 
@@ -140,6 +140,97 @@ def test_attach_canonical_quote_surface_reads_orderbook_index_once_per_date(tmp_
     assert out.loc[0, "token_up"] == "tok-up"
     assert float(out.loc[0, "quote_up_ask"]) == 0.41
     assert float(out.loc[0, "quote_down_ask"]) == 0.59
+
+
+def test_attach_canonical_quote_surface_scopes_orderbook_index_reads(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "v2"
+    data_cfg = DataConfig.build(market="sol", cycle="15m", surface="backtest", root=root)
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": "m-keep",
+                    "condition_id": "c-keep",
+                    "token_up": "tok-up",
+                    "token_down": "tok-down",
+                    "question": "SOL up?",
+                    "cycle_start_ts": 1_772_323_200,
+                    "cycle_end_ts": 1_772_324_100,
+                }
+            ]
+        ),
+        data_cfg.layout.market_catalog_table_path,
+    )
+    write_parquet_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "captured_ts_ms": 1_772_323_250_000,
+                    "market_id": "m-keep",
+                    "token_id": "tok-up",
+                    "side": "up",
+                    "best_ask": 0.41,
+                    "best_bid": 0.39,
+                    "ask_size_1": 15.0,
+                    "bid_size_1": 10.0,
+                    "huge_unused_payload": "x" * 10_000,
+                },
+                {
+                    "captured_ts_ms": 1_772_323_250_000,
+                    "market_id": "m-keep",
+                    "token_id": "tok-down",
+                    "side": "down",
+                    "best_ask": 0.59,
+                    "best_bid": 0.57,
+                    "ask_size_1": 13.0,
+                    "bid_size_1": 11.0,
+                    "huge_unused_payload": "y" * 10_000,
+                },
+                {
+                    "captured_ts_ms": 1_772_323_250_000,
+                    "market_id": "m-drop",
+                    "token_id": "tok-other",
+                    "side": "up",
+                    "best_ask": 0.99,
+                    "best_bid": 0.98,
+                    "ask_size_1": 1.0,
+                    "bid_size_1": 1.0,
+                    "huge_unused_payload": "z" * 10_000,
+                },
+            ]
+        ),
+        data_cfg.layout.orderbook_index_path("2026-03-01"),
+    )
+
+    calls: list[dict[str, object]] = []
+    original_loader = orderbook_surface_module.load_orderbook_index_frame
+
+    def _capturing_loader(*, index_path, recent_path=None, columns=None, filters=None):
+        calls.append({"columns": columns, "filters": filters})
+        return original_loader(index_path=index_path, recent_path=recent_path, columns=columns, filters=filters)
+
+    monkeypatch.setattr(orderbook_surface_module, "load_orderbook_index_frame", _capturing_loader)
+
+    replay = pd.DataFrame(
+        [
+            {
+                "decision_ts": "2026-03-01T00:01:00Z",
+                "cycle_start_ts": "2026-03-01T00:00:00Z",
+                "cycle_end_ts": "2026-03-01T00:15:00Z",
+                "offset": 7,
+                "market_id": "m-keep",
+                "condition_id": "c-keep",
+            }
+        ]
+    )
+
+    out, summary = attach_canonical_quote_surface(replay=replay, data_cfg=data_cfg)
+
+    assert summary.quote_ready_rows == 1
+    assert out.loc[0, "quote_status"] == "ok"
+    assert calls
+    assert "huge_unused_payload" not in set(calls[0]["columns"] or [])
+    assert ("market_id", "in", ["m-keep"]) in (calls[0]["filters"] or [])
 
 
 def test_attach_canonical_quote_surface_backfills_blank_market_id_from_cycle_catalog(tmp_path: Path) -> None:

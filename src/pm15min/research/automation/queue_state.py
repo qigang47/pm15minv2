@@ -8,23 +8,28 @@ from pathlib import Path
 from typing import Callable
 
 from pm15min.data.io import write_json_atomic
+from pm15min.research.automation.framework_gates import validate_research_candidate_meta
+from pm15min.research.automation.search_ledger import build_attempt_record
+from pm15min.research.automation.search_policy import validate_candidate_against_policy
 
 
 QueueInspectRun = Callable[[Path], dict[str, object]]
 QueueLauncher = Callable[[dict[str, object]], dict[str, object] | None]
+QueueBatchLauncher = Callable[[list[dict[str, object]]], dict[str, object] | None]
 DEFAULT_QUEUE_TRACK = "default"
 UNKNOWN_QUEUE_TRACK = "unknown"
 BLOCKED_QUEUE_ACTION = "blocked"
-DEFAULT_MAX_LIVE_RUNS = 8
+DEFAULT_MAX_LIVE_RUNS = 10
 DEFAULT_MAX_QUEUED_ITEMS = 24
 DEFAULT_TRACK_SLOT_CAPS = {
-    "direction_dense": 4,
-    "reversal_dense": 4,
+    "direction_dense": 5,
+    "reversal_dense": 5,
 }
 DENSE_QUICK_SCREEN_TRACKS = frozenset({"direction_dense", "reversal_dense"})
 SHARED_QUICK_SCREEN_MARKETS = frozenset({"sol", "xrp"})
 FIXED_TRACK_SLOT_CAPS_ENV = "PM15MIN_FIXED_TRACK_SLOT_CAPS_JSON"
 ALLOWED_QUEUE_MARKETS_ENV = "PM15MIN_ALLOWED_QUEUE_MARKETS"
+AUTO_REFILL_REASON_PREFIX = "auto_refill_"
 
 
 def experiment_queue_path(project_root: Path) -> Path:
@@ -79,7 +84,11 @@ def build_queue_item(
     }
 
 
-def load_experiment_queue(project_root: Path) -> dict[str, object]:
+def load_experiment_queue(
+    project_root: Path,
+    *,
+    apply_fixed_track_slot_caps: bool = True,
+) -> dict[str, object]:
     root = Path(project_root).resolve()
     path = experiment_queue_path(project_root)
     if not path.exists():
@@ -101,7 +110,10 @@ def load_experiment_queue(project_root: Path) -> dict[str, object]:
     payload.setdefault("version", 1)
     payload.setdefault("max_live_runs", DEFAULT_MAX_LIVE_RUNS)
     payload.setdefault("max_queued_items", DEFAULT_MAX_QUEUED_ITEMS)
-    payload["track_slot_caps"] = _normalize_track_slot_caps(payload.get("track_slot_caps"))
+    payload["track_slot_caps"] = _normalize_track_slot_caps(
+        payload.get("track_slot_caps"),
+        apply_fixed=apply_fixed_track_slot_caps,
+    )
     payload.setdefault("updated_at", _utc_now())
     return payload
 
@@ -117,7 +129,7 @@ def save_experiment_queue(project_root: Path, payload: dict[str, object]) -> dic
     items = normalized.get("items")
     normalized["items"] = _filter_queue_items_for_allowed_markets(
         [
-        _normalize_queue_item(root, item)
+        _apply_policy_gate_to_queue_item(root, _normalize_queue_item(root, item))
         for item in (items if isinstance(items, list) else [])
         if isinstance(item, dict)
         ]
@@ -135,6 +147,7 @@ def upsert_queue_item(project_root: Path, item: dict[str, object]) -> dict[str, 
     payload = load_experiment_queue(project_root)
     items = [dict(entry) for entry in payload.get("items") or [] if isinstance(entry, dict)]
     target_item = _normalize_queue_item(root, item)
+    target_item = _apply_policy_gate_to_queue_item(root, target_item)
     target_id = str(target_item.get("id") or "").strip()
 
     retained: list[dict[str, object]] = []
@@ -158,6 +171,56 @@ def upsert_queue_item(project_root: Path, item: dict[str, object]) -> dict[str, 
     retained.append(target_item)
     payload["items"] = retained
     return save_experiment_queue(project_root, payload)
+
+
+def validate_queue_item_search_policy(
+    project_root: Path,
+    item: dict[str, object],
+) -> dict[str, object]:
+    root = Path(project_root).resolve()
+    target_item = _normalize_queue_item(root, dict(item))
+    track = _policy_track_for_item(root, target_item)
+    if track is None:
+        return {"allowed": True, "reason": "", "candidate": {}, "attempts": [], "decision": {}}
+    candidate = build_attempt_record(root, _queue_item_run_payload(target_item), track=track)
+    market = str(target_item.get("market") or "").strip().lower()
+    attempts = _recent_attempt_records_for_policy(root, market=market, track=track)
+    validation = validate_candidate_against_policy(candidate, attempts)
+    validation["candidate"] = candidate
+    validation["attempts"] = attempts
+    return validation
+
+
+def validate_experiment_launch_search_policy(
+    project_root: Path,
+    *,
+    suite_name: str,
+    run_label: str,
+    market: str,
+    track: str | None = None,
+) -> dict[str, object]:
+    root = Path(project_root).resolve()
+    normalized_market = str(market or "").strip().lower()
+    if not normalized_market:
+        normalized_market = _single_suite_market_for_policy(root, suite_name) or ""
+    policy_track = _normalize_policy_track(track) or _infer_policy_track_from_suite(root, suite_name)
+    if not normalized_market or policy_track is None:
+        return {"allowed": True, "reason": "", "candidate": {}, "attempts": [], "decision": {}}
+    candidate = build_attempt_record(
+        root,
+        {
+            "suite_name": str(suite_name or "").strip(),
+            "run_label": str(run_label or "").strip(),
+            "market": normalized_market,
+            "top_case": {},
+        },
+        track=policy_track,
+    )
+    attempts = _recent_attempt_records_for_policy(root, market=normalized_market, track=policy_track)
+    validation = validate_candidate_against_policy(candidate, attempts)
+    validation["candidate"] = candidate
+    validation["attempts"] = attempts
+    return validation
 
 
 def select_launchable_queue_items(
@@ -194,11 +257,6 @@ def select_launchable_queue_items(
     if capacity <= 0:
         return []
 
-    occupied_unknown_markets = {
-        str(item.get("market") or "").strip().lower()
-        for item in occupied_fallback.values()
-        if str(item.get("market") or "").strip()
-    }
     track_usage: dict[str, int] = {}
     for item in occupied_exact.values():
         track = _item_track(item)
@@ -207,12 +265,21 @@ def select_launchable_queue_items(
     track_slot_caps = _normalize_track_slot_caps(payload.get("track_slot_caps"))
     selected: list[dict[str, object]] = []
     selected_track_usage: dict[str, int] = {}
-    occupied_shared_quick_screen_keys = {
+    occupied_shared_quick_screen_keys = _occupied_shared_quick_screen_keys(
+        payload,
+        live_workers=live_payload,
+    )
+    occupied_market_fallbacks = {
+        key[1]
+        for key in occupied_fallback
+        if len(key) == 2 and key[0] == "market"
+    }
+    occupied_suite_run_market_keys = {
         tuple(key[1:])
         for key in occupied_fallback
-        if len(key) == 4 and key[0] == "shared_quick_screen"
+        if len(key) == 4 and key[0] == "suite_run_market"
     }
-    selected_shared_quick_screen_keys: set[tuple[str, str, str]] = set()
+    selected_shared_quick_screen_keys: set[tuple[str, str, str, str]] = set()
     queue_items = [
         dict(item)
         for item in payload.get("items") or []
@@ -225,7 +292,10 @@ def select_launchable_queue_items(
         if market_track is None:
             continue
         market, track = market_track
-        if market in occupied_unknown_markets:
+        if market in occupied_market_fallbacks:
+            continue
+        suite_run_market_key = _suite_run_market_key(item)
+        if suite_run_market_key is not None and suite_run_market_key in occupied_suite_run_market_keys:
             continue
         shared_quick_screen_key = _shared_quick_screen_key(item)
         if shared_quick_screen_key is not None and (
@@ -235,7 +305,7 @@ def select_launchable_queue_items(
             continue
         track_cap = track_slot_caps.get(track)
         if track_cap is not None:
-            used = track_usage.get(track, 0) + unknown_track_usage + selected_track_usage.get(track, 0)
+            used = track_usage.get(track, 0) + selected_track_usage.get(track, 0)
             if used >= int(track_cap):
                 continue
         selected.append(item)
@@ -290,11 +360,15 @@ def reconcile_queue_with_live_workers(
     )
     worker_map: dict[tuple[str, str, str, str], dict[str, object]] = {}
     fallback_alive_keys: set[tuple[str, str, str]] = set()
-    shared_quick_screen_alive_keys: set[tuple[str, str, str]] = set()
+    shared_quick_screen_alive_keys: set[tuple[str, str, str, str]] = set()
+    live_batch_ids: set[str] = set()
     for item in live_workers or []:
         if not isinstance(item, dict):
             continue
         resolved_worker = _resolve_live_worker_metadata(item, known_items)
+        batch_id = _item_batch_id(resolved_worker)
+        if batch_id:
+            live_batch_ids.add(batch_id)
         shared_quick_screen_key = _shared_quick_screen_key(resolved_worker)
         if shared_quick_screen_key is not None:
             shared_quick_screen_alive_keys.add(shared_quick_screen_key)
@@ -317,8 +391,10 @@ def reconcile_queue_with_live_workers(
         identity_key = _resolved_identity_key(item)
         fallback_key = _suite_run_market_key(item)
         shared_quick_screen_key = _shared_quick_screen_key(item)
+        batch_id = _item_batch_id(item)
         if (
-            identity_key in worker_map
+            (batch_id and batch_id in live_batch_ids)
+            or identity_key in worker_map
             or (fallback_key is not None and fallback_key in fallback_alive_keys)
             or (shared_quick_screen_key is not None and shared_quick_screen_key in shared_quick_screen_alive_keys)
         ):
@@ -434,11 +510,17 @@ def reseed_empty_tracks_from_recent_done(
         for item in live_payload
         if _item_track(item) != UNKNOWN_QUEUE_TRACK
     )
-    pending_track_counts = Counter(
+    queued_or_repair_track_counts = Counter(
         _item_track(item)
         for item in items
         if _item_track(item) != UNKNOWN_QUEUE_TRACK
-        and str(item.get("status") or "").strip().lower() in {"queued", "repair", "running"}
+        and str(item.get("status") or "").strip().lower() in {"queued", "repair"}
+    )
+    active_track_counts = Counter(
+        _item_track(item)
+        for item in items
+        if _item_track(item) != UNKNOWN_QUEUE_TRACK
+        and str(item.get("status") or "").strip().lower() == "running"
     )
     occupied_markets_by_track: dict[str, set[str]] = {}
     for item in items:
@@ -471,14 +553,13 @@ def reseed_empty_tracks_from_recent_done(
         track_cap = max(0, int(raw_cap or 0))
         if track_cap <= 0:
             continue
-        track_usage = pending_track_counts.get(track, 0)
+        if queued_or_repair_track_counts.get(track, 0) > 0:
+            continue
+        track_usage = max(active_track_counts.get(track, 0), live_track_counts.get(track, 0))
         if track_usage >= track_cap:
             continue
         refill_gap = max(0, track_cap - track_usage)
         if refill_gap <= 0:
-            continue
-        fully_empty_track = live_track_counts.get(track, 0) <= 0 and pending_track_counts.get(track, 0) <= 0
-        if not fully_empty_track:
             continue
         candidates = _recent_done_reseed_candidates(
             project_root=project_root,
@@ -492,7 +573,7 @@ def reseed_empty_tracks_from_recent_done(
             item_id = str(candidate.get("id") or "").strip()
             if item_id:
                 selected_ids.add(item_id)
-                selected_reasons[item_id] = "auto_refill_empty_track_from_recent_done"
+                selected_reasons[item_id] = "auto_refill_underfilled_track_from_recent_done"
 
     if not selected_ids:
         return payload, []
@@ -551,7 +632,7 @@ def launch_ready_queue_items(
         blocked_by_id: dict[str, str] = {}
         launched_results: dict[str, dict[str, object]] = {}
         launched_ids: set[str] = set()
-        launched_shared_results: dict[tuple[str, str, str], dict[str, object]] = {}
+        launched_shared_results: dict[tuple[str, str, str, str], dict[str, object]] = {}
         for item in selected:
             blocker = _launch_candidate_blocker(item)
             if blocker is not None:
@@ -615,6 +696,236 @@ def launch_ready_queue_items(
     return saved, launched_items
 
 
+def select_launchable_queue_item_batches(
+    payload: dict[str, object],
+    *,
+    max_live_runs: int,
+    live_workers: list[dict[str, object]] | None = None,
+    quick_screen_batch_size: int = 1,
+    max_new_launches: int | None = None,
+    single_pool_per_track: bool = False,
+) -> list[list[dict[str, object]]]:
+    batch_size = max(1, int(quick_screen_batch_size or 1))
+    if batch_size <= 1:
+        selected = select_launchable_queue_items(
+            payload,
+            max_live_runs=max_live_runs,
+            live_workers=live_workers,
+        )
+        if max_new_launches is not None:
+            selected = selected[: max(0, int(max_new_launches))]
+        return [[item] for item in selected]
+
+    occupied_slots = _occupied_launch_slot_keys(payload, live_workers=live_workers)
+    process_capacity = max(0, int(max_live_runs) - len(occupied_slots))
+    if max_new_launches is not None:
+        process_capacity = min(process_capacity, max(0, int(max_new_launches)))
+    if process_capacity <= 0:
+        return []
+
+    track_slot_caps = _normalize_track_slot_caps(payload.get("track_slot_caps"))
+    selected_track_usage: Counter[str] = Counter()
+    running_track_usage = Counter(
+        _item_track(item)
+        for item in payload.get("items") or []
+        if isinstance(item, dict)
+        and str(item.get("status") or "").strip().lower() == "running"
+        and _item_track(item) != UNKNOWN_QUEUE_TRACK
+    )
+    occupied_shared_quick_screen_keys = _occupied_shared_quick_screen_keys(
+        payload,
+        live_workers=live_workers,
+    )
+    occupied_pool_keys = _occupied_quick_screen_pool_keys(
+        payload,
+        live_workers=live_workers,
+    ) if single_pool_per_track else set()
+    selected_ids: set[str] = set()
+    selected_shared_keys: set[tuple[str, str, str, str]] = set()
+    selected_pool_keys: set[tuple[str, str]] = set()
+    queue_items = [
+        dict(item)
+        for item in payload.get("items") or []
+        if isinstance(item, dict)
+        and str(item.get("status") or "").strip().lower() in {"queued", "repair"}
+    ]
+    queue_items.sort(key=_queue_sort_key)
+
+    batches: list[list[dict[str, object]]] = []
+    while len(batches) < process_capacity:
+        seed = _next_batch_seed(
+            queue_items,
+            selected_ids=selected_ids,
+            selected_shared_keys=selected_shared_keys,
+            occupied_shared_keys=occupied_shared_quick_screen_keys,
+            running_track_usage=running_track_usage,
+            selected_track_usage=selected_track_usage,
+            track_slot_caps=track_slot_caps,
+        )
+        if seed is None:
+            break
+        seed_track = _item_track(seed)
+        seed_pool_key = _quick_screen_pool_key(seed)
+        if single_pool_per_track and seed_pool_key is None:
+            selected_ids.add(str(seed.get("id") or "").strip())
+            continue
+        if single_pool_per_track and seed_pool_key in occupied_pool_keys:
+            selected_ids.add(str(seed.get("id") or "").strip())
+            continue
+        if single_pool_per_track and seed_pool_key in selected_pool_keys:
+            selected_ids.add(str(seed.get("id") or "").strip())
+            continue
+        batch: list[dict[str, object]] = []
+        for item in queue_items:
+            if len(batch) >= batch_size:
+                break
+            if _item_track(item) != seed_track:
+                continue
+            if single_pool_per_track and _quick_screen_pool_key(item) != seed_pool_key:
+                continue
+            if not _batch_candidate_available(
+                item,
+                selected_ids=selected_ids,
+                selected_shared_keys=selected_shared_keys,
+                occupied_shared_keys=occupied_shared_quick_screen_keys,
+                running_track_usage=running_track_usage,
+                selected_track_usage=selected_track_usage,
+                track_slot_caps=track_slot_caps,
+            ):
+                continue
+            item_id = str(item.get("id") or "").strip()
+            shared_key = _shared_quick_screen_key(item)
+            selected_ids.add(item_id)
+            if shared_key is not None:
+                selected_shared_keys.add(shared_key)
+            selected_track_usage[seed_track] += 1
+            batch.append(dict(item))
+        if not batch:
+            break
+        if single_pool_per_track:
+            assert seed_pool_key is not None
+            selected_pool_keys.add(seed_pool_key)
+        batches.append(batch)
+    return batches
+
+
+def launch_ready_queue_item_batches(
+    project_root: Path,
+    *,
+    live_workers: list[dict[str, object]] | None = None,
+    batch_launcher: QueueBatchLauncher | None = None,
+    max_live_runs: int = 3,
+    max_new_launches: int | None = None,
+    quick_screen_batch_size: int = 1,
+    single_pool_per_track: bool = False,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    if int(quick_screen_batch_size or 1) <= 1:
+        return launch_ready_queue_items(
+            project_root,
+            live_workers=live_workers,
+            launcher=(lambda item: (batch_launcher([item]) if batch_launcher is not None else {})),
+            max_live_runs=max_live_runs,
+            max_new_launches=max_new_launches,
+        )
+
+    payload = load_experiment_queue(project_root)
+    reserved_live_workers = [dict(item) for item in live_workers or [] if isinstance(item, dict)]
+    launched_items: list[dict[str, object]] = []
+    launched_batch_count = 0
+
+    while True:
+        if max_new_launches is not None and launched_batch_count >= max(0, int(max_new_launches)):
+            break
+        remaining_launches = None
+        if max_new_launches is not None:
+            remaining_launches = max(0, int(max_new_launches) - launched_batch_count)
+        batches = select_launchable_queue_item_batches(
+            payload,
+            max_live_runs=max_live_runs,
+            live_workers=reserved_live_workers,
+            quick_screen_batch_size=quick_screen_batch_size,
+            max_new_launches=remaining_launches,
+            single_pool_per_track=single_pool_per_track,
+        )
+        if not batches:
+            break
+
+        for batch in batches:
+            blocked_by_id: dict[str, str] = {}
+            for item in batch:
+                blocker = _launch_candidate_blocker(item)
+                if blocker is not None:
+                    blocked_by_id[str(item.get("id") or "").strip()] = blocker
+            launched_ids: set[str] = set()
+            launched_shared_results: dict[tuple[str, str, str, str], dict[str, object]] = {}
+            launch_result: dict[str, object] = {}
+            if not blocked_by_id:
+                try:
+                    launch_result = {} if batch_launcher is None else dict(batch_launcher([dict(item) for item in batch]) or {})
+                except Exception as exc:
+                    for item in batch:
+                        blocked_by_id[str(item.get("id") or "").strip()] = f"launch_error: {exc}"
+                else:
+                    launched_batch_count += 1
+                    for item in batch:
+                        item_id = str(item.get("id") or "").strip()
+                        if item_id:
+                            launched_ids.add(item_id)
+                        shared_key = _shared_quick_screen_key(item)
+                        if shared_key is not None:
+                            launched_shared_results[shared_key] = launch_result
+
+            updated_items: list[dict[str, object]] = []
+            for raw_item in payload.get("items") or []:
+                if not isinstance(raw_item, dict):
+                    continue
+                item = dict(raw_item)
+                item_id = str(item.get("id") or "").strip()
+                shared_key = _shared_quick_screen_key(item)
+                if item_id in blocked_by_id:
+                    item["action"] = BLOCKED_QUEUE_ACTION
+                    item["status"] = "dead"
+                    item["updated_at"] = _utc_now()
+                    item["last_error"] = blocked_by_id[item_id]
+                elif item_id in launched_ids or (
+                    shared_key is not None and shared_key in launched_shared_results
+                ):
+                    if str(item.get("status") or "").strip().lower() == "repair":
+                        item["action"] = "repair"
+                    item["status"] = "running"
+                    item["updated_at"] = _utc_now()
+                    if "pid" in launch_result:
+                        item["pid"] = launch_result["pid"]
+                    if "batch_id" in launch_result:
+                        item["batch_id"] = launch_result["batch_id"]
+                    if "manifest_path" in launch_result:
+                        item["batch_manifest_path"] = launch_result["manifest_path"]
+                updated_items.append(item)
+            payload["items"] = updated_items
+
+            batch_id = str(launch_result.get("batch_id") or "").strip()
+            round_launched = [
+                item
+                for item in updated_items
+                if str(item.get("id") or "").strip() in launched_ids
+                or (_shared_quick_screen_key(item) is not None and _shared_quick_screen_key(item) in launched_shared_results)
+            ]
+            if round_launched:
+                launched_items.extend(round_launched)
+                reserved_live_workers.append(
+                    {
+                        "batch_id": batch_id,
+                        "pid": launch_result.get("pid"),
+                    }
+                )
+                reserved_live_workers.extend(round_launched)
+        if max_new_launches is None:
+            continue
+
+    saved = save_experiment_queue(project_root, payload)
+    return saved, launched_items
+
+
 def set_queue_item_status(
     project_root: Path,
     *,
@@ -624,6 +935,7 @@ def set_queue_item_status(
     track: str | None = None,
     status: str,
     reason: str | None = None,
+    last_error: str | None = None,
 ) -> dict[str, object]:
     payload = load_experiment_queue(project_root)
     requested_track = _normalize_track(track)
@@ -653,8 +965,191 @@ def set_queue_item_status(
         items[index]["updated_at"] = _utc_now()
         if reason is not None:
             items[index]["reason"] = str(reason).strip()
+        if last_error is not None:
+            items[index]["last_error"] = str(last_error).strip()
     payload["items"] = items
     return save_experiment_queue(project_root, payload)
+
+
+def _occupied_launch_slot_keys(
+    payload: dict[str, object],
+    *,
+    live_workers: list[dict[str, object]] | None = None,
+) -> set[tuple[str, ...]]:
+    known_items = [dict(item) for item in payload.get("items") or [] if isinstance(item, dict)]
+    occupied: set[tuple[str, ...]] = set()
+    for item in known_items:
+        if str(item.get("status") or "").strip().lower() != "running":
+            continue
+        if not _queue_item_market_allowed(item):
+            continue
+        key = _launch_slot_key(item)
+        if key is not None:
+            occupied.add(key)
+    for worker in live_workers or []:
+        if not isinstance(worker, dict):
+            continue
+        resolved = _resolve_live_worker_metadata(dict(worker), known_items)
+        if not _queue_item_market_allowed(resolved):
+            continue
+        key = _launch_slot_key(resolved)
+        if key is not None:
+            occupied.add(key)
+    return occupied
+
+
+def _occupied_shared_quick_screen_keys(
+    payload: dict[str, object],
+    *,
+    live_workers: list[dict[str, object]] | None = None,
+) -> set[tuple[str, str, str, str]]:
+    known_items = [dict(item) for item in payload.get("items") or [] if isinstance(item, dict)]
+    live_batch_ids: set[str] = set()
+    occupied: set[tuple[str, str, str, str]] = set()
+
+    for worker in live_workers or []:
+        if not isinstance(worker, dict):
+            continue
+        resolved = _resolve_live_worker_metadata(dict(worker), known_items)
+        if not _queue_item_market_allowed(resolved):
+            continue
+        batch_id = _item_batch_id(resolved)
+        if batch_id:
+            live_batch_ids.add(batch_id)
+        shared_key = _shared_quick_screen_key(resolved)
+        if shared_key is not None:
+            occupied.add(shared_key)
+
+    for item in known_items:
+        if not _queue_item_market_allowed(item):
+            continue
+        shared_key = _shared_quick_screen_key(item)
+        if shared_key is None:
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        batch_id = _item_batch_id(item)
+        if status == "running" or (batch_id and batch_id in live_batch_ids):
+            occupied.add(shared_key)
+
+    return occupied
+
+
+def _occupied_quick_screen_pool_keys(
+    payload: dict[str, object],
+    *,
+    live_workers: list[dict[str, object]] | None = None,
+) -> set[tuple[str, str]]:
+    known_items = [dict(item) for item in payload.get("items") or [] if isinstance(item, dict)]
+    occupied: set[tuple[str, str]] = set()
+
+    for worker in live_workers or []:
+        if not isinstance(worker, dict):
+            continue
+        resolved = _resolve_live_worker_metadata(dict(worker), known_items)
+        if not _queue_item_market_allowed(resolved):
+            continue
+        if not _is_quick_screen_pool_worker(resolved):
+            continue
+        key = _quick_screen_pool_key(resolved)
+        if key is not None:
+            occupied.add(key)
+
+    live_batch_ids = {
+        _item_batch_id(worker)
+        for worker in live_workers or []
+        if isinstance(worker, dict) and _item_batch_id(worker)
+    }
+    for item in known_items:
+        if not _queue_item_market_allowed(item):
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        batch_id = _item_batch_id(item)
+        if status != "running" and not (batch_id and batch_id in live_batch_ids):
+            continue
+        if not str(batch_id).startswith("quick_screen_pool_"):
+            continue
+        key = _quick_screen_pool_key(item)
+        if key is not None:
+            occupied.add(key)
+
+    return occupied
+
+
+def _is_quick_screen_pool_worker(item: dict[str, object]) -> bool:
+    cmd = str(item.get("cmd") or "").lower()
+    batch_id = _item_batch_id(item)
+    launcher = str(item.get("launcher") or "").strip().lower()
+    return (
+        "run_quick_screen_pool.py" in cmd
+        or launcher == "quick_screen_pool"
+        or batch_id.startswith("quick_screen_pool_")
+    )
+
+
+def _launch_slot_key(item: dict[str, object]) -> tuple[str, ...] | None:
+    batch_id = _item_batch_id(item)
+    if batch_id:
+        return ("batch", batch_id)
+    fallback_key = _occupancy_fallback_key(item)
+    if fallback_key is not None:
+        return fallback_key
+    identity_key = _resolved_identity_key(item)
+    if identity_key is not None:
+        return ("identity", *identity_key)
+    return None
+
+
+def _next_batch_seed(
+    queue_items: list[dict[str, object]],
+    *,
+    selected_ids: set[str],
+    selected_shared_keys: set[tuple[str, str, str, str]],
+    occupied_shared_keys: set[tuple[str, str, str, str]],
+    running_track_usage: Counter[str],
+    selected_track_usage: Counter[str],
+    track_slot_caps: dict[str, int],
+) -> dict[str, object] | None:
+    for item in queue_items:
+        if _batch_candidate_available(
+            item,
+            selected_ids=selected_ids,
+            selected_shared_keys=selected_shared_keys,
+            occupied_shared_keys=occupied_shared_keys,
+            running_track_usage=running_track_usage,
+            selected_track_usage=selected_track_usage,
+            track_slot_caps=track_slot_caps,
+        ):
+            return dict(item)
+    return None
+
+
+def _batch_candidate_available(
+    item: dict[str, object],
+    *,
+    selected_ids: set[str],
+    selected_shared_keys: set[tuple[str, str, str, str]],
+    occupied_shared_keys: set[tuple[str, str, str, str]],
+    running_track_usage: Counter[str],
+    selected_track_usage: Counter[str],
+    track_slot_caps: dict[str, int],
+) -> bool:
+    item_id = str(item.get("id") or "").strip()
+    if not item_id or item_id in selected_ids:
+        return False
+    if _launch_candidate_blocker(item) is not None:
+        return False
+    track = _item_track(item)
+    if track not in DENSE_QUICK_SCREEN_TRACKS:
+        return False
+    shared_key = _shared_quick_screen_key(item)
+    if shared_key is not None and (shared_key in occupied_shared_keys or shared_key in selected_shared_keys):
+        return False
+    track_cap = track_slot_caps.get(track)
+    if track_cap is not None:
+        used = int(running_track_usage.get(track, 0)) + int(selected_track_usage.get(track, 0))
+        if used >= int(track_cap):
+            return False
+    return True
 
 
 def _queue_sort_key(item: dict[str, object]) -> tuple[int, int, str, str]:
@@ -689,10 +1184,14 @@ def _recent_done_reseed_candidates(
             continue
         if str(item.get("status") or "").strip().lower() != "done":
             continue
+        if _is_completed_auto_refill_repair(item):
+            continue
         if _launch_candidate_blocker(item) is not None:
             continue
         run_payload = inspect_run(_queue_run_dir(project_root, item))
         if str(run_payload.get("state") or "").strip().lower() != "completed":
+            continue
+        if _is_sparse_failure_reseed(item, run_payload):
             continue
         candidates.append(dict(item))
 
@@ -739,6 +1238,340 @@ def _queue_run_dir(project_root: Path, item: dict[str, object]) -> Path:
     suite_name = str(item.get("suite_name") or "").strip()
     run_label = str(item.get("run_label") or "").strip()
     return root / "research" / "experiments" / "runs" / f"suite={suite_name}" / f"run={run_label}"
+
+
+def _apply_policy_gate_to_queue_item(root: Path, item: dict[str, object]) -> dict[str, object]:
+    normalized = dict(item)
+    status = str(normalized.get("status") or "").strip().lower()
+    action = str(normalized.get("action") or "").strip().lower()
+    if status != "queued" or action != "launch":
+        return normalized
+    if "research_meta" in normalized:
+        candidate_gate = validate_research_candidate_meta(
+            normalized.get("research_meta") if isinstance(normalized.get("research_meta"), dict) else {}
+        )
+        normalized["research_candidate_gate"] = candidate_gate
+        if not bool(candidate_gate.get("passed")):
+            normalized["action"] = BLOCKED_QUEUE_ACTION
+            normalized["status"] = "dead"
+            normalized["reason"] = "research_candidate_quality_gate_failed"
+            normalized["last_error"] = ",".join(str(item) for item in candidate_gate.get("failures") or [])
+            normalized["updated_at"] = _utc_now()
+            normalized.pop("pid", None)
+            return normalized
+    try:
+        validation = validate_queue_item_search_policy(root, normalized)
+    except Exception as exc:
+        normalized["research_policy_warning"] = f"policy_validation_failed: {exc}"
+        return normalized
+    if bool(validation.get("allowed")):
+        decision = validation.get("decision")
+        if isinstance(decision, dict) and str(decision.get("required_lever") or "none") != "none":
+            normalized["research_policy_decision"] = decision
+        return normalized
+    normalized["action"] = BLOCKED_QUEUE_ACTION
+    normalized["status"] = "dead"
+    normalized["reason"] = "search_policy_blocked_repeated_sparse_route"
+    normalized["last_error"] = str(validation.get("reason") or "search_policy_blocked")
+    normalized["research_policy_decision"] = validation.get("decision") or {}
+    normalized["updated_at"] = _utc_now()
+    normalized.pop("pid", None)
+    return normalized
+
+
+def _queue_item_run_payload(item: dict[str, object]) -> dict[str, object]:
+    return {
+        "suite_name": str(item.get("suite_name") or "").strip(),
+        "run_label": str(item.get("run_label") or "").strip(),
+        "market": str(item.get("market") or "").strip().lower(),
+        "top_case": {},
+    }
+
+
+def _recent_attempt_records_for_item(root: Path, item: dict[str, object], *, limit: int = 5) -> list[dict[str, object]]:
+    market = str(item.get("market") or "").strip().lower()
+    track = _policy_track_for_item(root, item) or UNKNOWN_QUEUE_TRACK
+    return _recent_attempt_records_for_policy(root, market=market, track=track, limit=limit)
+
+
+def _recent_attempt_records_for_policy(
+    root: Path,
+    *,
+    market: str,
+    track: str,
+    limit: int = 5,
+) -> list[dict[str, object]]:
+    if not market or track == UNKNOWN_QUEUE_TRACK:
+        return []
+    run_dirs = _recent_completed_run_dirs(root)
+    attempts: list[dict[str, object]] = []
+    for run_dir in run_dirs:
+        try:
+            payload = _summarize_completed_run_for_policy(run_dir)
+        except Exception:
+            continue
+        payload_markets = _payload_markets_for_policy(payload)
+        if market not in payload_markets:
+            continue
+        if not _payload_matches_track_for_policy(payload, track):
+            continue
+        attempts.append(build_attempt_record(root, payload, track=track))
+        if len(attempts) >= max(1, int(limit)):
+            break
+    return attempts
+
+
+def _recent_completed_run_dirs(root: Path) -> list[Path]:
+    runs_root = Path(root).resolve() / "research" / "experiments" / "runs"
+    if not runs_root.exists():
+        return []
+    candidates = [
+        path
+        for path in runs_root.glob("suite=*/run=*")
+        if path.is_dir() and ((path / "summary.json").exists() or (path / "quick_screen_summary.json").exists())
+    ]
+    return sorted(candidates, key=_completed_run_mtime, reverse=True)
+
+
+def _completed_run_mtime(run_dir: Path) -> float:
+    for name in ("quick_screen_summary.json", "summary.json"):
+        path = run_dir / name
+        if path.exists():
+            return path.stat().st_mtime
+    return run_dir.stat().st_mtime
+
+
+def _summarize_completed_run_for_policy(run_dir: Path) -> dict[str, object]:
+    summary_path = run_dir / "quick_screen_summary.json"
+    leaderboard_path = run_dir / "quick_screen_leaderboard.csv"
+    quick_screen = True
+    if not summary_path.exists():
+        summary_path = run_dir / "summary.json"
+        leaderboard_path = run_dir / "leaderboard.csv"
+        quick_screen = False
+    summary = _read_json_object(summary_path)
+    top_case = _read_top_policy_csv_row(leaderboard_path, quick_screen=quick_screen)
+    return {
+        "suite_name": str(summary.get("suite_name") or _suite_name_from_run_dir(run_dir) or "").strip(),
+        "run_label": str(summary.get("run_label") or _run_label_from_run_dir(run_dir) or "").strip(),
+        "run_dir": str(run_dir),
+        "markets": _summary_markets_for_policy(summary, top_case),
+        "market": str(top_case.get("market") or "").strip().lower(),
+        "top_case": top_case,
+        "decision_start": str(summary.get("decision_start") or "").strip(),
+        "decision_end": str(summary.get("decision_end") or "").strip(),
+        "train_end": str(summary.get("train_end") or "").strip(),
+    }
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _read_top_policy_csv_row(path: Path, *, quick_screen: bool) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    import csv
+
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        row = next(csv.DictReader(fh), None)
+    if not isinstance(row, dict):
+        return {}
+    density = _parse_density_bottleneck_for_policy(row.get("density_bottleneck"))
+    return {
+        "market": row.get("market"),
+        "feature_set": row.get("feature_set"),
+        "roi_pct": _float_or_none(row.get("roi_pct")),
+        "trades": _int_or_none(row.get("trades") or row.get("trade_rows")),
+        "trade_rows": _int_or_none(row.get("trade_rows")),
+        "profitable_pool_rows": _int_or_none(row.get("profitable_pool_rows")),
+        "profitable_pool_correct_side_rows": _int_or_none(row.get("profitable_pool_correct_side_rows")),
+        "profitable_pool_capture_rows": _int_or_none(row.get("profitable_pool_capture_rows")),
+        "density_bottleneck": density,
+        "quick_screen": bool(quick_screen),
+    }
+
+
+def _parse_density_bottleneck_for_policy(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return dict(value)
+    token = str(value or "").strip()
+    if not token:
+        return {}
+    try:
+        payload = json.loads(token)
+    except json.JSONDecodeError:
+        return {"primary_bottleneck": token}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _summary_markets_for_policy(summary: dict[str, object], top_case: dict[str, object]) -> list[str]:
+    markets: list[str] = []
+    seen: set[str] = set()
+    for raw in summary.get("markets") or []:
+        token = str(raw or "").strip().lower()
+        if token and token not in seen:
+            seen.add(token)
+            markets.append(token)
+    top_market = str(top_case.get("market") or "").strip().lower()
+    if top_market and top_market not in seen:
+        markets.append(top_market)
+    return markets
+
+
+def _payload_markets_for_policy(payload: dict[str, object]) -> set[str]:
+    out = {
+        str(item or "").strip().lower()
+        for item in payload.get("markets") or []
+        if str(item or "").strip()
+    }
+    market = str(payload.get("market") or "").strip().lower()
+    if market:
+        out.add(market)
+    return out
+
+
+def _payload_matches_track_for_policy(payload: dict[str, object], track: str) -> bool:
+    payload_track = _infer_policy_track_from_suite(
+        _project_root_from_policy_payload(payload),
+        str(payload.get("suite_name") or "").strip(),
+    )
+    if payload_track is not None:
+        return payload_track == track
+    suite_name = str(payload.get("suite_name") or "").strip().lower()
+    run_label = str(payload.get("run_label") or "").strip().lower()
+    text = f"{suite_name} {run_label}"
+    if track == "direction_dense":
+        return "reversal" not in text
+    if track == "reversal_dense":
+        return "reversal" in text
+    return True
+
+
+def _policy_track_for_item(root: Path, item: dict[str, object]) -> str | None:
+    track = _normalize_policy_track(_item_track(item))
+    if track is not None:
+        return track
+    return _infer_policy_track_from_suite(root, str(item.get("suite_name") or "").strip())
+
+
+def _normalize_policy_track(value: object) -> str | None:
+    token = str(value or "").strip().lower()
+    if token in DENSE_QUICK_SCREEN_TRACKS:
+        return token
+    if token == "direction":
+        return "direction_dense"
+    if token == "reversal":
+        return "reversal_dense"
+    return None
+
+
+def _infer_policy_track_from_suite(root: Path, suite_name: str | None) -> str | None:
+    payload = _read_suite_spec_for_policy(root, suite_name)
+    if not payload:
+        text = str(suite_name or "").lower()
+        if "reversal" in text:
+            return "reversal_dense"
+        if "direction" in text or "midprice" in text:
+            return "direction_dense"
+        return None
+    targets = _suite_targets_for_policy(payload)
+    if targets == {"reversal"}:
+        return "reversal_dense"
+    if targets == {"direction"}:
+        return "direction_dense"
+    return None
+
+
+def _single_suite_market_for_policy(root: Path, suite_name: str | None) -> str | None:
+    payload = _read_suite_spec_for_policy(root, suite_name)
+    if not payload:
+        return None
+    markets = _suite_markets_for_policy(payload)
+    return next(iter(markets)) if len(markets) == 1 else None
+
+
+def _read_suite_spec_for_policy(root: Path, suite_name: str | None) -> dict[str, object]:
+    token = str(suite_name or "").strip()
+    if not token:
+        return {}
+    path = Path(root).resolve() / "research" / "experiments" / "suite_specs" / f"{token}.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _suite_targets_for_policy(payload: dict[str, object]) -> set[str]:
+    targets: set[str] = set()
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            target = str(value.get("target") or "").strip().lower()
+            if target in {"direction", "reversal"}:
+                targets.add(target)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    if not targets:
+        target = str(payload.get("target") or "").strip().lower()
+        if target in {"direction", "reversal"}:
+            targets.add(target)
+    return targets
+
+
+def _suite_markets_for_policy(payload: dict[str, object]) -> set[str]:
+    markets_payload = payload.get("markets")
+    if isinstance(markets_payload, dict):
+        return {str(key).strip().lower() for key in markets_payload if str(key).strip()}
+    if isinstance(markets_payload, list):
+        out: set[str] = set()
+        for item in markets_payload:
+            if isinstance(item, dict):
+                token = str(item.get("market") or item.get("asset") or "").strip().lower()
+            else:
+                token = str(item or "").strip().lower()
+            if token:
+                out.add(token)
+        return out
+    return set()
+
+
+def _project_root_from_policy_payload(payload: dict[str, object]) -> Path:
+    run_dir = str(payload.get("run_dir") or "").strip()
+    if run_dir:
+        path = Path(run_dir)
+        for candidate in [path, *path.parents]:
+            if (candidate / "research" / "experiments" / "suite_specs").exists():
+                return candidate
+    return Path.cwd()
+
+
+def _suite_name_from_run_dir(path: Path) -> str | None:
+    token = path.parent.name
+    if token.startswith("suite="):
+        return token.split("=", 1)[1] or None
+    return token or None
+
+
+def _run_label_from_run_dir(path: Path) -> str | None:
+    token = path.name
+    if token.startswith("run="):
+        return token.split("=", 1)[1] or None
+    return token or None
 
 
 def _default_inspect_run(run_dir: Path) -> dict[str, object]:
@@ -821,7 +1654,7 @@ def _normalize_track(track: object) -> str:
     return str(track or "").strip().lower()
 
 
-def _normalize_track_slot_caps(raw_caps: object) -> dict[str, int]:
+def _normalize_track_slot_caps(raw_caps: object, *, apply_fixed: bool = True) -> dict[str, int]:
     normalized = dict(DEFAULT_TRACK_SLOT_CAPS)
     if isinstance(raw_caps, dict):
         for raw_key, raw_value in raw_caps.items():
@@ -829,7 +1662,7 @@ def _normalize_track_slot_caps(raw_caps: object) -> dict[str, int]:
             if not key:
                 continue
             normalized[key] = max(0, int(raw_value or 0))
-    fixed_caps = _configured_fixed_track_slot_caps()
+    fixed_caps = _configured_fixed_track_slot_caps() if apply_fixed else {}
     if fixed_caps:
         for key, value in fixed_caps.items():
             normalized[key] = value
@@ -947,6 +1780,16 @@ def _market_track_key(item: dict[str, object]) -> tuple[str, str] | None:
     return (market, _item_track(item))
 
 
+def _quick_screen_pool_key(item: dict[str, object]) -> tuple[str, str] | None:
+    track = _item_track(item)
+    if track not in DENSE_QUICK_SCREEN_TRACKS:
+        return None
+    market = str(item.get("market") or "").strip().lower()
+    if market not in SHARED_QUICK_SCREEN_MARKETS:
+        return None
+    return (track, market)
+
+
 def _worker_run_key(item: dict[str, object]) -> tuple[str, str] | None:
     suite_name = str(item.get("suite_name") or "").strip()
     run_label = str(item.get("run_label") or "").strip()
@@ -974,7 +1817,11 @@ def _suite_run_market_key(item: dict[str, object]) -> tuple[str, str, str] | Non
     return (suite_name, run_label, market)
 
 
-def _shared_quick_screen_key(item: dict[str, object]) -> tuple[str, str, str] | None:
+def _item_batch_id(item: dict[str, object]) -> str:
+    return str(item.get("batch_id") or "").strip()
+
+
+def _shared_quick_screen_key(item: dict[str, object]) -> tuple[str, str, str, str] | None:
     track = _item_track(item)
     if track not in DENSE_QUICK_SCREEN_TRACKS:
         return None
@@ -985,7 +1832,7 @@ def _shared_quick_screen_key(item: dict[str, object]) -> tuple[str, str, str] | 
     run_label = str(item.get("run_label") or "").strip()
     if not suite_name or not run_label:
         return None
-    return (suite_name, run_label, track)
+    return (suite_name, run_label, market, track)
 
 
 def _occupancy_fallback_key(item: dict[str, object]) -> tuple[str, ...] | None:
@@ -1133,6 +1980,54 @@ def _launch_candidate_blocker(item: dict[str, object]) -> str | None:
     status = str(item.get("status") or "").strip().lower()
     label = "repair" if action == "repair" or status == "repair" else "launch"
     return f"unlaunchable_{label}: missing " + ",".join(missing)
+
+
+def _is_completed_auto_refill_repair(item: dict[str, object]) -> bool:
+    action = str(item.get("action") or "").strip().lower()
+    reason = str(item.get("reason") or "").strip().lower()
+    return action == "repair" and reason.startswith(AUTO_REFILL_REASON_PREFIX)
+
+
+def _is_sparse_failure_reseed(item: dict[str, object], run_payload: dict[str, object]) -> bool:
+    reason = str(item.get("reason") or "").strip().lower()
+    if any(
+        marker in reason
+        for marker in (
+            "reject_sparse",
+            "completed_sparse",
+            "below_56",
+            "below dense floor",
+            "below_dense_floor",
+            "probability_gate",
+            "no_sparse_promotion",
+        )
+    ):
+        return True
+
+    top_case = run_payload.get("top_case") if isinstance(run_payload.get("top_case"), dict) else {}
+    trades = _int_or_none(
+        top_case.get("trades")
+        or top_case.get("trade_rows")
+        or run_payload.get("trades")
+        or run_payload.get("trade_rows")
+    )
+    if trades is not None and trades < 56:
+        return True
+    return False
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        return None if value in {None, ""} else int(value)
+    except Exception:
+        return None
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        return None if value in {None, ""} else float(value)
+    except Exception:
+        return None
 
 
 def _advance_running_item_failure(

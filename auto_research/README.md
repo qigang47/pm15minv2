@@ -55,6 +55,8 @@ Main entrypoints:
   - keep up to the configured live-experiment cap running from the repo-local queue
 - `auto_research/summarize_experiment.py`
   - extract a compact JSON summary from a finished experiment run
+- `auto_research/factor_scout.py`
+  - prepare a public-source factor-scout prompt and inspect the candidate backlog
 - `auto_research/update_session.py`
   - append one cycle into the active session files
 - `auto_research/codex_background_loop.sh`
@@ -86,6 +88,8 @@ Core automation modules:
   - profitable-offset-pool fast-screen evaluation logic
 - `src/pm15min/research/automation/focus_feature_search.py`
   - focused feature-family search helpers
+- `src/pm15min/research/automation/factor_scout.py`
+  - public-source factor idea scouting prompt and backlog summarization
 
 Default session resolution:
 
@@ -109,7 +113,7 @@ Operator overrides:
   - choose a different isolated home root
 - `CODEX_MODEL=gpt-5.5`
   - default background decision model; override only for deliberate special cycles
-- `CODEX_REASONING_EFFORT=high`
+- `CODEX_REASONING_EFFORT=xhigh`
   - default background reasoning level used by `codex exec`
 - `CODEX_PROMPT_BUDGET_MODE=compact`
   - omit large prompt sections and rely on precomputed summaries unless the cycle is blocked
@@ -135,8 +139,8 @@ Operator overrides:
   - choose whether the primary provider path clears proxy env vars or inherits them
 - `CODEX_OFFICIAL_NETWORK_PROXY_MODE=direct|inherit|managed`
   - choose the network mode for the official auth path separately from the primary provider path
-- `CODEX_OFFICIAL_PRIORITY=first|fallback`
-  - choose whether official ChatGPT auth runs before external providers or only after they fail
+- `CODEX_OFFICIAL_PRIORITY=disabled|fallback|first`
+  - official login is disabled by default; set `fallback` or `first` only when you intentionally want to use `CODEX_OFFICIAL_AUTH_PATH`
 - `MAX_CONSECUTIVE_FAILURES=5`
   - change the consecutive failure threshold recorded in status
 - `CODEX_STOP_ON_CONSECUTIVE_FAILURES=0|1`
@@ -144,17 +148,60 @@ Operator overrides:
 
 Default background retry order:
 
-- official login from `CODEX_OFFICIAL_AUTH_PATH`
 - secondary Nimabo key from `CODEX_SECONDARY_BASE_URL` + `CODEX_SECONDARY_API_KEY`
 - optional backup provider from `CODEX_FALLBACK_BASE_URL` + `CODEX_FALLBACK_API_KEY`
-- when `CODEX_OFFICIAL_PRIORITY=fallback`, official login moves to the final fallback position
+- official login is disabled by default
+- when `CODEX_OFFICIAL_PRIORITY=fallback`, official login becomes the final fallback position
+- when `CODEX_OFFICIAL_PRIORITY=first`, official login runs before Nimabo
+
+## Search Discipline
+
+Autoresearch now treats every completed run as a structured attempt. The prompt
+receives the run window, feature-set width, model family, top-case outcome, and
+dominant bottleneck before it sees queue capacity. This prevents stale-window
+results and repeated same-suite sparse runs from steering the next cycle.
+
+When three recent attempts are sparse, the search policy can require the next
+branch to change feature width, factor family, model family, or weighting. Queue
+refill should keep underfilled SOL/XRP quick-screen tracks supplied instead of
+waiting until a track is completely empty.
+
+Every new launch queue item should carry candidate metadata:
+
+- primary lever
+- feature width
+- model family
+- feature set
+- factor-family change
+- expected trade-count effect
+- concrete difference from recent failures
+
+The queue accepts older historical items for compatibility, but new launch
+items with explicit metadata are checked before they are allowed to run. A
+candidate that repeats a sparse route without a real change should be blocked
+instead of consuming memory.
+
+Fast-screen winners are not final answers. When a quick-screen top row is marked
+for formal promotion, treat it as `formal_required`: it still needs a full
+formal confirmation before it is treated as a real result.
+
+The factor scout is a separate research-input layer. It looks for public-source
+factor ideas and writes them to `docs/DEEP_OTM_BASELINE_FACTOR_SCOUT_BACKLOG.md`.
+Those candidates are leads only: the main autoresearch loop may read the summary,
+but it must still turn any idea into a bounded experiment through the normal
+suite/spec/session flow.
+
+Each long-lived research line should keep its own factor-scout stamp under its
+own autorun directory. That lets BTC, ETH, direction, and reversal refresh their
+own public-source backlog independently instead of one recent scout pass blocking
+the other lines.
 
 Dense wrapper defaults:
 
 - `start_direction_dense.sh` and `start_reversal_dense.sh` pin `CODEX_OFFICIAL_AUTH_PATH` to the shared `var/research/autorun/codex-official-auth.json`
 - the dense wrappers keep `CODEX_NETWORK_PROXY_MODE=direct` unless you override it
-- the dense wrappers keep `CODEX_OFFICIAL_NETWORK_PROXY_MODE=managed` unless you override it, so official auth uses the managed proxy env file
-- the dense wrappers keep `CODEX_OFFICIAL_PRIORITY=first` unless you override it
+- the dense wrappers keep `CODEX_OFFICIAL_NETWORK_PROXY_MODE=managed` available for explicit official-auth runs, using the managed proxy env file when you opt in
+- the dense wrappers keep `CODEX_OFFICIAL_PRIORITY=disabled` unless you override it, so they default to Nimabo/fallback providers rather than official auth
 
 ## Runtime Flow
 
@@ -267,9 +314,10 @@ In practice the moving parts are:
    - it reconciles queue state against actual live workers
    - it launches or resumes work until it reaches the configured caps
    - current defaults are:
-     - `MAX_LIVE_RUNS=8`
-     - `TRACK_SLOT_CAPS_JSON={"direction_dense":4,"reversal_dense":4}`
-     - `MIN_AVAILABLE_MEM_GB=2`
+     - `MAX_LIVE_RUNS=5`
+     - `TRACK_SLOT_CAPS_JSON={"direction_dense":3,"reversal_dense":2}`
+     - `MIN_AVAILABLE_MEM_GB=1`
+     - `PM15MIN_QUEUE_QUICK_SCREEN_WORKER_MEM_GB=16`
      - `MAX_QUEUED_ITEMS=24`
      - `QUEUE_SUPERVISOR_LOOP_SLEEP_SEC=5`
 
@@ -319,11 +367,70 @@ Operational consequence:
 
 Current dense expectation:
 
-- direction and reversal together target up to 16 live workers total
+- direction and reversal together currently target up to 5 shared SOL/XRP quick-screen workers by default, as long as the memory gate has room for them
 - the intended steady state is usually near:
-  - 8 direction workers
-  - 8 reversal workers
-- temporary dips below 16 can still happen when a track finishes workers faster than its Codex loop produces the next refillable candidates
+  - 3 direction workers
+  - 2 reversal workers
+- temporary dips below 5 can still happen when memory is protected, a track has no refillable candidate, or a repeated sparse route is blocked
+
+## Memory Safety Runbook
+
+The queue supervisor has a launch-time memory gate, but it is not a full-machine
+safety guarantee. Full formal BTC/ETH workers and SOL/XRP quick-screen batches
+can each hold large feature/orderbook frames in memory. If they overlap too
+aggressively, Linux may kill a large Python worker even though the queue logic is
+still healthy.
+
+The default worker-memory budget is intentionally conservative:
+
+- keep `MIN_AVAILABLE_MEM_GB=1` for the hard system reserve
+- keep `PM15MIN_QUEUE_QUICK_SCREEN_WORKER_MEM_GB=16` unless live measurements
+  show a lower value is safe
+- this budget is for launch planning only; it does not cap the worker's real
+  memory use after launch
+
+When memory is tight, protect work in this order:
+
+1. Keep orderbook recording alive.
+2. Keep BTC/ETH formal workers alive if they are already running.
+3. Keep Codex decision loops alive if they are not adding pressure.
+4. Pause SOL/XRP quick-screen batches first, because they can be replayed later.
+
+Use this emergency pattern when `MemAvailable` is only a few GB, swap is nearly
+full, or `journalctl -k` shows OOM kills:
+
+```bash
+./auto_research/experiment_queue_supervisor.sh stop
+pkill -TERM -f scripts/research/run_quick_screen_queue_batch.py
+```
+
+Do not use the dense stack `stop` command for this emergency case unless you
+intend to stop orderbook recording and all experiment workers too. The dense
+stack stop path is intentionally broad.
+
+After the machine recovers, check the layers separately:
+
+```bash
+free -h
+journalctl -k --since "30 min ago" --no-pager | egrep -i "out of memory|oom|killed process" || true
+ps -eo pid,etime,%cpu,%mem,rss,cmd --sort=-%mem | egrep "run-suite|run_quick_screen_queue_batch|run_orderbook_recorder" | head -40
+PYTHONPATH=src python3 scripts/monitoring/report_orderbook_capture_health.py --root . --cycle 15m --assets btc,eth,sol,xrp --lookback-minutes 5
+PYTHONPATH=src python3 scripts/monitoring/report_orderbook_capture_health.py --root . --cycle 5m --assets btc,eth,sol,xrp --lookback-minutes 5
+```
+
+Restart SOL/XRP quick-screen dispatch only after BTC/ETH formal memory pressure
+has dropped or there is enough headroom for another large worker:
+
+```bash
+./auto_research/experiment_queue_supervisor.sh start
+```
+
+Important distinction:
+
+- stopping the queue supervisor prevents new quick-screen launches
+- terminating `run_quick_screen_queue_batch.py` releases current SOL/XRP fast-screen memory
+- neither action should stop orderbook recorders
+- neither action should stop already-running BTC/ETH formal workers
 
 Typical commands:
 
@@ -355,7 +462,8 @@ Standalone BTC/ETH midprice direction commands:
 
 These BTC/ETH lines intentionally do not use the shared SOL/XRP quick-screen
 queue. Each coin has its own Codex background loop, its own session, and one
-full formal midprice-direction experiment live at a time.
+full formal midprice-direction experiment live at a time. Their wrappers also
+default to `gpt-5.5` with `xhigh` reasoning and line-local factor-scout stamps.
 
 Queue one formal follow-up instead of launching it immediately:
 
@@ -365,7 +473,17 @@ Queue one formal follow-up instead of launching it immediately:
   --suite baseline_focus_feature_search_btc_reversal_40v6_bias60_2usd_5max_20260413 \
   --run-label auto_btc_40v6_bias60_2usd_5max_20260413 \
   --action launch \
-  --reason "queue from codex cycle"
+  --track reversal_dense \
+  --session-dir sessions/deep_otm_baseline_reversal_dense_autoresearch \
+  --program-path auto_research/program_reversal_dense.md \
+  --reason "queue from codex cycle" \
+  --primary-lever factor_family \
+  --feature-width 40 \
+  --model-family deep_otm \
+  --feature-set focus_btc_40_v6_bias60 \
+  --factor-family-change "replace overloaded short-return family with bias/flow features" \
+  --expected-trade-count-effect "increase dense trade count while preserving winner-side capture" \
+  --difference-from-recent-failures "changes the dominant factor family instead of repeating a same-width sparse retry"
 ```
 
 Long-lived formal worker launch:

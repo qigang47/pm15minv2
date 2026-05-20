@@ -1,0 +1,18 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+export PROGRAM_PATH="${PROGRAM_PATH:-$ROOT_DIR/auto_research/program_direction_dense_sol_xrp.md}"
+export SESSION_DIR="${SESSION_DIR:-$ROOT_DIR/sessions/deep_otm_baseline_direction_dense_sol_xrp_autoresearch}"
+export AUTORUN_DIR="${AUTORUN_DIR:-$ROOT_DIR/var/research/autorun/direction_dense_sol_xrp}"
+export WAKE_FLAG="${WAKE_FLAG:-$AUTORUN_DIR/wake.flag}"
+export PM15MIN_AUTORESEARCH_WAKE_FLAG="${PM15MIN_AUTORESEARCH_WAKE_FLAG:-$WAKE_FLAG}"
+export PM15MIN_ALLOWED_QUEUE_MARKETS="${PM15MIN_ALLOWED_QUEUE_MARKETS:-sol,xrp}"
+export PM15MIN_EXPERIMENT_LAUNCH_MODE="${PM15MIN_EXPERIMENT_LAUNCH_MODE:-quick_screen}"
+export PM15MIN_QUICK_SCREEN_TOP_K="${PM15MIN_QUICK_SCREEN_TOP_K:-1}"
+export PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS="${PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS:-1}"
+export PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY="${PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY:-5}"
+export CODEX_ATTEMPT_TIMEOUT_SEC="${CODEX_ATTEMPT_TIMEOUT_SEC:-1800}"
+export CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC="${CODEX_HEAVY_ANALYSIS_TIMEOUT_SEC:-2700}"
+
+exec "$ROOT_DIR/auto_research/start_direction_dense.sh" "$@"

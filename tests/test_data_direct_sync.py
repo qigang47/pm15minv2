@@ -38,6 +38,9 @@ class _FakeGammaClient:
             }
         ]
 
+    def fetch_closed_markets(self, *, start_ts: int, end_ts: int, limit: int, max_pages: int | None, sleep_sec: float):
+        return []
+
 
 class _FakeChainlinkSource:
     def __init__(self, rpc=None) -> None:
@@ -470,3 +473,65 @@ def test_sync_settlement_truth_from_gamma_does_not_promote_unresolved_market_pri
     assert df.iloc[0]["winner_side"] == ""
     assert bool(df.iloc[0]["onchain_resolved"]) is False
     assert bool(df.iloc[0]["full_truth"]) is False
+
+
+def test_sync_settlement_truth_from_gamma_falls_back_to_closed_market_window_when_id_lookup_misses(
+    tmp_path: Path,
+) -> None:
+    cfg = DataConfig.build(market="btc", cycle="15m", root=tmp_path / "v2")
+    market_table = pd.DataFrame(
+        [
+            {
+                "market_id": "2178090",
+                "condition_id": "cond-1",
+                "asset": "btc",
+                "cycle": "15m",
+                "cycle_start_ts": 1778197500,
+                "cycle_end_ts": 1778198400,
+                "token_up": "token-up",
+                "token_down": "token-down",
+                "slug": "btc-updown-15m-1778197500",
+                "question": "Bitcoin Up or Down",
+                "resolution_source": "https://data.chain.link/streams/btc-usd",
+                "event_id": "event-1",
+                "event_slug": "slug-1",
+                "event_title": "title-1",
+                "series_slug": "btc-up-or-down-15m",
+                "closed_ts": 1778198426,
+                "source_snapshot_ts": "2026-05-09T10:00:00Z",
+            }
+        ]
+    )
+    write_parquet_atomic(market_table, cfg.layout.market_catalog_table_path)
+
+    class _WindowOnlyGammaClient:
+        def __init__(self) -> None:
+            self.closed_market_calls: list[tuple[int, int]] = []
+
+        def fetch_markets_by_ids(self, market_ids: list[str], *, sleep_sec: float = 0.0):
+            return []
+
+        def fetch_closed_markets(self, *, start_ts: int, end_ts: int, limit: int, max_pages: int | None, sleep_sec: float):
+            self.closed_market_calls.append((int(start_ts), int(end_ts)))
+            return [
+                {
+                    "id": "2178090",
+                    "slug": "btc-updown-15m-1778197500",
+                    "outcomes": '["Up", "Down"]',
+                    "outcomePrices": '["1", "0"]',
+                    "umaResolutionStatus": "resolved",
+                }
+            ]
+
+    client = _WindowOnlyGammaClient()
+
+    summary = sync_settlement_truth_from_gamma(cfg, client=client)
+
+    assert summary["rows_imported"] == 1
+    assert summary["rows_resolved"] == 1
+    assert summary["matched_markets"] == 1
+    assert summary["market_window_fallbacks"] == 1
+    assert client.closed_market_calls == [(1778198400, 1778198460)]
+    df = pd.read_parquet(cfg.layout.settlement_truth_source_path)
+    assert df.iloc[0]["winner_side"] == "UP"
+    assert bool(df.iloc[0]["full_truth"]) is True

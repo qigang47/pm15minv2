@@ -76,9 +76,10 @@ pm15min_activate_python
 
 export PYTHONPATH="$ROOT_DIR/src"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/pm15min-mpl}"
-export PM15MIN_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES="${PM15MIN_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES:-1}"
+export PM15MIN_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES="${PM15MIN_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES:-0}"
+export PM15MIN_BACKTEST_SURFACE_RUNTIME_CACHE_MAX_ENTRIES="${PM15MIN_BACKTEST_SURFACE_RUNTIME_CACHE_MAX_ENTRIES:-0}"
 export PM15MIN_MEMORY_GUARD_ENABLE="${PM15MIN_MEMORY_GUARD_ENABLE:-1}"
-export PM15MIN_MIN_AVAILABLE_MEM_GB="${PM15MIN_MIN_AVAILABLE_MEM_GB:-12}"
+export PM15MIN_MIN_AVAILABLE_MEM_GB="${PM15MIN_MIN_AVAILABLE_MEM_GB:-1}"
 export PM15MIN_MEMORY_GUARD_SLEEP_SEC="${PM15MIN_MEMORY_GUARD_SLEEP_SEC:-30}"
 export PM15MIN_MEMORY_GUARD_MAX_WAIT_SEC="${PM15MIN_MEMORY_GUARD_MAX_WAIT_SEC:-0}"
 if [[ -n "$CLI_LAUNCH_MODE" ]]; then
@@ -101,8 +102,62 @@ if [[ -n "$CLI_EXPECTED_CONCURRENCY" ]]; then
 else
   export PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY="${PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY:-16}"
 fi
+if [[ "${PM15MIN_EXPERIMENT_LAUNCH_MODE:-formal}" == "quick_screen" ]]; then
+  export PM15MIN_MODEL_BUNDLE_COPY_DIAGNOSTICS="${PM15MIN_MODEL_BUNDLE_COPY_DIAGNOSTICS:-0}"
+  export PM15MIN_QUICK_SCREEN_ARTIFACT_RETENTION="${PM15MIN_QUICK_SCREEN_ARTIFACT_RETENTION:-compact_rejects}"
+  export PM15MIN_QUICK_SCREEN_RETAIN_MIN_TRADES="${PM15MIN_QUICK_SCREEN_RETAIN_MIN_TRADES:-56}"
+  export PM15MIN_QUICK_SCREEN_CLEAN_FEATURE_FRAMES="${PM15MIN_QUICK_SCREEN_CLEAN_FEATURE_FRAMES:-1}"
+  export PM15MIN_QUICK_SCREEN_CLEAN_TRAINING_SETS="${PM15MIN_QUICK_SCREEN_CLEAN_TRAINING_SETS:-1}"
+fi
 export PM15MIN_EXPERIMENT_CPU_THREADS="${PM15MIN_EXPERIMENT_CPU_THREADS:-}"
 mkdir -p "$MPLCONFIGDIR"
+
+RUN_DIR="$("$PYTHON_BIN" - <<'PY' "$ROOT_DIR" "$SUITE_NAME" "$RUN_LABEL"
+from pathlib import Path
+import sys
+from pm15min.research.layout import ResearchLayout
+
+root = Path(sys.argv[1]).resolve()
+suite = sys.argv[2]
+run_label = sys.argv[3]
+layout = ResearchLayout.discover(root)
+print(layout.experiment_run_dir(suite, run_label))
+PY
+)"
+
+if [[ -e "$RUN_DIR/summary.json" || -e "$RUN_DIR/quick_screen_summary.json" ]]; then
+  echo "[run_one_experiment] refusing to reuse completed run label run_dir=$RUN_DIR" >&2
+  exit 73
+fi
+
+if [[ ! -e "$RUN_DIR/logs/suite.jsonl" && ! -d "$RUN_DIR/artifacts" ]]; then
+  set +e
+  policy_gate_output="$(
+    PYTHONPATH="$ROOT_DIR/src" "$PYTHON_BIN" - <<'PY' "$ROOT_DIR" "$SUITE_NAME" "$RUN_LABEL" "$MARKET" "${EXPERIMENT_TRACK:-}"
+from pathlib import Path
+import json
+import sys
+
+from pm15min.research.automation.queue_state import validate_experiment_launch_search_policy
+
+payload = validate_experiment_launch_search_policy(
+    Path(sys.argv[1]),
+    suite_name=sys.argv[2],
+    run_label=sys.argv[3],
+    market=sys.argv[4],
+    track=sys.argv[5] or None,
+)
+print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+raise SystemExit(0 if payload.get("allowed", True) else 76)
+PY
+  )"
+  policy_gate_exit="$?"
+  set -e
+  if [[ "$policy_gate_exit" -ne 0 ]]; then
+    echo "[run_one_experiment] search_policy_blocked $policy_gate_output" >&2
+    exit "$policy_gate_exit"
+  fi
+fi
 
 if [[ -z "$PM15MIN_EXPERIMENT_CPU_THREADS" ]]; then
   cpu_count=""
@@ -132,6 +187,8 @@ export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$PM15MIN_EXPERIMENT_CPU_THREA
 export GOTO_NUM_THREADS="${GOTO_NUM_THREADS:-$PM15MIN_EXPERIMENT_CPU_THREADS}"
 export BLIS_NUM_THREADS="${BLIS_NUM_THREADS:-$PM15MIN_EXPERIMENT_CPU_THREADS}"
 export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-$PM15MIN_EXPERIMENT_CPU_THREADS}"
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+export PYTHONMALLOC="${PYTHONMALLOC:-malloc}"
 
 if [[ -z "$LOG_PATH" ]]; then
   LOG_PATH="$ROOT_DIR/var/research/logs/autorun/${RUN_LABEL}.log"
@@ -198,7 +255,7 @@ wait_for_memory_guard() {
 }
 
 notify_autoresearch_wake() {
-  if [[ "$LAUNCH_MODE" == "formal" ]]; then
+  if [[ "$LAUNCH_MODE" == "formal" || "$LAUNCH_MODE" == "quick_screen" ]]; then
     if [[ -n "${PM15MIN_AUTORESEARCH_WAKE_FLAG:-}" ]]; then
       mkdir -p "$(dirname "$PM15MIN_AUTORESEARCH_WAKE_FLAG")"
       touch "$PM15MIN_AUTORESEARCH_WAKE_FLAG"
@@ -259,19 +316,6 @@ notify_autoresearch_wake
 if [[ "$run_exit_code" -ne 0 ]]; then
   exit "$run_exit_code"
 fi
-
-RUN_DIR="$("$PYTHON_BIN" - <<'PY' "$ROOT_DIR" "$SUITE_NAME" "$RUN_LABEL"
-from pathlib import Path
-import sys
-from pm15min.research.layout import ResearchLayout
-
-root = Path(sys.argv[1]).resolve()
-suite = sys.argv[2]
-run_label = sys.argv[3]
-layout = ResearchLayout.discover(root)
-print(layout.experiment_run_dir(suite, run_label))
-PY
-)"
 
 echo "$RUN_DIR"
 exit "$run_exit_code"

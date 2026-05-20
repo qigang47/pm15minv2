@@ -18,6 +18,64 @@ def _utc_now_label() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _merge_markets_by_id(markets: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    return {
+        str(item.get("id") or "").strip(): item
+        for item in markets
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+
+
+def _fetch_missing_gamma_markets_by_end_window(
+    *,
+    client: GammaEventsClient,
+    base: pd.DataFrame,
+    known_market_ids: set[str],
+    limit: int,
+    sleep_sec: float,
+    max_workers: int,
+) -> tuple[list[dict[str, object]], int]:
+    missing = base[~base["market_id"].isin(known_market_ids)].copy()
+    if missing.empty:
+        return [], 0
+    missing["cycle_end_ts"] = pd.to_numeric(missing["cycle_end_ts"], errors="coerce")
+    end_series = missing["cycle_end_ts"].dropna()
+    if end_series.empty:
+        return [], 0
+    min_ts = int(end_series.min())
+    max_ts = int(end_series.max())
+    step = 86400
+    windows: list[tuple[int, int]] = []
+    cursor = min_ts
+    while cursor <= max_ts:
+        window_end = min(max_ts, cursor + step)
+        windows.append((cursor, window_end))
+        cursor = window_end + 1
+
+    def _fetch(window: tuple[int, int]) -> list[dict[str, object]]:
+        start_ts, end_ts = window
+        if end_ts <= start_ts:
+            end_ts = start_ts + 60
+        return client.fetch_closed_markets(
+            start_ts=int(start_ts),
+            end_ts=int(end_ts),
+            limit=int(limit),
+            max_pages=None,
+            sleep_sec=float(sleep_sec),
+        )
+
+    fetched: list[dict[str, object]] = []
+    if max(1, int(max_workers)) <= 1:
+        for window in windows:
+            fetched.extend(_fetch(window))
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
+            future_map = {executor.submit(_fetch, window): window for window in windows}
+            for future in as_completed(future_map):
+                fetched.extend(future.result())
+    return fetched, len(windows)
+
+
 def sync_streams_from_rpc(
     cfg: DataConfig,
     *,
@@ -354,13 +412,23 @@ def sync_settlement_truth_from_gamma(
                     fetched.extend(future.result())
     else:
         fetched = [item for item in fetched_markets if isinstance(item, dict)]
-    by_market_id = {
-        str(item.get("id") or "").strip(): item
-        for item in fetched
-        if isinstance(item, dict) and str(item.get("id") or "").strip()
-    }
-
     base["market_id"] = base["market_id"].astype(str)
+    by_market_id = _merge_markets_by_id(fetched)
+    fallback_fetched: list[dict[str, object]] = []
+    fallback_windows = 0
+    if fetched_markets is None:
+        fallback_fetched, fallback_windows = _fetch_missing_gamma_markets_by_end_window(
+            client=client,
+            base=base,
+            known_market_ids=set(by_market_id),
+            limit=cfg.gamma_limit,
+            sleep_sec=cfg.sleep_sec,
+            max_workers=workers,
+        )
+        if fallback_fetched:
+            fetched.extend(fallback_fetched)
+            by_market_id.update(_merge_markets_by_id(fallback_fetched))
+
     resolved_by_market_id = {
         market_id: gamma_market_is_resolved(market)
         for market_id, market in by_market_id.items()
@@ -417,6 +485,8 @@ def sync_settlement_truth_from_gamma(
         "rows_resolved": int(out["full_truth"].fillna(False).sum()),
         "markets_fetched": int(len(fetched)),
         "matched_markets": int(base["market_id"].isin(by_market_id).sum()),
+        "market_window_fallbacks": int(fallback_windows),
+        "markets_fetched_by_window": int(len(fallback_fetched)),
         "canonical_rows": int(len(canonical)),
         "target_path": str(cfg.layout.settlement_truth_source_path),
     }

@@ -260,6 +260,30 @@ def test_run_live_data_foundation_accepts_5m(tmp_path: Path, monkeypatch) -> Non
     assert summary["cycle"] == "5m"
 
 
+def test_run_live_data_foundation_degrades_binance_refresh_failure(tmp_path: Path, monkeypatch) -> None:
+    cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
+
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_market_catalog", lambda *args, **kwargs: {"dataset": "market_catalog"})
+    monkeypatch.setattr(
+        "pm15min.data.pipelines.foundation_runtime.sync_binance_klines_1m",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Failed to fetch Binance klines for SOLUSDT: 451")),
+    )
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.sync_streams_from_rpc", lambda *args, **kwargs: {"dataset": "chainlink_streams_rpc"})
+    monkeypatch.setattr(
+        "pm15min.data.pipelines.foundation_runtime.sync_polymarket_oracle_price_window",
+        lambda *args, **kwargs: {"dataset": "polymarket_direct_oracle_price_window"},
+    )
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.build_oracle_prices_15m", lambda *args, **kwargs: {"dataset": "oracle_prices_15m"})
+    monkeypatch.setattr("pm15min.data.pipelines.foundation_runtime.run_orderbook_recorder", lambda *args, **kwargs: {"status": "ok", "dataset": "orderbook_depth"})
+
+    summary = run_live_data_foundation(cfg, iterations=1, loop=False)
+
+    assert summary["status"] == "ok_with_errors"
+    assert summary["degraded_tasks"][0]["task"] == "binance"
+    assert summary["degraded_tasks"][0]["issue_code"] == "binance_refresh_failed"
+    assert summary["last_results"]["market_catalog"]["dataset"] == "market_catalog"
+
+
 def test_run_live_data_foundation_persists_error_metadata_before_raise(tmp_path: Path, monkeypatch) -> None:
     cfg = DataConfig.build(market="sol", cycle="15m", surface="live", root=tmp_path / "v2")
 

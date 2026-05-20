@@ -314,7 +314,7 @@ def apply_decision_engine_parity(
     min_dir_prob_boost_column: str | None = None,
 ) -> pd.DataFrame:
     """Annotate a frame with DecisionEngine parity columns using quote-style fallbacks."""
-    out = rows.copy()
+    out = rows.copy(deep=False)
     cfg = config or DecisionEngineParityConfig()
     if out.empty:
         for column in DECISION_ENGINE_PARITY_COLUMNS:

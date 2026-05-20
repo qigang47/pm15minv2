@@ -58,17 +58,27 @@ def split_policy_decisions(decisions: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
 
 
 def build_policy_reject_frame(decisions: pd.DataFrame) -> pd.DataFrame:
-    rejected = decisions.loc[decisions.get("policy_action", "reject").astype(str).ne("trade")].copy()
-    if rejected.empty:
+    policy_action = _string_series(decisions, "policy_action") if "policy_action" in decisions.columns else pd.Series(
+        "reject",
+        index=decisions.index,
+        dtype="string",
+    ).astype(str)
+    reject_mask = policy_action.ne("trade")
+    if not bool(reject_mask.any()):
         return pd.DataFrame(columns=[*REPLAY_KEY_COLUMNS, "decision_source", "policy_reason", "reason"])
-    frame = pd.DataFrame(index=rejected.index)
+    frame = pd.DataFrame(index=decisions.index[reject_mask])
     for column in REPLAY_KEY_COLUMNS:
-        if column in rejected.columns:
-            frame[column] = rejected[column]
+        if column in decisions.columns:
+            frame[column] = decisions.loc[reject_mask, column]
         else:
             frame[column] = pd.NA
-    frame["decision_source"] = _decision_source_series(rejected)
-    frame["policy_reason"] = rejected.get("policy_reason", rejected.get("reject_reason", "")).astype(str)
+    frame["decision_source"] = _decision_source_series(decisions).loc[reject_mask]
+    if "policy_reason" in decisions.columns:
+        frame["policy_reason"] = decisions.loc[reject_mask, "policy_reason"].astype(str)
+    elif "reject_reason" in decisions.columns:
+        frame["policy_reason"] = decisions.loc[reject_mask, "reject_reason"].astype(str)
+    else:
+        frame["policy_reason"] = ""
     frame["reason"] = frame["policy_reason"]
     for column in (
         "pre_submit_orderbook_retry_armed",
@@ -77,8 +87,8 @@ def build_policy_reject_frame(decisions: pd.DataFrame) -> pd.DataFrame:
         "pre_submit_orderbook_retry_max",
         "pre_submit_orderbook_retry_state_key",
     ):
-        if column in rejected.columns:
-            frame[column] = rejected[column]
+        if column in decisions.columns:
+            frame[column] = decisions.loc[reject_mask, column]
     return frame.reset_index(drop=True)
 
 

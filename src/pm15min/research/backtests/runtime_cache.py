@@ -10,17 +10,36 @@ from threading import RLock
 import pandas as pd
 
 
-DEFAULT_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES = 8
+DEFAULT_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES = 0
+DEFAULT_BACKTEST_SURFACE_RUNTIME_CACHE_MAX_ENTRIES = 0
+
+
+def _non_negative_int_env(name: str, *, default: int) -> int:
+    raw = str(os.environ.get(name) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return int(default)
+
+
+def _positive_int_env(name: str, *, default: int) -> int:
+    return max(1, _non_negative_int_env(name, default=default))
 
 
 def _default_backtest_runtime_cache_max_entries() -> int:
-    raw = str(os.environ.get("PM15MIN_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES") or "").strip()
-    if not raw:
-        return DEFAULT_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES
-    try:
-        return max(1, int(raw))
-    except Exception:
-        return DEFAULT_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES
+    return _non_negative_int_env(
+        "PM15MIN_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES",
+        default=DEFAULT_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES,
+    )
+
+
+def _default_backtest_surface_runtime_cache_max_entries() -> int:
+    return _non_negative_int_env(
+        "PM15MIN_BACKTEST_SURFACE_RUNTIME_CACHE_MAX_ENTRIES",
+        default=DEFAULT_BACKTEST_SURFACE_RUNTIME_CACHE_MAX_ENTRIES,
+    )
 
 
 @dataclass(frozen=True)
@@ -82,13 +101,61 @@ class BacktestPreparedRuntime:
         )
 
 
+@dataclass(frozen=True)
+class BacktestSurfaceRuntimeKey:
+    rewrite_root: str
+    market: str
+    cycle: str
+    source_surface: str
+    feature_set: str
+    label_set: str
+    profile_spec_key: str
+    liquidity_proxy_mode: str
+    raw_depth_fak_refresh_enabled: bool
+    decision_start: str
+    decision_end: str
+    available_offsets: tuple[int, ...]
+    surface_input_signature: str
+
+
+@dataclass(frozen=True)
+class BacktestSurfaceRuntime:
+    depth_replay: pd.DataFrame
+    depth_replay_summary: object
+    depth_candidate_lookup: Mapping[tuple[object, ...], list[dict[str, object]]]
+    runtime_replay: pd.DataFrame
+    quote_summary: object
+    state_summary: object
+    source_mtimes: tuple[tuple[str, int | None], ...]
+
+    def is_current(self) -> bool:
+        return all(_path_mtime_ns(Path(raw_path)) == expected for raw_path, expected in self.source_mtimes)
+
+    def clone(self) -> "BacktestSurfaceRuntime":
+        return BacktestSurfaceRuntime(
+            depth_replay=self.depth_replay.copy(deep=False),
+            depth_replay_summary=self.depth_replay_summary,
+            depth_candidate_lookup=self.depth_candidate_lookup,
+            runtime_replay=self.runtime_replay.copy(deep=False),
+            quote_summary=self.quote_summary,
+            state_summary=self.state_summary,
+            source_mtimes=tuple(self.source_mtimes),
+        )
+
+
 class BacktestRuntimeStageCache:
     def __init__(self, *, max_entries: int = DEFAULT_BACKTEST_RUNTIME_CACHE_MAX_ENTRIES) -> None:
-        self._max_entries = max(1, int(max_entries))
+        self._max_entries = max(0, int(max_entries))
         self._entries: OrderedDict[BacktestSharedRuntimeKey, BacktestPreparedRuntime] = OrderedDict()
         self._lock = RLock()
 
+    @property
+    def enabled(self) -> bool:
+        return self._max_entries > 0
+
     def get(self, key: BacktestSharedRuntimeKey) -> BacktestPreparedRuntime | None:
+        if self._max_entries <= 0:
+            return None
         with self._lock:
             cached = self._entries.get(key)
             if cached is None:
@@ -100,6 +167,47 @@ class BacktestRuntimeStageCache:
             return cached.clone()
 
     def put(self, key: BacktestSharedRuntimeKey, prepared: BacktestPreparedRuntime) -> BacktestPreparedRuntime:
+        if self._max_entries <= 0:
+            return prepared
+        stored = prepared.clone()
+        with self._lock:
+            self._entries[key] = stored
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+        return stored.clone()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+class BacktestSurfaceRuntimeStageCache:
+    def __init__(self, *, max_entries: int = DEFAULT_BACKTEST_SURFACE_RUNTIME_CACHE_MAX_ENTRIES) -> None:
+        self._max_entries = max(0, int(max_entries))
+        self._entries: OrderedDict[BacktestSurfaceRuntimeKey, BacktestSurfaceRuntime] = OrderedDict()
+        self._lock = RLock()
+
+    @property
+    def enabled(self) -> bool:
+        return self._max_entries > 0
+
+    def get(self, key: BacktestSurfaceRuntimeKey) -> BacktestSurfaceRuntime | None:
+        if self._max_entries <= 0:
+            return None
+        with self._lock:
+            cached = self._entries.get(key)
+            if cached is None:
+                return None
+            if not cached.is_current():
+                self._entries.pop(key, None)
+                return None
+            self._entries.move_to_end(key)
+            return cached.clone()
+
+    def put(self, key: BacktestSurfaceRuntimeKey, prepared: BacktestSurfaceRuntime) -> BacktestSurfaceRuntime:
+        if self._max_entries <= 0:
+            return prepared
         stored = prepared.clone()
         with self._lock:
             self._entries[key] = stored
@@ -116,14 +224,22 @@ class BacktestRuntimeStageCache:
 _PROCESS_BACKTEST_RUNTIME_CACHE = BacktestRuntimeStageCache(
     max_entries=_default_backtest_runtime_cache_max_entries()
 )
+_PROCESS_BACKTEST_SURFACE_RUNTIME_CACHE = BacktestSurfaceRuntimeStageCache(
+    max_entries=_default_backtest_surface_runtime_cache_max_entries()
+)
 
 
 def process_backtest_runtime_cache() -> BacktestRuntimeStageCache:
     return _PROCESS_BACKTEST_RUNTIME_CACHE
 
 
+def process_backtest_surface_runtime_cache() -> BacktestSurfaceRuntimeStageCache:
+    return _PROCESS_BACKTEST_SURFACE_RUNTIME_CACHE
+
+
 def clear_process_backtest_runtime_cache() -> None:
     _PROCESS_BACKTEST_RUNTIME_CACHE.clear()
+    _PROCESS_BACKTEST_SURFACE_RUNTIME_CACHE.clear()
 
 
 def snapshot_source_mtimes(paths: list[Path]) -> tuple[tuple[str, int | None], ...]:
@@ -144,7 +260,11 @@ __all__ = [
     "BacktestPreparedRuntime",
     "BacktestRuntimeStageCache",
     "BacktestSharedRuntimeKey",
+    "BacktestSurfaceRuntime",
+    "BacktestSurfaceRuntimeKey",
+    "BacktestSurfaceRuntimeStageCache",
     "clear_process_backtest_runtime_cache",
     "process_backtest_runtime_cache",
+    "process_backtest_surface_runtime_cache",
     "snapshot_source_mtimes",
 ]

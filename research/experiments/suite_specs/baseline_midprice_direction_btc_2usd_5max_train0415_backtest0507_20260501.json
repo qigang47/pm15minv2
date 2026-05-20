@@ -1,0 +1,61 @@
+{
+  "suite_name": "baseline_midprice_direction_btc_2usd_5max_train0415_backtest0507_20260501",
+  "cycle": "15m",
+  "profile": "deep_otm_midprice_direction",
+  "model_family": "deep_otm",
+  "label_set": "truth",
+  "target": "direction",
+  "feature_set": "bs_q_replace_direction",
+  "offsets": [
+    7,
+    8,
+    9
+  ],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-04-15"
+  },
+  "decision_start": "2026-04-15",
+  "decision_end": "2026-05-07",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "stakes": [
+    2.0
+  ],
+  "max_notional_usd": 10.0,
+  "max_trades_per_market_values": [
+    5
+  ],
+  "runtime_policy": {
+    "completed_cases": "rerun",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 1
+  },
+  "tags": [
+    "midprice_direction",
+    "direction",
+    "truth",
+    "2usd",
+    "max5",
+    "entry_45_50",
+    "min_dir_prob_60",
+    "formal_only",
+    "train0415",
+    "backtest0507"
+  ],
+  "markets": {
+    "btc": {
+      "groups": {
+        "midprice_direction": {
+          "runs": [
+            {
+              "run_name": "direction_entry45_50_prob60"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

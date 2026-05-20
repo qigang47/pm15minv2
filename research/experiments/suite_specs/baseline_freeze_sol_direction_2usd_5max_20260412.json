@@ -1,0 +1,42 @@
+{
+  "suite_name": "baseline_freeze_sol_direction_2usd_5max_20260412",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "label_set": "truth",
+  "target": "direction",
+  "feature_set": "bs_q_replace_direction",
+  "offsets": [7, 8, 9],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-31"
+  },
+  "decision_start": "2026-04-01",
+  "decision_end": "2026-04-23",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "stakes": [2.0],
+  "max_notional_usd": 10.0,
+  "max_trades_per_market_values": [5],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 1
+  },
+  "tags": ["baseline_freeze", "stage0", "direction", "truth", "2usd", "max5", "noret30"],
+  "markets": {
+    "sol": {
+      "groups": {
+        "baseline_freeze": {
+          "runs": [
+            {
+              "run_name": "direction_baseline"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

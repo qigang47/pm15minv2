@@ -9,27 +9,42 @@ PID_PATH="$STATE_DIR/experiment-queue-supervisor.pid"
 STATUS_PATH="$STATE_DIR/experiment-queue-supervisor.status.json"
 LOG_PATH="$STATE_DIR/experiment-queue-supervisor.log"
 STOP_FLAG="$STATE_DIR/experiment-queue-supervisor.stop.flag"
+RUN_LOCK_PATH="$STATE_DIR/experiment-queue-supervisor.run.lock"
 QUEUE_SUPERVISOR_LOOP_SLEEP_SEC="${QUEUE_SUPERVISOR_LOOP_SLEEP_SEC:-5}"
-MAX_LIVE_RUNS="${MAX_LIVE_RUNS:-8}"
+QUEUE_SUPERVISOR_PREWARM_ENABLE="${QUEUE_SUPERVISOR_PREWARM_ENABLE:-0}"
+MAX_LIVE_RUNS="${MAX_LIVE_RUNS:-10}"
 MAX_QUEUED_ITEMS="${MAX_QUEUED_ITEMS:-24}"
-MAX_LAUNCHES_PER_PASS="${MAX_LAUNCHES_PER_PASS:-1}"
+MAX_LAUNCHES_PER_PASS="${MAX_LAUNCHES_PER_PASS:-10}"
 MAX_REPAIR_ATTEMPTS="${MAX_REPAIR_ATTEMPTS:-3}"
-MIN_AVAILABLE_MEM_GB="${MIN_AVAILABLE_MEM_GB:-2}"
-DEFAULT_TRACK_SLOT_CAPS_JSON='{"direction_dense":4,"reversal_dense":4}'
+MIN_AVAILABLE_MEM_GB="${MIN_AVAILABLE_MEM_GB:-1}"
+PM15MIN_QUEUE_QUICK_SCREEN_BATCH_SIZE="${PM15MIN_QUEUE_QUICK_SCREEN_BATCH_SIZE:-10}"
+PM15MIN_QUEUE_QUICK_SCREEN_WORKER_MEM_GB="${PM15MIN_QUEUE_QUICK_SCREEN_WORKER_MEM_GB:-16}"
+PM15MIN_QUICK_SCREEN_USE_POOL="${PM15MIN_QUICK_SCREEN_USE_POOL:-1}"
+DEFAULT_TRACK_SLOT_CAPS_JSON='{"direction_dense":5,"reversal_dense":5}'
 TRACK_SLOT_CAPS_JSON="${TRACK_SLOT_CAPS_JSON:-$DEFAULT_TRACK_SLOT_CAPS_JSON}"
 PM15MIN_FIXED_TRACK_SLOT_CAPS_JSON="${PM15MIN_FIXED_TRACK_SLOT_CAPS_JSON:-$TRACK_SLOT_CAPS_JSON}"
 PM15MIN_ALLOWED_QUEUE_MARKETS="${PM15MIN_ALLOWED_QUEUE_MARKETS:-${MARKETS:-sol,xrp}}"
 PM15MIN_EXPERIMENT_LAUNCH_MODE="quick_screen"
 PM15MIN_QUICK_SCREEN_TOP_K="${PM15MIN_QUICK_SCREEN_TOP_K:-1}"
-PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS="${PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS:-2}"
-PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY="${PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY:-$MAX_LIVE_RUNS}"
+PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS="${PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS:-1}"
+PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY="${PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY:-5}"
 
 export PM15MIN_EXPERIMENT_LAUNCH_MODE
+export MAX_LIVE_RUNS
+export MAX_QUEUED_ITEMS
+export MAX_LAUNCHES_PER_PASS
+export MAX_REPAIR_ATTEMPTS
+export MIN_AVAILABLE_MEM_GB
+export TRACK_SLOT_CAPS_JSON
 export PM15MIN_QUICK_SCREEN_TOP_K
 export PM15MIN_QUICK_SCREEN_TRAIN_PARALLEL_WORKERS
 export PM15MIN_EXPECTED_EXPERIMENT_CONCURRENCY
+export PM15MIN_QUEUE_QUICK_SCREEN_BATCH_SIZE
+export PM15MIN_QUEUE_QUICK_SCREEN_WORKER_MEM_GB
+export PM15MIN_QUICK_SCREEN_USE_POOL
 export PM15MIN_FIXED_TRACK_SLOT_CAPS_JSON
 export PM15MIN_ALLOWED_QUEUE_MARKETS
+export QUEUE_SUPERVISOR_PREWARM_ENABLE
 
 mkdir -p "$STATE_DIR"
 
@@ -63,16 +78,26 @@ PY
 }
 
 run_once() {
-  "$PREWARM_SCRIPT" ensure >> "$LOG_PATH" 2>&1
-  PYTHONPATH="$ROOT_DIR/src" python3 "$ROOT_DIR/auto_research/experiment_queue.py" \
-    --root "$ROOT_DIR" \
-    supervise-once \
-    --max-live-runs "$MAX_LIVE_RUNS" \
-    --max-queued-items "$MAX_QUEUED_ITEMS" \
-    --max-launches-per-pass "$MAX_LAUNCHES_PER_PASS" \
-    --max-repair-attempts "$MAX_REPAIR_ATTEMPTS" \
-    --min-available-mem-gb "$MIN_AVAILABLE_MEM_GB" \
-    --track-slot-caps "$TRACK_SLOT_CAPS_JSON"
+  (
+    if ! flock -n 9; then
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] queue supervisor pass skipped; another pass is running" >> "$LOG_PATH"
+      return 0
+    fi
+    if [[ "$QUEUE_SUPERVISOR_PREWARM_ENABLE" == "1" ]]; then
+      "$PREWARM_SCRIPT" ensure >> "$LOG_PATH" 2>&1
+    fi
+    PYTHONPATH="$ROOT_DIR/src" python3 "$ROOT_DIR/auto_research/experiment_queue.py" \
+      --root "$ROOT_DIR" \
+      supervise-once \
+      --max-live-runs "$MAX_LIVE_RUNS" \
+      --max-queued-items "$MAX_QUEUED_ITEMS" \
+      --max-launches-per-pass "$MAX_LAUNCHES_PER_PASS" \
+      --max-repair-attempts "$MAX_REPAIR_ATTEMPTS" \
+      --min-available-mem-gb "$MIN_AVAILABLE_MEM_GB" \
+      --quick-screen-batch-size "$PM15MIN_QUEUE_QUICK_SCREEN_BATCH_SIZE" \
+      --quick-screen-worker-mem-gb "$PM15MIN_QUEUE_QUICK_SCREEN_WORKER_MEM_GB" \
+      --track-slot-caps "$TRACK_SLOT_CAPS_JSON"
+  ) 9>"$RUN_LOCK_PATH"
 }
 
 loop_body() {
@@ -84,7 +109,9 @@ loop_body() {
       write_status "stopped"
       exit 0
     fi
-    run_once >> "$LOG_PATH" 2>&1
+    if ! run_once >> "$LOG_PATH" 2>&1; then
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] queue supervisor pass failed; continuing" >> "$LOG_PATH"
+    fi
     write_status "running"
     sleep "$QUEUE_SUPERVISOR_LOOP_SLEEP_SEC"
   done

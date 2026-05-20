@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from pm15min.core.orderbook_index import iter_orderbook_index_record_batches
 from pm15min.data.config import DataConfig
 from pm15min.data.io.ndjson_zst import iter_ndjson_zst
 from pm15min.data.queries.loaders import load_market_catalog
@@ -51,6 +52,14 @@ DEPTH_REPLAY_INTERNAL_COLUMNS = [
 DEPTH_REPLAY_OUTPUT_COLUMNS = [
     *REPLAY_KEY_COLUMNS,
     *DEPTH_REPLAY_METADATA_COLUMNS,
+]
+DEPTH_REPLAY_INDEX_FALLBACK_COLUMNS = [
+    "captured_ts_ms",
+    "market_id",
+    "token_id",
+    "side",
+    "best_ask",
+    "ask_size_1",
 ]
 
 
@@ -161,7 +170,10 @@ def build_raw_depth_replay_frame(
             if heartbeat is not None:
                 heartbeat(f"Depth replay falling back to orderbook index for {date_str}")
             local_buckets, local_row_candidate_totals, local_records_scanned, local_record_matches = _scan_depth_replay_records(
-                records=_iter_orderbook_index_records(index_path),
+                records=_iter_orderbook_index_records(
+                    index_path,
+                    market_ids=date_lookup["market_ids"],
+                ),
                 source_path=index_path,
                 date_lookup=date_lookup,
                 snapshot_tolerance_ms=tolerance_ms,
@@ -299,29 +311,33 @@ def _merge_depth_bucket(target: dict[str, Any], incoming: dict[str, Any]) -> Non
     target["match_strategies"].update(set(incoming.get("match_strategies") or set()))
 
 
-def _iter_orderbook_index_records(index_path: Path) -> Any:
-    columns = [
-        "captured_ts_ms",
-        "market_id",
-        "token_id",
-        "side",
-        "best_ask",
-        "ask_size_1",
-    ]
-    frame = pd.read_parquet(index_path, columns=columns)
-    for row in frame.itertuples(index=False):
-        best_ask = _float_or_none(getattr(row, "best_ask", None))
-        ask_size_1 = _float_or_none(getattr(row, "ask_size_1", None))
-        asks: list[list[float]] = []
-        if best_ask is not None and best_ask > 0.0 and ask_size_1 is not None and ask_size_1 > 0.0:
-            asks = [[float(best_ask), float(ask_size_1)]]
-        yield {
-            "captured_ts_ms": _int_or_none(getattr(row, "captured_ts_ms", None)),
-            "market_id": str(getattr(row, "market_id", "") or "").strip(),
-            "token_id": str(getattr(row, "token_id", "") or "").strip(),
-            "side": str(getattr(row, "side", "") or "").strip().lower(),
-            "asks": asks,
-        }
+def _iter_orderbook_index_records(index_path: Path, *, market_ids: set[str] | None = None) -> Any:
+    filters = _orderbook_index_fallback_filters(market_ids=market_ids)
+    for frame in iter_orderbook_index_record_batches(
+        index_path=index_path,
+        columns=DEPTH_REPLAY_INDEX_FALLBACK_COLUMNS,
+        filters=filters,
+    ):
+        for row in frame.itertuples(index=False):
+            best_ask = _float_or_none(getattr(row, "best_ask", None))
+            ask_size_1 = _float_or_none(getattr(row, "ask_size_1", None))
+            asks: list[list[float]] = []
+            if best_ask is not None and best_ask > 0.0 and ask_size_1 is not None and ask_size_1 > 0.0:
+                asks = [[float(best_ask), float(ask_size_1)]]
+            yield {
+                "captured_ts_ms": _int_or_none(getattr(row, "captured_ts_ms", None)),
+                "market_id": str(getattr(row, "market_id", "") or "").strip(),
+                "token_id": str(getattr(row, "token_id", "") or "").strip(),
+                "side": str(getattr(row, "side", "") or "").strip().lower(),
+                "asks": asks,
+            }
+
+
+def _orderbook_index_fallback_filters(*, market_ids: set[str] | None = None) -> list[tuple[str, str, object]] | None:
+    cleaned_market_ids = sorted(str(value) for value in (market_ids or set()) if str(value))
+    if not cleaned_market_ids:
+        return None
+    return [("market_id", "in", cleaned_market_ids)]
 
 
 def _empty_depth_replay_frame(replay: pd.DataFrame) -> pd.DataFrame:

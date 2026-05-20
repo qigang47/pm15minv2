@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
+import gc
 import json
 import shutil
 from pathlib import Path
@@ -66,9 +67,9 @@ def train_research_run(
     event_log_path = logs_dir / "train.jsonl"
 
     summaries: list[dict[str, object]] = []
-    offset_metrics: dict[int, dict[str, object]] = {}
     base_trainer_cfg = TrainerConfig(
         parallel_workers=max(1, int(spec.parallel_workers or 1)),
+        include_catboost=_training_run_uses_catboost(spec.model_family),
         balance_classes=TrainerConfig.balance_classes if spec.balance_classes is None else bool(spec.balance_classes),
         weight_by_vol=TrainerConfig.weight_by_vol if spec.weight_by_vol is None else bool(spec.weight_by_vol),
         inverse_vol=TrainerConfig.inverse_vol if spec.inverse_vol is None else bool(spec.inverse_vol),
@@ -125,7 +126,6 @@ def train_research_run(
                 ),
             )
             input_paths.append({"kind": "training_set", "path": str(training_set_path)})
-            offset_metrics[offset] = result
             summaries.append(_training_summary_row(offset=offset, result=result))
             report_training_progress(
                 reporter,
@@ -145,6 +145,8 @@ def train_research_run(
                     "output_dir": str(run_dir / "offsets" / f"offset={offset}"),
                 },
             )
+            del result
+            _trim_training_memory()
     else:
         future_map = {}
         with ThreadPoolExecutor(max_workers=min(parallel_workers, total_offsets)) as executor:
@@ -186,7 +188,6 @@ def train_research_run(
                 training_set_path, result = future.result()
                 completed_offsets += 1
                 input_paths.append({"kind": "training_set", "path": str(training_set_path)})
-                offset_metrics[offset] = result
                 summaries.append(_training_summary_row(offset=offset, result=result))
                 report_training_progress(
                     reporter,
@@ -206,6 +207,8 @@ def train_research_run(
                         "output_dir": str(run_dir / "offsets" / f"offset={offset}"),
                     },
                 )
+                del result
+                _trim_training_memory()
 
     summary_df = pd.DataFrame(summaries).sort_values("offset").reset_index(drop=True)
     report_training_progress(
@@ -344,10 +347,12 @@ def _train_single_offset(
     )
     logreg = fit_logreg(X, y, cfg=trainer_cfg, sample_weight=sample_weight)
     lgbm = fit_lgbm(X, y, cfg=trainer_cfg, sample_weight=sample_weight)
-    try:
-        catboost = fit_catboost(X, y, cfg=trainer_cfg, sample_weight=sample_weight)
-    except CatBoostUnavailableError:
-        catboost = None
+    catboost = None
+    if trainer_cfg.include_catboost:
+        try:
+            catboost = fit_catboost(X, y, cfg=trainer_cfg, sample_weight=sample_weight)
+        except CatBoostUnavailableError:
+            catboost = None
 
     report_training_progress(
         reporter,
@@ -628,6 +633,14 @@ def _training_summary_row(*, offset: int, result: dict[str, object]) -> dict[str
         row["brier_catboost"] = metrics["catboost"]["brier"]
         row["auc_catboost"] = metrics["catboost"]["auc"]
     return row
+
+
+def _training_run_uses_catboost(model_family: str) -> bool:
+    return "catboost" in str(model_family or "").strip().lower()
+
+
+def _trim_training_memory() -> None:
+    gc.collect()
 
 
 def _trainer_cfg_for_offset(

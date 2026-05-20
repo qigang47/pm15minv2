@@ -8,7 +8,32 @@ import pytest
 
 from pm15min.research.config import ResearchConfig
 from pm15min.research.experiments.compare_policy import build_variant_compare_frame
-from pm15min.research.experiments.runner import run_experiment_suite
+from pm15min.research.experiments.runner import _backtest_run_label, run_experiment_suite
+
+
+class _LongNameMarketSpec:
+    market = "xrp"
+    variant_label = "default"
+
+
+def test_backtest_run_label_caps_long_formal_names(monkeypatch) -> None:
+    long_spec = _LongNameMarketSpec()
+    long_spec.group_name = "focus_search"
+    long_spec.run_name = (
+        "xrp_reversal_56v1r929_calendarcheap_crossguard_catboost_capturetrim_weightsearch"
+        "__fs_56v1r929_calendarcheap_crossguard_capturetrim_cycle474"
+        "__w_xrp_56v1r929_capturetrim_winner_080_offset9_low__max5"
+    )
+
+    label = _backtest_run_label(
+        run_label="formal_xrp_reversal_56v1r929_capturetrim_winner080_20260514_run",
+        market_spec=long_spec,
+        case_key="f8d2e461abcdef012345",
+    )
+
+    assert len(label) <= 120
+    assert label.startswith("formal_xrp_reversal_56v1r929_capturetrim_winner080_20260514_run-xrp")
+    assert label.endswith("-f8d2e461")
 
 
 def test_build_variant_compare_frame_assigns_reference_ranks_and_deltas() -> None:

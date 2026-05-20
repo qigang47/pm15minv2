@@ -1,0 +1,77 @@
+{
+  "suite_name": "baseline_focus_feature_search_eth_reversal_40family_vs30_20260407",
+  "cycle": "15m",
+  "profile": "deep_otm_baseline",
+  "model_family": "deep_otm",
+  "feature_set": "focus_eth_40_v4",
+  "label_set": "truth",
+  "target": "reversal",
+  "offsets": [
+    7,
+    8,
+    9
+  ],
+  "window": {
+    "start": "2025-10-27",
+    "end": "2026-03-27"
+  },
+  "decision_start": "2026-03-28",
+  "decision_end": "2026-04-03",
+  "backtest_spec": "baseline_truth",
+  "parity": {
+    "disable_ret_30m_direction_guard": true
+  },
+  "stakes": [
+    1.0
+  ],
+  "max_notional_usd": 3.0,
+  "max_trades_per_market_values": [
+    3
+  ],
+  "runtime_policy": {
+    "completed_cases": "resume",
+    "failed_cases": "rerun",
+    "parallel_case_workers": 2
+  },
+  "tags": [
+    "factor_search",
+    "focus_feature_search",
+    "reversal",
+    "latest7d",
+    "orderbook_locked",
+    "noret30",
+    "40factor",
+    "eth_followup",
+    "comparison"
+  ],
+  "markets": {
+    "eth": {
+      "groups": {
+        "focus_search": {
+          "runs": [
+            {
+              "run_name": "focus_search",
+              "feature_set_variants": [
+                {
+                  "label": "30_v4_compare",
+                  "feature_set": "focus_eth_30_v4",
+                  "notes": "ETH previous quick-screen leader kept only for comparison"
+                },
+                {
+                  "label": "40_v2",
+                  "feature_set": "focus_eth_40_v2",
+                  "notes": "ETH 40-factor active-trade candidate"
+                },
+                {
+                  "label": "40_v4",
+                  "feature_set": "focus_eth_40_v4",
+                  "notes": "ETH 40-factor high-ROI low-trade candidate"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -422,6 +422,8 @@ def _next_foundation_task_due_at(
 
 
 def _task_can_fail_open(cfg: DataConfig, *, task_name: str) -> bool:
+    if task_name == "binance":
+        return True
     if task_name in {"oracle", "streams"} and cfg.layout.oracle_prices_table_path.exists():
         return True
     return False

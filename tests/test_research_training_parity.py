@@ -17,7 +17,13 @@ from pm15min.research.labels.datasets import build_label_frame_dataset
 from pm15min.research.training.reports import render_offset_training_report, render_training_run_report
 from pm15min.research.training.runner import train_research_run
 from pm15min.research.training.splits import build_purged_time_series_splits
-from pm15min.research.training.trainers import TrainerConfig, fit_catboost, fit_lgbm, generate_oof_predictions
+from pm15min.research.training.trainers import (
+    TrainerConfig,
+    fit_catboost,
+    fit_lgbm,
+    generate_oof_predictions,
+    prepare_training_matrix,
+)
 from pm15min.research.training.weights import compute_sample_weights
 
 
@@ -210,21 +216,21 @@ def test_train_research_run_writes_reports_and_rich_offset_summary(tmp_path: Pat
         assert (offset_dir / "summary.json").exists()
         assert (offset_dir / "report.md").exists()
         assert (offset_dir / "feature_pruning.json").exists()
-        assert (offset_dir / "models" / "catboost.joblib").exists()
+        assert not (offset_dir / "models" / "catboost.joblib").exists()
         assert (offset_dir / "logreg_coefficients.json").exists()
         assert (offset_dir / "lgb_feature_importance.json").exists()
         assert (offset_dir / "factor_direction_summary.json").exists()
         assert (offset_dir / "factor_correlations.parquet").exists()
         assert (offset_dir / "probe.json").exists()
         assert (offset_dir / "calibration" / "reliability_bins.json").exists()
-        assert (offset_dir / "calibration" / "reliability_bins_catboost.json").exists()
+        assert not (offset_dir / "calibration" / "reliability_bins_catboost.json").exists()
         blend_weights = json.loads((offset_dir / "calibration" / "blend_weights.json").read_text(encoding="utf-8"))
         assert blend_weights["method"] == "inverse_brier_weight"
-        assert set(blend_weights) >= {"w_lgb", "w_lr", "w_catboost"}
-        assert blend_weights["w_catboost"] > 0.0
-        assert blend_weights["w_lgb"] + blend_weights["w_lr"] + blend_weights["w_catboost"] == pytest.approx(1.0)
+        assert set(blend_weights) >= {"w_lgb", "w_lr"}
+        assert "w_catboost" not in blend_weights
+        assert blend_weights["w_lgb"] + blend_weights["w_lr"] == pytest.approx(1.0)
         summary_payload = json.loads((offset_dir / "summary.json").read_text(encoding="utf-8"))
-        assert "catboost" in summary_payload["metrics"]
+        assert "catboost" not in summary_payload["metrics"]
         assert summary_payload["weight_summary"]["mean_weight"] is not None
         assert summary_payload["split_summary"]["folds_built"] >= summary_payload["split_summary"]["folds_used"]
         assert summary_payload["explainability"]["top_logreg_coefficients"]
@@ -233,6 +239,44 @@ def test_train_research_run_writes_reports_and_rich_offset_summary(tmp_path: Pat
         assert factor_direction_payload["rows"]
         correlation_payload = pd.read_parquet(offset_dir / "factor_correlations.parquet")
         assert not correlation_payload.empty
+
+
+def test_train_research_run_uses_catboost_only_for_catboost_family(tmp_path: Path) -> None:
+    cfg = _prepare_cfg(tmp_path)
+    build_feature_frame_dataset(cfg)
+    build_label_frame_dataset(cfg)
+    build_training_set_dataset(
+        cfg,
+        TrainingSetSpec(
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+            offset=7,
+        ),
+    )
+
+    summary = train_research_run(
+        cfg,
+        TrainingRunSpec(
+            model_family="catboost",
+            feature_set="deep_otm_v1",
+            label_set="truth",
+            target="direction",
+            window=DateWindow.from_bounds("2026-03-01", "2026-03-01"),
+            run_label="catboost-family",
+            offsets=(7,),
+        ),
+    )
+
+    offset_dir = Path(summary["run_dir"]) / "offsets" / "offset=7"
+    assert (offset_dir / "models" / "catboost.joblib").exists()
+    assert (offset_dir / "calibration" / "reliability_bins_catboost.json").exists()
+    blend_weights = json.loads((offset_dir / "calibration" / "blend_weights.json").read_text(encoding="utf-8"))
+    assert blend_weights["w_catboost"] > 0.0
+    assert blend_weights["w_lgb"] + blend_weights["w_lr"] + blend_weights["w_catboost"] == pytest.approx(1.0)
+    summary_payload = json.loads((offset_dir / "summary.json").read_text(encoding="utf-8"))
+    assert "catboost" in summary_payload["metrics"]
 
 
 def test_train_research_run_rerun_removes_stale_offset_outputs(monkeypatch, tmp_path: Path) -> None:
@@ -363,6 +407,23 @@ def test_fit_lgbm_splits_experiment_cpu_thread_cap_across_parallel_workers(monke
     assert model.get_params()["n_jobs"] == 2
 
 
+def test_prepare_training_matrix_downcasts_numeric_features_to_float32() -> None:
+    frame = pd.DataFrame(
+        {
+            "decision_ts": pd.date_range("2026-03-01", periods=3, freq="min", tz="UTC"),
+            "ret_1m": np.array([1.0, 2.0, 3.0], dtype=np.float64),
+            "ret_3m": ["4.0", "5.0", "6.0"],
+            "y": [0, 1, 0],
+        }
+    )
+
+    X, y, _plan = prepare_training_matrix(frame, feature_set="deep_otm_v1", cfg=TrainerConfig())
+
+    assert X["ret_1m"].dtype == np.dtype("float32")
+    assert X["ret_3m"].dtype == np.dtype("float32")
+    assert y.dtype == np.dtype("int64")
+
+
 def test_fit_catboost_splits_experiment_cpu_thread_cap_across_parallel_workers(monkeypatch) -> None:
     class FakeCatBoostClassifier:
         def __init__(self, **params):
@@ -388,8 +449,36 @@ def test_fit_catboost_splits_experiment_cpu_thread_cap_across_parallel_workers(m
 
     model = fit_catboost(X, y, cfg=TrainerConfig(parallel_workers=3), sample_weight=sample_weight)
 
-    assert model.get_params()["thread_count"] == 2
+    assert model.get_params()["thread_count"] == 1
+    assert model.get_params()["used_ram_limit"] == "12gb"
     assert model.fit_sample_weight is not None
+
+
+def test_fit_catboost_honors_used_ram_limit_env(monkeypatch) -> None:
+    class FakeCatBoostClassifier:
+        def __init__(self, **params):
+            self.params = params
+
+        def fit(self, X, y, *, sample_weight=None, verbose=None):
+            return self
+
+        def get_params(self):
+            return self.params
+
+    monkeypatch.setattr("pm15min.research.training.trainers.os.cpu_count", lambda: 24)
+    monkeypatch.setenv("PM15MIN_EXPERIMENT_CPU_THREADS", "8")
+    monkeypatch.setenv("PM15MIN_CATBOOST_USED_RAM_LIMIT", "8gb")
+    monkeypatch.setattr(
+        "pm15min.research.training.trainers._load_catboost_classifier",
+        lambda: FakeCatBoostClassifier,
+    )
+    X = pd.DataFrame({"feature_a": np.linspace(0.0, 1.0, 12), "feature_b": np.linspace(1.0, 0.0, 12)})
+    y = pd.Series([0, 1] * 6, dtype=int)
+
+    model = fit_catboost(X, y, cfg=TrainerConfig(parallel_workers=1))
+
+    assert model.get_params()["thread_count"] == 4
+    assert model.get_params()["used_ram_limit"] == "8gb"
 
 
 def test_train_research_run_reports_offset_progress_and_oof_heartbeats(tmp_path: Path) -> None:
